@@ -49,8 +49,8 @@ cp -R core/templates/paper papers/<arxiv-id>-<слово>
 | Что | Откуда | Лицензия | Как подключено |
 |---|---|---|---|
 | ManimGL | [3b1b/manim](https://github.com/3b1b/manim), © 3Blue1Brown LLC | MIT (`vendor/manim/LICENSE.md`) | копия исходников с правками (`vendor/manim/UPSTREAM.md`) |
-| Animator | [ashishjamarkattel/Animator](https://github.com/ashishjamarkattel/Animator), автор — Ashish Jamarkattel | **не указана** — лицензия запрошена у автора | вложенный репозиторий: форк [esurvanov/Animator](https://github.com/esurvanov/Animator); код в этот репозиторий не копируется |
+| Animator | [ashishjamarkattel/Animator](https://github.com/ashishjamarkattel/Animator), автор — Ashish Jamarkattel | **не указана** (ни файла, ни отметки на GitHub) | вложенный репозиторий: форк [esurvanov/Animator](https://github.com/esurvanov/Animator); код в этот репозиторий не копируется |
 | Детектор текста CRAFT (внутри Animator, `animator/models/craft.onnx`) | [clovaai/CRAFT-pytorch](https://github.com/clovaai/CRAFT-pytorch), NAVER Corp. | код — MIT; лицензия весов не указана | в составе форка Animator |
 
 Пока у Animator нет лицензии, его код живёт только в форке на GitHub (форк публичных репозиториев разрешён правилами
-GitHub); переносить его исходники в этот репозиторий — после того как автор добавит лицензию.
+GitHub). Переносить его исходники в этот репозиторий — только после того, как автор добавит лицензию.
