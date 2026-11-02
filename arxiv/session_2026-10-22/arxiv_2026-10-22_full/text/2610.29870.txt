@@ -1,0 +1,2176 @@
+## PAUSE: Search-Free Steering of Coding Agents Before Their First Source-Code Edit
+
+CCS: Software and its engineering Software maintenance toolsCCS: Software and its engineering Software testing and debuggingCCS: Computing methodologies Intelligent agents
+
+Viral Patel
+
+Affiliation: Mohamed bin Zayed University of Artificial Intelligence, Abu Dhabi, United Arab Emirates
+
+, 
+Boyin Tan
+
+Affiliation: Mohamed bin Zayed University of Artificial Intelligence, Abu Dhabi, United Arab Emirates
+
+, 
+Jason Xue
+
+Affiliation: Mohamed bin Zayed University of Artificial Intelligence, Abu Dhabi, United Arab Emirates
+
+ and 
+Youcheng Sun
+
+Affiliation: Mohamed bin Zayed University of Artificial Intelligence, Abu Dhabi, United Arab Emirates
+
+Abstract.
+
+Coding agents can invest substantial effort in repository exploration and testing yet still produce unsuccessful patches. Existing online steering methods commonly review execution trajectories periodically or invoke an advisor when a monitor detects behavioral problems. Frequent reviews are costly, and the absence of anomalous behavior does not mean that an agent is on the right track. To bridge this gap, we propose PAUSE, a framework for steering coding agents with a single planning intervention.
+We find that agents reach their first source-code edit at a median of 60% of trajectory progress, with the preceding work largely devoted to repository exploration, bug reproduction, and testing. This motivates intercepting the request before execution, so that the agent’s accumulated investigation can guide the repair it is about to implement.
+Because the first source-code edit directly identifies when to intervene, PAUSE locates this point without a learned monitor, a search over candidate checkpoints, or an extra model call—a property we call search-free. At this point, a separate Planner reads the task and pre-edit transcript to produce one repair plan. The same agent, the Executor, resumes with this plan, retaining its accumulated context and workspace. PAUSE applies both online, during a live run, and offline, from a recorded trajectory prefix.
+
+We evaluate PAUSE on SWE-bench Verified and SWE-bench Multilingual with two Executors and three agent harnesses. With Qwen3-coder as Executor and GPT-5.6 Sol as Planner, online steering in OpenHands improves resolution on Verified by 16.8%, and online steering in SWE-agent improves resolution on Multilingual by 14.7%. In SWE-agent, against LivePlan, which invokes an advisor through rule-based monitoring, PAUSE is more effective at a similar Planner cost, improving resolution by 3.2% and 3.7% on Verified and Multilingual, respectively. Against SICA, which reviews the trajectory periodically, PAUSE remains comparable on both benchmarks while incurring about 11% and 15% of SICA’s Planner cost on Verified and Multilingual, respectively. Offline, PAUSE recovers 35.4% of the eligible failed Verified tasks, and resuming from the recorded prefix uses 33–41% fewer Executor tokens than restarting. These results show that a single planning intervention at the first source-code edit is more effective than rule-based monitoring and competitive with periodic oversight at a small fraction of its cost.
+
+Keywords: 
+coding agents, agent steering, planning, trajectory reuse
+
+## 1. Introduction
+
+LLM-based coding agents tackle repository-level issues by inspecting code, making edits, and running commands and tests through an interactive tool interface (Yang et al., 2024; Wang et al., 2025a; Bouzenia et al., 2025).
+Existing repair systems gather relevant context through localization and structural code search (Xia et al., 2025; Zhang et al., 2024b), and infer code intent to guide repair (Ruan et al., 2025).
+However, agents can still struggle to turn this investigation into a correct repair (Yang et al., 2024).
+This motivates online steering, which uses the context accumulated during execution to guide the agent’s subsequent repair decisions (Gandhi et al., 2025b; Nanda et al., 2026; Liu et al., 2026a).
+
+The timing of guidance shapes both the effectiveness and cost of online steering (Liu et al., 2026b).
+As shown in Table 1, existing methods decide when to guide either through repeated model-based reviews or by waiting for a detected problem.
+With periodic model-based review, methods such as SWE-PRM (Gandhi et al., 2025b) and SICA (Robeyns et al., 2025) repeatedly assess ongoing execution at regular step or time intervals to determine whether guidance is needed.
+Each review incurs additional inference cost, while longer intervals can delay useful feedback until the agent has taken further steps along an ineffective path (Liu et al., 2026b).
+A fixed schedule also need not align with the point at which accumulated investigation is ready to inform a code change.
+To reduce review overhead, LivePlan uses rule-based checks to invoke an advisor when signals such as repetition, stagnation, or skipped phases are detected (Liu et al., 2026b).
+This reduces monitoring cost, but intervention remains limited by the coverage of predefined signals, which LivePlan acknowledges may be incomplete (Liu et al., 2026b).
+Thus, the absence of a behavioral alarm does not establish that the repair strategy is correct: an agent may follow an orderly workflow while preparing an ineffective change.
+
+Table 1. Online steering methods compared by how they decide when to guide.
+Trigger: the event that starts an intervention.
+Timing model call: whether a model must be called to decide when to intervene.
+Needs detected problem: whether guidance is given only after a problem in the trajectory is detected.
+Interventions: how many times guidance is inserted into a single run.
+
+Method
+Trigger
+Timing model call
+Needs detected problem
+Interventions
+
+SWE-PRM (Gandhi et al., 2025b)
+Fixed step interval
+Yes
+Yes
+Repeated
+
+SICA (Robeyns et al., 2025)
+Overseer-chosen interval
+Yes
+Yes
+Repeated
+
+LivePlan (Liu et al., 2026b)
+Rule-detected anomaly
+No
+Yes
+Repeated
+
+PAUSE (Ours)
+First source-code edit
+No
+No
+One
+
+We therefore seek a moment to guide repair using the agent’s accumulated investigation, without repeated trajectory reviews or waiting for a behavioral alarm.
+
+Figure 1. Actions in 500 Qwen3-coder runs on SWE-bench Verified. The curve marks first source-code edits (median 60.0%); 24 runs without one lie below the divider.A heatmap of 500 trajectories over normalized action progress from 0 to 100 percent. Yellow denotes think actions, blue file reads, green shell commands, red file-editor actions, and gray other or finish actions. The first 476 rows are sorted by their first source-code edit, traced by a black curve; a marker on the top edge labels their median position, 60.0 percent. The final 24 rows have no source-code edit and appear below a horizontal divider.
+
+Why the first source-code edit?
+
+To identify such a moment, we analyze 500 recorded Qwen3-coder trajectories on SWE-bench Verified.
+We define the first source-code edit as the first file-editor request targeting a source-code file of the repository.
+We classify recorded actions into five categories: explicit reasoning, file inspection, shell command execution, file editing, and other operations, including termination.
+Figure 1 visualizes these sequences over normalized action progress and orders trajectories by their first source-code edit; edits to scratch files or reproduction scripts outside the designated source-code paths are excluded.
+Among the 476 trajectories containing such a request, its median position is 60.0% of action progress, and 80.5% occur after the midpoint.
+Before this point, command execution is the most common action type and file reads account for 31% of actions, reflecting substantial repository investigation before the proposed source change.
+This observation motivates intervening before the proposed source-code edit executes, when accumulated evidence is available to inform the repair and the proposed change remains open to revision.
+Our experiments confirm that this point balances the two: an earlier intervention gives the Planner too little of the investigation to ground a plan, whereas a later one arrives after the agent has committed to and built on its own changes, which the plan must then overturn.
+
+Prior work uses explicit planning to coordinate repository edits (Bairi et al., 2024; Tao et al., 2024) and explores planning and execution roles in model collaboration (Lee et al., 2026; Gandhi et al., 2025a).
+To guide repair at this point, we introduce PAUSE, a framework that uses the first source-code edit to trigger a single planning intervention.
+The request identifies the intervention point directly from the agent’s proposed action and its target path, without a learned monitor, a search over candidate checkpoints, or an additional model call to locate the point; we call this property search-free.
+A separate Planner reads the task and the coding agent’s preceding transcript, including inspected code and execution feedback, and returns one natural-language repair plan.
+The same coding agent, the Executor, receives this plan and continues from its existing conversation and workspace, retaining its investigation and responsibility for editing and testing without updating its underlying language model.
+
+PAUSE supports online steering and offline recovery.
+Online, it blocks the first source-code edit during a live run and adds the Planner’s guidance before resuming the Executor from its live state.
+Offline, it restores an existing failed trajectory to a pre-edit state, adds a plan based on the recorded prefix, and resumes the same Executor with its remaining budget.
+
+We evaluate PAUSE on SWE-bench Verified (Jimenez et al., 2024) and SWE-bench Multilingual (Yang et al., 2025), which spans nine programming languages, using two Executors and three agent harnesses.
+With Qwen3-coder as Executor and GPT-5.6 Sol as Planner in OpenHands, online steering improves resolution on Verified by 16.8%.
+In SWE-agent, it improves resolution by 14.8% and 14.7% on Verified and Multilingual, respectively.
+Against LivePlan, which invokes an advisor through rule-based monitoring, PAUSE is more effective at a similar Planner cost, improving resolution by 3.2% and 3.7% on Verified and Multilingual, respectively.
+Against SICA, which reviews the trajectory periodically, PAUSE remains comparable on both benchmarks while incurring about 11% and 15% of SICA’s Planner cost on Verified and Multilingual, respectively.
+Offline, PAUSE recovers 79 of 223 eligible failed Verified tasks, a recovery rate of 35.4%.
+These results show that a single planning intervention at the first source-code edit is more effective than rule-based monitoring and competitive with periodic oversight at a small fraction of its cost.
+
+Our contributions are:
+
+• 
+
+An empirical characterization of the first source-code edit as an opportunity to guide repair after substantial repository investigation.
+
+• 
+
+PAUSE, a search-free framework that gives the same Executor one plan while preserving its context and workspace, supporting online steering and offline recovery.
+
+• 
+
+An evaluation across two benchmarks, two Executors, and three harnesses, showing that PAUSE is more effective than rule-based monitoring at a similar Planner cost and is competitive with periodic oversight at 11–15% of its Planner cost, with controlled studies of intervention timing, planning guidance, and state reuse.
+
+## 2. Related Work
+
+## 2.1. Repository-Level Repair and Planning
+
+SWE-bench frames repository-level repair as resolving real GitHub issues through changes to an existing codebase (Jimenez et al., 2024).
+SWE-agent equips language models with interfaces for navigating repositories, editing files, and using execution feedback (Yang et al., 2024).
+OpenHands provides an extensible platform in which agents perform software development through code execution and other tools (Wang et al., 2025a).
+CodeAgent integrates retrieval, navigation, implementation, and testing tools for repository-level coding (Zhang et al., 2024a), while RepoGraph and LingmaAgent use repository graphs to support context gathering and exploration (Ouyang et al., 2025; Ma et al., 2025).
+Alongside these interactive agents, Agentless separates localization, repair, and patch validation into a structured pipeline (Xia et al., 2025).
+SHERLOC further studies dedicated diagnostic exploration, transferring localization findings to a downstream repair agent (Tamoyan et al., 2026).
+Training-based approaches include SWE-Fixer’s specialized retrieval and editing modules (Xie et al., 2025) and SWE-Gym’s agent and verifier training in executable repository environments (Pan et al., 2025).
+
+Explicit planning also structures reasoning and collaboration.
+Plan-and-Solve decomposes problems before solving them (Wang et al., 2023), and Plan-and-Act separates high-level planning from environment actions (Erdogan et al., 2025).
+MetaGPT organizes software development through role-specific procedures and intermediate artifacts (Hong et al., 2024), while Self-Collaboration coordinates analyst, coder, and tester roles (Dong et al., 2024).
+Within repository repair, planning can compare candidate solutions before implementation.
+SWE-Manager trains an 8B model to select among competing repair proposals and synthesize a golden proposal for implementation (Tan et al., 2026).
+Its P2A framework separates proposal generation, managerial selection and synthesis, and implementation into distinct roles (Tan et al., 2026).
+PAUSE instead obtains one plan from the investigation already accumulated by an executing agent, using its first source-code edit to determine when guidance is provided.
+The same Executor then continues with its retained conversation and workspace.
+
+## 2.2. Online Steering
+
+Online steering introduces guidance while an agent is still carrying out its task.
+SWE-PRM periodically reviews a recent trajectory window and produces natural-language feedback grounded in a taxonomy of execution inefficiencies (Gandhi et al., 2025b).
+SICA includes an asynchronous overseer that examines execution state at regular intervals or key events and can notify or stop an agent when it detects problematic behavior (Robeyns et al., 2025).
+LivePlan separates detection from advice: a deterministic monitor checks for signals such as repetition, stagnation, and skipped phases, then requests corrective guidance when a signal fires (Liu et al., 2026b).
+These designs make the intervention decision depend on periodic assessment or detected behavioral conditions.
+PAUSE uses a different trigger: the first source-code edit identifies an opportunity to guide the repair regardless of whether the preceding trajectory exhibits a behavioral alarm.
+This enables a single planning intervention without repeated model-based reviews or a search for an intervention point.
+
+## 2.3. Trajectory Reuse and Reflection
+
+Search-based approaches explore alternative reasoning and action sequences.
+Tree of Thoughts searches over alternative reasoning paths (Yao et al., 2023a), while Language Agent Tree Search combines tree search with environment feedback and reflection (Zhou et al., 2024).
+For code generation, CodeTree searches over coding strategies, candidate programs, and revisions using execution and agent feedback (Li et al., 2025).
+
+Within repository repair, reusing intermediate work can reduce exploration repeated across attempts.
+SWE-Search combines Monte Carlo tree search with iterative refinement to explore alternative repair trajectories (Antoniades et al., 2025).
+SWE-Replay retains an archive of sampled trajectories and selects intermediate steps from which to restore state and generate new continuations (Ding and Zhang, 2026).
+DARS resamples actions at branching points using prior execution feedback (Aggarwal et al., 2025), while SE-Agent revises, recombines, and refines existing trajectories (Guo et al., 2025).
+These methods use intermediate states to diversify the search for a successful repair.
+Offline PAUSE reuses a recorded prefix to support a different operation: inserting one plan at a checkpoint determined by the first source-code edit and continuing with the remaining execution budget.
+
+Another approach uses verbal feedback to guide later attempts.
+Reflexion stores verbal feedback from prior attempts in an episodic memory to guide subsequent trials (Shinn et al., 2023).
+Self-Refine iterates between feedback generation and output revision using the same language model (Madaan et al., 2023).
+Tool-grounded feedback supports related correction mechanisms: CRITIC verifies and revises outputs through tool interaction (Gou et al., 2024), while Self-Debugging and LDB use program execution evidence to diagnose and revise generated code (Chen et al., 2024; Zhong et al., 2024).
+ChatRepair retains candidate patches and test feedback within a repair conversation to inform subsequent attempts (Xia and Zhang, 2024).
+
+Execution feedback also supports candidate selection: CodeT uses generated tests and execution agreement (Chen et al., 2023), whereas LEVER learns to score candidate programs from their inputs, code, and execution results (Ni et al., 2023).
+PAUSE places the planning call within an existing coding trajectory and retains the Executor’s conversation and workspace when delivering guidance.
+The Planner reasons over the recorded evidence in a separate invocation, which may use the Executor’s model.
+
+## 3. Method
+
+## 3.1. Problem Formulation
+
+A repository-level repair task consists of an issue description $d$ and an
+initial repository snapshot $R_{0}$ (Jimenez et al., 2024). A coding agent, which we call the
+Executor, investigates the issue, modifies files, and tests its changes
+through an execution harness (Yang et al., 2024; Wang et al., 2025a).
+Reasoning-and-acting agents interleave model decisions with observations
+from the environment (Yao et al., 2023b). After $t$ completed actions, the Executor’s conversation
+ $h_{t}$ contains the system prompt, the task, and the recorded actions and
+observations; $W_{t}$ is the resulting workspace. From this state, the
+Executor proposes its next action $a_{t+1}$ for the harness to execute.
+
+Online steering aims to improve the final repair during execution. It must
+determine when to intervene and what guidance to provide using the task and
+available evidence. We call the model supplying repair guidance the Planner.
+The available evidence includes inspected code, command outputs, and the
+Executor’s own test results. Benchmark evaluator feedback, hidden tests,
+reference patches, and future actions are excluded from the planning input.
+
+## 3.2. Pre-Edit Intervention
+
+The investigation preceding a source-code edit provides evidence for
+guidance while the proposed change remains open to revision.
+PAUSE uses the first source-code edit to trigger
+a single planning intervention, without repeated
+trajectory assessment or a search over intervention points.
+
+As illustrated in Figure 2, PAUSE blocks the
+request and asks the Planner to produce a repair plan from the preceding
+evidence. It appends this plan to the same Executor’s conversation, allowing
+the agent to continue with its context and workspace preserved.
+
+Figure 2. Overview of PAUSE. The Executor investigates the repository
+by reading code, writing scratch scripts, and running them. When the Executor
+issues its first source-code edit, PAUSE blocks the request and passes the
+task and the observed evidence to the Planner. The Planner returns one repair
+plan, which PAUSE appends to the Executor’s conversation, and the same
+Executor resumes with its context and workspace preserved.A reconstructed coding trajectory with small tool windows, bold action borders, and ellipses between representative investigation steps. Source reads and a scratch reproduction show that successive evaluations using the same cross-validation generator obtain two folds and then zero folds. Candidate scoring in the sequential feature selector repeatedly passes the original cv object through validation and splitter normalization. PAUSE blocks the first source-code edit. A lavender Planner panel combines these observations into a plan to normalize CV once per fit and propagate the reusable splitter to each candidate. A purple arrow appends the plan to context; the same Executor edits the sequential feature selector and checks that both evaluations retain two folds. The displayed fold counts come from local execution of the actual splitter functions.
+
+We identify a source-code edit by a file-editor request whose target is
+a source-code file of the repository. Let $\Pi$ be the set of source-code
+paths in the repository, fixed before execution. Writing
+ $\pi(a)$ for the target path, we define the predicate and the first source-code edit as
+
+(1)
+
+ $\displaystyle q(a)$ 
+ $\displaystyle=\bigl[\,a\text{ is an editor request}\,\bigr]\wedge\bigl[\,\pi(a)\in\Pi\,\bigr],$ 
+
+(2)
+
+ $\displaystyle k^{\ast}$ 
+ $\displaystyle=\min\{\,t:q(a_{t})\,\}.$ 
+
+The predicate can be evaluated before the requested edit executes, using
+only the action type and target path. No model call or future observation
+is needed to locate the boundary; this is its search-free property.
+A live run with no source-code edit request continues without an intervention.
+
+## 3.3. Plan Generation and Online Steering
+
+Interception and evidence.
+
+During a live run, PAUSE checks each proposed action before execution.
+On the first source-code edit $a_{k^{\ast}}$ , it blocks the edit and
+constructs a planning transcript from the completed history $h_{k^{\ast}-1}$ .
+The pending response, its edit payload, and its attached reasoning are
+excluded.
+
+Algorithm 1 PAUSE in online and offline mode.
+
+(a) Online steering
+
+ 1:
+
+ task $(d,R_{0})$ ; Planner $\mathcal{P}$ ; Executor in harness $H$ 
+
+ 2:
+
+ completed trajectory, or Unresolved
+
+ 3:
+
+ $h\leftarrow$ system prompt and $d$ ; $\mathit{armed}\leftarrow\textbf{true}$ 
+
+ 4:
+
+ while Executor has not finished do
+
+ 5:
+
+    $a\leftarrow$ next proposed action
+
+ 6:
+
+   if $\mathit{armed}$ and $q(a)$ then
+
+ 7:
+
+    block $a$ ; $g\leftarrow\mathcal{P}(d,\phi(h))$ 
+
+ 8:
+
+    if no usable plan is returned then
+
+ 9:
+
+       return Unresolved
+
+ 10:
+
+    end if
+
+ 11:
+
+    append $g$ to $h$ as a user message
+
+ 12:
+
+     $\mathit{armed}\leftarrow\textbf{false}$ 
+
+ 13:
+
+   else
+
+ 14:
+
+     $H$ runs $a$ ; append $a$ and result to $h$ 
+
+ 15:
+
+   end if
+
+ 16:
+
+ end while
+
+ 17:
+
+ return recorded trajectory
+
+(b) Offline recovery
+
+ 1:
+
+ task $(d,R_{0})$ ; failed trajectory; Planner $\mathcal{P}$ ; Executor; budget $B$ 
+
+ 2:
+
+ continued trajectory, or Ineligible
+
+ 3:
+
+ $k^{\ast}\leftarrow$ first source-code edit
+
+ 4:
+
+ $c\leftarrow$ last think before $k^{\ast}$ 
+
+ 5:
+
+ if $k^{\ast}$ or $c$ does not exist then
+
+ 6:
+
+   return Ineligible
+
+ 7:
+
+ end if
+
+ 8:
+
+ restore $h_{c}$ , $W_{c}$ , and counter $b_{c}$ 
+
+ 9:
+
+ if restoration fails the fidelity check then
+
+ 10:
+
+   return Ineligible
+
+ 11:
+
+ end if
+
+ 12:
+
+ $g\leftarrow\mathcal{P}(d,\phi(h_{c-1}))$ 
+
+ 13:
+
+ append $g$ to $h_{c}$ as a user message
+
+ 14:
+
+ resume Executor from $(h_{c},W_{c})$ with budget $B-b_{c}$ 
+
+ 15:
+
+ return continued trajectory
+
+Repair plan.
+
+The Planner $\mathcal{P}$ is a separate language-model invocation with no tools or direct
+workspace access. It may use a different underlying model from the Executor
+or a separate call to the same model. Given the issue and the transcript,
+it identifies the likely root cause, the code that needs to change, and the
+intended repair with its rationale:
+
+(3)
+
+ $g=\mathcal{P}\bigl(d,\phi(h_{k^{\ast}-1})\bigr),$ 
+
+where $\phi$ renders the recorded evidence as text, omitting editor actions.
+The plan $g$ is a
+natural-language recommendation; the Executor remains responsible for
+implementing and testing it. In Figure 2, the Planner combines
+observations from source reads and a reproduction run into a root cause,
+the code to change, and the intended repair.
+
+Guided continuation.
+
+PAUSE appends the plan as a user message to the same Executor’s
+conversation. The Executor retains the completed history in full, the
+workspace $W_{k^{\ast}-1}$ , and its model, system prompt, tools, and decoding
+settings. It then chooses its next action with this additional guidance.
+The blocked request is not executed automatically: the Executor may revise
+its approach or propose another edit to the same file. The interceptor is
+disabled after this intervention, and subsequent actions proceed under the
+harness’s native execution budget.
+
+## 3.4. Offline Recovery
+
+Offline recovery applies the same planning mechanism to recorded failures.
+The first source-code edit locates the intervention, but recovery restores
+an earlier reasoning checkpoint rather than pausing a live request. It requires a
+trajectory with explicit think actions.
+
+Checkpoint and planning input.
+
+To place the additional guidance immediately after the Executor’s last
+recorded reasoning step before the first source-code edit, we select
+
+(4)
+
+ $c=\max\{\,t<k^{\ast}:a_{t}\text{ is a }\textsf{think}\,\}.$ 
+
+The Executor retains that step and its observation in $h_{c}$ , whereas the
+Planner receives the preceding transcript and produces
+ $g=\mathcal{P}(d,\phi(h_{c-1}))$ . Thus, the Planner supplies a repair proposal
+from the evidence preceding the selected reasoning step, and the Executor
+receives both its original reasoning and the new guidance.
+Section 4.5 compares this checkpoint with earlier and
+later cuts of the same failures. Recovery retains
+the recorded prefix through checkpoint $c$ and generates a new continuation
+from $(h_{c},W_{c})$ . A trajectory without a source-code edit request or a preceding
+think is ineligible for this recovery protocol.
+
+Restoration and continuation.
+
+PAUSE rebuilds $h_{c}$ from the recorded model outputs and observations,
+and restores $W_{c}$ by replaying the prefix actions on $R_{0}$ in a fresh
+container. This retains files created during investigation, such as
+reproduction scripts, without calling the Executor model to regenerate
+the prefix. It also restores the harness’s iteration counter $b_{c}$ ;
+this counter is distinct from the action index $c$ . With an original
+budget $B$ , continuation receives only $B-b_{c}$ further iterations.
+A fidelity check compares the restored conversation, repository state,
+and counter with the recording. Tasks that fail this check are excluded
+from the recovery cohort. The plan is then appended using the same message
+interface as online steering, and the same Executor resumes with its
+retained state and remaining budget.
+
+Use of AI tools.
+
+Apart from the Executor and Planner models under study, we used AI coding
+assistants to implement the harness integrations, write the analysis and
+plotting scripts, and assemble the replication package. They produced no
+experimental data: every outcome comes from the agent runs and the official
+SWE-bench evaluation. The authors reviewed this code, and the released
+scripts recompute every reported number from the raw run outputs.
+
+## 4. Experiment
+
+We evaluate the effectiveness and efficiency of PAUSE for online
+steering (RQ1) and offline recovery (RQ2), its generalization across harnesses
+and reasoning interfaces (RQ3), and the effectiveness of the pre-edit
+boundary (RQ4). The shared setup below defines the benchmarks, metrics,
+comparisons, and execution protocols used to answer these questions.
+
+## 4.1. Experimental Setup
+
+## 4.1.1. Benchmarks
+
+We evaluate PAUSE on SWE-bench Verified (Jimenez et al., 2024), which contains 500 Python
+repository-level repair tasks, and SWE-bench Multilingual (Yang et al., 2025), which contains
+300 tasks across nine programming languages. Both benchmarks support the online comparisons
+in RQ1, and recorded Verified trajectories support offline recovery in RQ2.
+For RQ3, we compare harnesses on Verified. Full-benchmark evaluations measure
+overall task resolution, while recovery experiments focus on the Executor’s
+original failures. The checkpoint comparisons in RQ4 use failures that can
+be restored under both conditions.
+
+## 4.1.2. Evaluation Metrics
+
+Repair outcomes.
+We score patches with the corresponding benchmark evaluator.
+Resolution is the fraction of tasks resolved in the evaluated task
+set. For offline resume, tasks that are not continued retain their original
+outcomes; recovered failures are added to the original successes and observed
+regressions are subtracted.
+
+Failure recovery and regressions.
+The offline recovery and online model comparisons report
+Recovered, the number of originally failed tasks solved after
+intervention, and recovery rate, this count divided by the number of
+failures evaluated. Offline recovery uses eligible failures that meet the
+checkpoint and restoration requirements in Section 3.4.
+Regression rate is the fraction of evaluated baseline successes that
+fail after intervention. Changes in these rates are reported in percentage
+points.
+
+Resource use.
+To assess efficiency in RQ1 and RQ2, we report Planner and Executor tokens
+separately, in millions, and their model calls where measured.
+Dollar costs cover Planner inference at rates of
+$2.50 and $10 per million input and output tokens, respectively; they do
+not include Executor inference. Offline continuation costs exclude the
+recorded run used to obtain the prefix. Totals that include this original
+run are identified explicitly.
+
+Scoring and statistical analysis.
+Evaluator errors, empty patches, and missing evaluations count as unresolved.
+We compare paired outcomes with exact McNemar tests.
+
+## 4.1.3. Baselines and Control Conditions
+
+The unmodified Executor is the baseline.
+
+Online steering.
+RQ1 compares PAUSE with LivePlan (Liu et al., 2026b),
+which uses rule-based monitoring to invoke an advisor when it detects trouble,
+and the SICA overseer (Robeyns et al., 2025), which reviews the
+trajectory on a schedule and decides whether to interject. These methods
+compare a single pre-edit intervention with rule-triggered advice and
+periodic model oversight.
+
+Offline recovery.
+RQ2 compares PAUSE with SHERLOC (Tamoyan et al., 2026),
+which performs a dedicated diagnostic-localization pass before repair and
+transfers its findings to the Executor. At a fixed restored checkpoint,
+we compare no-plan continuation, self-reconsideration, and Planner guidance
+to assess the contribution of the supplied plan. With the same plan, we
+compare resuming the recorded state with restarting from the initial
+repository to assess the repair–cost trade-off of state reuse.
+
+Generalization and boundary controls.
+RQ3 compares each harness with its own unmodified Executor. A think-stripped variant removes explicit
+think content from the Planner input to test dependence on that
+reasoning interface. RQ4 uses guidance from successful donor runs to test
+whether failed trajectories can still be redirected at the boundary, then
+compares the default offline checkpoint with cuts after 20% and 90% of the
+recorded actions, an immediate pre-edit cut, and a checkpoint associated
+with a later source-code edit.
+
+## 4.1.4. Experimental Configuration
+
+Models and harnesses.
+We use Qwen3-Coder-30B-A3B-Instruct and Devstral-Small-2507 as Executors.
+We hereafter refer to them as Qwen3-coder and Devstral-small, respectively.
+The five Planners are GPT-5.6 Sol, Gemini 3.8 Flash, Gemini 3.5 Flash Lite,
+Qwen3-30B-A3B-Thinking-2507, hereafter Qwen3-30B-Thinking, and Qwen3-coder.
+Online steering runs in OpenHands, SWE-agent (Yang et al., 2024), and Pi (Zechner, 2025); offline recovery
+uses recorded OpenHands trajectories (Wang et al., 2025a).
+The main online comparison in RQ1 uses SWE-agent with Qwen3-coder and
+GPT-5.6 Sol; RQ3 extends the evaluation to other harnesses.
+OpenHands pauses source-code
+edit requests through its security and confirmation mechanisms, while SWE-agent and
+Pi block the edit tool call directly. OpenHands provides an explicit
+think tool; SWE-agent and Pi do not. Planner transcripts include
+reasoning text that the Executor writes alongside its actions.
+
+Table 2. Decoding settings and execution budgets.
+
+Component or setting
+
+Configuration
+
+Executors
+
+Temperature 0; top- $p$ 1; 4,096 output tokens
+
+Executor context
+
+262,144 tokens (Qwen3-coder); 131,072 (Devstral-small)
+
+PAUSE API Planners, default
+
+Temperature 0; 8,192 output tokens
+
+Qwen3-30B-Thinking Planner
+
+Temperature 0.99; top- $p$ 0.95; seed 0; 81,920 output tokens
+
+LivePlan advisor
+
+Temperature 0; 3,000 output tokens
+
+SICA overseer
+
+Temperature 0; 8,192 output tokens
+
+Recorded Verified runs
+
+100 iterations
+
+SWE-agent comparisons
+
+100 Executor calls; 14,400 seconds per run
+
+Planner configuration.
+Table 2 summarizes decoding and budget settings. Online, the Planner is queried
+once when triggered; no usable plan within the output limit counts as
+unresolved. Offline, malformed Planner output is retried before inserting
+one plan.
+
+Evaluation protocol.
+The main comparisons use one designated attempt per task. The donor-guidance
+diagnostic in RQ4 uses three attempts per donor–recipient pair and counts
+a pair as successful if at least one continuation succeeds. Online attempts
+interrupted by an endpoint connection, container, or runtime-start failure
+are rerun.
+
+In RQ2, resumed runs use the recorded remaining Executor budget, whereas
+restarted runs receive the full budget. In the paired checkpoint comparisons
+of RQ4, each arm independently restores its prefix, obtains a plan from that
+prefix, and receives the same number of fresh Executor iterations. The cuts
+after 20% and 90% of the actions are placed by the length of the recorded
+failed trajectory.
+
+## 4.2. RQ1: How Effective and Efficient Is Online Steering?
+
+The central design choice in PAUSE is to provide one repair plan when
+an Executor first requests a source-code edit. We first evaluate this choice
+during live execution: does a single intervention improve task resolution,
+and how much computation does it require compared with rule-based monitoring
+and periodic model oversight? This establishes the effectiveness of online
+steering before considering recovery from recorded failures.
+
+Comparison setup.
+Table 3 reports results in SWE-agent with Qwen3-coder
+as the Executor and GPT-5.6 Sol as the Planner. We compare PAUSE with
+LivePlan and SICA on all 500 Verified and 300 Multilingual tasks, using
+matched Executor budgets, together with the unmodified Executor on each benchmark. We compare
+resolution alongside Planner and Executor tokens; dollar costs cover
+Planner inference.
+
+Table 3. Steering compared with monitoring-based methods.
+Qwen3-coder Executor and GPT-5.6 Sol Planner in SWE-agent on all 500
+SWE-bench Verified and all 300 SWE-bench Multilingual tasks.
+Resolution: resolved tasks over the full benchmark, with the gain
+over each block’s baseline. Tokens are in millions; Cost covers
+Planner inference only.
+
+Method
+Planner
+Resolved
+Resolution (%)
+Tokens (M)
+Cost ($)
+
+Planner
+Executor
+
+SWE-bench Verified, 500 tasks
+
+Baseline
+–
+251/500
+50.2
+0
+595.5
+0
+
+LivePlan (Liu et al., 2026b)
+GPT-5.6 Sol
+309/500
+61.8 (+11.6)
+9.2
+561.9
+26.10
+
+SICA overseer (Robeyns et al., 2025)
+GPT-5.6 Sol
+338/500
+67.6 (+17.4)
+80.9
+1056.4
+231.71
+
+PAUSE
+GPT-5.6 Sol
+325/500
+65.0 (+14.8)
+9.0
+564.2
+26.13
+
+SWE-bench Multilingual, 300 tasks
+
+Baseline
+–
+85/300
+28.3
+0
+469.3
+0
+
+LivePlan (Liu et al., 2026b)
+GPT-5.6 Sol
+118/300
+39.3 (+11.0)
+5.9
+497.5
+16.41
+
+SICA overseer (Robeyns et al., 2025)
+GPT-5.6 Sol
+133/300
+44.3 (+16.0)
+55.9
+1003.5
+159.63
+
+PAUSE
+GPT-5.6 Sol
+129/300
+43.0 (+14.7)
+8.5
+459.9
+23.68
+
+Figure 3. Resolution and Planner cost by task difficulty on SWE-bench
+Verified with SWE-agent. Dashed lines show the unmodified Executor, and
+the accompanying values show percentage-point gains over it. Here,
+ $n$ denotes the number of tasks in each difficulty group.
+
+Figure 4. Resolution by programming language on SWE-bench Multilingual
+with SWE-agent. The bar in each row spans the lowest and highest
+resolution among the four configurations, and the number after each
+language is its task count.
+
+Overall repair gains.
+PAUSE improves resolution on both benchmarks while reducing Executor token use. On
+Verified, resolution rises from 50.2% to 65.0%, a gain of 14.8 percentage
+points and a net increase of 74 solved tasks. On Multilingual, it rises
+from 28.3% to 43.0%, adding 14.7 points and 44 solved tasks, a difference
+that is statistically significant ( $p=4\times 10^{-7}$ ). Executor tokens decrease from
+595.5M to 564.2M on Verified and from 469.3M to 459.9M on Multilingual,
+reductions of 5.3% and 2.0%, respectively, while the intervention adds 9.0M
+and 8.5M Planner tokens. These
+results show that the repair gains coincide with lower Executor token use,
+with the additional computation supplied by the Planner.
+
+Comparison with rule-based steering.
+Against LivePlan, PAUSE achieves higher observed resolution at
+similar Planner cost, a gain of 3.2 percentage points that is not
+statistically significant ( $p=0.11$ ). PAUSE makes 0.93 Planner calls per task
+against LivePlan’s 2.33, yet their aggregate Planner tokens are close,
+9.0M versus 9.2M, as are their costs, $26.13 versus $26.10. Thus, fewer
+planning requests here correspond to a similar total planning expenditure.
+On Multilingual, PAUSE leads LivePlan by 3.7 percentage points,
+129 against 118 solved tasks, a difference that is also not statistically
+significant ( $p=0.18$ ). Its Planner cost remains similar, $23.68 versus
+$16.41, while it uses 7.6% fewer Executor tokens, 459.9M versus 497.5M.
+These results support intervention at the first source-code edit as an effective
+alternative to rule-triggered advice in the evaluated settings.
+
+Comparison with periodic oversight.
+SICA achieves the highest aggregate resolution at 67.6%,
+2.6 percentage points and 13 tasks above PAUSE’s 65.0%; this
+difference is not statistically significant ( $p=0.18$ ).
+SICA’s resource use is substantially higher: it requires 21 times as many Planner calls, 8.9 times the Planner
+cost, and 1.9 times the Executor tokens; the Planner expenditure is
+$231.71 versus $26.13, and Executor token use is 1,056.4M versus 564.2M.
+Periodic oversight therefore does not yield significantly higher resolution
+for its additional computation: PAUSE stays within a non-significant
+margin of SICA at about 11% of its Planner cost.
+The same pattern holds on Multilingual, where SICA resolves 133 tasks
+against 129 for PAUSE, a lead of 1.3 percentage points that is not
+statistically significant ( $p=0.71$ ). SICA again incurs 6.7 times the
+Planner cost, $159.63 versus $23.68, and 2.2 times the Executor tokens,
+1,003.5M versus 459.9M, so PAUSE stays within this margin at about
+15% of SICA’s Planner cost.
+A single intervention can thus provide repair benefits
+comparable to repeated oversight with far less planning and execution.
+
+Task difficulty.
+Figure 4 shows that PAUSE improves over the
+unmodified Executor and exceeds LivePlan in all three difficulty groups,
+while its ranking relative to SICA varies. SICA leads by 1.5 percentage points on easy tasks and 5.4 on medium tasks,
+but at 8.3 and 9.0 times the Planner cost of PAUSE, spending $73.37
+against $8.82 and $128.81 against $14.25, respectively. These groups contain 194 and
+261 tasks, respectively, together accounting for 91% of Verified; their
+weight explains SICA’s higher aggregate resolution on Verified. In the 45-task hard
+group, PAUSE raises resolution from the unmodified Executor’s 11.1%
+to 26.7%, exceeding SICA’s 17.8% by 8.9 points, with Planner cost of
+$3.06 against $29.53. The hard-task gains suggest that external planning
+may help the Executor turn its accumulated investigation into a more
+effective repair strategy. By intervening before the first source-code
+edit, PAUSE gives the Planner an opportunity to reassess how the
+collected evidence should translate into a concrete change. A repair plan
+grounded in the accumulated evidence may therefore be useful even when
+the Executor’s unaided success rate is low.
+
+Programming languages.
+Figure 4 shows that PAUSE improves over the
+unmodified Executor in eight of the nine Multilingual languages. The largest
+gains come from Ruby, PHP, and JavaScript, which add 14, 10, and 7 solved
+tasks, respectively, and together account for 31 of the 44 additional tasks.
+Rust is the only language in which PAUSE falls below the unmodified
+Executor, resolving 16 of 43 tasks against 19. LivePlan and SICA also fall
+below it on Rust, with 18 and 17 tasks, so the drop is shared by all three
+forms of external guidance rather than specific to intervention at the first
+source-code edit. SICA’s lead on Multilingual comes mainly from C and Ruby,
+where it solves 7 and 3 more tasks than PAUSE, while PAUSE leads
+SICA on Java, 10 against 4. C++ and TypeScript contain only 12 and 10 tasks,
+so their per-language differences are not informative.
+
+Answer. With SWE-agent, PAUSE raises resolution
+by 14.8 percentage points on Verified and 14.7 on Multilingual while reducing Executor token use. It
+achieves higher observed resolution than LivePlan on both benchmarks at similar Planner cost.
+Against SICA, it trails by a non-significant 2.6 points on Verified and 1.3
+on Multilingual at about 11% and 15% of
+SICA’s Planner cost, and it leads on hard Verified tasks.
+
+## 4.3. RQ2: How Effective and Efficient Is Offline Recovery?
+
+Beyond steering a live run, PAUSE can revisit a failed attempt by
+resuming from its recorded pre-edit prefix. This setting allows the agent
+to reuse its repository investigation while following a new repair plan.
+We evaluate whether such guidance recovers failures and whether retaining
+the prefix reduces the computation needed compared with starting again.
+
+Comparison setup.
+We use recorded OpenHands trajectories on SWE-bench Verified.
+Table 4 compares three continuation conditions on 223 eligible
+Qwen3-coder failures: no plan (N), which resumes without an added
+message; self-reconsideration (S), which flags the selected
+think as a possible cause of failure and asks the Executor to
+reconsider; and Planner plan (P), which supplies a repair plan from
+the task and pre-edit transcript. All three retain the same checkpoint,
+conversation history, workspace, and remaining Executor budget. We evaluate
+four Planners with each Executor, including 174 eligible Devstral-small
+failures. The table reports recovery among these failures.
+Prior analyses of LLM self-correction emphasize distinguishing
+the sources of feedback when evaluating revision (Huang et al., 2024; Kamoi et al., 2024).
+
+Table 4. Offline recovery in OpenHands on SWE-bench Verified across Executors.
+Each failed trajectory resumes from its restored checkpoint, the last
+think before the first source-code edit, with its remaining budget.
+Recovered reports solved eligible failures: 223 for Qwen3-coder and 174 for
+Devstral-small. N: no plan; S: self-reconsideration; P: plan from the named Planner.
+
+Intervention
+Qwen3-coder Executor
+Devstral-small Executor
+
+N: no plan
+9/223 (4.0%)
+14/174 (8.0%)
+
+S: self-reconsideration
+13/223 (5.8%)
+17/174 (9.8%)
+
+P: Executor Model
+12/223 (5.4%)
+20/174 (11.5%)
+
+P: Gemini 3.5 Flash Lite
+22/223 (9.9%)
+12/174 (6.9%)
+
+P: Gemini 3.8 Flash
+31/223 (13.9%)
+29/174 (16.7%)
+
+P: GPT-5.6 Sol
+79/223 (35.4%)
+53/174 (30.5%)
+
+Recovery through external guidance.
+The continuation controls distinguish another opportunity to execute from
+the contribution of a new repair plan. Unaided continuation recovers 9 of
+223 failures (4.0%), showing that some failed attempts can succeed simply
+by continuing from the restored checkpoint. Self-reconsideration recovers
+13 (5.8%), so a cue to revisit the selected reasoning yields limited
+recovery in this evaluation. With GPT-5.6 Sol, PAUSE recovers 79
+failures (35.4%). These
+conditions share the restored state and remaining Executor budget,
+supporting the value of external repair guidance. One explanation
+is that spotting a flawed line of reasoning still leaves
+the Executor to find a replacement, whereas the Planner
+supplies a concrete direction.
+
+The choice of Planner matters.
+Using the Executor’s own model as a separate Planner recovers 12 failures
+(5.4%), close to the observed counts for unaided continuation and
+self-reconsideration. Introducing a planning role therefore does not by
+itself ensure a large recovery gain. Gemini 3.8 Flash recovers 31 failures,
+while GPT-5.6 Sol recovers 79. These differences
+suggest that the benefit depends on the guidance supplied by the chosen
+Planner, beyond the presence of an additional model call. With Devstral-small, GPT-5.6 Sol recovers 53 of 174 failures
+(30.5%), showing that this
+recovery benefit also extends to a second Executor.
+
+Full-benchmark comparison.
+Table 5 reports the separate 500-task evaluation
+with Qwen3-coder, comparing PAUSE with SHERLOC under
+Qwen3-30B-Thinking planning and additionally evaluating GPT-5.6 Sol.
+Resume retains the recorded history and workspace and uses the
+remaining budget; restart gives the same plan to a fresh Executor
+with the initial repository and full budget. The table reports net
+resolution, accounting for observed regressions, alongside Planner and
+Executor tokens. It therefore complements the failure-recovery results
+with overall repair outcomes and resource use.
+
+Table 5. Full-benchmark offline evaluation on SWE-bench Verified.
+Qwen3-coder in OpenHands, 500 tasks. Resume retains history and
+workspace with the remaining budget; restart uses the same plan from the
+initial repository with the full budget. Resume counts add recoveries
+to original successes and subtract observed regressions. Tokens (M)
+exclude the original run for continuations; costs cover Planner inference.
+
+Method
+Planner
+Resolved
+Resolution (%)
+Tokens (M)
+Cost ($)
+
+Planner
+Executor
+
+Baseline
+–
+228/500
+45.6
+0
+791.9
+0
+
+SHERLOC (Tamoyan et al., 2026)
+Qwen3-30B-Thinking
+211/500
+42.2 ( $-$ 3.4)
+65.7
+703.9
+0
+
+PAUSE (restart)
+Qwen3-30B-Thinking
+207/500
+41.4 ( $-$ 4.2)
+16.0
+641.6
+0
+
+PAUSE (resume)
+Qwen3-30B-Thinking
+217/500
+43.4 ( $-$ 2.2)
+14.5
+375.7
+0
+
+PAUSE (restart)
+GPT-5.6 Sol
+293/500
+58.6 (+13.0)
+8.7
+519.1
+25.75
+
+PAUSE (resume)
+GPT-5.6 Sol
+291/500
+58.2 (+12.6)
+8.7
+347.4
+25.75
+
+Reusing a failed investigation.
+The resume–restart comparison tests whether a failed attempt can still
+provide a useful starting point for another repair. It measures the
+practical trade-off of prefix reuse, with both retained state and available
+budget changing. On the 223 failures, the same GPT-5.6 Sol plans recover
+79 tasks with resume and 81 with restart. Restart requires 2.0 $\times$ as
+many Executor calls, or 6,020 additional calls, and 22% more Executor
+tokens, or 56.1M. These comparisons show that a failed run can still provide a useful
+starting state for recovery, with a trade-off between execution cost and
+the number of tasks recovered.
+
+At full-benchmark scale, GPT-5.6 Sol resume achieves 58.2% resolution
+against restart’s 58.6%, saving 171.7M Executor tokens (33%) with the
+same 8.7M Planner tokens. With Qwen3-30B-Thinking, resume saves 265.9M
+Executor tokens (41%) and resolves more tasks than restart.
+
+Cost of the recorded investigation.
+The savings above concern continuation from an existing trajectory.
+Relative to SHERLOC, resume with Qwen3-30B-Thinking uses 47% fewer Executor
+tokens and 78% fewer Planner tokens; GPT-5.6 Sol resume uses approximately
+half as many Executor tokens as SHERLOC. Including the original recorded
+run, however, GPT-5.6 Sol resume uses 1,139.3M Executor tokens against
+SHERLOC’s 703.9M. The practical use case is therefore recovery after an
+agent has already attempted the task: the recorded investigation provides
+an existing source of evidence and execution state, allowing another
+repair attempt at lower additional cost.
+
+Outcomes on originally solved tasks.
+An intervention that recovers failures could also break repairs that the
+Executor originally completed. We therefore examine the 178 originally
+solved tasks evaluated under both Planners; of the other 50 original
+successes, 13 never request a source-code edit, so PAUSE leaves them
+unchanged, and 37 could not be successfully replayed in a fresh container in at
+least one Planner’s run. GPT-5.6 Sol plans lead to 10 regressions, a
+regression rate of 5.6%, whereas Qwen3-30B-Thinking plans lead to 26, a
+rate of 14.6%; the difference between the two Planners is significant
+at $p<0.01$ . To determine how many of these regressions arise from
+resumption itself, we resume the same checkpoints with no plan. This
+control yields 10 regressions, the same number as under GPT-5.6 Sol, and the
+difference between the two is not statistically significant at $p=0.81$ .
+Restoring a checkpoint and re-executing the remaining steps therefore
+accounts for most of the observed regressions, and guidance from a strong
+Planner does not increase them. Plans from Qwen3-30B-Thinking, by contrast,
+produce 16 more regressions than the no-plan control, suggesting that weaker
+guidance can steer the Executor away from repairs it would otherwise
+complete. Because the full-benchmark resolution subtracts every observed
+regression, including those that resumption alone produces, it provides a
+conservative estimate of the gain attributable to the plan. Together with
+the recovery results, these findings show that GPT-5.6 Sol guidance
+recovers failed runs without breaking more successful runs than
+continuation alone.
+
+Net repair performance.
+The full-benchmark results establish whether failure recovery translates
+into an overall improvement after accounting for observed regressions.
+Resuming with GPT-5.6 Sol reaches 58.2% resolution, 12.6 percentage points
+above the unmodified Executor’s 45.6%. With Qwen3-30B-Thinking, resume reaches 43.4%, compared with SHERLOC’s
+42.2%; both remain below the unmodified Executor. The resource savings
+with this Planner therefore accompany a loss in absolute repair performance.
+GPT-5.6 Sol raises resolution by 16.0 points over SHERLOC, although this
+comparison also changes the Planner. Taken together, the results show why
+recovery quality and reuse efficiency matter jointly: a capable Planner
+can turn retained investigation into improved repair outcomes, while prefix
+reuse reduces the execution required for another attempt.
+
+Answer. Offline PAUSE can make productive use of a failed
+investigation by supplying new repair guidance. With GPT-5.6 Sol, it
+recovers 35.4% of eligible Qwen3-coder failures and 30.5% of
+Devstral-small failures; the separate full-benchmark evaluation raises net
+resolution from 45.6% to 58.2%, and its plans cause no more regressions on
+originally solved tasks than resuming without a plan. Given an existing
+trajectory, resuming
+uses 33–41% fewer Executor tokens than restarting at full-benchmark scale.
+Substantial recovery depends on the Planner, while prefix reuse offers a
+practical trade-off between additional execution cost and repair outcomes.
+
+## 4.4. RQ3: Does PAUSE Generalize Across Settings?
+
+We next examine whether the benefits of online steering extend across
+execution harnesses and reasoning interfaces, which vary across coding
+agents and determine the actions and transcript that PAUSE uses.
+
+Comparison setup.
+Table 6 compares SWE-agent, Pi, and OpenHands on
+all 500 Verified tasks with the Qwen3-coder Executor and GPT-5.6 Sol
+Planner fixed. Because the harnesses differ in tools, system prompts, and
+budgets, each is compared with its own unmodified Executor. Only OpenHands
+exposes an explicit think tool, and we also remove this content
+from its Planner input.
+
+Table 6. Transfer across agent harnesses. Online PAUSE with Qwen3-coder Executor and GPT-5.6 Sol Planner on 500 Verified tasks. Think stripped hides think content from the Planner; units follow Table 3.
+
+Harness
+Method
+Resolved
+Resolution (%)
+Tokens (M)
+Cost ($)
+
+Planner
+Executor
+
+SWE-agent
+no think tool
+
+Baseline
+251/500
+50.2
+0
+595.5
+0
+
+PAUSE
+325/500
+65.0 (+14.8)
+9.0
+564.2
+26.13
+
+Pi
+no think tool
+
+Baseline
+185/500
+37.0
+0
+341.9
+0
+
+PAUSE
+215/500
+43.0 (+6.0)
+6.7
+358.8
+18.57
+
+OpenHands
+think tool
+
+Baseline
+227/500
+45.4
+0
+372.5
+0
+
+PAUSE
+311/500
+62.2 (+16.8)
+6.7
+390.6
+20.38
+
+think stripped
+318/500
+63.6 (+18.2)
+6.1
+371.7
+18.79
+
+Across harnesses.
+PAUSE improves resolution in all three harnesses, by 14.8 percentage
+points in SWE-agent, 6.0 in Pi, and 16.8 in OpenHands, or 74, 30, and 84
+additional solved tasks. In OpenHands, it solves 106 tasks that the
+unmodified Executor misses while losing 22 ( $p=2\times 10^{-14}$ ). The gains
+vary even with the model pair fixed: the plan narrows the gap between
+SWE-agent and OpenHands from 4.8 to 2.8 points, whereas Pi gains least
+despite the lowest baseline. One likely contributor is that the Pi Executor
+sometimes modified source code through shell commands before its first edit
+tool call, so no plan was inserted (Section 5.1); we did
+not measure how often this occurs.
+
+Cost of transfer.
+The Planner cost stays between $0.037 and $0.052 per task, and Planner
+tokens remain below 2% of the Executor tokens in every harness. Executor tokens fall by 5.3% in SWE-agent but rise by 4.9% in both OpenHands and Pi, so the Executor savings observed in RQ1 depend on how the harness
+continues after receiving the plan.
+
+Where the online gain arises.
+Splitting the 500 OpenHands tasks by the outcome of the recorded
+trajectories used in RQ2 shows gains in every stratum. Resolution rises
+from 20.6% to 40.4% on the 223 tasks of the offline recovery cohort,
+from 16.3% to 44.9% on the 49 failures excluded from offline replay, and
+from 75.9% to 87.3% on the 228 recorded successes, where PAUSE
+gains 39 tasks and loses 13. The plan thus reaches failures that offline
+recovery cannot restore and also raises success on tasks within the
+Executor’s reach.
+
+Reasoning interfaces.
+Removing think content from the OpenHands Planner input yields 318
+solved tasks against 311 with the full transcript, at nearly the same cost.
+The two variants differ on 71 tasks, split 39 to 32 ( $p=0.48$ ), so explicit
+reasoning changes which tasks a plan helps but not significantly how many. Together with
+the gains in SWE-agent and Pi, which have no think tool, this
+indicates that reads, commands, and their outputs give the Planner
+sufficient evidence for a useful plan.
+
+Answer. Online PAUSE raises resolution by 6.0–16.8 percentage
+points across three harnesses on Verified at a Planner cost of at most
+$0.052 per task. In OpenHands, it improves resolution on both recorded
+failures and recorded successes. Gains persist without explicit
+think content, while their magnitude and the effect on Executor
+tokens vary with the harness.
+
+## 4.5. RQ4: Is the Pre-Edit Boundary Effective?
+
+The preceding evaluations assess what PAUSE achieves; we now examine
+the intervention point underlying those results. The first source-code edit
+occurs at a median of 60.0% of action progress on Verified
+(Figure 1), after substantial
+investigation. This raises two questions: can guidance still redirect the
+repair at this point, and would an earlier or later point improve
+recovery? We examine both through interventions on recorded trajectories.
+
+Comparison setup.
+We first insert pre-edit reasoning from a successful run of the same task
+as donor guidance, testing whether a failed trajectory can produce a
+successful continuation. We then compare the default offline checkpoint,
+after the last think before the first source-code edit, with three
+alternative cuts of the same recorded failures: after 20% of the recorded
+actions, immediately before the first source-code edit, and after 90% of
+the recorded actions. We also compare it with a checkpoint associated with a later source-code edit. Each arm independently
+restores its prefix and obtains its own GPT-5.6 Sol plan, with the same number of fresh Executor iterations. Each comparison thus tests the
+checkpoint together with its plan.
+
+Guidance at the boundary.
+Donor guidance produces a successful continuation in at least one of three
+attempts for 64 of 97 donor–recipient pairs, a rate of 66.0%, and in all
+three attempts for 41, a rate of 42.3%. Donor and recipient runs come from
+Executor configurations with different prompts, and across the four
+donor–recipient combinations the rate of at least one success ranges from
+58.8% to 69.0%. This diagnostic uses
+guidance drawn from successful executions, so it assesses the possibility
+of a successful continuation at the boundary. The retained investigation
+remains compatible with a correct repair even when the original run failed.
+
+Earlier and later cuts.
+Restoring a prefix replays its recorded actions in a fresh container, and
+this replay can fail the fidelity check or leave a continuation without a
+grading result. A task enters a comparison only when every arm in that
+comparison restores and is graded. The four-way comparison therefore uses
+the 161 tasks graded in all arms, and each pairwise comparison with
+PAUSE uses the larger set shared by that pair, which contains 207,
+196, or 167 tasks.
+Table 7 compares the four pause positions. On the
+161 tasks graded in every arm, the PAUSE checkpoint recovers 56 tasks,
+a rate of 34.8%, compared with 43 for the cut after 20% of the actions
+and 50 for both the cut immediately before the first source-code edit and
+the cut after 90%. In every paired comparison, PAUSE solves more
+tasks that the alternative misses than the reverse. The early cut performs
+worst: on 207 shared tasks, PAUSE solves 26 tasks that the 20% cut
+misses, while the 20% cut solves 15 that PAUSE misses, a gap of
+5.3 percentage points. This difference is a trend that is not significant
+at the 0.05 level ( $p=0.12$ ), but its direction is consistent with a
+Planner that has seen less of the investigation. Cutting immediately
+before the edit retains the intervening actions but recovers 59 of 196
+shared tasks, compared with 65 for PAUSE. The cut after 90% lets
+the Planner see almost the entire failed run, by which point the Executor
+has already edited, yet it recovers 32.3% of 167 shared tasks, compared
+with 34.7% for PAUSE. Neither later cut differs significantly from
+PAUSE ( $p=0.39$ and $p=0.62$ ). Recovery is therefore highest at the
+checkpoint associated with the first source-code edit, which PAUSE
+locates without knowing the length of the run.
+
+Table 7. Recovery under different pause positions on SWE-bench Verified.
+Each arm restores its own prefix of the same recorded failures and obtains
+its own GPT-5.6 Sol plan. Common: the 161 tasks graded in every arm.
+Paired: each arm against the PAUSE checkpoint on their largest
+shared set, with the tasks solved only by the arm or only by PAUSE
+and the exact McNemar $p$ -value.
+
+Pause position
+Common
+Paired with PAUSE
+
+Resolved (%)
+Tasks
+Arm (%)
+PAUSE (%)
+Only arm / PAUSE
+ $p$ 
+
+PAUSE checkpoint
+56/161 (34.8)
+–
+–
+–
+–
+–
+
+After 20% of actions
+43/161 (26.7)
+207
+27.5
+32.9
+15 / 26
+0.12
+
+Immediately before the edit
+50/161 (31.1)
+196
+30.1
+33.2
+14 / 20
+0.39
+
+After 90% of actions
+50/161 (31.1)
+167
+32.3
+34.7
+16 / 20
+0.62
+
+Waiting for a later source-code edit.
+As a supplementary check on a smaller cohort, we tie the later cut to the
+Executor’s own actions rather than to a fixed fraction of the run, selecting
+the first later source-code edit preceded by a different reasoning step. Of 46 candidate trajectories, 17 fail restoration checks
+before any model call, leaving 29 paired runs. The first and later source-code edit
+checkpoints each recover 15 tasks. Consistent with the cut after 90%,
+waiting for another source-code edit yields no increase in recovered tasks.
+
+Answer. Successful continuations remain possible at the pre-edit
+boundary: donor guidance yields success for 64 of 97
+pairs within three attempts. Under matched continuation budgets, no
+alternative pause position, whether after 20% or 90% of the actions,
+immediately before the first source-code edit, or at a later source-code
+edit, recovers more tasks than the default offline checkpoint, and an early
+cut shows a trend toward fewer recoveries. These
+results support the first source-code edit as a practical point for steering
+after investigation and before the requested edit executes.
+
+## 5. Limitations and Threats to Validity
+
+## 5.1. Limitations
+
+PAUSE relies on repository evidence accumulated before the
+intervention. The Planner receives the issue and the pre-edit transcript,
+but cannot independently inspect the workspace or execute commands. When
+the investigation omits relevant code or informative reproduction feedback,
+the Planner can propose hypotheses but cannot verify them against the
+repository. Prior studies distinguish correction based only on
+model-generated feedback from correction supported by reliable external
+feedback (Huang et al., 2024; Kamoi et al., 2024).
+Further investigation by the Executor may therefore be needed
+to assess whether the suggested strategy is appropriate.
+
+The framework supplies a single repair plan and does not refresh its
+guidance as new observations arrive. New test results or implementation
+discoveries may make parts of that plan obsolete, leaving subsequent
+adjustment to the Executor. Steering can redirect the repair strategy,
+but translating that strategy into a correct patch still requires the
+Executor to implement and validate the changes.
+
+The intervention depends on a file-editor request for the first source-code edit.
+Integrating PAUSE requires a harness that exposes this request
+before execution and a path rule appropriate to the repository layout.
+Trajectories without such a request receive no intervention, limiting
+coverage in workflows whose source changes use other editing interfaces,
+such as shell commands.
+
+Offline recovery further requires a recorded trajectory with a usable
+reasoning checkpoint and faithfully restorable history and workspace.
+A transcript alone is insufficient when the corresponding execution state
+cannot be reconstructed. The savings from recovery
+concern the additional Executor computation for another attempt once the
+prefix is available; producing the original trajectory remains part of
+the total cost. Online steering uses the live state without prior recording.
+
+## 5.2. Threats to Validity
+
+## 5.2.1. Internal validity.
+
+SWE-bench Verified and SWE-bench Multilingual issues and fixes are public and may have appeared in a
+Planner’s training data. We checked agent inputs, Planner prompts,
+repository snapshots, and container network access for direct exposure
+during execution; these checks cannot determine prior training exposure.
+All Executor runs mount only the instance ID and problem statement. The offline regression comparisons use one run per task, so small
+differences may be noise.
+
+## 5.2.2. External validity.
+
+The evaluation covers SWE-bench Verified, SWE-bench Multilingual, and the tested Planner,
+Executor, and harness configurations. Their diversity provides evidence
+across several settings, but transfer to substantially different
+repositories or longer, multi-stage development workflows remains
+unexamined. Beyond Python, the evidence comes from the online SWE-agent
+comparison on Multilingual; offline recovery and the harness comparison
+use Verified only. The pause-position ablation covers offline recovery with
+Qwen3-coder on Verified only. Offline recovery results additionally concern trajectories
+that meet the checkpoint and restoration requirements; failures outside
+this eligible cohort may respond differently to guidance.
+
+## 5.2.3. Construct validity.
+
+The first source-code edit operationalizes the intervention point through an
+action type and a benchmark-specific path rule. Broader rules can admit reproduction scripts,
+so the detected event need not represent the same stage of investigation
+in every repository. The alternative cuts at 20% and 90% of the actions
+are defined by the length of the recorded run, which is unknown during a
+live run, so they serve as offline reference points rather than deployable
+triggers. Benchmark tests provide the measure of repair success;
+behavior beyond their coverage remains unevaluated. Incomplete grading
+records count as unresolved.
+
+## 5.2.4. Conclusion validity.
+
+The main comparisons use one attempt per task, while the donor-guidance
+diagnostic uses three attempts per pair. The paired pause-position
+comparisons in RQ4 use 167 to 207 tasks, and none of them reaches
+significance at the 0.05 level; the lower recovery of the early cut is a
+trend that repeated runs would need to confirm. Similar observed
+recovery counts do not establish equivalence; repeated paired runs are
+needed to assess whether small differences persist.
+
+## 6. Future Work
+
+The results motivate two directions for studying and extending
+the benefits of a pre-edit plan.
+
+Evidence selection for planning.
+
+Removing explicit reasoning produces similar aggregate resolution but
+different task outcomes, leaving open which parts of an investigation
+support effective guidance. We hypothesize that a small set of relevant
+code observations and execution results can provide stronger diagnostic
+support than a longer transcript containing repeated or untested repair
+conjectures. This hypothesis could be tested by selectively retaining code
+reads, reproduction outputs, test feedback, and recorded reasoning at
+several fixed input budgets. Comparisons with equally long chronological
+and randomly selected excerpts would separate evidence selection from
+context length. Selection would use only information available before the
+edit, while the checkpoint, Planner, and Executor remain fixed. Repeated
+paired continuations would measure resolution, regressions, and planning
+cost, testing whether selective evidence can preserve repair gains with
+less computation.
+
+Selective reuse of failed investigations.
+
+The recovery–cost trade-off between resuming and restarting raises a
+further question about what should be retained from a failed attempt.
+Experience-based agents extract reusable insights (Zhao et al., 2024),
+workflows (Wang et al., 2025b), and grounded
+plans (Hayashi et al., 2025) from past executions, offering
+representations to compare when deciding what a repair attempt should retain.
+We hypothesize that observed facts and reusable workspace artifacts provide
+much of the reuse benefit, while earlier repair conjectures can sometimes
+make it harder for the Executor to adopt a different plan. To examine this,
+future experiments could compare the full history with a version that
+masks prior diagnostic conjectures but retains executed repository
+operations and their observations, keeping the workspace, supplied plan, and fresh
+execution budget identical. A separate restart condition would reset both
+history and workspace under the same plan and continuation budget.
+Measuring repair outcomes, adoption of the new plan, and repeated
+investigation would distinguish the effects of retained conjectures from
+the broader cost of rebuilding state. Evaluating these hypotheses across
+repository layouts and editing interfaces would test their generality.
+
+## 7. Conclusion
+
+We introduced PAUSE, a framework that steers coding agents with a
+single repair plan before their first source-code edit.
+This action provides a search-free trigger for guidance grounded in the
+agent’s preceding investigation. A separate Planner supplies the plan,
+and the same Executor continues with its accumulated context and workspace.
+The framework supports both live steering and recovery from recorded failures.
+
+Our evaluation on SWE-bench Verified and SWE-bench Multilingual shows that
+one pre-edit plan can improve online resolution and recover failed attempts
+offline. Online improvements across three harnesses and recovery with two
+Executors support the applicability of this design, with gains varying by
+Planner and execution setting. The results highlight complementary roles
+for external planning and state reuse: suitable guidance can improve repair
+outcomes, while retaining an existing investigation lowers the additional
+Executor computation required for another attempt compared with restarting.
+Comparisons with earlier and later pause positions find no point that
+recovers more failures. The first source-code edit therefore offers a
+practical opportunity to turn accumulated evidence into revised repair
+decisions.
+
+## 8. Data Availability
+
+We will publicly release the implementation of PAUSE for all three harnesses, the Planner prompt and configurations, per-task results and token counts for every table, the scripts that regenerate each table and figure, and the full agent trajectories.
+
+## References
+
+Aggarwal et al. (2025)
+
+Vaibhav Aggarwal, Ojasv
+Kamal, Abhinav Japesh, Zhijing Jin,
+and Bernhard Schölkopf.
+2025.
+
+DARS: Dynamic Action Re-Sampling to Enhance Coding
+Agent Performance by Adaptive Tree Traversal. In
+Proceedings of the 63rd Annual Meeting of the
+Association for Computational Linguistics (Volume 1: Long Papers).
+19808–19855.
+
+https://doi.org/10.18653/v1/2025.acl-long.973
+
+Antoniades et al. (2025)
+
+Antonis Antoniades, Albert
+Örwall, Kexun Zhang, Yuxi Xie,
+Anirudh Goyal, and William Wang.
+2025.
+
+SWE-Search: Enhancing Software Agents with Monte
+Carlo Tree Search and Iterative Refinement. In
+International Conference on Learning
+Representations, Vol. 2025.
+64485–64515.
+
+https://proceedings.iclr.cc/paper_files/paper/2025/hash/a1e6783e4d739196cad3336f12d402bf-Abstract-Conference.html
+
+Bairi et al. (2024)
+
+Ramakrishna Bairi, Atharv
+Sonwane, Aditya Kanade, Vageesh D. C.,
+Arun Iyer, Suresh Parthasarathy,
+Sriram Rajamani, B. Ashok, and
+Shashank Shet. 2024.
+
+CodePlan: Repository-Level Coding using LLMs and
+Planning.
+
+Proceedings of the ACM on Software
+Engineering 1, FSE
+(2024), 675–698.
+
+https://doi.org/10.1145/3643757
+
+Bouzenia et al. (2025)
+
+Islem Bouzenia, Premkumar
+Devanbu, and Michael Pradel.
+2025.
+
+RepairAgent: An Autonomous, LLM-Based Agent for
+Program Repair. In 2025 IEEE/ACM 47th
+International Conference on Software Engineering (ICSE).
+2188–2200.
+
+https://doi.org/10.1109/icse55347.2025.00157
+
+Chen et al. (2023)
+
+Bei Chen, Fengji Zhang,
+Anh Nguyen, Daoguang Zan,
+Zeqi Lin, Jian-Guang Lou, and
+Weizhu Chen. 2023.
+
+CodeT: Code Generation with Generated Tests. In
+International Conference on Learning
+Representations.
+
+https://openreview.net/forum?id=ktrw68Cmu9c
+
+Chen et al. (2024)
+
+Xinyun Chen, Maxwell Lin,
+Nathanael Schaerli, and Denny Zhou.
+2024.
+
+Teaching Large Language Models to Self-Debug. In
+International Conference on Learning
+Representations, Vol. 2024. 8746–8825.
+
+https://proceedings.iclr.cc/paper_files/paper/2024/hash/2460396f2d0d421885997dd1612ac56b-Abstract-Conference.html
+
+Ding and Zhang (2026)
+
+Yifeng Ding and Lingming
+Zhang. 2026.
+
+SWE-Replay: Efficient Test-Time Scaling for
+Software Engineering Agents.
+
+ArXiv abs/2601.22129
+(2026).
+
+Dong et al. (2024)
+
+Yihong Dong, Xue Jiang,
+Zhi Jin, and Ge Li.
+2024.
+
+Self-Collaboration Code Generation via ChatGPT.
+
+ACM Transactions on Software Engineering and
+Methodology 33, 7
+(2024), 1–38.
+
+https://doi.org/10.1145/3672459
+
+Erdogan et al. (2025)
+
+Lutfi Eren Erdogan,
+Nicholas Lee, Sehoon Kim,
+Suhong Moon, Hiroki Furuta,
+Gopala Anumanchipalli, Kurt Keutzer,
+and Amir Gholami. 2025.
+
+Plan-and-Act: Improving Planning of Agents for
+Long-Horizon Tasks. In Proceedings of the 42nd
+International Conference on Machine Learning, Vol. 267.
+15419–15462.
+
+https://proceedings.mlr.press/v267/erdogan25a.html
+
+Gandhi et al. (2025a)
+
+Shubham Gandhi, Atharva
+Naik, Yiqing Xie, and Carolyn Rose.
+2025a.
+
+An Empirical Study on Strong-Weak Model
+Collaboration for Repo-level Code Generation. In
+Proceedings of the 2025 Conference on Empirical
+Methods in Natural Language Processing. 20667–20686.
+
+https://doi.org/10.18653/v1/2025.emnlp-main.1043
+
+Gandhi et al. (2025b)
+
+Shubham Gandhi, Jason
+Tsay, Jatin Ganhotra, K. Kate, and
+Yara Rizk. 2025b.
+
+When Agents go Astray: Course-Correcting SWE Agents
+with PRMs.
+
+ArXiv abs/2509.02360
+(2025).
+
+Gou et al. (2024)
+
+Zhibin Gou, Zhihong Shao,
+Yeyun Gong, yelong shen,
+Yujiu Yang, Nan Duan, and
+Weizhu Chen. 2024.
+
+CRITIC: Large Language Models Can Self-Correct
+with Tool-Interactive Critiquing. In
+International Conference on Learning
+Representations, Vol. 2024.
+57734–57811.
+
+https://proceedings.iclr.cc/paper_files/paper/2024/hash/fef126561bbf9d4467dbb8d27334b8fe-Abstract-Conference.html
+
+Guo et al. (2025)
+
+Yifu Guo, Jiaye Lin,
+Huacan Wang, Yuzhen Han,
+Sen Hu, Ziyi Ni, Licheng
+Wang, and Mingguang Chen.
+2025.
+
+SE-Agent: Self-Evolution Trajectory Optimization
+in Multi-Step Reasoning with LLM-Based Agents. In
+Advances in Neural Information Processing
+Systems, Vol. 38, Main Conference.
+116314–116341.
+
+https://doi.org/10.52202/085713-3877
+
+Hayashi et al. (2025)
+
+Hiroaki Hayashi, Bo Pang,
+Wenting Zhao, Ye Liu,
+Akash Gokul, Srijan Bansal,
+Cai-Ming Xiong, Semih Yavuz, and
+Ying-Bo Zhou. 2025.
+
+Self-Abstraction from Grounded Experience for
+Plan-Guided Policy Refinement.
+
+ArXiv abs/2511.05931
+(2025).
+
+Hong et al. (2024)
+
+Sirui Hong, Mingchen
+Zhuge, Jonathan Chen, Xiawu Zheng,
+Yuheng Cheng, Jinlin Wang,
+Ceyao Zhang, zili wang,
+Steven Yau, Zijuan Lin,
+Liyang Zhou, Chenyu Ran,
+Lingfeng Xiao, Chenglin Wu, and
+Jürgen Schmidhuber. 2024.
+
+MetaGPT: Meta Programming for A Multi-Agent
+Collaborative Framework. In International
+Conference on Learning Representations, Vol. 2024.
+23247–23275.
+
+https://proceedings.iclr.cc/paper_files/paper/2024/hash/6507b115562bb0a305f1958ccc87355a-Abstract-Conference.html
+
+Huang et al. (2024)
+
+Jie Huang, Xinyun Chen,
+Swaroop Mishra, Huaixiu Steven Zheng,
+Adams Yu, Xinying Song, and
+Denny Zhou. 2024.
+
+Large Language Models Cannot Self-Correct
+Reasoning Yet. In International Conference on
+Learning Representations, Vol. 2024.
+32808–32824.
+
+https://proceedings.iclr.cc/paper_files/paper/2024/hash/8b4add8b0aa8749d80a34ca5d941c355-Abstract-Conference.html
+
+Jimenez et al. (2024)
+
+Carlos E Jimenez, John
+Yang, Alexander Wettig, Shunyu Yao,
+Kexin Pei, Ofir Press, and
+Karthik Narasimhan. 2024.
+
+SWE-bench: Can Language Models Resolve Real-world
+Github Issues?. In International Conference on
+Learning Representations, Vol. 2024.
+54107–54157.
+
+https://proceedings.iclr.cc/paper_files/paper/2024/hash/edac78c3e300629acfe6cbe9ca88fb84-Abstract-Conference.html
+
+Kamoi et al. (2024)
+
+Ryo Kamoi, Yusen Zhang,
+Nan Zhang, Jiawei Han, and
+Rui Zhang. 2024.
+
+When Can LLMs Actually Correct Their Own
+Mistakes? A Critical Survey of Self-Correction of LLMs.
+
+Transactions of the Association for
+Computational Linguistics 12 (2024),
+1417–1440.
+
+https://doi.org/10.1162/tacl_a_00713
+
+Lee et al. (2026)
+
+Byeongchan Lee, Jonghoon
+Lee, Dongyoung Kim, Jaehyung Kim,
+Kyungjoon Park, Dongjun Lee, and
+Jinwoo Shin. 2026.
+
+Efficient LLM Collaboration via Planning.
+
+Transactions on Machine Learning Research
+(2026).
+
+https://openreview.net/forum?id=RPzbeL0koP
+
+Li et al. (2025)
+
+Jierui Li, Hung Le,
+Yingbo Zhou, Caiming Xiong,
+Silvio Savarese, and Doyen Sahoo.
+2025.
+
+CodeTree: Agent-guided Tree Search for Code
+Generation with Large Language Models. In
+Proceedings of the 2025 Conference of the Nations
+of the Americas Chapter of the Association for Computational Linguistics:
+Human Language Technologies (Volume 1: Long Papers).
+3711–3726.
+
+https://doi.org/10.18653/v1/2025.naacl-long.189
+
+Liu et al. (2026a)
+
+Shuyang Liu, Yang Chen,
+Rahul Krishna, Saurabh Sinha,
+Jatin Ganhotra, and Reyhaneh
+Jabbarvand. 2026a.
+
+Process-Centric Analysis of Agentic Software
+Systems.
+
+Proceedings of the ACM on Programming
+Languages 10, OOPSLA1
+(2026), 1961–1988.
+
+https://doi.org/10.1145/3798271
+
+Liu et al. (2026b)
+
+Shuyang Liu, Saman
+Dehghan, Ji Young Kim, Jatin Ganhotra,
+Martin Hirzel, and Reyhaneh
+Jabbarvand. 2026b.
+
+Online Monitoring and Corrective Steering of
+Programming Agents.
+
+arXiv:2608.06701
+
+https://arxiv.org/abs/2608.06701
+
+Ma et al. (2025)
+
+Yingwei Ma, Qingping
+Yang, Rongyu Cao, Binhua Li,
+Fei Huang, and Yongbin Li.
+2025.
+
+Alibaba LingmaAgent: Improving Automated Issue
+Resolution via Comprehensive Repository Exploration. In
+Proceedings of the 33rd ACM International
+Conference on the Foundations of Software Engineering.
+238–249.
+
+https://doi.org/10.1145/3696630.3728549
+
+Madaan et al. (2023)
+
+Aman Madaan, Niket
+Tandon, Prakhar Gupta, Skyler Hallinan,
+Luyu Gao, Sarah Wiegreffe,
+Uri Alon, Nouha Dziri,
+Shrimai Prabhumoye, Yiming Yang,
+Shashank Gupta, Bodhisattwa Prasad
+Majumder, Katherine Hermann, Sean
+Welleck, Amir Yazdanbakhsh, and Peter
+Clark. 2023.
+
+Self-Refine: Iterative Refinement with
+Self-Feedback. In Advances in Neural Information
+Processing Systems, Vol. 36.
+46534–46594.
+
+https://doi.org/10.52202/075280-2019
+
+Nanda et al. (2026)
+
+Rahul Nanda, Chandra
+Maddila, Smriti Jha, Euna Mehnaz Khan,
+Matteo Paltenghi, and Satish Chandra.
+2026.
+
+Wink: Recovering from Misbehaviors in Coding
+Agents. In Proceedings of the 3rd ACM
+International Conference on AI-Powered Software. 208–217.
+
+https://doi.org/10.1145/3805760.3814911
+
+Ni et al. (2023)
+
+Ansong Ni, Srini Iyer,
+Dragomir Radev, Veselin Stoyanov,
+Wen-Tau Yih, Sida Wang, and
+Xi Victoria Lin. 2023.
+
+LEVER: Learning to Verify Language-to-Code
+Generation with Execution. In Proceedings of the
+40th International Conference on Machine Learning,
+Vol. 202. 26106–26128.
+
+https://proceedings.mlr.press/v202/ni23b.html
+
+Ouyang et al. (2025)
+
+Siru Ouyang, Wenhao Yu,
+Kaixin Ma, Zilin Xiao,
+Zhihan Zhang, Mengzhao Jia,
+Jiawei Han, Hongming Zhang, and
+Dong Yu. 2025.
+
+RepoGraph: Enhancing AI Software Engineering with
+Repository-level Code Graph. In International
+Conference on Learning Representations, Vol. 2025.
+30098–30121.
+
+https://proceedings.iclr.cc/paper_files/paper/2025/hash/4a4a3c197deac042461c677219efd36c-Abstract-Conference.html
+
+Pan et al. (2025)
+
+Jiayi Pan, Xingyao Wang,
+Graham Neubig, Navdeep Jaitly,
+Heng Ji, Alane Suhr, and
+Yizhe Zhang. 2025.
+
+Training Software Engineering Agents and Verifiers
+with SWE-Gym. In Proceedings of the 42nd
+International Conference on Machine Learning, Vol. 267.
+47717–47737.
+
+https://proceedings.mlr.press/v267/pan25g.html
+
+Robeyns et al. (2025)
+
+M. Robeyns, M. Szummer,
+and Laurence Aitchison. 2025.
+
+A Self-Improving Coding Agent.
+
+ArXiv abs/2504.15228
+(2025).
+
+Ruan et al. (2025)
+
+Haifeng Ruan, Yuntong
+Zhang, and Abhik Roychoudhury.
+2025.
+
+SpecRover: Code Intent Extraction via LLMs. In
+2025 IEEE/ACM 47th International Conference on
+Software Engineering (ICSE). 963–974.
+
+https://doi.org/10.1109/icse55347.2025.00080
+
+Shinn et al. (2023)
+
+Noah Shinn, Federico
+Cassano, Ashwin Gopinath, Karthik
+Narasimhan, and Shunyu Yao.
+2023.
+
+Reflexion: language agents with verbal
+reinforcement learning. In Advances in Neural
+Information Processing Systems, Vol. 36.
+8634–8652.
+
+https://doi.org/10.52202/075280-0377
+
+Tamoyan et al. (2026)
+
+Hovhannes Tamoyan, Sean
+Narenthiran, Erik Arakelyan, Mira
+Mezini, and Boris Ginsburg.
+2026.
+
+SHERLOC: Structured Diagnostic Localization for
+Code Repair Agents.
+
+ArXiv abs/2606.24820
+(2026).
+
+Tan et al. (2026)
+
+Boyin Tan, Haoning Deng,
+Junyuan Zhang, Junjielong Xu,
+Pinjia He, and Youcheng Sun.
+2026.
+
+SWE-Manager: Selecting and Synthesizing Golden
+Proposals Before Coding.
+
+ArXiv abs/2601.22956
+(2026).
+
+Tao et al. (2024)
+
+Wei Tao, Yucheng Zhou,
+Yanlin Wang, Wenqiang Zhang,
+Hongyu Zhang, and Yu Cheng.
+2024.
+
+MAGIS: LLM-Based Multi-Agent Framework for GitHub
+Issue Resolution. In Advances in Neural
+Information Processing Systems, Vol. 37.
+51963–51993.
+
+https://doi.org/10.52202/079017-1647
+
+Wang et al. (2023)
+
+Lei Wang, Wanyu Xu,
+Yihuai Lan, Zhiqiang Hu,
+Yunshi Lan, Roy Ka-Wei Lee, and
+Ee-Peng Lim. 2023.
+
+Plan-and-Solve Prompting: Improving Zero-Shot
+Chain-of-Thought Reasoning by Large Language Models. In
+Proceedings of the 61st Annual Meeting of the
+Association for Computational Linguistics (Volume 1: Long Papers).
+2609–2634.
+
+https://doi.org/10.18653/v1/2023.acl-long.147
+
+Wang et al. (2025a)
+
+Xingyao Wang, Boxuan Li,
+Yufan Song, Frank F Xu,
+Xiangru Tang, Mingchen Zhuge,
+Jiayi Pan, Yueqi Song,
+Bowen Li, Jaskirat Singh,
+Hoang Tran, Fuqiang Li,
+Ren Ma, Mingzhang Zheng,
+Bill Qian, Daniel Shao,
+Niklas Muennighoff, Yizhe Zhang,
+Binyuan Hui, Junyang Lin,
+Robert Brennan, Hao Peng,
+Heng Ji, and Graham Neubig.
+2025a.
+
+OpenHands: An Open Platform for AI Software
+Developers as Generalist Agents. In International
+Conference on Learning Representations, Vol. 2025.
+65882–65919.
+
+https://proceedings.iclr.cc/paper_files/paper/2025/hash/a4b6ad6b48850c0c331d1259fc66a69c-Abstract-Conference.html
+
+Wang et al. (2025b)
+
+Zora Zhiruo Wang, Jiayuan
+Mao, Daniel Fried, and Graham Neubig.
+2025b.
+
+Agent Workflow Memory. In
+Proceedings of the 42nd International Conference on
+Machine Learning, Vol. 267.
+63897–63911.
+
+https://proceedings.mlr.press/v267/wang25bx.html
+
+Xia et al. (2025)
+
+Chunqiu Steven Xia, Yinlin
+Deng, Soren Dunn, and Lingming Zhang.
+2025.
+
+Demystifying LLM-Based Software Engineering
+Agents.
+
+Proceedings of the ACM on Software
+Engineering 2, FSE
+(2025), 801–824.
+
+https://doi.org/10.1145/3715754
+
+Xia and Zhang (2024)
+
+Chunqiu Steven Xia and
+Lingming Zhang. 2024.
+
+Automated Program Repair via Conversation: Fixing
+162 out of 337 Bugs for $0.42 Each using ChatGPT. In
+ISSTA 2024 - Proceedings of the 33rd ACM SIGSOFT
+International Symposium on Software Testing and Analysis.
+819–831.
+
+https://doi.org/10.1145/3650212.3680323
+
+Xie et al. (2025)
+
+Chengxing Xie, Bowen Li,
+Chang Gao, He Du, Wai
+Lam, Difan Zou, and Kai Chen.
+2025.
+
+SWE-Fixer: Training Open-Source LLMs for Effective
+and Efficient GitHub Issue Resolution. In
+Findings of the Association for Computational
+Linguistics: ACL 2025. 1123–1139.
+
+https://doi.org/10.18653/v1/2025.findings-acl.62
+
+Yang et al. (2024)
+
+John Yang, Carlos
+Jimenez, Alexander Wettig, Kilian
+Lieret, Shunyu Yao, Karthik Narasimhan,
+and Ofir Press. 2024.
+
+SWE-agent: Agent-Computer Interfaces Enable
+Automated Software Engineering. In Advances in
+Neural Information Processing Systems, Vol. 37.
+50528–50652.
+
+https://doi.org/10.52202/079017-1601
+
+Yang et al. (2025)
+
+John Yang, Kilian Lieret,
+Carlos Jimenez, Alexander Wettig,
+Kabir Khandpur, Yanzhe Zhang,
+Binyuan Hui, Ofir Press,
+Ludwig Schmidt, and Diyi Yang.
+2025.
+
+SWE-smith: Scaling Data for Software Engineering
+Agents. In Advances in Neural Information
+Processing Systems, Vol. 38, Main Conference.
+
+https://doi.org/10.52202/085713-3239
+
+Yao et al. (2023a)
+
+Shunyu Yao, Dian Yu,
+Jeffrey Zhao, Izhak Shafran,
+Tom Griffiths, Yuan Cao, and
+Karthik Narasimhan. 2023a.
+
+Tree of Thoughts: Deliberate Problem Solving with
+Large Language Models. In Advances in Neural
+Information Processing Systems, Vol. 36.
+11809–11822.
+
+https://doi.org/10.52202/075280-0517
+
+Yao et al. (2023b)
+
+Shunyu Yao, Jeffrey Zhao,
+Dian Yu, Nan Du, Izhak
+Shafran, Karthik Narasimhan, and Yuan
+Cao. 2023b.
+
+ReAct: Synergizing Reasoning and Acting in
+Language Models. In International Conference on
+Learning Representations.
+
+https://openreview.net/forum?id=WE_vluYUL-X
+
+Zechner (2025)
+
+Mario Zechner.
+2025.
+
+Pi: A Minimal Terminal Coding Agent.
+
+https://github.com/badlogic/pi-mono
+
+Zhang et al. (2024a)
+
+Kechi Zhang, Jia Li,
+Ge Li, Xianjie Shi, and
+Zhi Jin. 2024a.
+
+CodeAgent: Enhancing Code Generation with
+Tool-Integrated Agent Systems for Real-World Repo-level Coding Challenges.
+In Proceedings of the 62nd Annual Meeting of the
+Association for Computational Linguistics (Volume 1: Long Papers).
+13643–13658.
+
+https://doi.org/10.18653/v1/2024.acl-long.737
+
+Zhang et al. (2024b)
+
+Yuntong Zhang, Haifeng
+Ruan, Zhiyu Fan, and Abhik
+Roychoudhury. 2024b.
+
+AutoCodeRover: Autonomous Program Improvement.
+In Proceedings of the 33rd ACM SIGSOFT
+International Symposium on Software Testing and Analysis.
+1592–1604.
+
+https://doi.org/10.1145/3650212.3680384
+
+Zhao et al. (2024)
+
+Andrew Zhao, Daniel
+Huang, Quentin Xu, Matthieu Lin,
+Yong-Jin Liu, and Gao Huang.
+2024.
+
+ExpeL: LLM Agents Are Experiential Learners.
+
+Proceedings of the AAAI Conference on
+Artificial Intelligence 38, 17
+(2024), 19632–19642.
+
+https://doi.org/10.1609/aaai.v38i17.29936
+
+Zhong et al. (2024)
+
+Li Zhong, Zilong Wang,
+and Jingbo Shang. 2024.
+
+Debug like a Human: A Large Language Model
+Debugger via Verifying Runtime Execution Step by Step. In
+Findings of the Association for Computational
+Linguistics: ACL 2024. 851–870.
+
+https://doi.org/10.18653/v1/2024.findings-acl.49
+
+Zhou et al. (2024)
+
+Andy Zhou, Kai Yan,
+Michal Shlapentokh-Rothman, Haohan Wang,
+and Yu-Xiong Wang. 2024.
+
+Language Agent Tree Search Unifies Reasoning,
+Acting, and Planning in Language Models. In
+Proceedings of the 41st International Conference on
+Machine Learning, Vol. 235.
+62138–62160.
+
+https://proceedings.mlr.press/v235/zhou24r.html

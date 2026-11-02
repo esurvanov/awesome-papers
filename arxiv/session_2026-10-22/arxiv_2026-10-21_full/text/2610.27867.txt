@@ -1,0 +1,905 @@
+## VISH-ASR: Viterbi-guided Selection of Hotwords for Speech-LLM Contextual ASR
+
+Xiaoyu Gu
+
+Yu Xi
+
+Chencheng Wang
+
+Zonghan Zhou
+
+Haoyu Li
+
+Jing Peng
+
+Kai Yu\sthanksKai Yu is the corresponding author
+
+Abstract
+
+Prompt-based contextual ASR requires selecting a compact hotword subset
+from large dynamic inventories, yet existing pre-selection methods rely either on discrete ASR hypotheses that may discard acoustic evidence or on
+separately trained retrieval models. We propose
+Viterbi-guided Selection of Hotwords (VISH), a training-free,
+plug-and-play framework that directly verifies candidate-specific
+acoustic support over frame-level CTC posteriors. VISH formulates
+pre-selection as constrained posterior search; M-VISH makes large-list
+verification scalable through frame-synchronous shared-prefix Viterbi
+search with bounded top- $K$ pruning, while Bi-MVISH exploits
+complementary backward evidence for robust verification. Across five benchmarks, M-VISH achieves up to 11.7% absolute improvement in Best-F1 over a strong learned-retrieval baseline and reduces candidate-search latency by 75.2% at 2,000 candidates relative to hypothesis-based filtering. These results demonstrate the effectiveness of posterior-level verification for accurate and scalable hotword pre-selection without additional model training.
+
+Index Terms: 
+automatic speech recognition, speech large language models, contextual ASR, hotword pre-selection
+
+††address: 1MoE Key Lab of Artificial Intelligence, AI Institute, X-LANCE Lab, Shanghai Jiao Tong University
+
+2School of Intelligence Science and Technology, Nanjing University, Suzhou, China
+
+## 1 Introduction
+
+End-to-end automatic speech recognition (ASR) performs well on
+general-domain corpora [18, 13], yet remains
+vulnerable to hotwords: semantically critical long-tail terms, such as
+contact names, locations, and products, that are sparsely represented in
+training data. These user- and task-specific terms are better supplied as
+external lexical context [24, 9, 5].
+Contextual ASR has used weighted finite-state transducers
+(WFSTs) [3] and neural context
+injection [21, 12, 27, 32]. Speech large language models
+(Speech LLMs) offer a new paradigm [25, 2, 20].
+
+Speech-LLM contextualization follows two paradigms. Architecture
+modification or extensive fine-tuning learns hotword-aware
+representations [7, 23, 14, 16], but is computationally costly, inflexible for
+dynamic contexts, and difficult to generalize without retraining.
+Alternatively, prompt-based systems inject hotwords directly into the
+input without adapting the Speech LLM [31, 4, 8], preserving model generality and enabling inexpensive
+per-request personalization. However, large candidate lists weaken prompt
+conditioning, increase interference, and cause bias-driven substitutions in
+both hotwords and background words [8]. Most systems
+therefore pre-select a compact candidate subset that retains acoustically
+supported hotwords while rejecting irrelevant
+alternatives [31].
+
+Existing pre-selection methods differ mainly in how candidate evidence is
+obtained. Hypothesis-based filtering relies on discrete recognition
+outputs and candidate matching [6, 30, 2]. For example, CTC-Assistant [30]
+first decodes a CTC hypothesis and then filters hotwords through lexical
+indexing and edit-distance matching; relevant acoustic evidence may
+therefore be lost when the candidate is absent from the discrete
+hypothesis. Learned speech–text retrievers, including BR-ASR, GLCLAP,
+and CLAR, require separately trained retrieval
+models [8, 15, 11].
+Search-graph approaches based on WFST composition or lattice
+rescoring [10, 28] often require
+decoder-side graphs, lattices, or task-specific search structures, making
+them less convenient for black-box contextual ASR. CTC-based keyword
+spotting has also explored posterior-level keyword-constrained alignment
+for detection [29]; however, its objective is keyword
+detection rather than ranking and selecting a compact subset from a large,
+dynamically changing inventory for downstream contextual prompting.
+
+We propose Viterbi-guided Selection of Hotwords (VISH), which formulates
+large-list hotword pre-selection as candidate-specific constrained search
+directly over frame-level CTC posterior trajectories. Unlike
+hypothesis-based filtering, VISH does not require a candidate to appear in
+a discrete first-pass transcript, and it requires no additional
+retrieval-model training. To make this formulation scalable,
+Multi-Word VISH (M-VISH) introduces a frame-synchronous shared-prefix
+search that reuses constrained-search computation among candidates with
+common token prefixes and bounds the active search space through
+top- $K$ pruning. Bidirectional M-VISH (Bi-MVISH) further exploits
+complementary backward acoustic evidence to improve verification robustness.
+
+The contributions of this work are threefold:
+
+1. 
+
+We formulate large-list hotword pre-selection as
+candidate-specific constrained search over frame-level CTC
+posteriors and propose VISH, enabling direct acoustic
+verification without relying on discrete ASR hypotheses
+or additional retrieval-model training.
+
+2. 
+
+We introduce M-VISH, a frame-synchronous shared-prefix
+multi-candidate search with bounded top- $K$ pruning, making
+acoustic verification scalable to large dynamic inventories.
+Bi-MVISH further exploits complementary backward evidence
+for more robust verification.
+
+3. 
+
+Experiments across multiple datasets and ASR systems
+demonstrate that improved pre-selection translates into
+lower downstream biased error while preserving overall
+recognition accuracy, with both native and external CTC
+posteriors supporting flexible integration.
+
+Figure 1: 
+Overview of VISH and the M-VISH search procedure.
+(a) VISH verifies candidate hotwords using internal or external CTC
+posteriors and selects a compact subset for contextual prompting
+without modifying the downstream ASR model.
+(b) A shared-prefix trie organizes candidate CTC-token sequences
+to reuse Viterbi computations across candidates.
+(c) At each retained frame, M-VISH updates constrained Viterbi
+scores, retains the top- $K_{\mathrm{p}}$ active prefixes, and records
+scores at terminal nodes for scalable large-list verification.
+Here, $p_{t}(k)$ denotes the CTC posterior of token $k$ at frame $t$ ,
+and $\ell$ denotes the trie depth.
+
+## 2 Methodology
+
+## 2.1 A plug-and-play VISH framework
+
+Given speech and a candidate list, VISH estimates candidate-specific acoustic support from frame-level CTC posteriors obtained from an accessible internal encoder or a frozen external CTC scorer (Figure 1). Here, “training-free” means no additional task-specific or retrieval-model training or fine-tuning: an off-the-shelf pretrained CTC scorer is used frozen for verification. An external scorer adds acoustic-encoding cost when internal posteriors are unavailable. VISH returns a compact prompt subset without downstream-model modification or decoder access. Verification relies on reliable candidate-token posterior evidence; unusual pronunciations or spelling variants may weaken the score.
+
+## 2.2 Multi-word Viterbi-guided selection of hotwords
+
+Let $p_{t}(k)=P(\pi_{t}=k\mid\mathbf{x})$ denote the frame-level CTC posterior for $k\in\Sigma\cup\{\varnothing\}$ , where $\Sigma$ is the CTC token vocabulary and $\varnothing$ is the blank symbol. Peak Suppression Decoding (PSD) removes frames satisfying $p_{t}(\varnothing)>\tau_{b}$ , yielding the ordered retained sequence $\widetilde{\mathbf{p}}=(\widetilde{p}_{1},\ldots,\widetilde{p}_{R})$ , where $R\leq T$ . Given a candidate $w$ , let $\mathbf{y}=(y_{1},\ldots,y_{L})$ denote its CTC-token sequence. VISH searches for its best constrained CTC alignment over any local interval:
+
+ $m_{w}=\max_{\begin{subarray}{c}1\leq a\leq b\leq R\\
+\boldsymbol{\pi}_{a:b}:B(\boldsymbol{\pi}_{a:b})=\mathbf{y}\end{subarray}}\sum_{r=a}^{b}\log\widetilde{p}_{r}(\pi_{r}),\qquad s_{w}=\frac{m_{w}}{N_{w}},$ 
+
+(1)
+
+where $N_{w}$ is the number of non-blank frames in the maximizing path. Normalizing the accumulated path score by its non-blank support reduces the duration bias of unnormalized path sums. No explicit duration bound is imposed; the constrained CTC states and accumulated posterior score determine the optimal local interval. For the blank-interleaved target $\mathbf{y}^{\prime}=(\varnothing,y_{1},\varnothing,\ldots,y_{L},\varnothing)$ , the active states follow
+
+ $\alpha_{r}(s)=\log\widetilde{p}_{r}(y^{\prime}_{s})+\max_{q\in\mathcal{P}(s)}\alpha_{r-1}(q),$ 
+
+(2)
+
+where $\mathcal{P}(s)$ denotes valid CTC predecessor states for stay, step, and skip transitions. Root states are reintroduced after each retained frame, allowing local matches to start throughout the utterance.
+
+Independent candidate-wise scoring repeats these state updates for candidates sharing common token prefixes. M-VISH avoids this redundancy by organizing the candidate list $W=\{w^{(1)},\ldots,w^{(N)}\}$ into a shared-prefix trie, where each edge corresponds to a CTC token. Each active node $u$ maintains a prefix score vector $\alpha_{r}^{u}$ and a companion accumulator $\gamma_{r}^{u}$ that follows the maximizing path and counts its non-blank aligned frames. The prefix-level confidence is
+
+ $\rho_{r}(u)=\max_{s}\alpha_{r}^{u}(s).$ 
+
+(3)
+
+At each retained frame, only the top- $K_{\mathrm{p}}$ prefixes ranked by $\rho_{r}(u)$ are retained and expanded. When a terminal node is reached, its best confidence and aligned length update $m_{w}$ and $N_{w}$ for the corresponding candidate. Algorithm 1 summarizes the search.
+
+Algorithm 1 Multi-Word Viterbi-guided Selection of Hotwords (M-VISH)
+
+Input: Posteriors $\{p_{t}\}_{t=1}^{T}$ ; candidates $W$ ; prefix budget $K_{\mathrm{p}}$ ; PSD threshold $\tau_{b}$ .
+
+Output: Candidate scores $\{s_{w}:w\in W\}$ .
+
+ 1
+ Form $\widetilde{\mathbf{p}}\leftarrow[p_{t}:p_{t}(\varnothing)\leq\tau_{b}]$ in temporal order; let $R\leftarrow|\widetilde{\mathbf{p}}|$ .
+
+ 2
+ Build a trie for $W$ with a dummy root; set $m_{w}\leftarrow-\infty$ and $N_{w}\leftarrow 0$ .
+
+ 3
+ Initialize active prefixes $P$ from the root children.
+
+ 4
+ for $r\leftarrow 1$ to $R$ do
+
+ 5
+ foreach $u\in P$ do
+
+ 6
+ Update $\alpha_{r}^{u}$ by (2) and update $\gamma_{r}^{u}$ along the maximizing predecessors.
+
+ 7
+ $s_{u}^{*}\leftarrow\arg\max_{s}\alpha_{r}^{u}(s)$ ; $\rho_{r}(u)\leftarrow\alpha_{r}^{u}(s_{u}^{*})$ .
+
+ 8
+ Retain the top- $K_{\mathrm{p}}$ prefixes in $P$ ranked by $\rho_{r}(u)$ .
+
+ 9
+ foreach terminal $u\in P$ representing $w$ do
+
+ 10
+ if $\rho_{r}(u)>m_{w}$ then
+
+ 11
+ $(m_{w},N_{w})\leftarrow(\rho_{r}(u),\gamma_{r}^{u}(s_{u}^{*}))$ 
+
+ 12
+ Expand surviving prefixes and initialize child states from their parents.
+
+ 13
+ Add root children to $P$ , initialized to start at retained frame $r+1$ .
+
+ 14
+ return $\{s_{w}:w\in W\}$ , where $s_{w}=m_{w}/N_{w}$ if $N_{w}>0$ , and $s_{w}=-\infty$ otherwise.
+
+A dummy root stabilizes local-match initialization, while PSD suppresses unnecessary propagation through blank-dominated frames. After PSD, independent scoring costs $O(RN\bar{L})$ , whereas M-VISH costs $O(RK_{\mathrm{p}}\bar{L})$ , with $K_{\mathrm{p}}\ll N$ ; in the worst case, $R=T$ .
+
+## 2.3 Bidirectional M-VISH
+
+Bi-MVISH supplements forward search when candidate-onset evidence is weak. It reverses both the retained posterior sequence and each candidate CTC-token sequence, constructs the reversed trie, and applies the same M-VISH search. Because CTC collapse commutes with sequence reversal, reversing both sequences preserves valid alignments and transition rules. Mapping the terminal score back to the original candidate gives $s_{w,\mathrm{bwd}}$ , which is averaged with the forward score $s_{w,\mathrm{fwd}}$ :
+
+ $s_{w,\mathrm{bi}}=\frac{1}{2}\left(s_{w,\mathrm{fwd}}+s_{w,\mathrm{bwd}}\right).$ 
+
+(4)
+
+M-VISH remains frame-synchronous, whereas Bi-MVISH uses future frames within each segment and therefore trades strict frame-level streaming for stronger segment-level verification.
+
+## 3 Experimental Setups
+
+## 3.1 Datasets and bias lists
+
+Test datasets. We use the following test sets:
+
+• 
+
+STOP1/STOP2 [26, 15]: English named-entity retrieval sets derived from the STOP test and evaluation splits, containing queries with person names (STOP1) or location names (STOP2). Both are used only for hotword pre-selection evaluation.
+
+• 
+
+AISHELL-1-NE [24]: A Mandarin named-entity contextual-biasing set derived from AISHELL-1. It is used for both hotword pre-selection and downstream contextual ASR evaluation.
+
+• 
+
+Libri-clean/other-2k [19]: LibriSpeech test-clean and
+test-other with fixed 2,000-word candidate lists per
+utterance, used for both pre-selection and downstream ASR evaluation; test-other is the more challenging condition.
+
+Bias lists. STOP1, STOP2, and AISHELL-1-NE follow their
+benchmark protocols. For LibriSpeech, following [17],
+rare words exclude the 5,000 most frequent training words. Each utterance
+uses a fixed 2,000-word list containing all ground-truth rare words plus
+randomly sampled distractors; the same seeded lists are shared across
+methods. For latency analysis, we additionally evaluate list sizes of
+100, 500, 1,000, and 2,000.
+
+## 3.2 Systems and inference setup
+
+We evaluate Whisper-medium [22] (encoder–decoder ASR) and Prompt-SLAM-ASR [30] (Speech-LLM contextual ASR). The latter’s released model does not support Mandarin; we evaluate it only on LibriSpeech. Frozen SenseVoice-Small [1] supplies VISH’s frame-level CTC posteriors and tokenizer for both backbones. We fix $K_{\mathrm{p}}=40$ and $\tau_{b}=0.997$ across all datasets and evaluation settings. GLCLAP, M-VISH, and Bi-MVISH share fixed Top-10 selection and the prompt: “Transcribe speech to text. Some hotwords might help. The hotwords are {}”. BR-ASR results are published; the backbone-only setting omits hotwords. For all methods, Table 4 measures candidate-search latency from available speech representations/CTC posteriors to candidate scores/retrieval results, excluding acoustic representation extraction.
+
+## 3.3 Evaluation metrics
+
+Best-F1 is the maximum F1 over candidate-score thresholds, measuring target–distractor score separability independently of a deployment selection budget. The fixed Top-10 downstream comparisons instead assess ASR utility under a shared prompt budget. We report character error rate (CER) and biased character error rate (B-CER) on AISHELL-1-NE, and word error rate (WER) and biased word error rate (B-WER) on LibriSpeech [17]. Biased metrics are computed over reference characters or words in the biasing vocabulary. Lower error rates are better.
+
+## 4 Results and Analysis
+
+## 4.1 Hotword pre-selection performance
+
+Table 1: Hotword pre-selection performance.
+Best-F1 (%) across five benchmarks.
+A1-NE denotes AISHELL-1-NE; L-clean-2k and L-other-2k
+denote LibriSpeech test-clean and test-other with 2,000
+candidate hotwords, respectively.
+∗ denotes our reproduced results; “–” indicates
+unreported results. Best results are bold.
+
+Method
+STOP1
+STOP2
+A1-NE
+L-clean-2k
+L-other-2k
+
+GLCLAP [15]
+–
+–
+97.0
+–
+–
+
+CLAR [11]
+–
+–
+97.0
+–
+–
+
+GLCLAP [15]∗
+80.5
+81.2
+96.6
+90.5
+82.4
+
+M-VISH
+83.1
+92.9
+97.5
+94.4
+87.7
+
+Bi-MVISH
+83.1
+93.8
+97.6
+95.3
+88.8
+
+CTC-Assistant serves as a representative hypothesis-based CTC
+filtering baseline. We use GLCLAP as our primary learned-retrieval
+baseline and reproduce it across all five benchmarks. We also
+include the original results of GLCLAP and CLAR where available.
+CTC-Assistant is omitted from Table 1
+because its published per-word matching procedure [30]
+does not directly provide compatible full-inventory scores for
+threshold-based F1 evaluation. Compared with our reproduced GLCLAP
+baseline, M-VISH achieves absolute Best-F1 improvements of
+0.9%–11.7% across all five benchmarks, with the largest gains
+on STOP2 (+11.7%) and Libri-other-2k (+5.3%). Bi-MVISH
+further improves Best-F1 by up to 1.1% in absolute terms on
+four of the five benchmarks, without additional retrieval-model
+training.
+
+## 4.2 Downstream contextual ASR performance
+
+Table 2: Downstream contextual ASR performance.
+WER/B-WER (%) are reported for LibriSpeech and CER/B-CER (%)
+for AISHELL-1-NE.
+GT Bias denotes oracle hotword prompting.
+∗ denotes our reproduced results.
+N/A indicates Prompt-SLAM-ASR model does not support Mandarin.
+Best non-oracle results are bold.
+
+ASR System
+L-clean-2k
+L-other-2k
+A1-NE
+
+Whisper-medium [22]
+
++No Bias
+3.1/14.0
+7.1/29.9
+7.3/21.3
+
++GT Bias
+2.2/6.2
+5.6/15.9
+4.3/7.4
+
++CTC-Assistant [30]∗
+2.4/7.8
+6.2/18.8
+4.7/9.9
+
++GLCLAP [15]∗
+2.4/7.6
+6.1/18.2
+4.6/9.1
+
++M-VISH
+2.4/7.5
+6.0/18.3
+4.4/7.8
+
++Bi-MVISH
+2.3/6.9
+5.9/17.3
+4.4/7.6
+
+Prompt-SLAM-ASR [30]
+
++No Bias
+2.0/9.3
+4.0/20.0
+N/A
+
++GT Bias
+1.2/2.8
+2.4/5.8
+N/A
+
++BR-ASR [8]
+1.4/4.2
+3.1/9.3
+N/A
+
++CTC-Assistant [30]∗
+1.4/4.4
+3.2/10.0
+N/A
+
++GLCLAP [15]∗
+1.5/4.8
+3.2/10.7
+N/A
+
++M-VISH
+1.4/4.2
+3.1/8.7
+N/A
+
++Bi-MVISH
+1.4/3.7
+3.1/8.0
+N/A
+
+Table 2 shows improved pre-selection
+translates into lower biased error under the same Top-10 prompting
+protocol. Compared with reproduced GLCLAP, Bi-MVISH reduces B-WER
+from 7.6% to 6.9% and from 18.2% to 17.3% on Whisper
+L-clean-2k and L-other-2k, respectively, while reducing A1-NE B-CER
+from 9.1% to 7.6%. With Prompt-SLAM-ASR, the corresponding
+B-WER decreases from 4.8% to 3.7% and from 10.7% to 8.0%.
+M-VISH is already competitive, while bidirectional verification yields
+the most consistent gains without degrading overall WER/CER. The
+consistent improvements across both backbones further suggest the
+frozen external CTC evidence transfers effectively to downstream
+contextual prompting.
+
+Table 3: Effect of CTC posterior source.
+Comparison of internal and external CTC encoders for Bi-MVISH
+with Prompt-SLAM-ASR using 2,000 candidate hotwords per utterance.
+Extra denotes additional encoder parameters beyond the ASR backbone.
+Clean and Other refer to LibriSpeech test-clean and test-other,
+respectively. Best results are bold.
+
+Encoder
+Params.
+Extra
+Test set
+Best-F1
+WER/B-WER
+
+SenseVoice-Small
+(external)
+
+234M
++234M
+Clean
+95.3
+1.4/3.7
+
+Other
+88.8
+3.1/8.0
+
+WavLM-Large
+(internal)
+
+315M
+0
+Clean
+94.7
+1.4/3.9
+
+Other
+87.8
+3.0/8.6
+
+## 4.3 Plug-and-play Adaptability
+
+To further validate the plug-and-play property of VISH, we
+evaluate Bi-MVISH using either the native CTC posteriors of
+Prompt-SLAM-ASR or a frozen external SenseVoice-Small encoder,
+without additional training or downstream-model modification.
+As shown in Table 3, both sources enable
+effective hotword verification. Native posteriors require no
+additional encoder or acoustic forward pass, whereas the external
+scorer achieves higher Best-F1 and lower B-WER. These results
+demonstrate the flexibility of VISH across CTC posterior sources,
+with a trade-off between verification accuracy and computational cost.
+
+## 4.4 Analysis of bidirectional verification
+
+Forward Viterbi verification can underestimate a hotword when its onset is acoustically weak or ambiguous. As shown in Figure 2, both directions detect “liddy”, whereas forward search provides weak evidence for “smolny” and backward search anchors on its clearer ending. Averaging the complementary directional scores can therefore compensate for weak forward evidence, providing a qualitative explanation for the additional Bi-MVISH gains in Tables 1 and 2.
+
+Table 4: Candidate-search efficiency.
+Average search latency (ms per utterance) with different bias list
+sizes, measured as the number of candidate hotwords per utterance.
+Acoustic representation extraction is excluded.
+
+Bias List Size
+100
+500
+1,000
+2,000
+
+CTC-Assistant [30]
+46
+206
+398
+817
+
+GLCLAP [15]
+61
+65
+74
+78
+
+M-VISH
+71
+85
+117
+203
+
+Bi-MVISH
+131
+176
+260
+400
+
+## 4.5 Candidate-search efficiency
+
+Table 4 compares the candidate-search
+latency of VISH with hypothesis-based filtering and learned
+speech–text retrieval methods. All methods are evaluated with
+batch size 1 on the same GPU, excluding acoustic representation
+extraction. With 2,000 candidate hotwords, M-VISH reduces
+search latency from 817 ms for CTC-Assistant to 203 ms,
+a relative reduction of 75.2%. Bi-MVISH achieves a 51.0%
+relative reduction despite performing bidirectional search.
+Although GLCLAP achieves the lowest search latency (78 ms),
+it yields lower Best-F1 than VISH (Table 1).
+These results demonstrate that VISH achieves a favorable balance
+between hotword pre-selection accuracy and search efficiency
+for large candidate inventories.
+
+Figure 2: Forward and backward Bi-MVISH alignments for “liddy” (left) and “smolny” (right). Both directions detect “liddy”, whereas backward search recovers stronger evidence for “smolny” with its weak onset. Yellow dotted lines denote word boundaries.
+
+## 5 Conclusion
+
+We presented VISH, a training-free hotword pre-selector for
+candidate-specific verification over CTC posteriors, together with
+M-VISH for scalable shared-prefix search and Bi-MVISH for
+bidirectional verification. Across five benchmarks, M-VISH achieves absolute Best-F1 improvements of 0.9%–11.7% over our reproduced
+GLCLAP baseline, while Bi-MVISH
+consistently reduces downstream biased error without degrading overall
+ASR accuracy. At 2,000 candidates, M-VISH reduces candidate-search
+latency from 817 to 203 ms relative to CTC-Assistant. Native CTC
+posteriors provide a lower-overhead option when available, while an
+external frozen scorer offers stronger plug-and-play verification.
+
+## 6 Compliance with Ethical Standards
+
+This study uses existing speech datasets, including STOP,
+AISHELL-1-NE, and LibriSpeech. No new human participants were recruited or recorded, and no animal experiments were conducted. All datasets were used in accordance
+with their respective access and licensing terms.
+
+## References
+
+[1]
+K. An et al. (2024)
+
+FunAudioLLM: voice understanding and generation foundation models for natural interaction between humans and LLMs.
+
+Note: arXiv:2407.04051
+
+Cited by: §3.2.
+
+[2]
+Y. Asano, S. Hassan, P. Sharma, A. B. Sicilia, K. Atwell, D. Litman, and M. Alikhani (2025)
+
+Contextual ASR error handling with LLMs augmentation for goal-oriented conversational AI.
+
+In Proceedings of the 31st International Conference on Computational Linguistics: Industry Track,
+
+pp. 374–386.
+
+Cited by: §1,
+§1.
+
+[3]
+E. Bakhturina, Y. Zhang, and B. Ginsburg (2022)
+
+Shallow fusion of weighted finite-state transducer and language model for text normalization.
+
+In Proc. Interspeech,
+
+pp. 491–495.
+
+Cited by: §1.
+
+[4]
+Z. Chen, H. Huang, A. Andrusenko, O. Hrinchuk, K. C. Puvvada, J. Li, S. Ghosh, J. Balam, and B. Ginsburg (2024)
+
+SALM: speech-augmented language model with in-context learning for speech recognition and translation.
+
+In Proc. IEEE ICASSP,
+
+pp. 13521–13525.
+
+Cited by: §1.
+
+[5]
+Z. Chen, M. Jain, Y. Wang, M. L. Seltzer, and C. Fuegen (2019)
+
+End-to-end contextual speech recognition using class language models and a token passing decoder.
+
+In Proc. IEEE ICASSP,
+
+pp. 6186–6190.
+
+Cited by: §1.
+
+[6]
+Z. Chen, M. Jain, Y. Wang, M. L. Seltzer, and C. Fuegen (2019)
+
+Joint grapheme and phoneme embeddings for contextual end-to-end ASR.
+
+In Proc. Interspeech,
+
+pp. 3490–3494.
+
+Cited by: §1.
+
+[7]
+L. Fu, Y. Xin, S. Zeng, L. Fan, Y. Wu, and X. He (2026)
+
+PAC: pronunciation-aware contextualized large language model-based automatic speech recognition.
+
+In ICASSP 2026-2026 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+pp. 16377–16381.
+
+Cited by: §1.
+
+[8]
+X. Gong, A. Lv, Z. Wang, H. Zhu, and Y. Qian (2025)
+
+BR-ASR: efficient and scalable bias retrieval framework for contextual biasing ASR in speech LLM.
+
+Note: arXiv:2505.19179
+
+Cited by: §1,
+§1,
+Table 2.
+
+[9]
+T. Hori, J. Cho, and S. Watanabe (2018)
+
+End-to-end speech recognition with word-based RNN language models.
+
+In Proc. IEEE SLT,
+
+pp. 389–396.
+
+Cited by: §1.
+
+[10]
+T. Hori, C. Hori, Y. Minami, and A. Nakamura (2007)
+
+Efficient WFST-based one-pass decoding with on-the-fly hypothesis rescoring in extremely large vocabulary continuous speech recognition.
+
+IEEE Trans. Audio, Speech, Lang. Process. 15 (4), pp. 1352–1365.
+
+Cited by: §1.
+
+[11]
+S. Huang, H. Shen, W. Zou, and Y. Chen (2026)
+
+CLAR: CIF-localized alignment for retrieval-augmented speech LLM-based contextual ASR.
+
+Note: arXiv:2603.25460
+
+Cited by: §1,
+Table 1.
+
+[12]
+M. Jain, G. Keren, J. Mahadeokar, G. Zweig, F. Metze, and Y. Saraf (2020)
+
+Contextual RNN-T for open domain ASR.
+
+In Proc. Interspeech,
+
+pp. 11–15.
+
+Cited by: §1.
+
+[13]
+S. Ji, Y. Chen, M. Fang, J. Zuo, J. Lu, H. Wang, Z. Jiang, L. Zhou, S. Liu, X. Cheng, et al. (2024)
+
+WavChat: a survey of spoken dialogue models.
+
+Note: arXiv:2411.13577
+
+Cited by: §1.
+
+[14]
+R. Jing, C. Gong, Y. Jiang, B. Zhu, S. Liu, C. Zhang, X. Zhang, and X. Li (2025)
+
+Rare word recognition and translation without fine-tuning via task vector in speech models.
+
+Note: arXiv:2512.21894
+
+Cited by: §1.
+
+[15]
+Y. Kong, F. Cui, L. Guo, H. Dinkel, L. Fan, J. Zhang, and J. Luan (2025)
+
+GLCLAP: a novel contrastive learning pre-trained model for contextual biasing in ASR.
+
+In Proc. Interspeech,
+
+pp. 5173–5177.
+
+External Links: Document
+
+Cited by: §1,
+1st item,
+Table 1,
+Table 1,
+Table 2,
+Table 2,
+Table 4.
+
+[16]
+Y. Kong, J. Hou, J. Tang, B. Zhu, J. Zhang, and S. Xue (2025)
+
+Contextual biasing for LLM-based ASR with hotword retrieval and reinforcement learning.
+
+Note: arXiv:2512.21828
+
+Cited by: §1.
+
+[17]
+D. Le, M. Jain, G. Keren, S. Kim, Y. Shi, J. Mahadeokar, J. Chan, Y. Shangguan, C. Fuegen, O. Kalinli, et al. (2021)
+
+Contextualized streaming end-to-end speech recognition with trie-based deep biasing and shallow fusion.
+
+Note: arXiv:2104.02194
+
+Cited by: §3.1,
+§3.3.
+
+[18]
+J. Li (2021)
+
+Recent advances in end-to-end automatic speech recognition.
+
+arXiv preprint arXiv:2111.01690.
+
+Cited by: §1.
+
+[19]
+V. Panayotov, G. Chen, D. Povey, and S. Khudanpur (2015)
+
+LibriSpeech: an ASR corpus based on public domain audio books.
+
+In Proc. IEEE ICASSP,
+
+pp. 5206–5210.
+
+Cited by: 3rd item.
+
+[20]
+J. Peng, Y. Wang, B. Li, Y. Guo, H. Wang, Y. Fang, Y. Xi, H. Li, X. Li, K. Zhang, et al. (2025)
+
+A survey on speech large language models for understanding.
+
+IEEE Journal of Selected Topics in Signal Processing.
+
+Cited by: §1.
+
+[21]
+G. Pundak, T. N. Sainath, R. Prabhavalkar, A. Kannan, and D. Zhao (2018)
+
+Deep context: end-to-end contextual speech recognition.
+
+In Proc. IEEE SLT,
+
+pp. 418–425.
+
+Cited by: §1.
+
+[22]
+A. Radford, J. W. Kim, T. Xu, G. Brockman, C. McLeavey, and I. Sutskever (2023)
+
+Robust speech recognition via large-scale weak supervision.
+
+In Proceedings of the 40th International Conference on Machine Learning,
+
+pp. 28492–28518.
+
+Cited by: §3.2,
+Table 2.
+
+[23]
+B. Ren, R. Fan, Y. Shen, W. Chen, and J. Li (2026)
+
+RLBR: reinforcement learning with biasing rewards for contextual speech large language models.
+
+In ICASSP 2026-2026 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+pp. 17637–17641.
+
+Cited by: §1.
+
+[24]
+X. Shi, Y. Yang, Z. Li, Y. Chen, Z. Gao, and S. Zhang (2024)
+
+SeACo-Paraformer: a non-autoregressive ASR system with flexible and effective hotword customization ability.
+
+In Proc. IEEE ICASSP,
+
+pp. 10346–10350.
+
+Cited by: §1,
+2nd item.
+
+[25]
+G. Song, Z. Wu, G. Pundak, A. Chandorkar, K. Joshi, X. Velez, D. Caseiro, B. Haynor, W. Wang, N. Siddhartha, et al. (2023)
+
+Contextual spelling correction with large language models.
+
+In Proc. IEEE ASRU,
+
+pp. 1–8.
+
+Cited by: §1.
+
+[26]
+P. Tomasello, A. Shrivastava, D. Lazar, P. Hsu, D. Le, A. Sagar, A. Elkahky, J. Copet, W. Hsu, Y. Adi, R. Algayres, T. A. Nguyen, E. Dupoux, L. Zettlemoyer, and A. Mohamed (2023)
+
+STOP: a dataset for spoken task oriented semantic parsing.
+
+In Proc. IEEE Spoken Language Technology Workshop (SLT),
+
+pp. 991–998.
+
+External Links: Document
+
+Cited by: 1st item.
+
+[27]
+E. Variani, D. Rybach, C. Allauzen, and M. Riley (2020)
+
+Hybrid autoregressive transducer (HAT).
+
+In Proc. IEEE ICASSP,
+
+pp. 6139–6143.
+
+Cited by: §1.
+
+[28]
+W. Wang, Z. Wu, D. Caseiro, T. Munkhdalai, K. C. Sim, P. Rondon, G. Pundak, G. Song, R. Prabhavalkar, Z. Meng, et al. (2023)
+
+Contextual biasing with the Knuth-Morris-Pratt matching algorithm.
+
+Note: arXiv:2310.00178
+
+Cited by: §1.
+
+[29]
+Y. Xi, H. Li, X. Gu, H. Li, Y. Jiang, and K. Yu (2025)
+
+Streaming keyword spotting boosted by cross-layer discrimination consistency.
+
+In Proc. IEEE ICASSP,
+
+pp. 1–5.
+
+Cited by: §1.
+
+[30]
+G. Yang, Z. Ma, Z. Gao, S. Zhang, and X. Chen (2024)
+
+CTC-assisted LLM-based contextual ASR.
+
+In Proc. IEEE SLT,
+
+pp. 126–131.
+
+Cited by: §1,
+§3.2,
+§4.1,
+Table 2,
+Table 2,
+Table 2,
+Table 4.
+
+[31]
+Z. Yang, S. Sun, X. Wang, Y. Zhang, L. Ma, and L. Xie (2023)
+
+Two stage contextual word filtering for context bias in unified streaming and non-streaming transducer.
+
+Note: arXiv:2301.06735
+
+Cited by: §1.
+
+[32]
+D. Zhao, T. N. Sainath, D. Rybach, P. Rondon, D. Bhatia, B. Li, and R. Pang (2019)
+
+Shallow-fusion end-to-end contextual biasing.
+
+In Proc. Interspeech,
+
+pp. 1418–1422.
+
+Cited by: §1.

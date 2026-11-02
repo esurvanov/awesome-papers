@@ -1,0 +1,2326 @@
+## On the Fragility of Tasks under Composition: Implicit Budgeting in Language Models
+
+Chenpan Li†
+
+Email: chenpan.li@tum.de
+
+Thies Brockmoeller†
+
+Email: thies.brockmoeller@tum.de
+
+Stefanie Jegelka
+
+Email: stefje@mit.edu
+
+Sharut Gupta‡
+
+Email: sharut@mit.edu
+
+Nikolaos Karalias‡† TU Munich, ‡MIT CSAIL
+
+Email: stalence@mit.edu
+
+Abstract
+
+Modern language models are increasingly asked to handle several tasks within a single prompt. Doing so requires solving each task correctly while integrating the resulting answers into a coherent response. In this paper, we identify a fundamental limitation in this process, where models make substantially more errors when tasks are composed, even when they can solve every constituent task reliably in isolation. This degradation cannot be fully explained by the accumulation of independent errors. Across both open-weight models and the frontier model Claude Opus 5, our findings instead point to an implicit thinking budget underlying this effect. In particular, under composition, models use substantially fewer tokens per task than in isolation, even when the full sequence remains well within the context window. Tasks that require longer solution traces in isolation are consequently more fragile under composition, i.e., models make more errors on prompts containing these tasks. In isolation, non-fragile tasks receive more reasoning than they need and waste compute. However, by grouping tasks according to their fragility, the implicit budgeting can be manipulated to reduce token usage by $43$ % across a range of math and linguistic tasks while also preserving accuracy.
+
+Project page: https://chenpanli.github.io/fragility 
+
+Code: https://github.com/chenpanli/fragility
+
+**footnotetext: denotes equal advisory role.
+
+Figure 1: Composition reduces every task’s reasoning by the same factor. When solved in isolation (top), each task receives more reasoning than it requires. When composed into a single prompt (bottom), the reasoning allocated to each task shrinks proportionally (yellow). Tasks with sufficient slack absorb this reduction and are still solved correctly, whereas the task that requires long reasoning falls below its requirement and thus fails.
+
+## 1 Introduction
+
+A single prompt often asks a language model to do several things at once, such as answering a handful of questions, solving a set of math problems, or following a list of instructions before writing one response. Common benchmarks, however, still test models one task at a time (Rein et al., 2023; Hendrycks et al., 2021; Gema et al., 2025).
+As scores on these benchmarks saturate, they may overstate how robust the underlying capabilities are. We ask whether a model that reliably solves a task on its own can still solve it when other tasks share the prompt.
+
+One natural explanation is error accumulation. If each task fails with nonzero probability, solving many at once fails more often. Prior work has found this phenomenon when models are tasked to do familiar reasoning steps (Press et al., 2023; Dziri et al., 2023; Sinha et al., 2026) or follow several instructions at once (Harada et al., 2025; Vasileva, 2026). However, accumulation is only half of the story. Because composition in these settings also changes the structure and token demands of the task, it remains unclear whether the model’s ability to solve each constituent task degrades as well, and what mechanism drives that degradation.
+
+To investigate the question, we analyze the effect of composition on each constituent task of a composition. We start by establishing that this per-task degradation exists at all. For that, we select tasks the model solves correctly in isolation, which establishes that the requisite capability is present. We then leave those tasks unchanged and simply concatenate them within a single prompt. This design separates degradation under increased task load from baseline solvability on the constituent tasks.
+
+Across state-of-the-art open models, as well as the frontier model Claude Opus 5, we find substantial performance degradation when more previously solved tasks are concatenated within the same prompt. The drop in accuracy is substantially larger than what the constituent tasks’ isolated error rates would predict, and is consistent across both mathematical and linguistic domains. We characterize this degradation along two dimensions. 1) Failures concentrate on a subset of fragile tasks that, for a given model, remains stable across sampling noise and composition sizes. These tasks also have longer reasoning traces in isolation. 2) As more tasks are presented together, models systematically reduce the reasoning tokens devoted to each task, even though no explicit per-task token constraint is imposed. This reduction follows a clear scaling pattern, with reasoning per task decreasing approximately as a power law with composition size.
+Together, these findings reveal an implicit thinking budget under composition, under which fragile tasks disproportionately lose accuracy as per-task reasoning decreases.
+
+This mechanism also creates an opportunity for more efficient inference than solving every task separately. Non-fragile tasks can be grouped into larger batches, where the implicit thinking budget reduces per-task reasoning and token usage without impacting accuracy. Fragile tasks, in contrast, are placed in smaller batches so that each receives more reasoning and remains accurate. We demonstrate this with fragility-aware batching, a strategy that composes each task based on its fragility. By using empirical measurements of the fragility of tasks, it reduces token usage by $43$ % on average with no drop in performance compared to solving each task individually. Because it is entirely black-box, it also applies directly to proprietary models, reducing generated tokens by $24\%$ on GPQA-Diamond with Claude Opus 5 without degrading performance.
+
+Taken together, these results show that the failure of LLMs to generalize their reasoning budget management is a double-edged sword. Under composition, it causes fragile tasks to fail, whereas in isolation, it makes models overspend reasoning on non-fragile tasks, thus wasting compute during inference. Our key contributions and findings are:
+
+• 
+
+We show that simply concatenating tasks that are already solved correctly in isolation causes substantial accuracy degradation across both frontier and open models (Section 3).
+
+• 
+
+We identify an implicit per-task thinking budget that shrinks as a power law in the number of composed tasks (Section 3.1).
+
+• 
+
+We show that this uniform reduction concentrates degradation on tasks with long isolated reasoning, a set that is stable within each model but differs between models (Sections 3.1 and 3.2). We refer to this set of tasks as fragile.
+
+• 
+
+We turn these findings into fragility-aware batching, a strategy that groups tasks according to their measured fragility. It reduces generated tokens by $\sim$ 43% across all datasets while preserving accuracy on both state-of-the-art open-weight models and proprietary frontier models (Section 4).
+
+## 2 Preliminaries
+
+Our central goal is to investigate whether an LLM that can solve a task in isolation keeps this ability when several such tasks are presented together. To answer this, we use a controlled setting in which the constituent tasks are unchanged and only the number of tasks in the prompt varies. We then measure how each task’s accuracy changes relative to its performance in isolation. All experiments share the setup described below.
+
+Compositions. We compose independent tasks drawn from the same dataset $\mathcal{D}$ . A composition of size $k$ is a tuple $C=(t_{1},\dots,t_{k})$ with $t_{i}\in\mathcal{D}$ , rendered into a single prompt by a fixed per-dataset template that asks the model to answer all $k$ tasks in order.
+We split the model’s single response into $k$ answers and grade each for correctness (further details in Appendix A.2.6).
+
+Accuracy drop. For a model $m$ , the accuracy drop of each individual task $t_{i}$ at composition size $k$ is $\Delta^{m}_{i}(k)=\mathrm{acc}^{m}_{i}(k)-\mathrm{acc}^{m}_{i}(1)$ , where negative values indicate degradation. Unless stated otherwise, accuracy is estimated from 5 independent trials.
+
+Datasets. We use eight datasets whose tasks vary widely in the reasoning they require. We build two datasets ourselves: 1,000 indefinite integrals with randomized coefficients across diverse function classes, verified symbolically, and OneWordQA, a set of factual questions with single-word or numeric answers that require minimal reasoning. The remaining six are established benchmarks: GPQA-Diamond (Rein et al., 2023), GSM8K (Cobbe et al., 2021), MATH-500 (Hendrycks et al., 2021; Lightman et al., 2023), MMLU-Redux (Gema et al., 2025), StrategyQA (Geva et al., 2021) and AIME (further details in Appendix A.2.6).
+
+Models. We evaluate three Qwen3 models (4B Thinking, 8B, 14B) (Yang et al., 2025a), trained by strong-to-weak distillation from larger RL-trained Qwen3 models, and Qwen3.8 27B (Qwen Team, 2026). We also evaluate three DeepSeek-R1-distilled models (Qwen 7B, Llama 8B, Qwen3 8B) (Guo et al., 2025), obtained by supervised fine-tuning on R1 reasoning traces, and the frontier model Claude Opus 5 with medium reasoning effort.
+The first two groups let us compare two different post-training recipes at similar scale. Open-weight models are sampled at temperature 0.6 and use a context limit of at least $131{,}072$ tokens (further details in Appendix A.2.2).
+
+## 3 Composing tasks causes performance degradation
+
+Prior work has repeatedly reported that accuracy falls when several tasks share a single prompt.
+However, these evaluations do not isolate whether a model fails because it cannot solve a task reliably or purely because the task is composed with others, which leaves the underlying mechanism unclear.
+
+Building on these observations, we ask whether degradation can arise from composition alone. Answering this requires separating a model’s ability to solve a task from its ability to solve the same task in composition. For that, we restrict each model $M$ to a subset $\mathcal{D}_{M}\subseteq\mathcal{D}$ of confidently solved tasks: a task enters $\mathcal{D}_{M}$ only if $M$ solves it in isolation in three out of three independent attempts. We then build compositions $C$ of size $k\in\{3,6,10,20\}$ **
+ *
+
+ $k=20$ is left out on GPQA-Diamond and AIME because of overflowing context. exclusively from $\mathcal{D}_{M}$ , sampling task categories uniformly within each dataset, and evaluate the accuracy of each task within them. The accuracies at $k=1$ come from runs independent of those used for selection.
+
+Figure 2: Accuracy degradation on confidently solved GPQA-Diamond tasks. Left: accuracy drop per model at $k=10$ . Right: accuracy drop as a function of composition size $k$ . All tasks were solved in three out of three isolated attempts, yet accuracy drops once they are composed.
+
+Figure 3: Context usage across datasets. Most responses use under 25% of the context window; in most datasets, under 1% hit the limit.
+
+As Figure 2 shows, simply concatenating tasks that are solvable in isolation causes substantial accuracy degradation across all models on GPQA-Diamond (Rein et al., 2023). This observation also holds for all other datasets we tested, except OneWordQA and StrategyQA, whose tasks require little reasoning. Furthermore, this degradation cannot be explained by context-length issues, since nearly all responses stay within the context limit (see Figure 3 and Appendix A.1.1). Compositional degradation is therefore driven by effects inherent to composition and cannot be predicted from the solvability of tasks in isolation alone.
+
+The extent of this degradation varies strongly across models. The R1-distilled models degrade the most, while the Qwen3 models degrade moderately less. Frontier models are not immune either: Claude Opus 5, despite its leading benchmark results, loses about $7$  pp at $k=10$ on GPQA-Diamond, on tasks it solved in all three runs individually.
+
+Contrary to explanations for compositions with dependent tasks, where models either match solution patterns seen in training instead of learning systematic procedures (Dziri et al., 2023) or fail to combine facts they know individually (Press et al., 2023), we propose that compositional degradation arises from a misallocation of the implicit thinking budget.
+
+## 3.1 Degradation as a misallocation of the implicit thinking budget
+
+Reasoning models solve tasks by thinking stepwise, a process shown to be crucial for task success (Wei et al., 2023). We therefore ask whether the accuracy degradation under composition can be explained by changes in thinking behavior. A central property of this behavior is the number of thinking tokens the model spends on a task, i.e., how much effort it invests in it. This effort can strongly affect whether a task is solved (Snell et al., 2024), and prior work has shown that overall reasoning shortens when batching tasks (Srivastava et al., 2026; Deng et al., 2026; Cheng et al., 2023). What remains unclear is how each constituent task is affected, that is, how its thinking length under composition compares to its thinking length in isolation and how that change affects the task’s success.
+
+Figure 4: Token ratio $r_{i}(k)=T_{i}(k)/T_{i}(1)$ as a function of composition size $k$ , where $T_{i}(k)$ is the number of thinking tokens spent on task $t_{i}$ within a composition of size $k$ and $T_{i}(1)$ the number spent in isolation. Per-task token counts in compositions are obtained by locating task tags in the reasoning trace. Tasks are binned by the quantile of their isolated trace length into Low ( $\leq 20\%$ ), Medium ( $20$ – $80\%$ ), and High ( $>80\%$ ). On log-log axes, the ratio decreases approximately linearly in $\log k$ , indicating that LLMs shrink the relative token usage of each task under composition by roughly $k^{m}$ , with no systematic dependence on $T_{i}(1)$ . Results are from Qwen3 4B Thinking.
+
+Thinking traces shrink under composition.
+We close this gap by measuring the thinking tokens spent on each task within a composition of $k$ tasks, denoted $T_{i}(k)$ . To this end, we prefix each task with a unique tag (Q01, Q02, …) in the prompt that does not appear in the task description itself. These tags let us attribute each segment of the reasoning trace to the task it addresses (details in Appendix A.2.1).
+We quantify the reduction for each task by the token ratio $r_{i}(k)=T_{i}(k)/T_{i}(1)$ between its thinking tokens under composition and in isolation. Figure 4 shows how this token ratio evolves with composition size. With one exception (R1 Qwen 7B on MATH-500), the thinking tokens of almost all tasks decrease monotonically as compositions grow (further models and datasets in Appendix A.1.2); a weak positional bias is discussed in Appendix A.1.4.
+
+Long-reasoning tasks degrade more.
+This reduction has important implications, since prior work has established that the number of thinking tokens spent on a task can influence its accuracy. In particular, interrupting the thinking process externally at earlier stages causes a larger degradation (Muennighoff et al., 2025). Composing tasks has an analogous effect on thinking length, as it implicitly constrains the per-task thinking tokens but without any external enforcement. This naturally raises the question of whether the implicit token reduction under composition is related to the accuracy degradation.
+Figure 5 shows how the reduction affects tasks with different isolated thinking lengths. Tasks with longer isolated traces degrade substantially more when thinking tokens are reduced, whereas tasks with shorter traces are largely unaffected. We refer to tasks that break under composition in this way as fragile.
+
+Figure 5: Accuracy drop as a function of the relative thinking token reduction for Qwen3 4B Thinking on MMLU-Redux (left) and MATH-500 (right) below the dashed line, the y-axis is logarithmic for presentation purposes. Tasks are binned by the quantile of their isolated trace length into Low ( $\leq 20\%$ ), Medium ( $20$ – $80\%$ ), and High ( $>80\%$ ). As the reduction through composition (comp.) grows, accuracy drops, and tasks with high reasoning requirements degrade substantially more than low-effort tasks. Forcing a fixed budget externally (forced) generally causes stronger degradation, but the degradation follows the same patterns (more details in Appendix A.1.3).
+
+Thinking length follows a power law.
+One possible source of the uneven degradation in Figure 5 could be that long-reasoning tasks lose a larger share of their thinking tokens.
+The token ratio approximately follows a power law in $k$ ,
+
+ $\log r_{i}(k)\approx m\log k\quad\Longleftrightarrow\quad r_{i}(k)=\frac{T_{i}(k)}{T_{i}(1)}\approx k^{m}.$ 
+
+(1)
+
+Since $r_{i}(1)=1$ by definition, we fit a line through the origin on log-log axes for each model and dataset. The fitted slopes have a median of $m=-0.54$ ( $m\in[-0.88,-0.04]$ ), with a median $R^{2}$ of $0.91$ ; averaged per model, $R^{2}$ ranges from $0.55$ to $0.94$ (Appendix A.1.2). Under composition, the reasoning trace of each task thus shrinks by approximately the same factor $k^{m}$ , without systematic dependence on its isolated length $T_{i}(1)$ , so long-reasoning tasks do not systematically lose a larger share of their reasoning than short ones. The model preserves the relative allocation across tasks, assigning more reasoning to tasks that required more in isolation, but applies roughly the same proportional reduction to all of them.
+Considering that every task loses roughly the same fraction of its reasoning, the uneven degradation is best explained by how much reasoning each task can afford to lose. Short isolated traces seem to contain redundancy in reasoning beyond what the task requires, whereas long traces lie closer to the minimum reasoning needed to solve the task reliably. Hence, the same relative reduction pushes long-reasoning tasks below their minimal requirement while leaving short ones above it, concentrating degradation on tasks with long isolated traces. Since $k^{m}$ decreases with $k$ ( $m<0$ ), the implicit thinking budget shrinks as more tasks are composed, and degradation grows accordingly. This reveals a systematic failure of implicit thinking budget allocation under composition. The way models allocate their implicit thinking budget does not generalize well to composed tasks.
+
+## 3.2 Fragile tasks are stable within a model
+
+It remains to establish whether the implicit thinking budget estimation fails consistently on the same tasks across models and composition sizes. This tells us how the proposed misallocation changes as the conditions, i.e., model and composition size, vary.
+Since a failure in implicit thinking budget estimation manifests as accuracy degradation, we can test this consistency directly on the accuracy drops. For two conditions $A$ and $B$ , we obtain the accuracy drops across tasks, $\Delta_{A}$ and $\Delta_{B}$ , and measure their Pearson correlation, applying Spearman’s correction for attenuation to reduce the impact of noisy accuracy estimates (details in Appendix A.2.3).
+
+At a fixed composition size, the mean correlation across models is only $0.24\pm 0.03$ . Different models thus largely disagree on which tasks degrade, even when evaluated under identical conditions. The exception is models trained with the same recipe, such as Qwen3 8B and 14B, which correlate at $0.56\pm 0.09$ . Within a single model, the correlation across composition sizes reaches $0.81\pm 0.04$ . When the same model faces compositions of different sizes, groupings and orderings, the same set of fragile tasks tends to break.
+Fragility is therefore a stable property of a task for a given model. Measuring a task’s accuracy drop at some composition sizes lets us anticipate how it will degrade in new compositions presented to the same model, which makes fragility predictable.
+
+## 4 Exploiting implicit budgeting for efficient inference
+
+Table 1: Task accuracy (Acc.) and output tokens (Tok., includes thinking and answer) per task under different batching policies. For each policy, the left column reports accuracy and the right column tokens, with the change to solving in isolation ( $k=1$ ) in parentheses, given as an absolute difference in percentage points for accuracy and as a relative change in % for tokens. The Average row gives the mean change over the models shown. Standard fixed-size random batching causes substantial accuracy degradation, which fragility-aware batching largely mitigates. With a model-specific linear predictor, part of these token savings carries over to unseen tasks while still avoiding compositional degradation.
+
+Isolated, $k{=}1$ 
+Random batching, $k{=}6$ 
+Fragility-aware (measured)
+Fragility-aware (predictor)
+
+Acc.
+Tok.
+Acc.
+Tok.
+Acc.
+Tok.
+Acc.
+Tok.
+
+GPQA-Diamond
+
+Qwen3 4B T.
+66.7%
+7663
+56.4%  $(-10.3)$ 
+2470  $(-67.8\%)$ 
+66.8%  $(+0.2)$ 
+5200  $(-32.1\%)$ 
+67.3%  $(+0.7)$ 
+7534  $(-1.7\%)$ 
+
+Qwen3 8B
+58.7%
+5973
+53.4%  $(-5.3)$ 
+1950  $(-67.4\%)$ 
+60.0%  $(+1.3)$ 
+3520  $(-41.1\%)$ 
+56.9%  $(-1.8)$ 
+5106  $(-14.5\%)$ 
+
+Qwen3 14B
+61.5%
+4597
+51.8%  $(-9.7)$ 
+1500  $(-67.4\%)$ 
+57.9%  $(-3.7)$ 
+2111  $(-54.1\%)$ 
+61.3%  $(-0.2)$ 
+3665  $(-20.3\%)$ 
+
+Qwen3.8 27B
+83.2%
+4303
+79.2%  $(-4.0)$ 
+2740  $(-36.3\%)$ 
+84.0%  $(+0.8)$ 
+4102  $(-4.7\%)$ 
+85.3%  $(+2.1)$ 
+4324  $(+0.5\%)$ 
+
+R1 Qwen 7B
+49.1%
+6686
+23.6%  $(-25.5)$ 
+1305  $(-80.5\%)$ 
+49.6%  $(+0.5)$ 
+4037  $(-39.6\%)$ 
+46.7%  $(-2.4)$ 
+5953  $(-11.0\%)$ 
+
+R1 Llama 8B
+47.7%
+7424
+32.1%  $(-15.6)$ 
+1771  $(-76.2\%)$ 
+49.6%  $(+1.9)$ 
+4526  $(-39.0\%)$ 
+48.6%  $(+0.9)$ 
+5816  $(-21.7\%)$ 
+
+R1 Qwen3 8B
+60.8%
+9084
+48.1%  $(-12.6)$ 
+2398  $(-73.6\%)$ 
+61.9%  $(+1.2)$ 
+6595  $(-27.4\%)$ 
+59.8%  $(-1.0)$ 
+8877  $(-2.3\%)$ 
+
+Claude Opus 5
+89.5%
+689
+88.7%  $(-0.9)$ 
+564  $(-18.2\%)$ 
+89.2%  $(-0.4)$ 
+521  $(-24.3\%)$ 
+87.6%  $(-2.0)$ 
+686  $(-0.5\%)$ 
+
+Average
+64.7%
+5802
+ $-10.5$ 
+ $-60.9\%$ 
+ $+0.2$ 
+ $-32.8\%$ 
+ $-0.5$ 
+ $-8.9\%$ 
+
+MATH-500
+
+Qwen3 4B T.
+97.6%
+4064
+96.4%  $(-1.1)$ 
+2148  $(-47.2\%)$ 
+97.7%  $(+0.1)$ 
+3716  $(-8.6\%)$ 
+96.8%  $(-0.8)$ 
+3605  $(-11.3\%)$ 
+
+Qwen3 8B
+95.9%
+3449
+95.6%  $(-0.3)$ 
+1751  $(-49.2\%)$ 
+95.1%  $(-0.8)$ 
+2173  $(-37.0\%)$ 
+95.9%  $(+0.1)$ 
+2775  $(-19.5\%)$ 
+
+Qwen3 14B
+96.9%
+2604
+95.9%  $(-1.0)$ 
+1375  $(-47.2\%)$ 
+96.6%  $(-0.2)$ 
+2454  $(-5.8\%)$ 
+96.6%  $(-0.2)$ 
+2444  $(-6.2\%)$ 
+
+Qwen3.8 27B
+98.1%
+1014
+96.7%  $(-1.5)$ 
+748  $(-26.2\%)$ 
+97.8%  $(-0.4)$ 
+943  $(-7.1\%)$ 
+97.2%  $(-0.9)$ 
+994  $(-2.0\%)$ 
+
+R1 Qwen 7B
+93.0%
+2383
+69.8%  $(-23.2)$ 
+1658  $(-30.4\%)$ 
+93.2%  $(+0.2)$ 
+2205  $(-7.5\%)$ 
+93.4%  $(+0.4)$ 
+2381  $(-0.1\%)$ 
+
+R1 Llama 8B
+88.7%
+3019
+79.4%  $(-9.3)$ 
+1569  $(-48.0\%)$ 
+88.5%  $(-0.2)$ 
+2948  $(-2.3\%)$ 
+88.8%  $(+0.2)$ 
+3333  $(+10.4\%)$ 
+
+R1 Qwen3 8B
+96.8%
+6767
+93.0%  $(-3.8)$ 
+3705  $(-45.2\%)$ 
+96.6%  $(-0.2)$ 
+6608  $(-2.4\%)$ 
+96.7%  $(-0.2)$ 
+6657  $(-1.6\%)$ 
+
+Average
+95.3%
+3329
+ $-5.7$ 
+ $-41.9\%$ 
+ $-0.2$ 
+ $-10.1\%$ 
+ $-0.2$ 
+ $-4.3\%$ 
+
+MMLU-Redux
+
+Qwen3 4B T.
+84.7%
+1944
+82.9%  $(-1.8)$ 
+527  $(-72.9\%)$ 
+85.3%  $(+0.6)$ 
+527  $(-72.9\%)$ 
+84.9%  $(+0.2)$ 
+1663  $(-14.5\%)$ 
+
+Qwen3 8B
+87.2%
+921
+84.0%  $(-3.3)$ 
+306  $(-66.7\%)$ 
+86.1%  $(-1.1)$ 
+285  $(-69.0\%)$ 
+86.9%  $(-0.3)$ 
+922  $(+0.2\%)$ 
+
+Qwen3 14B
+89.0%
+718
+85.8%  $(-3.3)$ 
+212  $(-70.5\%)$ 
+88.2%  $(-0.9)$ 
+319  $(-55.6\%)$ 
+88.3%  $(-0.7)$ 
+678  $(-5.5\%)$ 
+
+Qwen3.8 27B
+92.4%
+488
+91.9%  $(-0.5)$ 
+262  $(-46.4\%)$ 
+91.8%  $(-0.6)$ 
+196  $(-59.8\%)$ 
+92.1%  $(-0.3)$ 
+352  $(-27.9\%)$ 
+
+R1 Qwen 7B
+70.1%
+1079
+60.6%  $(-9.5)$ 
+397  $(-63.2\%)$ 
+69.7%  $(-0.3)$ 
+601  $(-44.3\%)$ 
+70.4%  $(+0.3)$ 
+1127  $(+4.5\%)$ 
+
+R1 Llama 8B
+75.5%
+1458
+58.6%  $(-16.9)$ 
+431  $(-70.4\%)$ 
+75.9%  $(+0.3)$ 
+896  $(-38.5\%)$ 
+75.3%  $(-0.2)$ 
+1430  $(-1.9\%)$ 
+
+R1 Qwen3 8B
+81.6%
+1711
+64.5%  $(-17.1)$ 
+279  $(-83.7\%)$ 
+82.1%  $(+0.5)$ 
+1273  $(-25.6\%)$ 
+82.2%  $(+0.6)$ 
+1714  $(+0.2\%)$ 
+
+Average
+82.9%
+1188
+ $-7.5$ 
+ $-67.7\%$ 
+ $-0.2$ 
+ $-52.2\%$ 
+ $-0.1$ 
+ $-6.4\%$ 
+
+So far, our results suggest that LLMs fail on compositions mainly because their estimate of the implicit thinking budget does not generalize, rather than because they cannot transfer their problem-solving skills. If so, controlling how much reasoning each task receives should prevent the drop. The composition size $k$ offers a practical control mechanism on implicit budgeting, since the token reduction ratio follows a power law in $k$ . Hence, assigning robust tasks to larger compositions and fragile tasks to smaller ones could save tokens while limiting accuracy degradation.
+
+## 4.1 Fragility-aware batching
+
+To test whether this idea is viable, we first ask how many tokens could be saved if each task’s fragility were known. We estimate fragility from the measured accuracy drops and compose tasks accordingly, which gives a sense of what fragility-aware batching can achieve. In Section 4.2, we replace these measurements with a linear predictor that predicts fragility, turning the approach into a method that can be deployed.
+Formally, we seek to assign each task a composition size $k_{i}$ that maximizes the expected token savings while bounding the expected accuracy degradation by $B$ . We express this trade-off as a Lagrangian relaxation,
+
+ $k_{i}(\lambda)=\argmax_{k\in\mathcal{K}}\Big[\mathbb{E}[\Delta_{i}(k)]+\lambda\big(1-\mathrm{cost}_{k}\big)\Big],$ 
+
+(2)
+
+where $\mathcal{K}$ is the set of available composition sizes, $\mathbb{E}[\Delta_{i}(k)]$ is the expected accuracy drop of task $t_{i}$ at composition size $k$ , and $\mathrm{cost}_{k}\in(0,1]$ is the model-specific token cost of solving a task within a composition of size $k$ , relative to solving it in isolation. The parameter $\lambda\geq 0$ acts as an exchange rate between saved tokens and accuracy.
+We then choose $\lambda$ such that the mean expected accuracy drop over the dataset, $\bar{\Delta}(\lambda)=\frac{1}{n}\sum_{i=1}^{n}\mathbb{E}\big[\Delta_{i}(k_{i}(\lambda))\big]$ , conservatively stays within the budget $B$ ,
+
+ $\lambda^{*}=\max\Big\{\lambda\geq 0\;:\;\bar{\Delta}(\lambda)-\mathrm{SE}\big(\bar{\Delta}(\lambda)\big)\geq-B\Big\}.$ 
+
+(3)
+
+We find $\lambda^{*}$ by a grid search on held-out splits, using repeated nested $5$ -fold cross-validation (Cawley and Talbot, 2010) to reduce the effect of noise in the empirical accuracy estimates. Given the assignments $k_{i}(\lambda^{*})$ , we greedily group tasks into as few compositions as possible such that every task $t_{i}$ lands in a composition $C$ with $|C|\leq k_{i}(\lambda^{*})$ (details in Appendix A.2.4). Throughout our experiments, we use the composition sizes $\mathcal{K}=\{1,3,6,10,20\}$ , where $k=1$ solves a task alone, and an accuracy drop budget of $B=0.5\%$ .
+
+Table 1 compares the accuracy degradation and token savings of different batching strategies relative to solving tasks in isolation. The common practice of batching tasks randomly into fixed-size compositions (Cheng et al., 2023), here of six tasks, saves the most tokens on average but degrades accuracy strongly, particularly on GPQA-Diamond, whose tasks require many reasoning steps. Fragility-aware batching almost entirely avoids this degradation while still achieving substantial token savings. Averaged over all models and over every dataset but AIME, where fragility-aware batching leaves nearly every task in isolation (Appendix A.1.6), it saves $43\%$ of tokens while keeping accuracy constant ( $+0.6$  pp). How these savings arise depends on the dataset. On OneWordQA and StrategyQA, fragility-aware batching matches random batching, saving $68$ – $74\%$ of output tokens without losing accuracy relative to solving each task individually. On the remaining five datasets, where random batching degrades accuracy, fragility-aware batching preserves it while still saving roughly $32\%$ .
+
+These results show that much of the thinking an LLM spends on a task in isolation is not needed to solve it. Specifically, on GPQA-Diamond, GSM8K and MMLU-Redux, grouping tasks by fragility saves a substantial share of tokens at no cost in accuracy.
+
+## 4.2 Predicting fragility on held-out tasks
+
+Our results show that the set of fragile tasks is stable for a given model, which hints at the existence of steady properties that define fragility. If such properties exist, fragility should be predictable for tasks the model has never seen under composition. Hence, we extend the intervention to unseen tasks by predicting their fragility with a simple linear predictor.
+We encode each task description with Qwen3 Embedding 8B (Zhang et al., 2025), keep the embeddings fixed, and train a separate linear predictor for each evaluated language model. To generate labels, we evaluate each task in the training split with 10 trials at every composition size $k\in\{3,6,10,20\}$ , placing it in a different composition each time. Then, for each composition size $k$ the predictor outputs the probability that the task performs at least as well in composition as in isolation. To obtain predictions on unseen tasks, we use $5$ -fold cross-fitting (Chernozhukov et al., 2024), so that the held-out folds together cover the entire dataset (details in Appendix A.2.5). Finally, we feed the predicted accuracy drops into the same batching algorithm as in Section 4.1.
+
+Table 1 reports the results of the linear predictor. Guided by the predictor, fragility-aware batching limits the accuracy loss to at most $0.5$  pp on every dataset and saves $31.0\%$ of tokens on average. Because few training examples are available, the predictor is simple, and it works best on tasks with short, plain descriptions such as Integrals, GSM8K and OneWordQA. This simple demonstration thus shows that fragility is partly predictable from task properties encoded in the embeddings. Scaling such predictors further could enable saving tokens on real-world unseen tasks, just by batching them well.
+
+Fragility-aware batching on a frontier model. We further test whether fragility-aware batching carries over to flagship frontier LLMs. Since the intervention requires neither fine-tuning nor access to internal states and works purely by restructuring compositions, we can apply it directly to Claude Opus 5 on GPQA-Diamond (Table 1). In isolation, Claude Opus 5 reaches an accuracy of $89.5\%$ with 689 output tokens per task. Random composition with $k{=}6$ lowers accuracy by $0.9$  pp and saves $18\%$ of output tokens. Batching by measured fragility does better on both metrics, losing just $0.4$  pp while saving $24\%$ of generated tokens. The linear predictor, trained on fewer trials for Opus than for the open-weight models, transfers less well: it saves almost no tokens and loses $2.0$  pp. At least in its consequences, the mechanism we found in open-weight models carries over to a frontier model.
+
+## 5 Effects of post-training on compositional degradation
+
+Figure 6: Effects of implicit budgeting across three post-training stages of OLMo 3 7B on GPQA-Diamond. Left: Token ratio $r_{i}(k)=T_{i}(k)/T_{i}(1)$ as a function of composition size $k$ . Right: Accuracy drop as a function of the token ratio.
+
+The models in our analysis degrade very differently under composition, most clearly between the two model families, which differ in their post-training strategy. This hints that post-training strongly influences how well a model handles compositions. To investigate this, we repeat our analysis on OLMo 3 7B (Olmo et al., 2026) at three stages of its training curriculum: SFT (Ouyang et al., 2022), DPO (Rafailov et al., 2024) and RLVR (Lambert et al., 2025; Guo et al., 2025).
+
+Figure 6 summarizes the results on OLMo 3 7B. All three stages show very similar implicit budgeting under composition, and their token counts shrink at similar rates. Nevertheless, the same reduction affects accuracy differently. At similar token ratios, the final RLVR stage loses substantially less accuracy than the SFT and DPO stages. These degrade by similar amounts and also tend to fail on the same fragile tasks. Correlating their accuracy degradation on GPQA-Diamond, MATH-500 and MMLU-Redux as in Section 3.2 gives a disattenuated Pearson $\rho$ of $1.03\pm 0.35$ . RLVR’s fragile set tends to overlap less with theirs, with $\rho=0.69\pm 0.23$ against SFT and $\rho=0.89\pm 0.26$ against DPO.
+
+We conclude that RLVR post-training mitigates the accuracy drop incurred by implicit budgeting under composition, but it does not eliminate the misallocation of the thinking budget in the first place, which remained similar across the stages.
+
+## 6 Related work
+
+Previous work has examined both how task composition affects accuracy and reasoning length and how batching can improve efficiency or reliability. Several studies ask whether models can solve tasks as reliably together as they do separately (Pan et al., 2025; Wang et al., 2025; Chen et al., 2026). Related studies examine whether failures to meet multiple response requirements can be explained by independent errors (Harada et al., 2025; Vasileva, 2026). These studies document accuracy losses under composition, although their causes are not yet fully understood.
+At the same time, batching methods have shown promise for improving efficiency and reliability (Xu et al., 2026a; Ji et al., 2025), with accuracy gains reported in some settings (Srivastava et al., 2026; Yang et al., 2026b; Lin et al., 2024) (consistent with our observations on light-reasoning datasets OneWordQA and StrategyQA, see Appendix A.1.6). Batching has also been observed to reduce the number of reasoning tokens used per task (Srivastava et al., 2026; Deng et al., 2026). The effects of added context also vary across questions. For factual questions, models tend to resist misleading information more successfully when they can also answer related questions correctly, suggesting that accuracy in isolation does not fully capture robustness (Xu et al., 2026b).
+The number of steps needed to solve a task also matters. Tasks requiring more steps show larger accuracy drops when irrelevant information is added (Yang et al., 2025b).
+More broadly, researchers distinguish task difficulty from sensitivity to prompt changes (Romanou et al., 2026) and examine how that sensitivity varies with model size, training and architecture (Qin et al., 2026). Overall accuracy can remain largely unchanged even when irrelevant context changes which questions a model answers correctly (Zhang et al., 2026). Estimates of this sensitivity also depend on how answers are graded. Rigid matching rules can treat differently worded correct answers as errors, exaggerating the apparent sensitivity (Hua et al., 2025).
+Alongside these studies, work on reasoning allocation has shown that adding other tasks or irrelevant text can shorten reasoning traces and reduce self-checking (Rodionov et al., 2026). Researchers have also trained models to solve groups of tasks more efficiently under a shared token limit (Yang et al., 2026a). However, studies of budget allocation find that models often devote more reasoning to earlier questions than to those worth more points (Fan et al., 2026). In a single-task setting, model confidence has also been used to guide a search for shorter reasoning paths (Huang et al., 2026).
+
+These findings can be difficult to reconcile within a common explanation, given the differences in experimental settings, interventions and datasets. Our work offers a unifying perspective on several of these observations. Budget misallocation is consistent with the greater sensitivity of deeper reasoning tasks to irrelevant context (Yang et al., 2025b), self-compression (Deng et al., 2026), composition errors that cannot be explained by independent error rates alone (Harada et al., 2025), and the token savings achieved through batching (Srivastava et al., 2026; Cheng et al., 2023). We identify reasoning trace length in isolation as a key variable that helps connect these findings and informs simple, effective interventions. Using this information, we are able to show how to mitigate degradation under composition, even in frontier models.
+
+## 7 Discussion and conclusions
+
+In this work, we show that language models fail on tasks they solve reliably in isolation once those tasks are combined in a single prompt. The resulting accuracy drop is larger than expected from isolated error rates alone. As more tasks are combined, models use fewer reasoning tokens per task, following an approximate power-law decay with composition size, and the largest failures occur on tasks that require longer reasoning in isolation. This reveals an implicit per-task budget that acts as a double-edged sword. Under composition, fragile tasks receive too little reasoning and fail. In isolation, non-fragile tasks receive more reasoning than they need and waste compute. By batching tasks according to their fragility, however, the implicit budgeting can be manipulated to reduce token usage by about 43% on average while preserving accuracy, and since it does not require internal states of the model, it also applies to proprietary models such as Claude Opus 5.
+
+Previous context can cause degradation too. We deliberately compose independent tasks of the same type, isolating the budget effect in its simplest form. An important question is how this effect extends to richer contexts. Prior work finds that reasoning traces also shorten when the same task is embedded in irrelevant context, conversation history, or a larger task (Rodionov et al., 2026), suggesting that implicit thinking budgeting may extend beyond same-type composition.
+
+Long-running agents in production. This is particularly relevant to agentic workflows, where tool outputs, interaction histories, and intermediate results continually accumulate. Agents are widely observed to degrade as their context grows, a phenomenon known as context rot (Hong et al., 2025). Our results point to a degradation that sets in long before the context fills up. In an agentic workflow, this means a high-effort step can be unknowingly misbudgeted, thus possibly leading to error propagation in subsequent tasks. As a direct practical intervention, agents can keep their context lean and hand reasoning-intensive steps to subagents that start from a fresh context.
+
+Post-training as a potential mitigation. Our results suggest that reasoning allocation contributes to the difficulty of composed tasks, even when the constituent tasks are solvable in isolation. Post-training may therefore help mitigate degradation under composition. For instance, integrating budget management into RL pipelines through explicit training on composed tasks could help models allocate reasoning more effectively across a shared prompt.
+
+Limitations.
+While we show that composition systematically reduces per-task reasoning and disproportionately harms fragile tasks, we do not yet know what drives this reduction. Our study is limited to independent, same-dataset compositions, and detailed reasoning-length analysis is restricted to open-weight models. Extending these results to mixed-domain, dependent, and proprietary-model settings remains important future work.
+
+## Acknowledgments
+
+This project was funded by NSF award CCF-2112665 (TILOS) and an Alexander von Humboldt professorship. Sharut Gupta was supported by a MathWorks Engineering Fellowship. Thies Brockmöller and Chenpan Li are supported by the scholarship of the Studienstiftung des deutschen Volkes, and Chenpan Li is also supported by the scholarship of the Thomas-Weiland Wissenschaftsstiftung.
+
+## References
+
+Cawley and Talbot [2010]
+
+G. C. Cawley and N. L. Talbot.
+
+On over-fitting in model selection and subsequent selection bias in performance evaluation.
+
+J. Mach. Learn. Res., 11:2079–2107, Aug. 2010.
+
+ISSN 1532-4435.
+
+Chen et al. [2026]
+
+J. Chen, M. T. Pilehvar, and J. Camacho-Collados.
+
+Understanding llm performance degradation in multi-instance processing: The roles of instance count and context length, 2026.
+
+URL https://arxiv.org/abs/2603.22608.
+
+Cheng et al. [2023]
+
+Z. Cheng, J. Kasai, and T. Yu.
+
+Batch prompting: Efficient inference with large language model apis, 2023.
+
+URL https://arxiv.org/abs/2301.08721.
+
+Chernozhukov et al. [2024]
+
+V. Chernozhukov, D. Chetverikov, M. Demirer, E. Duflo, C. Hansen, W. Newey, and J. Robins.
+
+Double/debiased machine learning for treatment and causal parameters, 2024.
+
+URL https://arxiv.org/abs/1608.00060.
+
+Cobbe et al. [2021]
+
+K. Cobbe, V. Kosaraju, M. Bavarian, M. Chen, H. Jun, L. Kaiser, M. Plappert, J. Tworek, J. Hilton, R. Nakano, C. Hesse, and J. Schulman.
+
+Training verifiers to solve math word problems, 2021.
+
+URL https://arxiv.org/abs/2110.14168.
+
+Deng et al. [2026]
+
+J. Deng, S. Liang, J. Li, H. Li, and Y. Xie.
+
+ConPress: Learning Efficient Reasoning from Multi-Question Contextual Pressure.
+
+In International Conference on Machine Learning, 2026.
+
+URL https://arxiv.org/abs/2602.01472.
+
+Dziri et al. [2023]
+
+N. Dziri, X. Lu, M. Sclar, X. L. Li, L. Jiang, B. Y. Lin, P. West, C. Bhagavatula, R. L. Bras, J. D. Hwang, S. Sanyal, S. Welleck, X. Ren, A. Ettinger, Z. Harchaoui, and Y. Choi.
+
+Faith and fate: Limits of transformers on compositionality, 2023.
+
+URL https://arxiv.org/abs/2305.18654.
+
+Fan et al. [2026]
+
+C. Fan, Y. Cheng, M. Li, Y. Liang, T. Zhou, and S. Feizi.
+
+Thinking Hard, Not Smart: Reasoning Models Fail to Ration Test-Time Compute Across Questions, 2026.
+
+URL https://arxiv.org/abs/2608.07968.
+
+Gema et al. [2025]
+
+A. P. Gema, J. O. J. Leang, G. Hong, A. Devoto, A. C. M. Mancino, R. Saxena, X. He, Y. Zhao, X. Du, M. R. G. Madani, C. Barale, R. McHardy, J. Harris, J. Kaddour, E. van Krieken, and P. Minervini.
+
+Are we done with mmlu?, 2025.
+
+URL https://arxiv.org/abs/2406.04127.
+
+Geva et al. [2021]
+
+M. Geva, D. Khashabi, E. Segal, T. Khot, D. Roth, and J. Berant.
+
+Did aristotle use a laptop? a question answering benchmark with implicit reasoning strategies, 2021.
+
+URL https://arxiv.org/abs/2101.02235.
+
+Guo et al. [2025]
+
+D. Guo, D. Yang, H. Zhang, J. Song, P. Wang, Q. Zhu, R. Xu, R. Zhang, S. Ma, X. Bi, X. Zhang, X. Yu, Y. Wu, Z. F. Wu, Z. Gou, Z. Shao, Z. Li, Z. Gao, A. Liu, B. Xue, B. Wang, B. Wu, B. Feng, C. Lu, C. Zhao, C. Deng, C. Ruan, D. Dai, D. Chen, D. Ji, E. Li, F. Lin, F. Dai, F. Luo, G. Hao, G. Chen, G. Li, H. Zhang, H. Xu, H. Ding, H. Gao, H. Qu, H. Li, J. Guo, J. Li, J. Chen, J. Yuan, J. Tu, J. Qiu, J. Li, J. L. Cai, J. Ni, J. Liang, J. Chen, K. Dong, K. Hu, K. You, K. Gao, K. Guan, K. Huang, K. Yu, L. Wang, L. Zhang, L. Zhao, L. Wang, L. Zhang, L. Xu, L. Xia, M. Zhang, M. Zhang, M. Tang, M. Zhou, M. Li, M. Wang, M. Li, N. Tian, P. Huang, P. Zhang, Q. Wang, Q. Chen, Q. Du, R. Ge, R. Zhang, R. Pan, R. Wang, R. J. Chen, R. L. Jin, R. Chen, S. Lu, S. Zhou, S. Chen, S. Ye, S. Wang, S. Yu, S. Zhou, S. Pan, S. S. Li, S. Zhou, S. Wu, T. Yun, T. Pei, T. Sun, T. Wang, W. Zeng, W. Liu, W. Liang, W. Gao, W. Yu, W. Zhang, W. L. Xiao, W. An, X. Liu, X. Wang, X. Chen, X. Nie, X. Cheng, X. Liu, X. Xie, X. Liu, X. Yang, X. Li,
+X. Su, X. Lin, X. Q. Li, X. Jin, X. Shen, X. Chen, X. Sun, X. Wang, X. Song, X. Zhou, X. Wang, X. Shan, Y. K. Li, Y. Q. Wang, Y. X. Wei, Y. Zhang, Y. Xu, Y. Li, Y. Zhao, Y. Sun, Y. Wang, Y. Yu, Y. Zhang, Y. Shi, Y. Xiong, Y. He, Y. Piao, Y. Wang, Y. Tan, Y. Ma, Y. Liu, Y. Guo, Y. Ou, Y. Wang, Y. Gong, Y. Zou, Y. He, Y. Xiong, Y. Luo, Y. You, Y. Liu, Y. Zhou, Y. X. Zhu, Y. Huang, Y. Li, Y. Zheng, Y. Zhu, Y. Ma, Y. Tang, Y. Zha, Y. Yan, Z. Z. Ren, Z. Ren, Z. Sha, Z. Fu, Z. Xu, Z. Xie, Z. Zhang, Z. Hao, Z. Ma, Z. Yan, Z. Wu, Z. Gu, Z. Zhu, Z. Liu, Z. Li, Z. Xie, Z. Song, Z. Pan, Z. Huang, Z. Xu, Z. Zhang, and Z. Zhang.
+
+Deepseek-r1 incentivizes reasoning in llms through reinforcement learning.
+
+Nature, 645(8081):633–638, Sept. 2025.
+
+ISSN 1476-4687.
+
+doi: 10.1038/s41586-025-09422-z.
+
+URL http://dx.doi.org/10.1038/s41586-025-09422-z.
+
+Harada et al. [2025]
+
+K. Harada, Y. Yamazaki, M. Taniguchi, E. Marrese-Taylor, T. Kojima, Y. Iwasawa, and Y. Matsuo.
+
+When Instructions Multiply: Measuring and Estimating LLM Capabilities of Multiple Instructions Following.
+
+In Findings of the Association for Computational Linguistics: EMNLP 2025, pages 16506–16526, 2025.
+
+doi: 10.18653/v1/2025.findings-emnlp.896.
+
+URL https://aclanthology.org/2025.findings-emnlp.896/.
+
+Hendrycks et al. [2021]
+
+D. Hendrycks, C. Burns, S. Kadavath, A. Arora, S. Basart, E. Tang, D. Song, and J. Steinhardt.
+
+Measuring mathematical problem solving with the math dataset, 2021.
+
+URL https://arxiv.org/abs/2103.03874.
+
+Hong et al. [2025]
+
+K. Hong, A. Troynikov, and J. Huber.
+
+Context rot: How increasing input tokens impacts llm performance.
+
+Technical report, Chroma, July 2025.
+
+URL https://trychroma.com/research/context-rot.
+
+Hua et al. [2025]
+
+A. Hua, K. Tang, C. Gu, J. Gu, E. Wong, and Y. Qin.
+
+Flaw or Artifact? Rethinking Prompt Sensitivity in Evaluating LLMs.
+
+In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing, pages 19889–19899, 2025.
+
+doi: 10.18653/v1/2025.emnlp-main.1006.
+
+URL https://aclanthology.org/2025.emnlp-main.1006/.
+
+Huang et al. [2026]
+
+Z. Huang, X. Xia, Y. Ren, J. Zheng, X. Wang, Z. Zhang, H. Xie, S. Liang, Z. Chen, X. Xiao, F. Zhuang, J. Li, D. Wang, and Y. Ban.
+
+Does Your Reasoning Model Implicitly Know When to Stop Thinking?
+
+In International Conference on Machine Learning, 2026.
+
+URL https://arxiv.org/abs/2602.08354.
+
+Ji et al. [2025]
+
+Z. Ji, X. Wang, Z. Luo, Z. Xie, and M. Zhang.
+
+Optimized Batch Prompting for Cost-effective LLMs.
+
+Proceedings of the VLDB Endowment, 18(7):2172–2184, 2025.
+
+doi: 10.14778/3734839.3734853.
+
+URL https://www.vldb.org/pvldb/vol18/p2172-zhang.pdf.
+
+Lambert et al. [2025]
+
+N. Lambert, J. Morrison, V. Pyatkin, S. Huang, H. Ivison, F. Brahman, L. J. V. Miranda, A. Liu, N. Dziri, S. Lyu, Y. Gu, S. Malik, V. Graf, J. D. Hwang, J. Yang, R. L. Bras, O. Tafjord, C. Wilhelm, L. Soldaini, N. A. Smith, Y. Wang, P. Dasigi, and H. Hajishirzi.
+
+Tulu 3: Pushing frontiers in open language model post-training, 2025.
+
+URL https://arxiv.org/abs/2411.15124.
+
+Lightman et al. [2023]
+
+H. Lightman, V. Kosaraju, Y. Burda, H. Edwards, B. Baker, T. Lee, J. Leike, J. Schulman, I. Sutskever, and K. Cobbe.
+
+Let’s verify step by step, 2023.
+
+URL https://arxiv.org/abs/2305.20050.
+
+Lin et al. [2024]
+
+J. Lin, M. Diesendruck, L. Du, and R. Abraham.
+
+Batchprompt: Accomplish more with less, 2024.
+
+URL https://arxiv.org/abs/2309.00384.
+
+Muennighoff et al. [2025]
+
+N. Muennighoff, Z. Yang, W. Shi, X. L. Li, L. Fei-Fei, H. Hajishirzi, L. Zettlemoyer, P. Liang, E. Candès, and T. Hashimoto.
+
+s1: Simple test-time scaling, 2025.
+
+URL https://arxiv.org/abs/2501.19393.
+
+Olmo et al. [2026]
+
+T. Olmo, :, A. Ettinger, A. Bertsch, B. Kuehl, D. Graham, D. Heineman, D. Groeneveld, F. Brahman, F. Timbers, H. Ivison, J. Morrison, J. Poznanski, K. Lo, L. Soldaini, M. Jordan, M. Chen, M. Noukhovitch, N. Lambert, P. Walsh, P. Dasigi, R. Berry, S. Malik, S. Shah, S. Geng, S. Arora, S. Gupta, T. Anderson, T. Xiao, T. Murray, T. Romero, V. Graf, A. Asai, A. Bhagia, A. Wettig, A. Liu, A. Rangapur, C. Anastasiades, C. Huang, D. Schwenk, H. Trivedi, I. Magnusson, J. Lochner, J. Liu, L. J. V. Miranda, M. Sap, M. Morgan, M. Schmitz, M. Guerquin, M. Wilson, R. Huff, R. L. Bras, R. Xin, R. Shao, S. Skjonsberg, S. Z. Shen, S. S. Li, T. Wilde, V. Pyatkin, W. Merrill, Y. Chang, Y. Gu, Z. Zeng, A. Sabharwal, L. Zettlemoyer, P. W. Koh, A. Farhadi, N. A. Smith, and H. Hajishirzi.
+
+Olmo 3, 2026.
+
+URL https://arxiv.org/abs/2512.13961.
+
+Ouyang et al. [2022]
+
+L. Ouyang, J. Wu, X. Jiang, D. Almeida, C. L. Wainwright, P. Mishkin, C. Zhang, S. Agarwal, K. Slama, A. Ray, J. Schulman, J. Hilton, F. Kelton, L. Miller, M. Simens, A. Askell, P. Welinder, P. Christiano, J. Leike, and R. Lowe.
+
+Training language models to follow instructions with human feedback, 2022.
+
+URL https://arxiv.org/abs/2203.02155.
+
+Pan et al. [2025]
+
+Z. Pan, Q. Pei, Y. Li, Q. Sun, Z. Tang, H. V. Zhao, C. He, and L. Wu.
+
+Rest: Stress testing large reasoning models by asking multiple problems at once, 2025.
+
+URL https://arxiv.org/abs/2507.10541.
+
+Press et al. [2023]
+
+O. Press, M. Zhang, S. Min, L. Schmidt, N. A. Smith, and M. Lewis.
+
+Measuring and Narrowing the Compositionality Gap in Language Models.
+
+In Findings of the Association for Computational Linguistics: EMNLP 2023, pages 5687–5711, 2023.
+
+doi: 10.18653/v1/2023.findings-emnlp.378.
+
+URL https://aclanthology.org/2023.findings-emnlp.378/.
+
+Qin et al. [2026]
+
+R. Qin, Q. Wang, T. Wang, Z. Wei, and W. Shen.
+
+Evaluating and Explaining Prompt Sensitivity of LLMs Using Interactions.
+
+In International Conference on Machine Learning, 2026.
+
+URL https://arxiv.org/abs/2608.18539.
+
+Qwen Team [2026]
+
+Qwen Team.
+
+Qwen3.8-Max: A new bar for coding and cowork, August 2026.
+
+URL https://qwen.ai/blog?id=qwen3.8.
+
+Rafailov et al. [2024]
+
+R. Rafailov, A. Sharma, E. Mitchell, S. Ermon, C. D. Manning, and C. Finn.
+
+Direct preference optimization: Your language model is secretly a reward model, 2024.
+
+URL https://arxiv.org/abs/2305.18290.
+
+Rein et al. [2023]
+
+D. Rein, B. L. Hou, A. C. Stickland, J. Petty, R. Y. Pang, J. Dirani, J. Michael, and S. R. Bowman.
+
+Gpqa: A graduate-level google-proof q&a benchmark, 2023.
+
+URL https://arxiv.org/abs/2311.12022.
+
+Rodionov et al. [2026]
+
+G. Rodionov, R. Garipov, and G. Yakushev.
+
+Reasoning Shift: How Context Silently Shortens LLM Reasoning, 2026.
+
+URL https://arxiv.org/abs/2604.01161.
+
+Romanou et al. [2026]
+
+A. Romanou, M. Ibrahim, C. Ross, C. Shaib, K. Oktar, S. J. Bell, A. Ovalle, J. Dodge, A. Bosselut, K. Sinha, and A. Williams.
+
+Brittlebench: Quantifying LLM Robustness via Prompt Sensitivity, 2026.
+
+URL https://arxiv.org/abs/2603.13285.
+
+Sinha et al. [2026]
+
+A. Sinha, A. Arun, S. Goel, S. Staab, and J. Geiping.
+
+The illusion of diminishing returns: Measuring long horizon execution in llms, 2026.
+
+URL https://arxiv.org/abs/2509.09677.
+
+Snell et al. [2024]
+
+C. Snell, J. Lee, K. Xu, and A. Kumar.
+
+Scaling llm test-time compute optimally can be more effective than scaling model parameters, 2024.
+
+URL https://arxiv.org/abs/2408.03314.
+
+Srivastava et al. [2026]
+
+S. Srivastava, J. Bidhan, H. Yan, A. Dey, T. Kansal, P. Kath, S. Mansouri, M. Marvania, V. S. Simhadri, and G. Singh.
+
+Reasoning Under Constraint: How Batch Prompting Suppresses Overthinking in Reasoning Models.
+
+ICLR Workshop on Logical Reasoning of Large Language Models, 2026.
+
+URL https://iclr.cc/virtual/2026/poster/10017459.
+
+Non-archival workshop presentation; preprint first posted in 2025.
+
+Vasileva [2026]
+
+M. I. Vasileva.
+
+Large language models can follow instructions, but not many at once: Phase transitions in compositional constraint satisfaction, 2026.
+
+URL https://arxiv.org/abs/2608.12426.
+
+Wang et al. [2025]
+
+Z. Wang, J. Kodner, and O. Rambow.
+
+Evaluating LLMs with Multiple Problems at once.
+
+In Proceedings of the Fourth Workshop on Generation, Evaluation and Metrics (GEM2), pages 178–199, 2025.
+
+URL https://aclanthology.org/2025.gem-1.14/.
+
+Wei et al. [2023]
+
+J. Wei, X. Wang, D. Schuurmans, M. Bosma, B. Ichter, F. Xia, E. Chi, Q. Le, and D. Zhou.
+
+Chain-of-thought prompting elicits reasoning in large language models, 2023.
+
+URL https://arxiv.org/abs/2201.11903.
+
+Xu et al. [2026a]
+
+H. Xu, K. Zhao, and J. Xie.
+
+Towards Cost-effective LLMs Routing with Batch Prompting, 2026a.
+
+URL https://arxiv.org/abs/2605.28268.
+
+Xu et al. [2026b]
+
+H. Xu, N. Zhao, Y. Yao, W. Xu, H. Wang, X. Deng, S. Deng, J. Z. Pan, H. Chen, and N. Zhang.
+
+Illusions of Confidence? Diagnosing LLM Truthfulness via Neighborhood Consistency.
+
+In Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 4432–4457. Association for Computational Linguistics, 2026b.
+
+doi: 10.18653/v1/2026.acl-long.203.
+
+URL https://aclanthology.org/2026.acl-long.203/.
+
+Yang et al. [2025a]
+
+A. Yang, A. Li, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu, C. Gao, C. Huang, C. Lv, C. Zheng, D. Liu, F. Zhou, F. Huang, F. Hu, H. Ge, H. Wei, H. Lin, J. Tang, J. Yang, J. Tu, J. Zhang, J. Yang, J. Yang, J. Zhou, J. Zhou, J. Lin, K. Dang, K. Bao, K. Yang, L. Yu, L. Deng, M. Li, M. Xue, M. Li, P. Zhang, P. Wang, Q. Zhu, R. Men, R. Gao, S. Liu, S. Luo, T. Li, T. Tang, W. Yin, X. Ren, X. Wang, X. Zhang, X. Ren, Y. Fan, Y. Su, Y. Zhang, Y. Zhang, Y. Wan, Y. Liu, Z. Wang, Z. Cui, Z. Zhang, Z. Zhou, and Z. Qiu.
+
+Qwen3 technical report, 2025a.
+
+URL https://arxiv.org/abs/2505.09388.
+
+Yang et al. [2026a]
+
+B. Yang, H. Ma, J. Fan, and G. Liu.
+
+Batched Contextual Reinforcement: A Task-Scaling Law for Efficient Reasoning, 2026a.
+
+URL https://arxiv.org/abs/2604.02322v1.
+
+arXiv version 1.
+
+Yang et al. [2025b]
+
+M. Yang, E. Huang, L. Zhang, M. Surdeanu, W. Y. Wang, and L. Pan.
+
+How Is LLM Reasoning Distracted by Irrelevant Context? An Analysis Using a Controlled Benchmark.
+
+In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing, pages 13329–13347, 2025b.
+
+doi: 10.18653/v1/2025.emnlp-main.674.
+
+URL https://aclanthology.org/2025.emnlp-main.674/.
+
+Yang et al. [2026b]
+
+X. Yang, F. Jia, R. Xie, X. Xi, H. Bian, J. Li, and M. Agrawal.
+
+Batch-of-Thought: Cross-Instance Learning for Enhanced LLM Reasoning, 2026b.
+
+URL https://arxiv.org/abs/2601.02950.
+
+Zhang et al. [2025]
+
+Y. Zhang, M. Li, D. Long, X. Zhang, H. Lin, B. Yang, P. Xie, A. Yang, D. Liu, J. Lin, F. Huang, and J. Zhou.
+
+Qwen3 embedding: Advancing text embedding and reranking through foundation models, 2025.
+
+URL https://arxiv.org/abs/2506.05176.
+
+Zhang et al. [2026]
+
+Y. Zhang, S. Koyejo, and D. Yang.
+
+The Illusion of Robustness: Aggregate Accuracy Hides Prediction Flips under Task-Irrelevant Context, 2026.
+
+URL https://arxiv.org/abs/2607.12963.
+
+## Appendix A Appendix
+
+## A.1 Further results
+
+## A.1.1 Compositional degradation is observable over a wide range of datasets and models
+
+Figure 7: Accuracy drop as a function of composition size $k$ for all datasets and models. All tasks were solved in three out of three isolated attempts, yet accuracy drops once they are composed, on every dataset except OneWordQA and StrategyQA, whose tasks require little reasoning. The R1-distilled models degrade the most, and the extent of degradation varies strongly between datasets.
+
+Compositional degradation is not caused by context length or parsing.
+
+Since composed tasks require more context and use a different answer format than isolated tasks, two natural confounders of compositional degradation are truncation due to context overflow and failures in parsing the composed answer. The results in Table 3 show that neither factor accounts for the observed degradation. Context length poses little difficulty: in most datasets, fewer than 1% of responses reach the context limit, even at the largest $k$ we evaluate. Parsing failures are likewise rare across all datasets except AIME. There, the majority of these failures arise because the model returns fewer answers than there are tasks, which itself constitutes a failure to solve the composition.
+
+## A.1.2 Composition size influences token ratio
+
+Figures 8–14 show the token ratio $r_{i}(k)=T_{i}(k)/T_{i}(1)$ as a function of composition size $k$ for all seven open-weight models. Tasks are binned by the quantile of their isolated trace length into Low ( $\leq 20\%$ ), Medium ( $20$ – $80\%$ ), and High ( $>80\%$ ). On log-log axes, the ratio decreases approximately linearly in $\log k$ for nearly all models and datasets, indicating that LLMs shrink the relative token usage of each task under composition by $k^{m}$ . The exception is R1 Qwen 7B on MATH-500, where the ratio of the Low bin rises above 1 and the fit over all tasks is flat ( $m=-0.04$ , $R^{2}=-0.43$ ). This reduction shows no systematic dependence on $T_{i}(1)$ , since the ordering of the length bins varies across models and datasets and no bin is consistently reduced more than the others. We fix each power-law fit to pass through $(1,1)$ , since a composition of a single task has a token ratio of 1 by construction. Each caption summarizes the six fits of a model, one per dataset over all of its tasks, by the median and range of the slope $m$ and the mean $R^{2}$ .
+
+Figure 8: Token ratio on Qwen3 4B Thinking. Power-law fits through $(1,1)$ , one per dataset: median slope $m=-0.46$ (range $[-0.79,-0.34]$ ), mean $R^{2}=0.94$ .
+
+Figure 9: Token ratio on Qwen3 8B. Power-law fits through $(1,1)$ , one per dataset: median slope $m=-0.56$ (range $[-0.72,-0.45]$ ), mean $R^{2}=0.94$ .
+
+Figure 10: Token ratio on Qwen3 14B. Power-law fits through $(1,1)$ , one per dataset: median slope $m=-0.55$ (range $[-0.73,-0.42]$ ), mean $R^{2}=0.87$ .
+
+Figure 11: Token ratio on Qwen3.8 27B. Power-law fits through $(1,1)$ , one per dataset: median slope $m=-0.15$ (range $[-0.26,-0.07]$ ), mean $R^{2}=0.72$ .
+
+Figure 12: Token ratio on R1 Llama 8B. Power-law fits through $(1,1)$ , one per dataset: median slope $m=-0.68$ (range $[-0.78,-0.35]$ ), mean $R^{2}=0.59$ .
+
+Figure 13: Token ratio on R1 Qwen 7B. Power-law fits through $(1,1)$ , one per dataset: median slope $m=-0.62$ (range $[-0.78,-0.04]$ ), mean $R^{2}=0.62$ .
+
+Figure 14: Token ratio on R1 Qwen3 8B. Power-law fits through $(1,1)$ , one per dataset: median slope $m=-0.61$ (range $[-0.88,-0.46]$ ), mean $R^{2}=0.55$ .
+
+## A.1.3 Token ratio influences accuracy degradation
+
+Figures 15–21 extend the analysis of Figure 5 to further models and datasets. We restrict this analysis to a subset of six datasets, chosen to span a wide range of tasks from math, logical inference and linguistics, as running it on all datasets would be prohibitively expensive.
+
+In each plot, tasks are binned by the quantile of their isolated thinking length $T_{i}(1)$ into Low ( $\leq 20\%$ ), Medium ( $20$ – $80\%$ ), and High ( $>80\%$ ), and the accuracy drop is shown as a function of the relative thinking token reduction. Below the dashed line, the y-axis is logarithmic. The pattern holds across all models. Accuracy drops as the reduction grows, and in most cases tasks with long isolated thinking traces degrade substantially more than tasks with short ones.
+
+Figure 15: Accuracy drop versus relative thinking token reduction for Qwen3 4B Thinking.
+
+Figure 16: Accuracy drop versus relative thinking token reduction for Qwen3 8B.
+
+Figure 17: Accuracy drop versus relative thinking token reduction for Qwen3 14B.
+
+Figure 18: Accuracy drop versus relative thinking token reduction for Qwen3.8 27B.
+
+Figure 19: Accuracy drop versus relative thinking token reduction for R1 Llama 8B.
+
+Figure 20: Accuracy drop versus relative thinking token reduction for R1 Qwen 7B.
+
+Figure 21: Accuracy drop versus relative thinking token reduction for R1 Qwen3 8B.
+
+Budget forcing causes a degradation analogous to composition.
+
+To rule out possible context effects, we take the budget a task receives when it is solved in composition and apply it to the same task solved in isolation. Following Muennighoff et al. [2025], we inject </think> once the thinking trace reaches this budget. In composition, the model also spends tokens on restating the question and checking the output format. To cover this constant overhead, we add the full share of unattributed tokens (tokens not attributed to any task) from the composed solution to the budget. Figures 5 and 15–21 show the results as “forced”. We find that stopping the thinking abruptly causes substantially larger degradation than the planned reduction of thinking tokens under composition. Still, the same pattern emerges. Degradation rises monotonically as the budget shrinks, and tasks with higher reasoning requirements, measured by their thinking length in isolation, consistently degrade more than tasks with low requirements. In terms of its effect on accuracy, composing tasks therefore appears to act analogously to forcing a budget.
+
+## A.1.4 Budgeting is slightly position dependent
+
+Figure 22: Positional dependence of thinking budget allocation and compositional degradation on MATH-500 at composition size $k=20$ . The upper panels show thinking tokens (yellow-red-purple) and the lower panels show the accuracy drop (yellow-green-purple). The last position in each composition holds the dummy task, which we exclude from the analysis because our method cannot reliably determine its token usage (Appendix A.2.1).
+
+We also report results on how the implicit budgeting depends on position, where a task’s position in a composition is simply its position in the prompt. Previous work has observed a position bias in thinking tokens [Pan et al., 2025], so we ask whether this bias also influences the accuracy degradation through composition.
+
+Figure 22 plots the budgeting and accuracy drop by position on MATH-500 across all models. We observe a similar budgeting effect as previously described in the literature: models use fewer thinking tokens towards the end of a composition. Remarkably, as a result, the accuracy drop grows towards the end in most models, in line with our earlier observations.
+
+Qwen3.8 27B does not show a positional bias, and thus its accuracy stays constant across positions, which hints that the training recipe is the main driver of this bias. The original Qwen3 8B and its R1-distilled version point the same way. They share the same architecture, yet R1 Qwen3 8B reduces thinking tokens substantially more at later positions, which again suggests that post-training has a large influence on budgeting behavior. Future work should investigate this phenomenon further, since it can impact performance when high-effort tasks are placed at the end of a prompt.
+
+## A.1.5 Correlating accuracy drop across models and composition sizes
+
+Figure 23: Disattenuated Pearson $r$ correlation of accuracy degradation across different conditions, i.e. model and composition size. Each pair of conditions (a cell in the heatmap) averages over datasets and, on the left, over models, on the right, over composition sizes. Left: The correlation is substantially larger when comparing accuracy degradation within the same model across different composition sizes $k$ . Right: By contrast, the correlation between different models is low, especially across model families, suggesting different architectures and training recipes lead to different tasks being fragile.
+
+## A.1.6 Fragility-aware batching
+
+Table 2: Task accuracy (Acc.) and output tokens (Tok., includes thinking and answer) per task under different batching policies for all models and datasets. The $k{=}1$ columns report absolute values. All other columns report absolute values with the change with respect to $k{=}1$ in parentheses, as an absolute difference in percentage points for accuracy and as a relative change in % for tokens. Within each policy, the left column is accuracy and the right column is tokens. The Average row reports the mean over all models shown, eight on GPQA-Diamond and seven on the other datasets: absolute values for $k{=}1$ and the mean change for all other policies. On OneWordQA, the Average leaves out R1 Qwen3 8B (grey), whose answers in composition do not follow our result contract, which leads to increased parsing errors.
+
+Isolated, $k{=}1$ 
+Random batching, $k{=}6$ 
+Fragility-aware (measured)
+Fragility-aware (predictor)
+
+Acc.
+Tok.
+Acc.
+Tok.
+Acc.
+Tok.
+Acc.
+Tok.
+
+GPQA-Diamond
+
+Qwen3 4B T.
+66.7%
+7663
+56.4%  $(-10.3)$ 
+2470  $(-67.8\%)$ 
+66.8%  $(+0.2)$ 
+5200  $(-32.1\%)$ 
+67.3%  $(+0.7)$ 
+7534  $(-1.7\%)$ 
+
+Qwen3 8B
+58.7%
+5973
+53.4%  $(-5.3)$ 
+1950  $(-67.4\%)$ 
+60.0%  $(+1.3)$ 
+3520  $(-41.1\%)$ 
+56.9%  $(-1.8)$ 
+5106  $(-14.5\%)$ 
+
+Qwen3 14B
+61.5%
+4597
+51.8%  $(-9.7)$ 
+1500  $(-67.4\%)$ 
+57.9%  $(-3.7)$ 
+2111  $(-54.1\%)$ 
+61.3%  $(-0.2)$ 
+3665  $(-20.3\%)$ 
+
+Qwen3.8 27B
+83.2%
+4303
+79.2%  $(-4.0)$ 
+2740  $(-36.3\%)$ 
+84.0%  $(+0.8)$ 
+4102  $(-4.7\%)$ 
+85.3%  $(+2.1)$ 
+4324  $(+0.5\%)$ 
+
+R1 Qwen 7B
+49.1%
+6686
+23.6%  $(-25.5)$ 
+1305  $(-80.5\%)$ 
+49.6%  $(+0.5)$ 
+4037  $(-39.6\%)$ 
+46.7%  $(-2.4)$ 
+5953  $(-11.0\%)$ 
+
+R1 Llama 8B
+47.7%
+7424
+32.1%  $(-15.6)$ 
+1771  $(-76.2\%)$ 
+49.6%  $(+1.9)$ 
+4526  $(-39.0\%)$ 
+48.6%  $(+0.9)$ 
+5816  $(-21.7\%)$ 
+
+R1 Qwen3 8B
+60.8%
+9084
+48.1%  $(-12.6)$ 
+2398  $(-73.6\%)$ 
+61.9%  $(+1.2)$ 
+6595  $(-27.4\%)$ 
+59.8%  $(-1.0)$ 
+8877  $(-2.3\%)$ 
+
+Claude Opus 5
+89.5%
+689
+88.7%  $(-0.9)$ 
+564  $(-18.2\%)$ 
+89.2%  $(-0.4)$ 
+521  $(-24.3\%)$ 
+87.6%  $(-2.0)$ 
+686  $(-0.5\%)$ 
+
+Average
+64.7%
+5802
+ $-10.5$ 
+ $-60.9\%$ 
+ $+0.2$ 
+ $-32.8\%$ 
+ $-0.5$ 
+ $-8.9\%$ 
+
+GSM8K
+
+Qwen3 4B T.
+95.2%
+1151
+91.9%  $(-3.3)$ 
+472  $(-59.0\%)$ 
+93.4%  $(-1.8)$ 
+467  $(-59.5\%)$ 
+94.9%  $(-0.3)$ 
+793  $(-31.2\%)$ 
+
+Qwen3 8B
+95.4%
+769
+95.2%  $(-0.2)$ 
+371  $(-51.8\%)$ 
+95.0%  $(-0.4)$ 
+279  $(-63.7\%)$ 
+95.1%  $(-0.3)$ 
+537  $(-30.1\%)$ 
+
+Qwen3 14B
+96.1%
+587
+95.9%  $(-0.2)$ 
+253  $(-56.9\%)$ 
+95.9%  $(-0.2)$ 
+200  $(-66.0\%)$ 
+95.7%  $(-0.3)$ 
+314  $(-46.6\%)$ 
+
+Qwen3.8 27B
+97.4%
+263
+97.5%  $(+0.1)$ 
+200  $(-24.0\%)$ 
+97.5%  $(+0.1)$ 
+158  $(-40.1\%)$ 
+97.5%  $(0.0)$ 
+157  $(-40.1\%)$ 
+
+R1 Qwen 7B
+91.4%
+834
+87.5%  $(-3.9)$ 
+187  $(-77.6\%)$ 
+90.8%  $(-0.7)$ 
+308  $(-63.1\%)$ 
+91.6%  $(+0.1)$ 
+824  $(-1.2\%)$ 
+
+R1 Llama 8B
+89.5%
+685
+81.8%  $(-7.8)$ 
+278  $(-59.4\%)$ 
+89.3%  $(-0.2)$ 
+672  $(-1.9\%)$ 
+89.4%  $(-0.1)$ 
+797  $(+16.4\%)$ 
+
+R1 Qwen3 8B
+92.8%
+2377
+91.8%  $(-1.0)$ 
+795  $(-66.6\%)$ 
+93.0%  $(+0.2)$ 
+911  $(-61.7\%)$ 
+92.8%  $(0.0)$ 
+2163  $(-9.0\%)$ 
+
+Average
+94.0%
+952
+ $-2.3$ 
+ $-56.5\%$ 
+ $-0.4$ 
+ $-50.8\%$ 
+ $-0.1$ 
+ $-20.3\%$ 
+
+MATH-500
+
+Qwen3 4B T.
+97.6%
+4064
+96.4%  $(-1.1)$ 
+2148  $(-47.2\%)$ 
+97.7%  $(+0.1)$ 
+3716  $(-8.6\%)$ 
+96.8%  $(-0.8)$ 
+3605  $(-11.3\%)$ 
+
+Qwen3 8B
+95.9%
+3449
+95.6%  $(-0.3)$ 
+1751  $(-49.2\%)$ 
+95.1%  $(-0.8)$ 
+2173  $(-37.0\%)$ 
+95.9%  $(+0.1)$ 
+2775  $(-19.5\%)$ 
+
+Qwen3 14B
+96.9%
+2604
+95.9%  $(-1.0)$ 
+1375  $(-47.2\%)$ 
+96.6%  $(-0.2)$ 
+2454  $(-5.8\%)$ 
+96.6%  $(-0.2)$ 
+2444  $(-6.2\%)$ 
+
+Qwen3.8 27B
+98.1%
+1014
+96.7%  $(-1.5)$ 
+748  $(-26.2\%)$ 
+97.8%  $(-0.4)$ 
+943  $(-7.1\%)$ 
+97.2%  $(-0.9)$ 
+994  $(-2.0\%)$ 
+
+R1 Qwen 7B
+93.0%
+2383
+69.8%  $(-23.2)$ 
+1658  $(-30.4\%)$ 
+93.2%  $(+0.2)$ 
+2205  $(-7.5\%)$ 
+93.4%  $(+0.4)$ 
+2381  $(-0.1\%)$ 
+
+R1 Llama 8B
+88.7%
+3019
+79.4%  $(-9.3)$ 
+1569  $(-48.0\%)$ 
+88.5%  $(-0.2)$ 
+2948  $(-2.3\%)$ 
+88.8%  $(+0.2)$ 
+3333  $(+10.4\%)$ 
+
+R1 Qwen3 8B
+96.8%
+6767
+93.0%  $(-3.8)$ 
+3705  $(-45.2\%)$ 
+96.6%  $(-0.2)$ 
+6608  $(-2.4\%)$ 
+96.7%  $(-0.2)$ 
+6657  $(-1.6\%)$ 
+
+Average
+95.3%
+3329
+ $-5.7$ 
+ $-41.9\%$ 
+ $-0.2$ 
+ $-10.1\%$ 
+ $-0.2$ 
+ $-4.3\%$ 
+
+Integrals
+
+Qwen3 4B T.
+99.9%
+1914
+99.2%  $(-0.7)$ 
+1029  $(-46.3\%)$ 
+99.7%  $(-0.2)$ 
+1411  $(-26.3\%)$ 
+99.6%  $(-0.3)$ 
+908  $(-52.6\%)$ 
+
+Qwen3 8B
+99.7%
+2887
+98.8%  $(-0.9)$ 
+946  $(-67.2\%)$ 
+99.8%  $(+0.1)$ 
+2717  $(-5.9\%)$ 
+98.8%  $(-0.9)$ 
+1192  $(-58.7\%)$ 
+
+Qwen3 14B
+99.8%
+2321
+99.0%  $(-0.8)$ 
+670  $(-71.1\%)$ 
+99.5%  $(-0.3)$ 
+1335  $(-42.5\%)$ 
+99.6%  $(-0.2)$ 
+756  $(-67.4\%)$ 
+
+Qwen3.8 27B
+99.8%
+724
+98.8%  $(-1.0)$ 
+564  $(-22.1\%)$ 
+99.5%  $(-0.3)$ 
+624  $(-13.8\%)$ 
+99.6%  $(-0.2)$ 
+550  $(-24.0\%)$ 
+
+R1 Qwen 7B
+96.4%
+2519
+90.8%  $(-5.5)$ 
+547  $(-78.3\%)$ 
+96.0%  $(-0.4)$ 
+2277  $(-9.6\%)$ 
+96.3%  $(0.0)$ 
+2291  $(-9.0\%)$ 
+
+R1 Llama 8B
+93.7%
+2462
+86.7%  $(-7.0)$ 
+613  $(-75.1\%)$ 
+93.1%  $(-0.6)$ 
+2161  $(-12.2\%)$ 
+93.6%  $(-0.1)$ 
+1926  $(-21.8\%)$ 
+
+R1 Qwen3 8B
+98.5%
+4082
+96.7%  $(-1.8)$ 
+1339  $(-67.2\%)$ 
+97.9%  $(-0.6)$ 
+4344  $(+6.4\%)$ 
+98.5%  $(0.0)$ 
+2701  $(-33.8\%)$ 
+
+Average
+98.3%
+2416
+ $-2.5$ 
+ $-61.0\%$ 
+ $-0.3$ 
+ $-14.8\%$ 
+ $-0.3$ 
+ $-38.2\%$ 
+
+OneWordQA
+
+Qwen3 4B T.
+92.0%
+668
+92.1%  $(+0.1)$ 
+383  $(-42.6\%)$ 
+91.7%  $(-0.3)$ 
+179  $(-73.2\%)$ 
+91.8%  $(-0.2)$ 
+185  $(-72.4\%)$ 
+
+Qwen3 8B
+91.7%
+212
+92.0%  $(+0.3)$ 
+71  $(-66.7\%)$ 
+92.1%  $(+0.4)$ 
+46  $(-78.2\%)$ 
+92.2%  $(+0.5)$ 
+46  $(-78.1\%)$ 
+
+Qwen3 14B
+92.4%
+207
+92.8%  $(+0.4)$ 
+73  $(-64.6\%)$ 
+93.2%  $(+0.7)$ 
+48  $(-76.6\%)$ 
+93.3%  $(+0.9)$ 
+47  $(-77.1\%)$ 
+
+Qwen3.8 27B
+93.3%
+71
+93.4%  $(+0.1)$ 
+40  $(-43.8\%)$ 
+93.4%  $(+0.2)$ 
+36  $(-50.0\%)$ 
+93.4%  $(+0.2)$ 
+35  $(-51.3\%)$ 
+
+R1 Qwen 7B
+72.0%
+454
+76.5%  $(+4.4)$ 
+105  $(-76.8\%)$ 
+76.5%  $(+4.4)$ 
+98  $(-78.3\%)$ 
+77.1%  $(+5.0)$ 
+89  $(-80.4\%)$ 
+
+R1 Llama 8B
+78.0%
+484
+84.0%  $(+6.0)$ 
+86  $(-82.2\%)$ 
+83.5%  $(+5.5)$ 
+74  $(-84.6\%)$ 
+84.0%  $(+6.0)$ 
+81  $(-83.3\%)$ 
+
+R1 Qwen3 8B
+81.5%
+328
+28.6%  $(-52.9)$ 
+136  $(-58.6\%)$ 
+82.1%  $(+0.6)$ 
+354  $(+7.8\%)$ 
+82.3%  $(+0.8)$ 
+322  $(-1.7\%)$ 
+
+Average
+86.6%
+349
+ $+1.9$ 
+ $-62.8\%$ 
+ $+1.8$ 
+ $-73.5\%$ 
+ $+2.1$ 
+ $-73.8\%$ 
+
+StrategyQA
+
+Qwen3 4B T.
+63.2%
+836
+67.7%  $(+4.5)$ 
+509  $(-39.1\%)$ 
+68.2%  $(+5.0)$ 
+248  $(-70.4\%)$ 
+67.4%  $(+4.1)$ 
+246  $(-70.6\%)$ 
+
+Qwen3 8B
+70.1%
+394
+72.1%  $(+1.9)$ 
+96  $(-75.6\%)$ 
+71.8%  $(+1.7)$ 
+57  $(-85.4\%)$ 
+70.8%  $(+0.7)$ 
+52  $(-86.8\%)$ 
+
+Qwen3 14B
+70.0%
+366
+73.2%  $(+3.3)$ 
+84  $(-77.1\%)$ 
+73.5%  $(+3.5)$ 
+60  $(-83.6\%)$ 
+73.4%  $(+3.4)$ 
+54  $(-85.3\%)$ 
+
+Qwen3.8 27B
+79.4%
+224
+80.2%  $(+0.8)$ 
+151  $(-32.4\%)$ 
+81.8%  $(+2.4)$ 
+145  $(-35.0\%)$ 
+81.0%  $(+1.6)$ 
+144  $(-35.5\%)$ 
+
+R1 Qwen 7B
+56.9%
+651
+58.9%  $(+2.0)$ 
+84  $(-87.1\%)$ 
+58.5%  $(+1.6)$ 
+57  $(-91.2\%)$ 
+57.8%  $(+0.8)$ 
+47  $(-92.8\%)$ 
+
+R1 Llama 8B
+58.9%
+446
+65.6%  $(+6.7)$ 
+81  $(-81.9\%)$ 
+65.2%  $(+6.3)$ 
+95  $(-78.7\%)$ 
+64.6%  $(+5.6)$ 
+51  $(-88.5\%)$ 
+
+R1 Qwen3 8B
+70.0%
+606
+67.7%  $(-2.3)$ 
+89  $(-85.4\%)$ 
+71.1%  $(+1.1)$ 
+425  $(-29.9\%)$ 
+69.9%  $(-0.1)$ 
+629  $(+3.8\%)$ 
+
+Average
+66.9%
+503
+ $+2.4$ 
+ $-68.4\%$ 
+ $+3.1$ 
+ $-67.7\%$ 
+ $+2.3$ 
+ $-65.1\%$ 
+
+MMLU-Redux
+
+Qwen3 4B T.
+84.7%
+1944
+82.9%  $(-1.8)$ 
+527  $(-72.9\%)$ 
+85.3%  $(+0.6)$ 
+527  $(-72.9\%)$ 
+84.9%  $(+0.2)$ 
+1663  $(-14.5\%)$ 
+
+Qwen3 8B
+87.2%
+921
+84.0%  $(-3.3)$ 
+306  $(-66.7\%)$ 
+86.1%  $(-1.1)$ 
+285  $(-69.0\%)$ 
+86.9%  $(-0.3)$ 
+922  $(+0.2\%)$ 
+
+Qwen3 14B
+89.0%
+718
+85.8%  $(-3.3)$ 
+212  $(-70.5\%)$ 
+88.2%  $(-0.9)$ 
+319  $(-55.6\%)$ 
+88.3%  $(-0.7)$ 
+678  $(-5.5\%)$ 
+
+Qwen3.8 27B
+92.4%
+488
+91.9%  $(-0.5)$ 
+262  $(-46.4\%)$ 
+91.8%  $(-0.6)$ 
+196  $(-59.8\%)$ 
+92.1%  $(-0.3)$ 
+352  $(-27.9\%)$ 
+
+R1 Qwen 7B
+70.1%
+1079
+60.6%  $(-9.5)$ 
+397  $(-63.2\%)$ 
+69.7%  $(-0.3)$ 
+601  $(-44.3\%)$ 
+70.4%  $(+0.3)$ 
+1127  $(+4.5\%)$ 
+
+R1 Llama 8B
+75.5%
+1458
+58.6%  $(-16.9)$ 
+431  $(-70.4\%)$ 
+75.9%  $(+0.3)$ 
+896  $(-38.5\%)$ 
+75.3%  $(-0.2)$ 
+1430  $(-1.9\%)$ 
+
+R1 Qwen3 8B
+81.6%
+1711
+64.5%  $(-17.1)$ 
+279  $(-83.7\%)$ 
+82.1%  $(+0.5)$ 
+1273  $(-25.6\%)$ 
+82.2%  $(+0.6)$ 
+1714  $(+0.2\%)$ 
+
+Average
+82.9%
+1188
+ $-7.5$ 
+ $-67.7\%$ 
+ $-0.2$ 
+ $-52.2\%$ 
+ $-0.1$ 
+ $-6.4\%$ 
+
+Table 2 extends Table 1 to GSM8K, Integrals, OneWordQA and StrategyQA. We leave out AIME, where nearly every task degrades beyond the 0.5% budget already at $k=3$ , so fragility-aware batching falls back to $k=1$ throughout. We note that the pattern observed in the selected datasets in the main text also holds for the other datasets we tested. Random batching at $k{=}6$ saves many tokens but loses accuracy, most visibly on reasoning-heavy datasets such as GPQA-Diamond, MMLU-Redux and MATH-500. Fragility-aware batching keeps accuracy close to the isolated baseline while still using substantially fewer tokens, and the linear predictor recovers this gain partially without access to measured fragility. Claude Opus 5 appears only on GPQA-Diamond, and to limit cost it is measured with fewer trials than the open-weight models: random batching rests on 5 trials per task instead of 10, the measured-fragility assignment on 5 isolated and 5 composed trials per task instead of 10 each, and the predictor’s labels on 10 isolated trials and 5 per composition size.
+
+R1 Qwen3 8B is the one model that collapses on OneWordQA under random batching, from $81.5\%$ to $28.6\%$ . Contrary to asking questions in isolation, in composition R1 Qwen3 8B often fails to adhere to the answering contract under composition, leading to parsing errors.
+
+When testing on the Integrals dataset, fragility-aware batching with held-out predictions from the linear predictor outperforms the measured variant. This is because even comparably fragile integrals lose very little accuracy, so estimates from a limited number of observations are noisy. The trained predictor also has access to the structure of each integral, which makes it more robust to this measurement noise.
+
+On OneWordQA and StrategyQA, batching even raises accuracy for most models, by up to $6.7$ points (R1 Llama 8B on StrategyQA under random batching). We observe that both datasets need little reasoning. OneWordQA only asks the model to recall a fact, and StrategyQA to chain a few commonsense inferences. On such tasks, models seem to think more than the task needs, which can degrade performance too, consistent with Srivastava et al. [2026].
+
+## A.2 Methodological details
+
+## A.2.1 Measuring per-task thinking length
+
+To measure how a model divides its thinking across the tasks of a composition, we prefix each task with a unique tag (Q01, Q02, …) and instruct the model to name the tag whenever it turns to that task. The tags mark where the reasoning on one task ends and the next begins. We assign every token after a tag to the corresponding task, up to the next tag or the end of the thinking trace. The thinking length $T_{i}(k)$ of task $t_{i}$ in a composition of size $k$ is the total number of tokens assigned to it, and the model may return to a task more than once. A task that is never named receives no tokens.
+
+<think> Q01: The dye emits light with an energy of 2.34 eV … maybe A.
+
+Q02: A dual catalyst system for ethylene polymerization … tentatively D.
+
+Back to Q01: 2.34 eV is about 530 nm, so the absorbed light … B.
+
+Q03: … </think>
+
+Here the tokens after both Q01 tags count towards $t_{1}$ , while $t_{2}$ receives the tokens between its tag and the second Q01.
+
+This rule cannot reliably find where the trace for the last question in a composition ends, since no next tag marks its end, so its length is often overestimated. To fix this, we append an ungraded dummy question at the end of each composition.
+
+In our experiments, this tagging strategy works quite well: LLMs name every task in $99.5\%$ of all tagged thinking traces. GPQA-Diamond is the exception at $92.9\%$ , mostly because R1 Qwen 7B names every task in only $61.5\%$ of its traces at $k\geq 3$ .
+
+## A.2.2 Sampling parameters and context length
+
+Every open-weight model is decoded with the same settings: temperature $0.6$ and top- $p$ 
+ $0.95$ , with no top- $k$ cutoff and
+no repetition penalty. These are the values Qwen recommends for its models in
+thinking mode [Yang et al., 2025a], and the values DeepSeek recommends for the R1-distilled models. Each trial is an independent sample; we set no per-request seed. The context window is shared by the prompt and the model’s response, including its thinking. It is $131{,}072$ tokens for Qwen3 8B, Qwen3 14B, Qwen3.8 27B and the three R1-distilled models, and $262{,}144$ for Qwen3 4B Thinking. Claude Opus 5 is queried through the OpenRouter API with reasoning effort set to medium, a $200{,}000$ -token context window and at most $128{,}000$ output tokens, thinking included. With these limits, fewer than 1% of responses reach the context limit in most datasets (Table 3).
+
+Table 3: Context limits and parsing failures in the composed sets. Each response has a token budget equal to the context window minus the prompt, capped at the model’s maximum generation length; a response that exhausts it is truncated. Response tokens are the mean at the largest $k$ . Truncation and parsing-failure rates are pooled over all models and $k$ , with the worst model and $k$ in brackets. †Most unparseable responses come from R1 Qwen3 8B, which often breaks the answering contract under composition.
+
+Response at largest $k$ 
+Responses (%)
+
+Dataset
+ $k$ 
+tokens
+of budget
+hit limit
+unparseable
+
+GSM8K
+20
+2.8k
+3%
+0.0 [0]
+0.2 [2]
+
+MATH-500
+20
+19.6k
+29%
+0.9 [10]
+2.4 [32]
+
+AIME
+10
+57.6k
+35%
+4.8 [39]
+10.7 [47]
+
+Integrals
+20
+7.4k
+17%
+0.0 [0]
+1.4 [15]
+
+MMLU-Redux†
+20
+1.6k
+4%
+0.2 [2]
+3.9 [44]
+
+GPQA-Diamond
+10
+8.9k
+8%
+0.2 [1]
+2.3 [20]
+
+OneWordQA
+20
+0.8k
+2%
+0.1 [0]
+0.1 [1]
+
+StrategyQA
+20
+1.1k
+1%
+0.0 [0]
+0.0 [0]
+
+## A.2.3 Correlating accuracy degradation across conditions
+
+Conditions and degradation variables.
+
+We define a condition as a tuple $c=(m,k)$ of a model $m$ and a composition size $k$ , e.g. $(\text{Qwen3 8B},k=20)$ . For a condition $A=(m_{A},k_{A})$ we write $\Delta_{A}$ for the random variable that assigns to each task $t_{i}$ its accuracy degradation $\Delta^{m_{A}}_{i}(k_{A})$ under that condition, and analogously $\Delta_{B}$ for the second condition $B=(m_{B},k_{B})$ that we correlate against. All correlations below are computed over all tasks of a dataset $t_{i}\in\mathcal{D}$ .
+
+Correlation and disattenuation.
+
+For each pair of conditions we compute the Pearson correlation $r$ between $\Delta_{A}$ and $\Delta_{B}$ over all tasks of a dataset. Because $\Delta_{A}$ and $\Delta_{B}$ are estimated from a finite number of trials, measurement noise attenuates $r$ toward zero. We therefore apply Spearman’s correction for attenuation to every pair of conditions separately,
+
+ $r^{*}=\frac{r}{\sqrt{r_{AA}\,r_{BB}}},$ 
+
+(4)
+
+where the reliability $r_{AA}$ is the test-retest correlation of $\Delta_{A}$ , that is, the correlation between the accuracy drops at condition $A$ measured in the first and in the second pass. We then average $r^{*}$ arithmetically over all pairs of conditions and datasets that enter a reported value. We do not clip $r^{*}$ .
+
+Avoiding shared measurement noise.
+
+When $A$ and $B$ share a model, both drops subtract the same isolated accuracy, so its estimation error would inflate their correlation. We therefore measure every task in two independent passes and take $\Delta_{A}$ from one pass and $\Delta_{B}$ from the other.
+
+Confidence intervals.
+
+We report half the width of a $95\%$ percentile interval from a bootstrap over tasks. In each of $5000$ replicates we resample the tasks of a dataset with replacement at the original size and recompute every correlation and every reliability on the resampled tasks.
+
+## A.2.4 Implementation details of the fragility-aware batching algorithm
+
+Estimating $\mathbb{E}[\Delta_{i}(k)]$ .
+
+For the fragility-aware batching intervention in Section 4.1, each task has 10 isolated trials and 10 trials at every composition size. We split these trials at random into two halves, A and B. For each $k$ , an isotonic map from the drop measured on half A to the drop measured on half B gives $\mathbb{E}[\Delta_{i}(k)]$ .
+
+Estimating $\mathrm{cost}_{k}$ .
+
+The ratio $\mathrm{cost}_{k}$ does not depend on the individual task and is
+estimated once per model and dataset as the mean number of output tokens
+attributable to a single task inside a composition of size $k$ , divided by the
+mean number of output tokens used for isolated solving:
+
+ $\mathrm{cost}_{k}=\frac{\frac{1}{k}\,\overline{T}(k)}{\overline{T}(1)},$ 
+
+(5)
+
+where $\overline{T}(k)$ is the mean total output length of a composition of size
+ $k$ . In each experiment, we estimate it over the entire dataset.
+
+Selecting $\lambda^{*}$ by repeated cross-fitting.
+
+Per-task accuracy estimates are noisy and our pool of tasks is limited, so a $\lambda^{*}$ selected on the same data used to estimate $\mathbb{E}[\Delta_{i}(k)]$ would be optimistically biased. We therefore split the task pool into 5 outer folds and determine $\lambda^{*}$ for each fold only on its training part.
+
+Within a training slice, we split the tasks into 5 blocks, four times under different random shuffles, which gives 20 held-out blocks. For each block, we fit the isotonic maps on the remaining tasks, apply them to the block and assign every task in it a composition size by Equation 2. We do this for a grid of $121$ exchange rates ( $\lambda=0$ together with $120$ values spaced logarithmically over $[10^{-4},3.0]$ ) and record the accuracy and token ratio realized on half B.
+
+Averaging the 20 blocks results in one accuracy curve over $\lambda$ , which we make non-increasing by isotonic regression, since a larger exchange rate can only move tasks to larger composition sizes. The term $\mathrm{SE}(\bar{\Delta}(\lambda))$ in Equation 3 is the standard error of the realized accuracy across the 20 blocks. We select the cheapest rate whose accuracy, minus one standard error, stays above $\overline{\mathrm{acc}}(1)-B$ , where $\overline{\mathrm{acc}}(1)$ is the mean isolated accuracy. If no rate clears this threshold, we take the rate with the highest accuracy minus one standard error.
+
+Finally, we fit the isotonic maps on the whole training slice, apply them to the accuracy drops measured on half A of the held-out fold and assign each of its tasks a composition size at $\lambda^{*}$ . Only these held-out assignments enter the reported results.
+
+Forming compositions.
+
+The assignment yields a per-task upper bound $k_{i}(\lambda^{*})$ on the size of the composition that task may be placed in, and compositions must be formed such that $|C|\leq\min_{t_{i}\in C}k_{i}(\lambda^{*})$ for every composition $C$ . Placing a task in a composition smaller than its assigned size is admissible, since its expected drop is then no larger, so the realized mean drop should not exceed the planned one. We use the greedy procedure in Algorithm 1: proceeding from the smallest assigned size upwards, we form full compositions from the tasks assigned to the current size and fill any remaining partial composition with tasks assigned to strictly larger sizes, which are by construction more robust and whose bound is therefore not violated. Filler tasks come from the nearest larger size first and are drawn at random within it. Compositions are formed separately within each outer test fold, so tasks from different folds never share a prompt.
+
+Algorithm 1 Forming compositions from a size assignment
+
+ 1:
+
+ Tasks $t_{1},\dots,t_{n}$ with assigned sizes $k_{i}\in\mathcal{K}$ 
+
+ 2:
+
+ A set of compositions $\mathcal{B}$ 
+
+ 3:
+
+ $\mathcal{B}\leftarrow\emptyset$ ;   $U\leftarrow\{t_{1},\dots,t_{n}\}$ 
+
+ 4:
+
+ for $k\in\mathcal{K}$ in increasing order do
+
+ 5:
+
+    $P\leftarrow\{\,t_{i}\in U:k_{i}=k\,\}$ 
+
+ 6:
+
+   while $|P|\geq k$ do
+
+ 7:
+
+    remove $k$ randomly chosen tasks from $P$ and from $U$ , and add them as composition $\mathcal{B}\leftarrow\mathcal{B}\cup\{(t_{1},...,t_{k})\}$ 
+
+ 8:
+
+   end while
+
+ 9:
+
+   if $P\neq\emptyset$ then
+
+ 10:
+
+     $F\leftarrow$ up to $k-|P|$ tasks from $\{\,t_{i}\in U:k_{i}>k\,\}$ ,
+nearest larger size first, at random within a size
+
+ 11:
+
+    remove $P\cup F$ from $U$ and add $P\cup F$ as a composition to $\mathcal{B}$ 
+
+ 12:
+
+   end if
+
+ 13:
+
+ end for
+
+ 14:
+
+ return $\mathcal{B}$ 
+
+If fewer than $k-|P|$ tasks with a larger assigned size remain, the leftover tasks form a composition smaller than $k$ . Since filler tasks are consumed from the pools of larger assigned sizes, the realized mean composition size is slightly below the assigned one, so the reported token savings are a conservative estimate of what the assignment permits.
+
+## A.2.5 Predicting fragility from the task
+
+Architecture.
+
+The predictor takes the task description and embeds it with Qwen3 Embedding 8B
+using last-token pooling. A linear head maps the embedding to a single logit
+ $\ell_{i}(k_{1})$ , the logit for the smallest composition size $k_{1}=3$ . The logits for the
+remaining sizes are obtained by accumulating non-negative offsets along increasing k,
+
+ $\ell_{i}(k_{1})=w^{\top}e_{i}+b,\qquad\ell_{i}(k_{j})=\ell_{i}(k_{j-1})-\mathrm{softplus}(\theta_{j}),\quad j=2,\dots,J,$ 
+
+(6)
+
+where $e_{i}$ is the embedding of task $t_{i}$ , $k_{1}<\dots<k_{J}$ are
+the composition sizes in $\mathcal{K}\setminus\{1\}=\{3,6,10,20\}$ ( $\{3,6,10\}$ for GPQA-Diamond), and $\theta_{j}$ are
+trainable scalars shared across all tasks. The softplus constrains every offset to
+be non-negative, so the predicted probability is non-increasing in $k$ by
+construction, matching the behavior established in
+Section 3. Accuracy measurements under composition are expensive, so the predictor has to learn from little data. We therefore use a linear head, which has few parameters and builds monotonicity in $k$ into its architecture.
+
+Training.
+
+For every task and every $k\in\mathcal{K}\setminus\{1\}$ we form a binary target indicating
+that the task performs no worse under composition than in isolation, using the
+ $10$ composed and $10$ isolated trials measured for that task. The head is trained
+with a class-balanced binary cross-entropy loss averaged over all tasks and composition sizes, so a single
+coefficient vector is shared across the ladder and the sizes differ only through
+the learned offsets. We optimize with AdamW at a learning rate of $3\times 10^{-3}$ , weight decay $1.0$ and a cosine schedule for $2000$ steps with batch size $64$ and gradient
+clipping at $1.0$ . Every $100$ steps we evaluate the head on its inner held-out fold and keep the best checkpoint.
+
+Nested cross-fitting.
+
+The predictor and the exchange rate $\lambda^{*}$ must both be estimated without
+access to the data on which the intervention is evaluated, so we nest the fitting
+of the head inside the cross-fitting scheme of Appendix A.2.4.
+
+We split the dataset into $5$ outer folds. For each outer fold, the $4/5$ training
+slice is split again into $4$ inner folds; one head is trained on each inner training
+split and predicts on the corresponding inner test split. Concatenating these
+predictions yields an out-of-training prediction for every task in the outer
+training slice, which takes the place of the half-A accuracy drops used in
+Appendix A.2.4. The isotonic maps then run from this prediction to the accuracy drop measured on all $10$ trials. On the held-out fold, we average the predicted accuracy drops of the four heads, and the remainder of the intervention is unchanged.
+
+## A.2.6 Further details on datasets
+
+Indefinite integrals.
+
+We generate the integral pool ourselves, to ensure that every problem is known to be solvable and simple enough for most small open-weight models to solve confidently.
+It holds 1,000 atomic integrands, 200 from each of five function classes:
+
+• 
+
+polynomial: $a\,x^{n}$ ;
+
+• 
+
+exponential: $a\,e^{bx}$ ;
+
+• 
+
+trigonometric: $a\,f(bx+c)$ with $f\in\{\sin,\cos,\tan\}$ ;
+
+• 
+
+logarithmic and rational: $a\ln(bx+c)$ or $a/(bx+c)$ ;
+
+• 
+
+integration by parts: $a\,x\,f(bx+c)$ with
+ $f\in\{\exp,\sin,\cos,\ln,\arctan\}$ .
+
+The coefficient $a$ is a nonzero integer in $[-5,5]$ . The exponent $n$ and the
+frequency $b$ are nonzero integers in $[-15,15]$ , and the shift $c$ is an integer in
+ $[-15,15]$ . All parameters are drawn with a fixed seed. Structural duplicates are
+discarded.
+
+An integrand is kept only if SymPy finds an elementary antiderivative for it, and only
+if that antiderivative passes the same checker that grades the models. The checker works
+symbolically rather than by string matching. It parses the boxed LaTeX answer,
+differentiates it, and tests whether the derivative equals the integrand, first
+structurally, then numerically at random points, and finally with a symbolic proof
+under a timeout. An additive constant is accepted, but any other free symbol is
+rejected. Answers that cannot be parsed, or whose check times out, are recorded
+separately rather than counted as wrong.
+
+OneWordQA.
+
+OneWordQA is a set of 1,548 questions that we generated using Claude Opus 5 and checked manually. They cover 23
+categories of simple factual lookups whose answers leave little room for
+interpretation. Examples include country capitals, dialing and ISO codes, chemical
+symbols and atomic numbers, Roman numerals, polygon sides and the number of players
+per team in a sport. Each answer is a single word, a number or a short code.
+Grading normalizes only how an answer is written (case, diacritics and surrounding
+punctuation). Where a question has more than one
+correct answer, the alternatives are listed explicitly in the dataset.
+
+Benchmarks.
+
+The six public benchmarks are loaded from the Hugging Face Hub at pinned revisions. We use the error-free questions of MMLU-Redux, drawing the same number from each of 19 subjects (74 per subject, 1,406 questions), and keep the answer options in their published order. GPQA-Diamond contributes 196 of its 198 questions; we drop the two that repeat an answer option. From GSM8K we take the 1,319 problems of the test split, from MATH-500 all 500 problems, and from AIME the 60 problems of 2024 and 2025. StrategyQA contributes the 687 questions of its test split, and an answer counts as correct when it is the gold yes or no.
+
+Prompts.
+
+We now list the prompt every model receives, for each of the eight datasets used in
+the main experiments: indefinite integrals, MMLU-Redux, GPQA-Diamond, OneWordQA,
+GSM8K, MATH-500, AIME and StrategyQA.
+
+Conventions shared by all datasets:
+
+• 
+
+An atomic task is
+treated as a composition of size $k=1$ and uses the same template
+as a $k$ -task composition, with the plural wording made singular.
+
+• 
+
+The prompt is sent as a single
+user message through the model’s chat template, with no few-shot
+examples and no system message.
+
+• 
+
+Models must answer in the order the tasks are shown, which is
+the order in which we grade them.
+
+Indefinite integrals
+
+A composition of $k$ atomic integrands is shown as one integral whose integrand
+is their sum, rendered in LaTeX by SymPy. $\langle$ integral $\rangle$ is that LaTeX string,
+for example:
+
+\int 3 x^{2} + 2 \sin{\left(4 x + 1 \right)} \, dx.
+
+The prompt shows the whole sum unchanged, but the model reports one
+antiderivative per term. The terms are listed in the order in which they appear in the rendered integral. Answer $i$ is checked symbolically against term $i$ .
+
+⬇
+
+ 1
+
+ Find an antiderivative for each term of the following indefinite integral: @ $\langle$ integral $\rangle$ @.
+
+ 2
+
+ 3
+
+ The integrand is a sum of @ $\langle$ k $\rangle$ @ terms, listed below in the order they appear in the integral:
+
+ 4
+
+ 1. \int @ $\langle$ term 1 $\rangle$ @ \, dx
+
+ 5
+
+ 2. \int @ $\langle$ term 2 $\rangle$ @ \, dx
+
+ 6
+
+ ...
+
+ 7
+
+ @ $\langle$ k $\rangle$ @. \int @ $\langle$ term k $\rangle$ @ \, dx
+
+ 8
+
+ Do not add the antiderivatives together, and do not give an antiderivative of the whole sum. Solve each term on its own and report @ $\langle$ k $\rangle$ @ separate antiderivatives, one per term, in the order above.
+
+ 9
+
+ 10
+
+ Give symbolic answers only in standard LaTeX format. Do not give a decimal approximation. The constant of integration may be omitted.
+
+ 11
+
+ Return your answers in the following format in the last @ $\langle$ k $\rangle$ @ lines, with no additional text: one line per term, in the order above, each line holding exactly one \boxed{}.
+
+ 12
+
+ 13
+
+ 1. \boxed{<antiderivative of term 1>}
+
+ 14
+
+ 2. \boxed{<antiderivative of term 2>}
+
+ 15
+
+ ...
+
+ 16
+
+ @ $\langle$ k $\rangle$ @. \boxed{<antiderivative of term @ $\langle$ k $\rangle$ @>}
+
+ 17
+
+ 18
+
+ Before you finish, re-read your answer block and check that it holds exactly @ $\langle$ k $\rangle$ @ lines, each with exactly one \boxed{}, in the order the terms are listed above.
+
+Listing 1: 
+
+MMLU-Redux and GPQA (multiple choice)
+
+Both datasets use the same multiple-choice layout. Every question is followed by
+its lettered options, and consecutive questions are separated by a blank line:
+
+⬇
+
+ 1
+
+ 1. @ $\langle$ question 1 $\rangle$ @
+
+ 2
+
+ A. @ $\langle$ option A $\rangle$ @
+
+ 3
+
+ B. @ $\langle$ option B $\rangle$ @
+
+ 4
+
+ C. @ $\langle$ option C $\rangle$ @
+
+ 5
+
+ D. @ $\langle$ option D $\rangle$ @
+
+ 6
+
+ 7
+
+ 2. @ $\langle$ question 2 $\rangle$ @
+
+ 8
+
+ A. ...
+
+Listing 2: 
+
+In GPQA, the four options of each question are shuffled once, with a fixed seed,
+when the dataset is built, so the correct answer does not always sit in the same
+position. $\langle$ example $\rangle$ is the letters offered, cycled to length $k$ (for
+example A, B, C, D, A, B for $k=6$ ). For $k=1$ it is A.
+
+⬇
+
+ 1
+
+ Answer the following multiple-choice questions.
+
+ 2
+
+ 3
+
+ @ $\langle$ question block $\rangle$ @
+
+ 4
+
+ 5
+
+ For each question, give only the letter of the single best option.
+
+ 6
+
+ End your response with a line of the following form, and write nothing after it: a comma-separated list of @ $\langle$ k $\rangle$ @ letters, one per question, in the order the questions were asked.
+
+ 7
+
+ Answer: @ $\langle$ example $\rangle$ @
+
+Listing 3: 
+
+The GPQA prompt is the MMLU-Redux prompt word for word, with one extra closing
+sentence. GPQA questions are long and hard, and its thinking traces are several times longer than those on MMLU-Redux. After such long reasoning, models often lose the answer format they were given at the start, so we ask them to re-check their answer line. The sentence concerns only the format of the answer line, so it does not change what the two prompts ask about the questions:
+
+⬇
+
+ 1
+
+ Before you finish, re-read that final line and check that it holds exactly @ $\langle$ k $\rangle$ @ letters, in the order the questions were asked, with nothing written after them.
+
+Listing 4: 
+
+For $k=1$ this sentence reads “…holds exactly 1 letter, with nothing
+written after it.”
+
+OneWordQA and StrategyQA
+
+Both datasets use the same layout. Each question sits on a single line, numbered,
+and consecutive questions are separated by a single newline ( $\langle$ question block $\rangle$ ).
+The answer is a numbered block of $k$ lines under the heading Answer:.
+
+⬇
+
+ 1
+
+ Answer the following questions. Each answer is short -- usually a single word or a number.
+
+ 2
+
+ 3
+
+ @ $\langle$ question block $\rangle$ @
+
+ 4
+
+ 5
+
+ Give the answer only: no explanation, and no units unless the question asks for them.
+
+ 6
+
+ End your response with an answer block: the line "Answer:" followed by exactly @ $\langle$ k $\rangle$ @ lines, one answer per line, numbered, in the order the questions were asked. Write nothing after the block.
+
+ 7
+
+ 8
+
+ Answer:
+
+ 9
+
+ 1. <your answer to question 1>
+
+ 10
+
+ 2. <your answer to question 2>
+
+ 11
+
+ ...
+
+ 12
+
+ @ $\langle$ k $\rangle$ @. <your answer to question @ $\langle$ k $\rangle$ @>
+
+ 13
+
+ Before you finish, re-read your answer block and check that it holds exactly @ $\langle$ k $\rangle$ @ answer lines, in the order the questions were asked, with nothing written after them.
+
+Listing 5: 
+
+The StrategyQA prompt is the OneWordQA prompt word for word, apart from two
+sentences that restrict the answer to yes or no:
+
+⬇
+
+ 1
+
+ Answer the following questions. Each answer is either yes or no.
+
+ 2
+
+ ...
+
+ 3
+
+ Give the answer only, as the single word yes or no: no explanation, and no answer other than those two words.
+
+Listing 6: 
+
+The instruction is not enforced strictly. Case and punctuation are ignored, and
+true and false are accepted alongside yes and
+no. For $k=1$ the first sentence reads “Answer the following
+question.”
+
+GSM8K, MATH-500 and AIME (short mathematical answers)
+
+The three datasets use the same answer contract as OneWordQA: a numbered block
+of $k$ lines under the heading Answer:. The difference is in the
+problems themselves, which are much longer (several sentences, displayed
+equations, and for 42 MATH-500 problems an Asymptote figure). Consecutive
+problems are therefore separated by a blank line rather than a single newline.
+Blank lines inside a problem are collapsed when the pool is built, so a blank
+line in $\langle$ problem block $\rangle$ always marks the start of the next problem. For
+ $k=1$ the answer block has the single line 1. <your answer> (for
+MATH-500, 1. \boxed{<your answer>}), and the closing sentence reads
+“…holds exactly one answer line, with nothing written after it.” The
+three prompts differ only in their first line and in the sentence that describes
+the answer format.
+
+⬇
+
+ 1
+
+ Solve the following problems. Each answer is a single number.
+
+ 2
+
+ 3
+
+ @ $\langle$ problem block $\rangle$ @
+
+ 4
+
+ 5
+
+ Give the final answer to each problem as a number only: no units, no currency symbol, no thousands separator and no explanation.
+
+ 6
+
+ End your response with an answer block: the line "Answer:" followed by exactly @ $\langle$ k $\rangle$ @ lines, one answer per line, numbered, in the order the problems were asked. Write nothing after the block.
+
+ 7
+
+ 8
+
+ Answer:
+
+ 9
+
+ 1. <your answer to problem 1>
+
+ 10
+
+ 2. <your answer to problem 2>
+
+ 11
+
+ ...
+
+ 12
+
+ @ $\langle$ k $\rangle$ @. <your answer to problem @ $\langle$ k $\rangle$ @>
+
+ 13
+
+ Before you finish, re-read your answer block and check that it holds exactly @ $\langle$ k $\rangle$ @ answer lines, in the order the problems were asked, with nothing written after them.
+
+Listing 7: 
+
+In MATH-500 each answer is boxed. Many answers contain spaces or commas, such as
+tuples, intervals, or 10,\!080, so the box marks exactly where an answer
+begins and ends. The instruction “in the form the problem asks for” matters
+because many MATH-500 problems set their own answer format (for example
+“Express your answer as a common fraction”), and the reference answer follows
+that format.
+
+⬇
+
+ 1
+
+ Solve the following problems.
+
+ 2
+
+ 3
+
+ @ $\langle$ problem block $\rangle$ @
+
+ 4
+
+ 5
+
+ Give the final answer to each problem only, with no explanation. Write each answer in LaTeX, in the form the problem asks for, wrapped in \boxed{...}.
+
+ 6
+
+ End your response with an answer block: the line "Answer:" followed by exactly @ $\langle$ k $\rangle$ @ lines, one answer per line, numbered, in the order the problems were asked. Write nothing after the block.
+
+ 7
+
+ 8
+
+ Answer:
+
+ 9
+
+ 1. \boxed{<your answer to problem 1>}
+
+ 10
+
+ 2. \boxed{<your answer to problem 2>}
+
+ 11
+
+ ...
+
+ 12
+
+ @ $\langle$ k $\rangle$ @. \boxed{<your answer to problem @ $\langle$ k $\rangle$ @>}
+
+ 13
+
+ Before you finish, re-read your answer block and check that it holds exactly @ $\langle$ k $\rangle$ @ answer lines, in the order the problems were asked, with nothing written after them.
+
+Listing 8: 
+
+⬇
+
+ 1
+
+ Solve the following competition problems. Each answer is an integer between 0 and 999.
+
+ 2
+
+ 3
+
+ @ $\langle$ problem block $\rangle$ @
+
+ 4
+
+ 5
+
+ Give the final answer to each problem as an integer between 0 and 999: digits only, no units, no thousands separator and no explanation.
+
+ 6
+
+ End your response with an answer block: the line "Answer:" followed by exactly @ $\langle$ k $\rangle$ @ lines, one answer per line, numbered, in the order the problems were asked. Write nothing after the block.
+
+ 7
+
+ 8
+
+ Answer:
+
+ 9
+
+ 1. <your answer to problem 1>
+
+ 10
+
+ 2. <your answer to problem 2>
+
+ 11
+
+ ...
+
+ 12
+
+ @ $\langle$ k $\rangle$ @. <your answer to problem @ $\langle$ k $\rangle$ @>
+
+ 13
+
+ Before you finish, re-read your answer block and check that it holds exactly @ $\langle$ k $\rangle$ @ answer lines, in the order the problems were asked, with nothing written after them.
+
+Listing 9: 
+
+For $k\leq 3$ the example answer block in all three prompts lists every line,
+with no ellipsis.

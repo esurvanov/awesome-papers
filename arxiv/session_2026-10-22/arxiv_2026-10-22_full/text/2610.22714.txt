@@ -1,0 +1,3593 @@
+## First Passage Attention
+
+Yuxuan Liu
+
+Affiliation: Department of Mathematics, University of Bergen, Bergen, Norway
+
+Email: yuxuan.liu@uib.no
+
+October 2026
+
+Abstract
+
+Augmenting softmax attention with forget gates typically relies on summing decay contributions along the key–query path.
+Because such accumulation is monotonic, these mechanisms cannot selectively erase intermediate context while preserving older, structurally relevant tokens.
+We propose First Passage Attention (FPA), which shifts from path summation to path extrema by lowering a key’s logit proportionally to the deepest dip of a learned scalar field below that key’s level over the intervening span.
+FPA encompasses the Forgetting Transformer (FoX) as a special case, and when the field and levels follow a shared learned walk, the alive keys with unpenalised logits naturally form a stack.
+We show that a constant-dimension FPA head realises any subset of keys left alive by subsequent dips, whereas softmax heads with positional biases or token-level forget gates require a head dimension linear in the number of keys.
+In synthetic experiments, one-layer FPA heads converge to these target sets while comparable softmax and FoX baselines fail on every seed.
+Scaling to a 110M-parameter language model, FPA matches FoX in perplexity and uniquely achieves perfect passkey retrieval at $8\times$ the training length, even with its key–value cache compressed to about $25\%$ .
+
+input
+ $\langle$ s $\rangle$ 
+c
+a
+t
+ $\leftarrow$ 
+r
+?
+typed text car
+
+walk $W$ 
+0
+1
+2
+3
+2
+3
+3
+query ? should read c, a, r
+
+(a) Softmax attention
+
+ $\ell_{ts}=q_{t}^{\top}k_{s}$ 
+
+key $s$ 
+c
+a
+t
+r
+
+bias
+0
+0
+0
+0
+
+c
+  24.7%
+
+a
+  24.7%
+
+t
+  24.7%
+
+r
+  24.7%
+
+rest
+  1.4%
+
+The deleted t keeps its weight.
+
+(b) Forgetting Transformer
+
+ $\ell_{ts}=q_{t}^{\top}k_{s}+\sum_{s<u\leq t}\log f_{u}$ 
+
+key $s$ 
+c
+a
+t
+r
+
+bias
+ $-4$ 
+ $-4$ 
+ $-4$ 
+0
+
+c
+  1.7%
+
+a
+  1.7%
+
+t
+  1.7%
+
+r
+  91.6%
+
+rest
+  3.4%
+
+Removing t also removes c and a.
+
+(c) First Passage Attention
+
+ $\ell_{ts}=q_{t}^{\top}k_{s}+\beta\min\bigl(0,\min_{s<u\leq t}\phi_{u}-\psi_{s}\bigr)$ 
+
+key $s$ 
+c
+a
+t
+r
+
+level $\psi_{s}$ 
+1
+2
+3
+3
+
+ $\min_{s<u\leq t}\phi_{u}$ 
+2
+2
+2
+3
+
+bias
+0
+0
+ $-4$ 
+0
+
+c
+  32.5%
+
+a
+  32.5%
+
+t
+  0.6%
+
+r
+  32.5%
+
+rest
+  1.8%
+
+Only t is removed.
+
+The bias of key $s$ depends on  (a) nothing after $s$   (b) every forget gate after $s$   (c) only the deepest dip of the field below the level of $s$ 
+
+Figure 1: Three heads read the same typed word.
+A user types c, a and t, deletes t with the backspace key ( $\leftarrow$ ) and types r, so the query ? should attend to c, a and r.
+Every character has the content score $q_{t}^{\top}k_{s}=2$ and every other token $-2$ .
+(a) Softmax attention has no term that a later token can change.
+(b) The Forgetting Transformer (FoX) can remove t only through a small forget gate $f_{u}$ at $\leftarrow$ , and that gate lowers c and a as well.
+(c) First Passage Attention (FPA) in its stack form uses the walk $W$ as the field $\phi$ and as the level $\psi$ , with strength $\beta=4$ .
+Only t has a level above the lowest later value of $W$ , so only t loses its weight.
+
+## 1 Introduction
+
+Transformers power most modern large language models, with softmax attention serving as their central operation (Vaswani et al., 2017; Jiang et al., 2023).
+Standard attention scores each earlier token by matching its key against the current query, typically incorporating relative positional encodings such as rotary embeddings or distance penalties (Press et al., 2022; Su et al., 2024).
+Intervening tokens between a key and a query do not directly enter this score.
+In many sequences, however, a subsequent event renders earlier information obsolete.
+A backspace deletes the last typed character, a closing bracket terminates an enclosed scope, and a reassignment overwrites a variable’s value.
+Crucially, such events often invalidate a newer key while leaving older keys intact.
+
+Several recent mechanisms modulate attention logits via sums, products, or transformations accumulated along the key–query path (Csordás et al., 2022; Golovneva et al., 2024; Tan et al., 2025; Yang et al., 2025; Zhang et al., 2026).
+The Forgetting Transformer (FoX) integrates recurrent forget gates into softmax attention to improve long-context modelling and length extrapolation (Lin et al., 2025a).
+Selective Attention allows tokens to mark earlier keys as obsolete (Leviathan et al., 2025), and Dynamic Context Pruning (DCP) drops keys to reduce inference memory (Anagnostidis et al., 2023).
+However, because these mechanisms aggregate path contributions via summation or multiplication, they face two structural limitations.
+First, token-level forget gates (as in FoX) attenuate keys monotonically with age, which makes it impossible to erase a recent token without simultaneously suppressing all older ones.
+Second, pairwise accumulation (as in Selective Attention and DCP) causes suppression to grow with the number of intervening steps (confounding the depth of an event with its duration) while incurring pairwise computation overhead.
+
+We introduce First Passage Attention (FPA), which aggregates the key–query path by its minimum rather than its sum.
+Each head computes a scalar field at every position and a scalar level for every key.
+A key’s logit remains unattenuated (the key is alive) as long as the subsequent field stays at or above its level.
+Otherwise, FPA lowers the logit in proportion to the depth of the deepest dip below that level, regardless of how long that dip lasts.
+We show that a single linear parameterisation encompasses FoX, a bottleneck bias, and learned expiry (Sukhbaatar et al., 2021) as special cases.
+Most notably, when the field and levels share a learned walk (a prefix sum of per-token increments), any drop in the walk selectively eliminates only those alive keys whose levels lie above the new value.
+The alive keys naturally evolve as a stack, which allows a later token to erase a newer key while preserving older ones (Figure 1).
+
+We prove that in one layer a single constant-dimension FPA head realises every dip-induced alive set, whereas softmax heads with positional biases or token-level forget gates need a head dimension linear in the number of keys.
+We also prove that range extrema uniquely achieve duration-invariant suppression, so FPA fits variable-duration dips where additive selection fails, and that head-specific fields overcome the dimension bottleneck of layer-shared masks.
+We implement FPA in a deterministic Triton kernel that runs about as fast as PyTorch’s scaled dot-product attention (SDPA) in training.
+In preregistered one-layer probes, FPA learns our theoretical target families on most seeds, whereas the baselines that our lower bounds cover fail on every seed.
+We train a 110M-parameter FPA language model that matches FoX in perplexity and uniquely achieves $100\%$ passkey retrieval at $4\times$ and $8\times$ its training length, even with about a quarter of its key–value cache.
+
+## 2 First Passage Attention
+
+In this section we define the bias and its parameterisation, list its special cases and properties, and describe how we train and compute it.
+
+## Definition.
+
+Let a causal head of dimension $d$ have queries $q_{t}$ , keys $k_{s}$ and values $v_{s}$ , a scalar field $\phi_{u}$ at every position and a scalar level $\psi_{s}$ for every key.
+FPA outputs $\sum_{s\leq t}w_{ts}v_{s}$ with the softmax weights $w_{ts}\propto e^{\ell_{ts}}$ of the logits $\ell_{ts}=q_{t}^{\top}k_{s}/\sqrt{d}+b_{ts}$ , where the first-passage bias is
+
+ $b_{ts}=\beta\min\Bigl(0,\ \min_{s<u\leq t}\phi_{u}-\psi_{s}\Bigr)$ 
+
+(1)
+
+with a learned strength $\beta>0$ , and $b_{tt}=0$ .
+We write $\bar{\phi}_{ts}=\min_{s<u\leq t}\phi_{u}$ for the range minimum of the field after key $s$ .
+
+Definition 2.1 (Alive and dead keys).
+
+Key $s\leq t$ is alive at time $t$ if $b_{ts}=0$ , that is if $s=t$ or $\bar{\phi}_{ts}\geq\psi_{s}$ , and dead otherwise.
+The alive keys at time $t$ form the alive set, and a dip is a decrease of the field below the level of an earlier key.
+
+As $\beta\to\infty$ , the bias of a dead key tends to $-\infty$ and its weight to zero.
+For a finite strength the bias of a dead key $s$ is $-\beta$ times the depth $\psi_{s}-\bar{\phi}_{ts}$ of its deepest dip.
+
+## Walk, field and level.
+
+Each head computes three scalars at every position from the input $x_{t}$ of the layer by linear maps, an increment $\delta_{t}$ and two offsets $g_{t}$ and $h_{t}$ .
+With the walk $W_{t}=\sum_{u\leq t}\delta_{u}$ , the field and the level are
+
+ $\phi_{t}=W_{t}+g_{t},\qquad\psi_{t}=W_{t}+h_{t},$ 
+
+(2)
+
+and the strength $\beta$ is a learned positive scalar per head.
+A token can thus move the reference of every later comparison through $\delta$ , and it can dip or set a level without moving it through $g$ and $h$ .
+A layer of width $D$ with $H$ heads gains $3H(D+1)+H$ parameters, 332 thousand in our 110M language model.
+
+Proposition 2.2 (Special cases).
+
+Under (2) the following hold.
+
+(a) 
+
+If $g=h=0$ , then $b_{ts}=-\beta L_{ts}$ with $L_{ts}=\max\bigl(0,\max_{s<u\leq t}(W_{s}-W_{u})\bigr)$ , the regulator of a queue that starts empty at time $s$ and receives the net input $\delta_{u}$ at step $u$ .
+
+(b) 
+
+If in addition $\delta_{u}\leq 0$ for all $u$ , then $b_{ts}=\sum_{s<u\leq t}\log f_{u}$ with $f_{u}=e^{\beta\delta_{u}}\in(0,1]$ , the bias of FoX with forget gates $f_{u}$ .
+
+(c) 
+
+If $\delta=0$ , $h=0$ , $g\leq 0$ and $\beta=1$ , then $b_{ts}=\min_{s<u\leq t}g_{u}$ , a bottleneck bias.
+
+(d) 
+
+If $\delta_{u}=-1$ , $g=0$ and $h_{s}=-e_{s}$ with $e_{s}\geq 0$ , then $b_{ts}=\beta\min\bigl(0,e_{s}-(t-s)\bigr)$ , so key $s$ is alive exactly while $t-s\leq e_{s}$ .
+
+We call the case $g=h=0$ the stack form, for a reason that Proposition 2.3 gives.
+Part (b) makes FoX the stack form with a walk that never rises.
+A rising walk lets FPA keep an old key while it removes newer ones, which no forget gate can do (Figure 1).
+Part (a) reads the stack form as a queue (Lindley, 1952; Skorokhod, 1961), and the strengths of the Neural Stack follow the same closed form (Grefenstette et al., 2015).
+We use this reading only as an interpretation.
+Part (d) has the expiry rule of Expire-Span (Sukhbaatar et al., 2021), and part (b) is not the only way to contain FoX in a larger family (Zhang et al., 2026).
+
+Proposition 2.3 (Death is permanent, and the stack form gives a stack).
+
+(a) For all $s<t<t^{\prime}$ , $b_{t^{\prime}s}\leq b_{ts}$ , so a dead key stays dead.
+(b) If $\phi=\psi=W$ , the levels $W_{s}$ of the keys alive at time $t$ do not decrease with $s$ , and the keys that step $u$ kills form a suffix in time of the keys alive at $u-1$ .
+The alive set therefore evolves as a stack.
+
+Selective Attention and DCP share the property of part (a), which both papers state (Anagnostidis et al., 2023; Leviathan et al., 2025).
+The weights of the alive keys still change when other keys die, because the softmax renormalises over the keys that remain.
+
+## Training.
+
+The bias is piecewise linear in the field and the levels.
+On the closed side of the outer minimum it passes no gradient to the field, and in our pilot runs this minimum could close for every key of a head early in training and stay closed.
+We train FPA with a straight-through estimator for this reason.
+The forward pass uses the range minimum, and the backward pass uses in its place the gradient of the soft minimum $-\tau\log\sum_{s<u\leq t}e^{-\phi_{u}/\tau}$ with $\tau=1$ .
+The outer minimum acts on the hard value, and evaluation uses the bias of (1) unchanged.
+
+Proposition 2.4 (Cost).
+
+(a) In a blocked computation with block size $B$ , the bias between a query block $I$ and an earlier key block $J$ depends on the field only through three quantities.
+They are the suffix minima of $\phi$ within $J$ , the minimum of $\phi$ over the blocks strictly between $J$ and $I$ , and the prefix minima of $\phi$ within $I$ .
+It costs $O(B^{2})$ operations per pair of blocks, as an element-wise bias such as that of FoX does, together with $O(T/B)$ block minima for a sequence of length $T$ .
+(b) In autoregressive decoding, $\bar{\phi}_{ts}=\min(\bar{\phi}_{t-1,s},\phi_{t})$ for $s<t-1$ and $\bar{\phi}_{t,t-1}=\phi_{t}$ , so each step updates the bias row in $O(t)$ operations and stores two scalars per cached key and head.
+
+The decomposition of part (a) is the standard blocked range minimum (Bender and Farach-Colton, 2000).
+Our Triton kernel fuses it with the attention, which it computes in blocks with an online softmax as fused attention kernels do.
+In the backward pass it computes the soft-minimum gradient for the positions in the key block, in the query block, in the blocks between and in the diagonal block.
+It adds nothing atomically, so its gradients are deterministic (Appendix E).
+The kernel needs the range minimum only for a finite strength.
+In the hard limit every key is visible on one interval of queries, which mask formats such as that of FlashMask already represent (Wang et al., 2025).
+Selective Attention and DCP, by contrast, accumulate a score for every pair of a later token and a key.
+Their bias for a pair of blocks depends on the score of every token in between with every key of the block.
+Section 4.3 compares the cost of FPA and Selective Attention.
+
+## 3 Theory
+
+In this section we compare FPA with other heads on three properties of the alive set.
+All proofs are in Appendix A, and each argument is short.
+
+## 3.1 Alive sets chosen by later dips
+
+Fix $r\geq 3$ .
+The ladder family $\mathcal{F}_{r}$ consists of $2^{r-1}$ sequences of length $3r$ (Section A.1).
+Every sequence starts with $\langle\mathrm{s}\rangle$ , places the same key token K at the positions $\sigma_{j}=3j-2$ for $j=1,\dots,r$ , and ends with the query token ?.
+Between key $j$ and key $j+1$ it places either U D or D U, and the tokens K, U and D have the walk increments $1$ , $\tfrac{1}{2}$ and $-\tfrac{1}{2}$ .
+In the stack form, key $j<r$ is alive at the final query exactly when U D follows it, so the alive sets of the family are all $2^{r-1}$ subsets of the first $r-1$ keys, each with the last key.
+We say that a head realises an alive set $A$ with tolerance $\varepsilon$ when, at the final query, every key in $A$ has weight at least $(1-\varepsilon)/|A|$ and the other keys have total weight at most $\varepsilon$ .
+
+Theorem 3.1 (Positional biases).
+
+Let a head have logits $\langle q_{t},k_{s}\rangle+\rho(t,s)+c_{t}$ .
+Here $k_{s}\in\mathbb{R}^{d}$ depends only on the token and the position of $s$ , $\rho$ is any fixed function of the two positions, and $q_{t}$ and $c_{t}$ may depend arbitrarily on the prefix up to $t$ .
+If on every sequence of $\mathcal{F}_{r}$ every alive key receives more weight than every dead key at the final query, then $d\geq r-2$ .
+The bound still holds when the head adds a path term $\sum_{s<u\leq t}\lambda(x_{u})$ in which $\lambda$ depends only on the token $x_{u}$ and may take either sign.
+
+The path term covers a FoX head whose forget gates depend only on the token, as in the first layer of a model without positional embeddings.
+The condition on the weights holds whenever the head realises the alive sets with tolerance $\varepsilon<1/(r+1)$ .
+In the first layer every key depends only on its token and position.
+Deeper keys may read their prefix, and Theorem 3.2 bounds such heads by their precision.
+
+Theorem 3.2 (Keys fixed when written).
+
+Let a head have logits $\langle q_{t},k_{s}\rangle+\rho(t,s)+c_{t}$ with $q_{t},k_{s}\in\mathbb{R}^{d}$ .
+Let $k_{s}$ depend only on the prefix up to $s$ , let $q_{t}$ and $c_{t}$ depend on the prefix up to $t$ , and let $\rho$ be a fixed function of the two positions.
+Let every coordinate of $q_{t}$ take one of at most $2^{p}$ values from a set that does not depend on the input, with logits and weights evaluated exactly.
+If the head realises the alive set of every sequence of $\mathcal{F}_{r}$ with tolerance $0<\varepsilon\leq 1/(2r+2)$ , then $dp\geq r-2$ .
+
+Proposition 3.3 (One FPA head).
+
+Let a head use the stack form on $\mathcal{F}_{r}$ and add to its bias a one-dimensional dot product, whose query is the constant $-M$ and whose key is $1$ at the tokens other than K and $0$ at K.
+If $\beta\geq 2\log(2(r-1)/\varepsilon)$ and $M\geq\log(4r/\varepsilon)$ , this head realises the alive set of every sequence of $\mathcal{F}_{r}$ with tolerance $\varepsilon$ , and its walk takes at most $2r+1$ values.
+
+At $\varepsilon=1/(2r+2)$ one FPA head thus uses scalars of $O(\log r)$ bits and constants $\beta$ and $M$ of order $\log r$ , whereas the heads of Theorems 3.1 and 3.2 need $r-2$ dimensions or $r-2$ bits of query in total.
+The proof of Theorem 3.1 bounds how many sign patterns affine functions can take on fixed points, a classical argument (Cover, 1965; Dudley, 1978) that earlier lower bounds for attention also use (Sanford et al., 2023; Weller et al., 2026).
+In the proof of Theorem 3.2 we instead count the values that the query must take.
+What is new is the family of alive sets that later dips create, and the comparison with a single range minimum.
+
+The results of this subsection do not cover biases in which a later token acts on each key separately.
+Selective Attention, DCP and keys that later tokens update (Song et al., 2026) realise the same alive sets in the hard limit, so FPA is not more expressive than they are in that limit.
+FPA differs from Selective Attention and DCP in that its bias depends only on scalars of single positions (Proposition 2.4), and from Selective Attention in its dependence on depth rather than duration (Section 3.2).
+The results also say nothing about deeper models, because a few layers of softmax attention can compute bracket depth (Yao et al., 2021; Hayakawa and Sato, 2025).
+Without a bound on precision no lower bound on $d$ holds for the ordering condition of Theorem 3.1, since keys that read their prefix can encode the alive set in one coordinate (Appendix A).
+Finally, the theorems constrain the weights of one head and not the function of a layer, since one attention layer with low-rank weights and feed-forward layers already approximates every continuous permutation-equivariant function (Kajitsuka and Sato, 2024).
+
+## 3.2 Depth, not duration
+
+Let $D^{\max}_{ts}=\max_{s<u\leq t}(\psi_{s}-\phi_{u})_{+}$ denote the deepest dip after key $s$ and $D^{\mathrm{sum}}_{ts}=\sum_{s<u<t}(\psi_{s}-\phi_{u})_{+}$ the sum of its dips, where $(x)_{+}=\max(0,x)$ .
+Selective Attention subtracts from the logit of key $s$ the selection $F_{ts}$ that the tokens between $s$ and $t$ assign to it (Leviathan et al., 2025).
+
+Proposition 3.4 (Depth, not duration).
+
+The first-passage bias is $b_{ts}=-\beta D^{\max}_{ts}$ , whereas Selective Attention with a selection head of the form $\omega(\psi_{s}-\phi_{u})$ , $\omega>0$ , subtracts $F_{ts}=\omega D^{\mathrm{sum}}_{ts}$ for every key after the first token.
+
+(i) 
+
+Inserting into $(s,t)$ steps whose dips below $\psi_{s}$ are at most $D^{\max}_{ts}$ , while every other position keeps its values, leaves $b_{ts}$ unchanged.
+For a key after the first token it increases $F_{ts}$ by $\omega$ times the sum of the inserted dips.
+
+(ii) 
+
+For every depth $\eta>0$ and every $m\geq 1$ there are inputs with $D^{\max}_{ts}=\eta$ and $D^{\mathrm{sum}}_{ts}=m\eta$ .
+
+(iii) 
+
+Let $\Gamma$ map every finite non-empty multiset of non-negative reals to a real number. If $\Gamma$ does not change when any value at most the maximum is added, then $\Gamma$ depends only on the maximum, and every function of the maximum has this property.
+
+Part (iii) makes functions of the maximum the only aggregations of dips that do not change when a dip no deeper than the deepest is added or held longer.
+When the durations of the dips vary within the training data, the difference matters already for fitting it, not only for generalising.
+
+Proposition 3.5 (Durations that vary in training).
+
+Let a sequence contain $r\geq 2$ keys at increasing levels at least five apart, each followed with positive probability by a dip of depth $\eta\in\{1,2,3,4\}$ .
+The dip consists of three steps at the depths $\eta$ , $\eta-1$ and $0$ in any order, and its deepest step is held for one or two steps.
+Every combination of the level of the first key, depth, order and duration occurs with positive probability.
+Let the target weight of key $j$ at the query be proportional to $e^{-\kappa\eta_{j}}$ with $\kappa>0$ , where $\eta_{j}=0$ without a dip.
+(a) No head whose logit for key $s$ is $\mu(x_{s})-\sum_{s<u<t}\chi(x_{u},x_{s})$ , where $\mu$ and $\chi\geq 0$ read only the tokens, realises the targets exactly on the keys of all such sequences.
+(b) One FPA head realises them exactly, and its bias does not change when a step is held longer or a further dip of a key, no deeper than its own, is inserted before the next key.
+
+The class of part (a) contains Selective Attention whose queries and keys depend only on the token, and it contains FoX whose gates, queries and keys read only the token.
+The proposition concerns exact fits, and we have not bounded what the class reaches within a tolerance.
+
+## 3.3 One field per head
+
+Selective Attention computes one mask per layer from the selection of one head and subtracts it from every head, and DCP also adds one mask per layer (Anagnostidis et al., 2023; Leviathan et al., 2025).
+The two-walk family $\mathcal{G}_{r}$ interleaves two walks in the same tokens (Appendix A).
+Every key token raises both walks by one, and the two tokens after key $j$ follow pattern $P^{(1)}_{j}$ for the first walk and $P^{(2)}_{j}$ for the second, as in $\mathcal{F}_{r}$ .
+In its complementary part, $P^{(2)}$ is the complement of $P^{(1)}$ , so every key except the last is alive under exactly one walk.
+
+Proposition 3.6 (A shared mask).
+
+Let two heads $h\in\{1,2\}$ have the logits $\langle q^{h},k^{h}_{s}\rangle+\rho^{h}(t,s)+c^{h}-F_{s}$ at the final query.
+Here $k^{h}_{s}\in\mathbb{R}^{d}$ depends only on the token and the position of $s$ , $\rho^{h}$ is fixed, $q^{h}$ and $c^{h}$ depend arbitrarily on the sequence, and the mask $F_{s}$ is the same for both heads.
+Let head $h$ follow walk $h$ on every sequence.
+(a) At most $N(r,d)=\sum_{i\leq 2d+1}\binom{r-1}{i}$ sequences of the complementary part have each head rank its alive keys above its dead keys, so all $2^{r-1}$ require $2d\geq r-2$ .
+(b) With tolerance $0<\varepsilon\leq 1/(2r+2)$ , at most $N^{\prime}(r,d)=\sum_{i\leq 2d}\binom{r-1}{i}$ of them have each head realise its alive set, so all require $2d\geq r-1$ .
+
+FPA with one walk per head realises both alive sets on every sequence with one-dimensional dot products (by the proof of Proposition 3.3).
+A shared mask therefore at most halves the dimension that Theorem 3.1 demands, and it does not remove the dependence on $r$ .
+For $r=14$ and $d=2$ the bounds are 2,380 and 1,093 of the 8,192 sequences.
+The bound concerns the shared mask, a design choice of Selective Attention and DCP, and Selective Attention with one mask per head lies outside it.
+
+## 4 Experiments
+
+We ran three groups of experiments, namely one-layer probes of the results in Section 3, language models, and measurements of cost.
+We preregistered every experiment except those that we mark as exploratory, and Appendices B, C, D and E give the full protocols, the records of the hyperparameter searches and the amendments.
+
+## 4.1 One-layer probes
+
+Table 1: Seeds out of 15 that succeeded in the one-layer probes.
+The alive-set columns use the ladder family with head dimension $d=4$ , where positional heads realise all alive sets only for $r\leq 6$ .
+The varied durations hold the deepest step of each dip for one or two steps in training, the two walks are the complementary part of the two-walk family ( $r=14$ , $d=2$ per head), and the stack column uses push and pop sequences.
+A dash marks a pair that we did not run.
+With $d=r+2$ every positional head and FoX succeeded on all seeds.
+Selective Attention∗ lies outside the class of Theorem 3.1.
+FPA, First Passage Attention.
+RoPE, rotary position embedding.
+NoPE, no positional encoding.
+ALiBi, attention with linear biases.
+FoX, Forgetting Transformer.
+DCP, Dynamic Context Pruning.
+
+Alive sets, $d=4$ 
+Varied
+Two
+
+Method
+ $r=10$ 
+ $r=14$ 
+ $r=18$ 
+durations
+walks
+Stack
+
+FPA
+11/15
+12/15
+13/15
+13/15
+11/15
+14/15
+
+FPA, sum of dips
+—
+—
+—
+0/15
+—
+11/15
+
+Softmax + RoPE
+0/15
+0/15
+0/15
+—
+—
+0/15
+
+Softmax + NoPE
+0/15
+0/15
+0/15
+—
+—
+—
+
+Softmax + ALiBi
+0/15
+0/15
+0/15
+—
+—
+—
+
+FoX
+0/15
+0/15
+0/15
+—
+—
+0/15
+
+Selective Attention∗
+15/15
+13/15
+15/15
+0/15
+0/15
+0/15
+
+DCP
+—
+—
+—
+—
+0/15
+—
+
+Each probe was one attention layer whose weights at the final query we supervised directly (Appendix B).
+On the alive-set, two-walk and stack families we counted a seed as a success when the head ranked every alive key above every dead key on at least 90% of the test sequences.
+On the varied-duration family we required the weights on the keys to lie within total variation $0.05$ of the target on at least 90% of the sequences, for both durations.
+We tuned each competitor on a matched positive control, and every setting ran on 15 seeds.
+In the probes we trained the selection of Selective Attention with a softplus straight-through gradient, which keeps its selection from closing early, whereas the language model used the gradient of its paper.
+We compared FPA with each competitor by a one-sided exact McNemar test on the seeds that succeeded, at level $\alpha=0.05/7$ , and a hypothesis held only when all its comparisons rejected.
+
+## Alive sets.
+
+With $d=4$ , Theorem 3.1 lets a positional head realise every alive set only for $r\leq 6$ .
+We tested softmax heads with rotary position embedding (RoPE), without positional encoding (NoPE) and with linear biases (ALiBi), and FoX heads whose gates read only the token.
+They succeeded at $r=6$ on 14 or 15 seeds and failed on every seed for $r=10$ , 14 and 18 (Tables 1 and 5).
+The same heads with $d=r+2$ succeeded on all seeds, so the failures do not come from training.
+FPA heads succeeded on 11, 12 and 13 seeds, and all twelve comparisons rejected ( $p=0.00049$ ).
+Selective Attention, whose bias depends on later tokens, lies outside the theorem and succeeded as well.
+Four-layer softmax and FoX models learned the task for $r=14$ and $r=18$ , as Section 3.1 anticipates for deeper models.
+
+## Durations.
+
+When the deepest step of each dip lasted one or two steps in training (Proposition 3.5), FPA succeeded on 13 seeds.
+Selective Attention and FPA with the sum of dips in place of the minimum succeeded on none ( $p=0.00012$ for both).
+Both competitors fitted the same family with fixed durations on all 15 seeds, so they failed only when the durations varied.
+
+## Two walks.
+
+With two heads of dimension 2 on the complementary part of the two-walk family, FPA succeeded on 11 seeds, and Selective Attention and DCP, whose heads share one mask, on none ( $p=0.00049$ each).
+Both learned identical walks with one mask (15 and 13 seeds), and Selective Attention with one mask per head learned the complementary part on 13 seeds.
+We thus attribute the failures to the shared mask, and no run exceeded the bounds of Proposition 3.6.
+
+## Stack and retrieval.
+
+On push and pop sequences FPA succeeded on 14 seeds and FPA with the sum of dips on 11, while one-layer FoX, softmax and Selective Attention heads succeeded on none.
+A further task asked for the occurrences of a name among the alive keys, so it needs both a level per key and retrieval by content (Section B.6).
+FPA succeeded on all 15 seeds, and variants without the level of the key, with the level of the query instead, or without retrieval by content succeeded on none, as did FoX, stick-breaking attention and softmax attention.
+Selective Attention succeeded on 13 seeds.
+
+## Tasks from earlier work.
+
+On six published tasks with small decoders (Section B.7), FPA succeeded on every seed in flip-flop language modelling, copying and counting, and on 9 of 15 in variable assignment, where FoX succeeded on all.
+In multi-query repeated associative recall no model succeeded on more than 4 seeds.
+In multi-query associative recall FPA failed on every seed, where softmax attention succeeded on all.
+In our diagnosis, the bias of the first layer suppressed the attention from each value to its own key early in training, so the first step of the recall circuit never formed.
+An FPA model without a bias in its first layer succeeded on all 15 seeds, and in an exploratory check three- and four-layer FPA models failed as the two-layer one did.
+
+## 4.2 Language models
+
+We trained four decoders with 12 layers of width 768 and 12 heads of dimension 64 on 2.7B tokens of SlimPajama (Soboleva et al., 2023), following the 125M recipe of FoX (Lin et al., 2025a) with the 32k-token vocabulary of Mistral 7B (Jiang et al., 2023).
+The models differed only in attention, namely FPA and FoX without positional encoding, Selective Attention with RoPE, and softmax attention with RoPE.
+We trained all of them with context 2048, one seed and mixed precision (Appendix C).
+We tested two hypotheses of FPA against FoX, each at level $0.05/7$ .
+The first asked whether the test loss of FPA is worse by no more than $\ln 1.01$ , that is 1% in perplexity.
+The second asked whether FPA has a lower loss beyond the training length on PG-19 (Rae et al., 2020) or retrieves more passkeys placed beyond it (Mohtashami and Jaggi, 2023).
+
+Table 2: Language models with 110M parameters, one seed each.
+Losses are in nats per token on the SlimPajama test set, on WikiText-103 (Merity et al., 2017) and on PG-19 positions 2048 to 4095 in windows of 4096 tokens.
+Passkey accuracy averages 50 items at each of two lengths, and RULER averages 13 tasks at length 8192.
+The models were trained with context 2048.
+Bold marks the best value in each column.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+RoPE, rotary position embedding.
+
+Loss (nats per token) $\downarrow$ 
+Accuracy $\uparrow$ 
+
+SlimPajama
+WikiText
+PG-19
+Passkey
+Passkey
+RULER
+
+Method
+test
+103
+2k–4k
+3k–4k
+8k–16k
+8k
+
+FPA
+2.8640
+3.1001
+3.282
+1.00
+1.00
+0.202
+
+FoX
+2.8832
+3.1425
+3.316
+0.73
+0.20
+0.117
+
+Selective Attention
+2.8686
+3.1197
+3.805
+0.11
+0.04
+0.008
+
+Softmax + RoPE
+2.8908
+3.1374
+5.064
+0.00
+0.00
+0.002
+
+## Perplexity and extrapolation.
+
+Both tests supported FPA (Table 2).
+On the SlimPajama test set the loss of FPA was 0.0192 nats below that of FoX, and the upper confidence bound of the difference, $-0.0186$ , lay inside the margin of $0.00995$ .
+On 99 PG-19 test books its loss at positions 2048 to 4095 was 0.034 nats lower, with upper bound $-0.028$ .
+It retrieved all 100 passkeys at lengths 3072 and 4096, against 73 for FoX ( $p=7.5\times 10^{-9}$ ).
+
+## Longer contexts and other evaluations.
+
+In windows of 16,384 tokens FPA and FoX kept a flat loss far beyond the training length, while Selective Attention and softmax attention with RoPE did not (Figure 2).
+FPA was 0.02 to 0.03 nats below FoX up to position 8192 but $0.026$ nats above it from 8192 to 16,384 (95% interval $[0.019,0.032]$ ).
+FPA retrieved every passkey at lengths 8192 and 16,384, where FoX retrieved 20% (Figure 3).
+On RULER (Hsieh et al., 2024) FPA scored 0.202 at length 8192 against 0.117 for FoX, but slightly below FoX at 4096 and 16,384, and no model reached 0.09 on BABILong (Kuratov et al., 2024).
+Zero-shot accuracies on six downstream tasks were close to those of FoX, and most 95% intervals of the differences contained zero (Appendix C).
+
+Figure 2: Loss far beyond the training length.
+Mean loss of the four language models on 94 PG-19 test books read in windows of 16,384 tokens, in bins of 256 positions.
+The models were trained with context 2048 (vertical line).
+The vertical axis is logarithmic in the loss minus 3.1 nats, which spreads out the lowest losses.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+RoPE, rotary position embedding.
+
+Figure 3: Passkey accuracy by length of the prompt.
+Each point averages 50 items, ten passkeys at each of five depths.
+Lengths up to 4096 come from the preregistered evaluation and the two longer ones from the descriptive one.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+RoPE, rotary position embedding.
+
+## What the trained model does.
+
+In an observational analysis of the FPA model on SlimPajama test windows, most heads left few keys alive (Section C.6).
+At queries beyond position 1024 the median head left 0.3% of the keys with a bias of at least $-1$ .
+In 19 of the 144 heads more than 10% of the alive sets were not suffixes, which no forget gate can produce.
+The share of deaths at the document boundaries $\langle\mathrm{s}\rangle$ and $\langle/\mathrm{s}\rangle$ was 6.6 times their share of the tokens, in the median head.
+In 56 heads the walk moved in opposite directions at opening and closing brackets and its correlation with bracket depth lay outside a familywise 99% band of shifted controls (Figure 4).
+The correlations were small (largest $0.25$ ), so we read them as a description, not as evidence that the model tracks brackets.
+
+Figure 4: Steps of the walk at brackets in the FPA language model.
+(a) Increments $\delta_{t}$ of layer 1, head 5 at positions 447 to 846 of one test window, with the bracket depth shaded and the mean increments where the depth rises and falls in the whole window.
+A fixed seed chose the window before the analysis, and the head contrasts the two kinds of bracket most in it.
+(b) Mean increments at opening and at closing brackets of all 144 heads over 256 test windows.
+Filled markers show the 56 heads with increments of opposite signs and a familywise significant correlation with the bracket depth.
+FPA, First Passage Attention.
+
+## 4.3 Cost
+
+Table 3: Cost on one 12 GB partition of a Turing GPU in half precision.
+One attention layer has 12 heads of dimension 64 at batch 4 and length 2048 (medians of 20 rounds).
+Model throughput is in training tokens per second of the 110M models in the benchmark.
+Decoding uses batch size 1 at length 8192, and bytes per position count the keys, values and per-key state of 12 layers in single precision.
+The lower rows switch off parts of the FPA kernel.
+SDPA, the scaled dot-product attention of PyTorch, with its memory-efficient kernel on this GPU.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+
+One layer, ms
+Model
+Decoding at 8k
+
+Method
+forward
+fwd + bwd
+tokens/s
+ms/token
+bytes/pos.
+
+FPA
+0.78
+4.31
+29,694
+22.0
+74,880
+
+FoX
+0.74
+2.87
+32,481
+20.2
+74,304
+
+Softmax (SDPA)
+0.87
+4.42
+26,913
+23.9
+73,728
+
+Selective Attention
+2.00
+10.45
+20,150
+36.7
+73,776
+
+The same kernel with parts of FPA switched off
+
+FoX bias
+0.66
+3.01
+—
+—
+—
+
+ $+$ range minimum
+0.78
+3.43
+—
+—
+—
+
+ $+$ gradient of the field
+0.78
+4.33
+—
+—
+—
+
+We measured the cost of the kernels and models (Table 3, Appendix E).
+For the forward and backward pass, one FPA layer took 0.97 times as long as SDPA and 1.50 times as long as FoX, whose bias needs no range minimum.
+On this GPU SDPA runs its memory-efficient kernel.
+Over five shapes from $16\times 512$ to $1\times 8192$ these ratios ranged from 0.95 to 1.08 and from 1.42 to 1.56.
+Selective Attention took 2.4 times as long as FPA, and 2.0 to 2.5 times over the five shapes.
+The forward pass of FPA alone took 1.03 to 1.07 times as long as that of FoX.
+Within one kernel, the range minimum added 14% to the time of the bias of FoX and the gradient of the field another 26%.
+In the benchmark of Table 3, the whole FPA model trained at 0.914 times the throughput of FoX, 1.103 times that of softmax attention and 1.47 times that of Selective Attention.
+At batch size 1 and length 8192, decoding with FPA took 22.0 ms per token, against 20.2 ms for FoX and 23.9 ms for softmax attention.
+These times did not grow from 1024 to 16,384 tokens, so fixed overheads dominate them at this size.
+The state of FPA enlarged the cache by 1.56% over keys and values.
+
+The bias of a key never rises again (Proposition 2.3), so a decoder can drop a key once its bias falls below a threshold.
+When we dropped every key whose bias fell below $-10$ , the loss of FPA rose by 0.00044 nats at length 2048 and by 0.00047 at 8192, while the model kept 34% and 26% of the keys.
+With between 24% and 27% of its cache the model still retrieved every passkey at 8192 and 16,384.
+The same rule cost FoX 0.0195 to 0.0227 nats while it kept 15% and 7% of the keys, and a sliding window of the same mean size cost softmax attention 0.115 nats at 2048.
+
+## 5 Related Work
+
+## Path-dependent biases.
+
+FoX adds a sum of log forget gates (Lin et al., 2025a), and it is the stack form of FPA with a walk that never rises.
+Its bias falls with the age of a key, so its visible sets are suffixes.
+Stick-breaking attention (Tan et al., 2025), the geometric attention of the Neural Data Router (Csordás et al., 2022), contextual position encoding (Golovneva et al., 2024), PaTH (Yang et al., 2025) and GRAPE (Zhang et al., 2026) change logits through products, sums or transformations along the path.
+GRAPE contains FoX and ALiBi as special cases.
+Selective Attention (Leviathan et al., 2025) and DCP (Anagnostidis et al., 2023) let later tokens remove a key, and in the hard limit they realise the same alive sets as FPA.
+Their bias accumulates a score for every pair of a later token and a key, whereas the bias of FPA depends only on scalars of single positions and costs less to compute than that of Selective Attention (Section 4.3).
+The suppression of Selective Attention also adds up over the path, so it depends on the duration of a dip (Proposition 3.4), and in both methods one mask serves all heads of a layer (Proposition 3.6).
+The concurrent Universal Attention also accumulates a pairwise sum along the path and evicts keys whose bias passes a threshold (Wertheimer et al., 2026).
+
+## Range extremes and stacks.
+
+StructFormer compares a maximum over a range with a level through a sigmoid, the smooth form of the same comparison (Shen et al., 2021).
+Its level belongs to the token that attends, however, so a fixed token sees a contiguous span, and the comparison feeds a parser that the whole layer shares in a masked language model.
+PRPN (Shen et al., 2018) and syntax-guided local attention (Hou et al., 2022) also gate by a range extreme against a threshold of the query, and our variant of FPA with the level of the query learned only suffixes (Appendix B).
+The strengths of the Neural Stack have the first-passage form as a closed form, in an external memory of a recurrent network that reads only its top (Grefenstette et al., 2015).
+Ordered Neurons (Shen et al., 2019b), Ordered Memory (Shen et al., 2019a), Stack Attention (DuSell and Chiang, 2024; Li et al., 2024), Pushdown Layers (Murty et al., 2023), Transformer Grammars (Sartran et al., 2022) and DeltaStack (Nguyen et al., 2026) build stacks or syntax into recurrent or attention models, several with supervision of the structure.
+FPA learns its walk without such supervision.
+Expire-Span (Sukhbaatar et al., 2021) and adaptive attention spans (Sukhbaatar et al., 2019) learn when keys expire, which FPA contains as the case of a clock as field.
+Preisach Attention studies extremum stacks as a sequence memory, without a learned level per key or scores between queries and keys (Frydrych, 2026).
+Tropical Attention takes max-plus extremes over keys rather than over the path between key and query (Hashemi et al., 2025).
+
+## Expressivity.
+
+Lower bounds on head dimension, rank or precision (Bhojanapalli et al., 2020; Sanford et al., 2023; Amsel et al., 2025; Kozachinskiy et al., 2025; Weller et al., 2026) rest on rank, Vapnik–Chervonenkis (VC) dimension or sign-rank arguments of the kind that Theorem 3.1 uses, and our contribution is the family of alive sets that later dips create.
+One layer needs linear size for bounded Dyck languages (Bhattamishra et al., 2024), while a few layers suffice (Yao et al., 2021; Hayakawa and Sato, 2025), which is why we state the separation for one layer.
+Soft attention simulates hard attention when its temperature scales with the margin (Yang et al., 2026), as Proposition 3.3 does with its strength.
+Non-negative gates limit state tracking in linear recurrences (Sarrof et al., 2024; Grazzi et al., 2025), and the walk of FPA may rise as well as fall.
+
+## Eviction.
+
+H2O (Zhang et al., 2023) and attention sinks (Xiao et al., 2024) drop cached keys by heuristics, and adaptive computation pruning skips the blocks that the bias of FoX makes negligible (Lin et al., 2025b).
+The bias of an FPA key never rises again, so a decoder can drop a key once its bias falls below a threshold, and in the hard limit it drops exactly the dead keys.
+
+## 6 Limitations and Conclusion
+
+## Limitations.
+
+Our language models had 110M parameters and one seed each, and they trained on 2.7B tokens on one 12 GB partition of a Turing GPU, so the comparison may change at larger scale.
+
+## Conclusion.
+
+We have introduced First Passage Attention, which lowers the logit of a key by the deepest later dip of a learned field below the level of the key.
+One parameterisation contains the Forgetting Transformer, a stack, a bottleneck bias and learned expiry.
+In one layer a single FPA head realises alive sets for which positional heads and forget-gate heads with token-level gates need $r-2$ dimensions.
+Without positional information, no head that subtracts a sum of non-negative scores of token pairs fits exactly the targets of dips whose durations vary, while one FPA head does.
+Preregistered probes agreed with these predictions.
+A 110M-parameter FPA language model was not worse than FoX in perplexity, had a lower loss on PG-19 at positions 2048 to 4095 and retrieved every passkey at lengths up to 16,384.
+
+## Use of large language models.
+
+We used large language models to assist with code, literature search, proof checking and editing, and we take full responsibility for the content of the paper.
+
+## References
+
+Amsel et al. (2025)
+N. Amsel, G. Yehudai, and J. Bruna
+
+Quality over quantity in attention layers: when adding more heads hurts.
+
+In International Conference on Learning Representations,
+
+pp. 62431–62483.
+
+Cited by: §5.
+
+Anagnostidis et al. (2023)
+S. Anagnostidis, D. Pavllo, L. Biggio, L. Noci, A. Lucchi, and T. Hofmann
+
+Dynamic context pruning for efficient and interpretable autoregressive transformers.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 36, pp. 65202–65223.
+
+External Links: Document
+
+Cited by: §A.6,
+§1,
+§2,
+§3.3,
+§5.
+
+Arora et al. (2024)
+S. Arora, S. Eyuboglu, A. Timalsina, I. Johnson, M. Poli, J. Y. Zou, A. Rudra, and C. Ré
+
+Zoology: measuring and improving recall in efficient language models.
+
+In International Conference on Learning Representations,
+
+pp. 15664–15730.
+
+Cited by: §B.7.
+
+Bender and Farach-Colton (2000)
+M. A. Bender and M. Farach-Colton
+
+The LCA problem revisited.
+
+In LATIN 2000: Theoretical Informatics,
+
+Lecture Notes in Computer Science, pp. 88–94.
+
+External Links: Document
+
+Cited by: §2.
+
+Bhattamishra et al. (2024)
+S. Bhattamishra, M. Hahn, P. Blunsom, and V. Kanade
+
+Separations in the representational capabilities of transformers and recurrent architectures.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 37, pp. 36002–36045.
+
+External Links: Document
+
+Cited by: §5.
+
+Bhojanapalli et al. (2020)
+S. Bhojanapalli, C. Yun, A. S. Rawat, S. Reddi, and S. Kumar
+
+Low-rank bottleneck in multi-head attention models.
+
+In Proceedings of the 37th International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 119, pp. 864–873.
+
+Cited by: §5.
+
+Bisk et al. (2020)
+Y. Bisk, R. Zellers, R. Le Bras, J. Gao, and Y. Choi
+
+PIQA: reasoning about physical commonsense in natural language.
+
+In Proceedings of the AAAI Conference on Artificial Intelligence,
+
+Vol. 34, pp. 7432–7439.
+
+External Links: Document
+
+Cited by: §C.4.
+
+Clark et al. (2018)
+P. Clark, I. Cowhey, O. Etzioni, T. Khot, A. Sabharwal, C. Schoenick, and O. Tafjord
+
+Think you have solved question answering? Try ARC, the AI2 reasoning challenge.
+
+arXiv preprint arXiv:1803.05457.
+
+Cited by: §C.4.
+
+Cover (1965)
+T. M. Cover
+
+Geometrical and statistical properties of systems of linear inequalities with applications in pattern recognition.
+
+IEEE Transactions on Electronic Computers EC-14 (3), pp. 326–334.
+
+External Links: Document
+
+Cited by: §A.5,
+§3.1.
+
+Csordás et al. (2022)
+R. Csordás, K. Irie, and J. Schmidhuber
+
+The neural data router: adaptive control flow in transformers improves systematic generalization.
+
+In International Conference on Learning Representations,
+
+Cited by: §1,
+§5.
+
+Dudley (1978)
+R. M. Dudley
+
+Central limit theorems for empirical measures.
+
+The Annals of Probability 6 (6), pp. 899–929.
+
+External Links: Document
+
+Cited by: §A.5,
+§3.1.
+
+DuSell and Chiang (2024)
+B. DuSell and D. Chiang
+
+Stack attention: improving the ability of transformers to model hierarchical patterns.
+
+In International Conference on Learning Representations,
+
+pp. 7411–7430.
+
+Cited by: §5.
+
+Frydrych (2026)
+P. Frydrych
+
+Preisach attention: a hysteretic model of sequential memory.
+
+arXiv preprint arXiv:2605.23603.
+
+Cited by: §5.
+
+Gao et al. (2024)
+L. Gao, J. Tow, B. Abbasi, S. Biderman, S. Black, A. DiPofi, C. Foster, L. Golding, J. Hsu, A. Le Noac’h, H. Li, K. McDonell, N. Muennighoff, C. Ociepa, J. Phang, L. Reynolds, H. Schoelkopf, A. Skowron, L. Sutawika, E. Tang, A. Thite, B. Wang, K. Wang, and A. Zou
+
+A framework for few-shot language model evaluation.
+
+Note: Zenodo, version v0.4.3
+
+External Links: Document
+
+Cited by: Table 10.
+
+Golovneva et al. (2024)
+O. Golovneva, T. Wang, J. Weston, and S. Sukhbaatar
+
+Contextual position encoding: learning to count what’s important.
+
+arXiv preprint arXiv:2405.18719.
+
+Cited by: §1,
+§5.
+
+Grazzi et al. (2025)
+R. Grazzi, J. Siems, A. Zela, J. Franke, F. Hutter, and M. Pontil
+
+Unlocking state-tracking in linear RNNs through negative eigenvalues.
+
+In International Conference on Learning Representations,
+
+pp. 36565–36597.
+
+Cited by: §5.
+
+Grefenstette et al. (2015)
+E. Grefenstette, K. M. Hermann, M. Suleyman, and P. Blunsom
+
+Learning to transduce with unbounded memory.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 28.
+
+Cited by: §2,
+§5.
+
+Hashemi et al. (2025)
+B. Hashemi, K. Pasque, C. Teska, and R. Yoshida
+
+Tropical attention: neural algorithmic reasoning for combinatorial algorithms.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 38, pp. 98631–98656.
+
+External Links: Document
+
+Cited by: §5.
+
+Hayakawa and Sato (2025)
+D. Hayakawa and I. Sato
+
+Theoretical analysis of hierarchical language recognition and generation by transformers without positional encoding.
+
+In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+
+pp. 30777–30834.
+
+External Links: Document
+
+Cited by: §3.1,
+§5.
+
+Hou et al. (2022)
+S. Hou, J. Kai, H. Xue, B. Zhu, B. Yuan, L. Huang, X. Wang, and Z. Lin
+
+Syntax-guided localized self-attention by constituency syntactic distance.
+
+In Findings of the Association for Computational Linguistics: EMNLP 2022,
+
+pp. 2334–2341.
+
+External Links: Document
+
+Cited by: §5.
+
+Hsieh et al. (2024)
+C. Hsieh, S. Sun, S. Kriman, S. Acharya, D. Rekesh, F. Jia, and B. Ginsburg
+
+RULER: what’s the real context size of your long-context language models?.
+
+In First Conference on Language Modeling,
+
+Cited by: §4.2.
+
+Jiang et al. (2023)
+A. Q. Jiang, A. Sablayrolles, A. Mensch, C. Bamford, D. S. Chaplot, D. de las Casas, F. Bressand, G. Lengyel, G. Lample, L. Saulnier, L. R. Lavaud, M. Lachaux, P. Stock, T. Le Scao, T. Lavril, T. Wang, T. Lacroix, and W. El Sayed
+
+Mistral 7B.
+
+arXiv preprint arXiv:2310.06825.
+
+Cited by: §1,
+§4.2.
+
+Kajitsuka and Sato (2024)
+T. Kajitsuka and I. Sato
+
+Are transformers with one layer self-attention using low-rank weight matrices universal approximators?.
+
+In International Conference on Learning Representations,
+
+pp. 35177–35205.
+
+Cited by: §3.1.
+
+Kozachinskiy et al. (2025)
+A. Kozachinskiy, F. Urrutia, H. Orellana, T. Steifer, G. Pizarro, M. Fuentes, F. Meza Vásquez, C. Buc Calderon, and C. Rojas
+
+Strassen attention, split VC dimension and compositionality in transformers.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 38, pp. 9665–9696.
+
+External Links: Document
+
+Cited by: §5.
+
+Kuratov et al. (2024)
+Y. Kuratov, A. Bulatov, P. Anokhin, I. Rodkin, D. Sorokin, A. Sorokin, and M. Burtsev
+
+BABILong: testing the limits of LLMs with long context reasoning-in-a-haystack.
+
+In Advances in Neural Information Processing Systems, Datasets and Benchmarks Track,
+
+Vol. 37, pp. 106519–106554.
+
+External Links: Document
+
+Cited by: §4.2.
+
+Leviathan et al. (2025)
+Y. Leviathan, M. Kalman, and Y. Matias
+
+Selective attention improves transformer.
+
+In International Conference on Learning Representations,
+
+pp. 4389–4414.
+
+Cited by: §A.6,
+§A.8,
+§1,
+§2,
+§3.2,
+§3.3,
+§5.
+
+Li et al. (2024)
+J. Li, J. White, M. Sachan, and R. Cotterell
+
+A transformer with stack attention.
+
+In Findings of the Association for Computational Linguistics: NAACL 2024,
+
+pp. 4318–4335.
+
+External Links: Document
+
+Cited by: §5.
+
+Lin et al. (2025a)
+Z. Lin, E. Nikishin, X. He, and A. Courville
+
+Forgetting transformer: softmax attention with a forget gate.
+
+In International Conference on Learning Representations,
+
+pp. 69704–69738.
+
+Cited by: §C.1,
+§1,
+§4.2,
+§5.
+
+Lin et al. (2025b)
+Z. Lin, J. Obando-Ceron, X. O. He, and A. Courville
+
+Adaptive computation pruning for the forgetting transformer.
+
+In Second Conference on Language Modeling,
+
+Cited by: Table 23,
+§5.
+
+Lindley (1952)
+D. V. Lindley
+
+The theory of queues with a single server.
+
+Mathematical Proceedings of the Cambridge Philosophical Society 48 (2), pp. 277–289.
+
+External Links: Document
+
+Cited by: §A.2,
+§2.
+
+Liu et al. (2023)
+B. Liu, J. Ash, S. Goel, A. Krishnamurthy, and C. Zhang
+
+Exposing attention glitches with flip-flop language modeling.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 36, pp. 25549–25583.
+
+External Links: Document
+
+Cited by: §B.7.
+
+Merity et al. (2017)
+S. Merity, C. Xiong, J. Bradbury, and R. Socher
+
+Pointer sentinel mixture models.
+
+In International Conference on Learning Representations,
+
+Cited by: §C.2,
+Table 2.
+
+Mohtashami and Jaggi (2023)
+A. Mohtashami and M. Jaggi
+
+Random-access infinite context length for transformers.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 36, pp. 54567–54585.
+
+External Links: Document
+
+Cited by: §C.2,
+§4.2.
+
+Murty et al. (2023)
+S. Murty, P. Sharma, J. Andreas, and C. D. Manning
+
+Pushdown layers: encoding recursive structure in transformer language models.
+
+In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing,
+
+pp. 3233–3247.
+
+External Links: Document
+
+Cited by: §5.
+
+Nguyen et al. (2026)
+A. T. Nguyen, S. Momeni, A. Chaubey, C. Xiao, and B. Liu
+
+Push, pop, parallelize: stack-augmented linear attention via the delta rule.
+
+In Proceedings of the 43rd International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 306, pp. 92579–92592.
+
+Cited by: §5.
+
+Paperno et al. (2016)
+D. Paperno, G. Kruszewski, A. Lazaridou, N. Q. Pham, R. Bernardi, S. Pezzelle, M. Baroni, G. Boleda, and R. Fernández
+
+The LAMBADA dataset: word prediction requiring a broad discourse context.
+
+In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+
+pp. 1525–1534.
+
+External Links: Document
+
+Cited by: §C.4.
+
+Press et al. (2022)
+O. Press, N. Smith, and M. Lewis
+
+Train short, test long: attention with linear biases enables input length extrapolation.
+
+In International Conference on Learning Representations,
+
+Cited by: §1.
+
+Rae et al. (2020)
+J. W. Rae, A. Potapenko, S. M. Jayakumar, C. Hillier, and T. P. Lillicrap
+
+Compressive transformers for long-range sequence modelling.
+
+In International Conference on Learning Representations,
+
+Cited by: §4.2.
+
+Sakaguchi et al. (2020)
+K. Sakaguchi, R. Le Bras, C. Bhagavatula, and Y. Choi
+
+WinoGrande: an adversarial Winograd schema challenge at scale.
+
+In Proceedings of the AAAI Conference on Artificial Intelligence,
+
+Vol. 34, pp. 8732–8740.
+
+External Links: Document
+
+Cited by: §C.4.
+
+Sanford et al. (2023)
+C. Sanford, D. J. Hsu, and M. Telgarsky
+
+Representational strengths and limitations of transformers.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 36, pp. 36677–36707.
+
+External Links: Document
+
+Cited by: §3.1,
+§5.
+
+Sarrof et al. (2024)
+Y. Sarrof, Y. Veitsman, and M. Hahn
+
+The expressive capacity of state space models: a formal language perspective.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 37, pp. 41202–41241.
+
+External Links: Document
+
+Cited by: §5.
+
+Sartran et al. (2022)
+L. Sartran, S. Barrett, A. Kuncoro, M. Stanojević, P. Blunsom, and C. Dyer
+
+Transformer grammars: augmenting transformer language models with syntactic inductive biases at scale.
+
+Transactions of the Association for Computational Linguistics 10, pp. 1423–1439.
+
+External Links: Document
+
+Cited by: §5.
+
+Sauer (1972)
+N. Sauer
+
+On the density of families of sets.
+
+Journal of Combinatorial Theory, Series A 13 (1), pp. 145–147.
+
+External Links: Document
+
+Cited by: §A.10,
+§A.5.
+
+Shelah (1972)
+S. Shelah
+
+A combinatorial problem; stability and order for models and theories in infinitary languages.
+
+Pacific Journal of Mathematics 41 (1), pp. 247–261.
+
+External Links: Document
+
+Cited by: §A.10,
+§A.5.
+
+Shen et al. (2018)
+Y. Shen, Z. Lin, C. Huang, and A. Courville
+
+Neural language modeling by jointly learning syntax and lexicon.
+
+In International Conference on Learning Representations,
+
+Cited by: §5.
+
+Shen et al. (2019a)
+Y. Shen, S. Tan, A. Hosseini, Z. Lin, A. Sordoni, and A. Courville
+
+Ordered memory.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 32.
+
+Cited by: §5.
+
+Shen et al. (2019b)
+Y. Shen, S. Tan, A. Sordoni, and A. Courville
+
+Ordered neurons: integrating tree structures into recurrent neural networks.
+
+In International Conference on Learning Representations,
+
+Cited by: §5.
+
+Shen et al. (2021)
+Y. Shen, Y. Tay, C. Zheng, D. Bahri, D. Metzler, and A. Courville
+
+StructFormer: joint unsupervised induction of dependency and constituency structure from masked language modeling.
+
+In Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers),
+
+pp. 7196–7209.
+
+External Links: Document
+
+Cited by: §5.
+
+Skorokhod (1961)
+A. V. Skorokhod
+
+Stochastic equations for diffusion processes in a bounded region.
+
+Theory of Probability and Its Applications 6 (3), pp. 264–274.
+
+External Links: Document
+
+Cited by: §A.2,
+§2.
+
+Soboleva et al. (2023)
+D. Soboleva, F. Al-Khateeb, R. Myers, J. R. Steeves, J. Hestness, and N. Dey
+
+SlimPajama: a 627B token cleaned and deduplicated version of RedPajama.
+
+Note: Cerebras blog
+
+Cited by: §C.1,
+§4.2.
+
+Song et al. (2026)
+Z. Song, P. Sun, H. Yuan, and Q. Gu
+
+Causal attention with lookahead keys.
+
+In Proceedings of the 43rd International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 306, pp. 115068–115107.
+
+Cited by: §A.6,
+§3.1.
+
+Su et al. (2024)
+J. Su, M. Ahmed, Y. Lu, S. Pan, W. Bo, and Y. Liu
+
+RoFormer: enhanced transformer with rotary position embedding.
+
+Neurocomputing 568, pp. 127063.
+
+External Links: Document
+
+Cited by: §1.
+
+Sukhbaatar et al. (2019)
+S. Sukhbaatar, É. Grave, P. Bojanowski, and A. Joulin
+
+Adaptive attention span in transformers.
+
+In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics,
+
+pp. 331–335.
+
+External Links: Document
+
+Cited by: §5.
+
+Sukhbaatar et al. (2021)
+S. Sukhbaatar, D. Ju, S. Poff, S. Roller, A. Szlam, J. Weston, and A. Fan
+
+Not all memories are created equal: learning to forget by expiring.
+
+In Proceedings of the 38th International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 139, pp. 9902–9912.
+
+Cited by: §1,
+§2,
+§5.
+
+Tan et al. (2025)
+S. Tan, S. Yang, A. Courville, R. Panda, and Y. Shen
+
+Scaling stick-breaking attention: an efficient implementation and in-depth study.
+
+In International Conference on Learning Representations,
+
+pp. 4030–4046.
+
+Cited by: §1,
+§5.
+
+Vaswani et al. (2017)
+A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, Ł. Kaiser, and I. Polosukhin
+
+Attention is all you need.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 30.
+
+Cited by: §1.
+
+Wang et al. (2025)
+G. Wang, J. Zeng, X. Xiao, S. Wu, J. Yang, L. Zheng, Z. Chen, J. Bian, D. Yu, and H. Wang
+
+FlashMask: efficient and rich mask extension of FlashAttention.
+
+In International Conference on Learning Representations,
+
+pp. 27641–27661.
+
+Cited by: §2.
+
+Weller et al. (2026)
+O. Weller, M. Boratko, I. Naim, and J. Lee
+
+On the theoretical limitations of embedding-based retrieval.
+
+In International Conference on Learning Representations,
+
+pp. 11202–11216.
+
+Cited by: §3.1,
+§5.
+
+Wertheimer et al. (2026)
+D. Wertheimer, H. Shen, A. Gupta, D. Liu, Y. C. F. Lim, M. Srivatsa, R. K. Ganti, M. Zhang, and N. Wang
+
+A self-pruning transformer: extreme KV-cache compression with universal attention.
+
+arXiv preprint arXiv:2610.09051.
+
+Cited by: §5.
+
+Xiao et al. (2024)
+G. Xiao, Y. Tian, B. Chen, S. Han, and M. Lewis
+
+Efficient streaming language models with attention sinks.
+
+In International Conference on Learning Representations,
+
+pp. 21875–21895.
+
+Cited by: §5.
+
+Yang et al. (2026)
+A. Yang, L. Strobl, D. Chiang, and D. Angluin
+
+Simulating hard attention using soft attention.
+
+Transactions of the Association for Computational Linguistics 14, pp. 147–166.
+
+External Links: Document
+
+Cited by: §5.
+
+Yang et al. (2025)
+S. Yang, Y. Shen, K. Wen, S. Tan, M. Mishra, L. Ren, R. Panda, and Y. Kim
+
+PaTH attention: position encoding via accumulating Householder transformations.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 38, pp. 62220–62247.
+
+External Links: Document
+
+Cited by: §1,
+§5.
+
+Yao et al. (2021)
+S. Yao, B. Peng, C. Papadimitriou, and K. Narasimhan
+
+Self-attention networks can process bounded hierarchical languages.
+
+In Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers),
+
+pp. 3770–3785.
+
+External Links: Document
+
+Cited by: §3.1,
+§5.
+
+Zellers et al. (2019)
+R. Zellers, A. Holtzman, Y. Bisk, A. Farhadi, and Y. Choi
+
+HellaSwag: can a machine really finish your sentence?.
+
+In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics,
+
+pp. 4791–4800.
+
+External Links: Document
+
+Cited by: §C.4.
+
+Zhang et al. (2026)
+Y. Zhang, Z. Chen, Y. Liu, Z. Qin, H. Yuan, K. Xu, Y. Yuan, Q. Gu, and A. C. Yao
+
+Group representational position encoding.
+
+In International Conference on Learning Representations,
+
+pp. 56496–56519.
+
+Cited by: §1,
+§2,
+§5.
+
+Zhang et al. (2023)
+Z. Zhang, Y. Sheng, T. Zhou, T. Chen, L. Zheng, R. Cai, Z. Song, Y. Tian, C. Ré, C. Barrett, Z. Wang, and B. Chen
+
+H2O: heavy-hitter oracle for efficient generative inference of large language models.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 36, pp. 34661–34710.
+
+External Links: Document
+
+Cited by: §5.
+
+## Appendix A Proofs
+
+Throughout, a head gives key $s$ at query $t$ the weight $w_{ts}=e^{\ell_{ts}}/\sum_{u\leq t}e^{\ell_{tu}}$ , so weight ratios depend only on logit differences, $w_{ts}/w_{ts^{\prime}}=e^{\ell_{ts}-\ell_{ts^{\prime}}}$ .
+All logits are finite unless a statement says otherwise, and all arithmetic is exact.
+The field $\phi_{u}$ and the level $\psi_{s}$ do not change once their positions are written.
+
+## A.1 The ladder family
+
+Fix $r\geq 3$ .
+The tokens are $\langle\mathrm{s}\rangle$ , the key token K, the tokens D and U, and the query token ?, with walk increments $\delta(\langle\mathrm{s}\rangle)=\delta(\texttt{?})=0$ , $\delta(\texttt{K})=1$ , $\delta(\texttt{D})=-\tfrac{1}{2}$ and $\delta(\texttt{U})=\tfrac{1}{2}$ .
+For a pattern $P=(P_{1},\dots,P_{r-1})\in\{0,1\}^{r-1}$ the sequence $x^{P}$ is
+
+ $\langle\mathrm{s}\rangle,\ \texttt{K},\ \pi_{1},\ \texttt{K},\ \pi_{2},\ \dots,\ \texttt{K},\ \pi_{r-1},\ \texttt{K},\ \texttt{?},$ 
+
+where the block $\pi_{i}$ is U D if $P_{i}=1$ and D U if $P_{i}=0$ .
+With positions numbered from 0, every sequence has length $3r$ , key $j$ sits at $\sigma_{j}=3j-2$ and the query at $t=3r-1$ .
+The family $\mathcal{F}_{r}$ has the following four properties, which we also checked by computation for $r$ up to 10.
+
+1. 
+
+Alive sets. In the stack form, key $j<r$ is alive at the final query exactly when $P_{j}=1$ , and key $r$ is always alive. Indeed $W_{\sigma_{j}}=j$ , and within block $\pi_{j}$ the walk visits $j+\tfrac{1}{2}$ (pattern U D) or $j-\tfrac{1}{2}$ (pattern D U) and returns to $j$ . Every later block starts at least at $j+1$ and dips by at most $\tfrac{1}{2}$ , so the alive key set is $A^{P}=\{j<r:P_{j}=1\}\cup\{r\}$ .
+
+2. 
+
+Prefixes. The prefix of $x^{P}$ up to position $\sigma_{j}$ depends only on $P_{1},\dots,P_{j-1}$ .
+
+3. 
+
+Alive positions. In the stack form each block with its key holds exactly one position that is dead at the final query, namely key $j$ if $P_{j}=0$ and the U of the block if $P_{j}=1$ . With $\langle\mathrm{s}\rangle$ , key $r$ and the query alive, there are $r-1$ dead positions and $2r+1$ alive ones.
+
+4. 
+
+Equal multisets. The blocks U D and D U are orderings of one multiset. So for any function $\lambda$ of a token, $\sum_{s<u\leq t}\lambda(x_{u})$ with $s$ a key position and $t$ the final query takes the same value for every pattern. In the stack form every dip lies at least $\tfrac{1}{2}$ below the level of every position it kills.
+
+## A.2 Proof of Proposition 2.2
+
+(a) With $g=h=0$ , $\min\bigl(0,\bar{\phi}_{ts}-\psi_{s}\bigr)=\min\bigl(0,\min_{s<u\leq t}(W_{u}-W_{s})\bigr)=-\max\bigl(0,\max_{s<u\leq t}(W_{s}-W_{u})\bigr)=-L_{ts}$ .
+A queue that starts empty at time $s$ and receives the net input $\delta_{u}$ at step $u$ has the content $R_{s}=0$ and $R_{u}=\max(0,R_{u-1}+\delta_{u})$ (Lindley, 1952).
+Unrolling the recursion gives $R_{t}=W_{t}-\min_{s\leq v\leq t}W_{v}=(W_{t}-W_{s})+L_{ts}$ , so $L_{ts}$ is the total amount by which the reflection at zero has pushed the walk $W-W_{s}$ up (Skorokhod, 1961).
+The proposition uses this reading only as a name for $L_{ts}$ .
+
+(b) If $\delta\leq 0$ , the walk does not increase, so $\bar{\phi}_{ts}=W_{t}\leq W_{s}$ and $b_{ts}=\beta(W_{t}-W_{s})=\sum_{s<u\leq t}\beta\delta_{u}=\sum_{s<u\leq t}\log f_{u}$ .
+
+(c) Here $W=0$ and $\psi=0$ , so $b_{ts}=\min\bigl(0,\min_{s<u\leq t}g_{u}\bigr)=\min_{s<u\leq t}g_{u}$ because $g\leq 0$ .
+
+(d) The walk is $W_{u}=W_{0}-u$ , so $\phi=W$ and $\psi_{s}=W_{s}-e_{s}$ .
+The minimum of the decreasing walk over $(s,t]$ is $W_{t}$ , so $\bar{\phi}_{ts}-\psi_{s}=W_{t}-W_{s}+e_{s}=e_{s}-(t-s)$ , which gives the stated bias.
+Key $s$ is alive, for every $\beta$ , exactly when $e_{s}\geq t-s$ . $\square$ 
+
+## A.3 Proof of Proposition 2.3
+
+(a) Since $(s,t]\subset(s,t^{\prime}]$ , $\bar{\phi}_{t^{\prime}s}\leq\bar{\phi}_{ts}$ , and $x\mapsto\beta\min(0,x-\psi_{s})$ does not decrease.
+So $b_{t^{\prime}s}\leq b_{ts}$ , and $b_{ts}<0$ gives $b_{t^{\prime}s}<0$ .
+
+(b) Let $s<s^{\prime}$ both be alive at time $t$ .
+Since $s^{\prime}\in(s,t]$ , $W_{s^{\prime}}\geq\bar{\phi}_{ts}\geq W_{s}$ , so the levels of the alive keys do not decrease with the time of writing.
+Step $u$ kills a key $s<u-1$ that is alive at $u-1$ exactly when $W_{u}<W_{s}$ , and it kills the key written at $u-1$ under the same condition.
+Since the levels of the keys alive at $u-1$ do not decrease in $s$ , the keys with $W_{s}>W_{u}$ among them form a suffix in time.
+Every key alive at $u-1$ has $W_{s}\leq W_{u-1}$ , so a step that does not decrease the walk kills nothing.
+Every key alive at $u$ has a level of at most $W_{u}$ , so the key written at $u$ joins at the top.
+The alive keys therefore evolve as a stack. $\square$ 
+
+## A.4 Proof of Proposition 2.4
+
+(a) Let $s\in J$ and $t\in I$ with $J$ before $I$ .
+The range $(s,t]$ is the disjoint union of the rest of $J$ after $s$ , the full blocks strictly between $J$ and $I$ , and the part of $I$ up to $t$ .
+So $\bar{\phi}_{ts}$ is the minimum of the suffix minimum of $J$ after $s$ , the minimum over the blocks in between, and the prefix minimum of $I$ up to $t$ .
+Suffix and prefix minima of a block take $O(B)$ operations, and the $O(T/B)$ block minima take $O(T)$ for the whole sequence.
+The minimum over the blocks in between costs $O(1)$ per pair of blocks when it runs back along $J$ from the block before $I$ .
+The bias of a pair of blocks is then an element-wise expression in these minima, $\psi$ and $\beta$ .
+On a diagonal block the range lies inside the block, and the running minimum $\bar{\phi}_{ts}=\min(\bar{\phi}_{t-1,s},\phi_{t})$ gives all range minima with $B(B-1)/2$ updates.
+
+(b) Since $(s,t]=(s,t-1]\cup\{t\}$ , $\bar{\phi}_{ts}=\min(\bar{\phi}_{t-1,s},\phi_{t})$ , and the bias needs only $\bar{\phi}_{ts}$ and $\psi_{s}$ for each cached key.
+Since $\bar{\phi}_{ts}$ does not increase in $t$ , a key with $\bar{\phi}_{ts}<\psi_{s}$ stays dead. $\square$ 
+
+## A.5 Proof of Theorem 3.1
+
+At the final query $t=3r-1$ the token and position of key $j$ are the same in every sequence, so $k_{j}:=k_{\sigma_{j}}$ and $\rho_{j}:=\rho(t,\sigma_{j})$ do not depend on the pattern.
+Fix a pattern $P$ and let $q=q^{P}$ .
+All weights at the query share one denominator, so the hypothesis orders the logits of the keys, and $\min_{a\in A^{P}}\ell_{\sigma_{a}}>\max_{x\notin A^{P}}\ell_{\sigma_{x}}$ , where the maximum over an empty set is $-\infty$ .
+Pick $\theta_{0}$ strictly in between and set $\theta=\theta_{0}-c^{P}$ .
+The function $f(j)=\langle q,k_{j}\rangle+\rho_{j}-\theta$ is then positive on the alive keys and negative on the dead keys among $j=1,\dots,r-1$ .
+So the class $\mathcal{C}=\{j\mapsto\langle q,k_{j}\rangle+\rho_{j}-\theta:q\in\mathbb{R}^{d},\theta\in\mathbb{R}\}$ realises every sign pattern on $\{1,\dots,r-1\}$ .
+
+Suppose that $r-1\geq d+2$ .
+The $r-1$ vectors $(k_{j},1)\in\mathbb{R}^{d+1}$ are then linearly dependent, $\sum_{j<r}a_{j}(k_{j},1)=0$ with $a\neq 0$ , and the last coordinate gives $\sum_{j}a_{j}=0$ , so both $J_{+}=\{j:a_{j}>0\}$ and $J_{-}=\{j:a_{j}<0\}$ are non-empty.
+Every $f\in\mathcal{C}$ satisfies $\sum_{j<r}a_{j}f(j)=\sum_{j<r}a_{j}\rho_{j}=:C$ , a constant.
+If $C\leq 0$ , a function positive exactly on $J_{+}$ would make the sum positive, and if $C>0$ , a function positive exactly on $J_{-}$ would make it negative.
+In both cases some pattern of the family is not realised, a contradiction, so $r-1\leq d+1$ .
+
+For the path term, the range $(\sigma_{j},t]$ consists of the blocks $\pi_{j},\dots,\pi_{r-1}$ , the keys $j+1,\dots,r$ and the query.
+By the fourth property of $\mathcal{F}_{r}$ , $\Lambda_{j}=\sum_{\sigma_{j}<u\leq t}\lambda(x_{u})$ is the same for every pattern.
+The proof uses $\rho$ only through the numbers $\rho_{j}$ , which must not depend on the pattern, and replacing them by $\rho_{j}+\Lambda_{j}$ keeps that property. $\square$ 
+
+This is the classical bound on the VC dimension of the positivity sets of a fixed function plus a $(d+1)$ -dimensional space of functions (Cover, 1965; Dudley, 1978).
+By the Sauer–Shelah lemma (Sauer, 1972; Shelah, 1972) such a head orders at most $\sum_{i\leq d+1}\binom{r-1}{i}$ of the $2^{r-1}$ sequences, fewer than 90% for $d=4$ and $r\geq 9$ .
+With $d=r-2$ the bound is attained by the keys $k_{\sigma_{j}}=e_{j}$ for $j\leq r-2$ and $k_{\sigma_{r-1}}=k_{\sigma_{r}}=0$ .
+The positional bias is zero on the keys $j<r$ , large on the last key and large and negative on the positions without a key, and the query has the coordinate $L$ or $-L$ by the fate of each key.
+The path term must depend on the token alone.
+If it may also read the position, a head with $d=0$ already orders every sequence of $\mathcal{F}_{r}$ .
+
+## A.6 Proof of Theorem 3.2
+
+Let $q^{P}$ , $c^{P}$ , $k^{P}_{s}$ and $\ell^{P}_{s}$ denote the query, the offset, the keys and the logits at the final query of $x^{P}$ .
+
+Lemma A.1 (Gap).
+
+Let $0<\varepsilon\leq 1/(2r+2)$ and let the head realise $A^{P}$ with tolerance $\varepsilon$ on $x^{P}$ .
+Then for all alive keys $a,a^{\prime}$ and every dead key $x$ ,
+
+ $|\ell^{P}_{\sigma_{a}}-\ell^{P}_{\sigma_{a^{\prime}}}|\leq\gamma_{\mathrm{A}}=\log\frac{1+(r-1)\varepsilon}{1-\varepsilon},\qquad\ell^{P}_{\sigma_{a}}-\ell^{P}_{\sigma_{x}}\geq\gamma_{\mathrm{D}}=\log\frac{1-\varepsilon}{r\varepsilon},$ 
+
+and $\gamma_{\mathrm{D}}>\gamma_{\mathrm{A}}$ .
+
+Proof.
+
+Let $m=|A^{P}|$ .
+Every alive key has $w_{a}\geq(1-\varepsilon)/m$ , and the weights of all positions sum to one, so another alive key has $w_{a^{\prime}}\leq 1-(m-1)(1-\varepsilon)/m$ and $w_{a^{\prime}}/w_{a}\leq(1+(m-1)\varepsilon)/(1-\varepsilon)$ .
+A dead key has $w_{x}\leq\varepsilon$ , so $w_{a}/w_{x}\geq(1-\varepsilon)/(r\varepsilon)$ .
+The inequality $\gamma_{\mathrm{D}}>\gamma_{\mathrm{A}}$ is equivalent to $(1-\varepsilon)^{2}>r\varepsilon(1+(r-1)\varepsilon)$ , whose left side decreases and whose right side increases in $\varepsilon$ .
+At $\varepsilon=1/(2r+2)$ it reads $(2r+1)^{2}>r(3r+1)$ , that is $r^{2}+3r+1>0$ .
+∎
+
+Lemma A.2 (One pattern per query).
+
+Under the hypothesis of Theorem 3.2, if $P\neq P^{\prime}$ and $P_{1}=P^{\prime}_{1}=1$ , then $q^{P}\neq q^{P^{\prime}}$ .
+
+Proof.
+
+Suppose that $q^{P}=q^{P^{\prime}}=q$ , and let $j$ be the smallest index with $P_{j}\neq P^{\prime}_{j}$ , so that $2\leq j\leq r-1$ , and assume $P_{j}=1$ and $P^{\prime}_{j}=0$ .
+The prefixes of $x^{P}$ and $x^{P^{\prime}}$ up to $\sigma_{j}$ coincide by the second property of $\mathcal{F}_{r}$ , so the keys at $\sigma_{1}$ and $\sigma_{j}$ coincide as well.
+With the common query and positional bias the offset cancels, and $\Delta=\ell^{P}_{\sigma_{j}}-\ell^{P}_{\sigma_{1}}=\ell^{P^{\prime}}_{\sigma_{j}}-\ell^{P^{\prime}}_{\sigma_{1}}$ .
+In $x^{P}$ keys 1 and $j$ are both alive, so $\Delta\geq-\gamma_{\mathrm{A}}$ , and in $x^{P^{\prime}}$ key 1 is alive and key $j$ dead, so $\Delta\leq-\gamma_{\mathrm{D}}<-\gamma_{\mathrm{A}}$ , a contradiction.
+∎
+
+There are $2^{r-2}$ patterns with $P_{1}=1$ , and by Lemma A.2 they have pairwise different queries.
+Each of the $d$ coordinates of a query takes at most $2^{p}$ values, so $2^{r-2}\leq 2^{dp}$ , that is $dp\geq r-2$ . $\square$ 
+
+The proof uses four facts.
+All sequences share the length and the key positions, the prefix up to key $j$ depends only on the fates of the earlier keys, key 1 is alive in $2^{r-2}$ patterns, and the tolerance gives $\gamma_{\mathrm{D}}>\gamma_{\mathrm{A}}$ .
+Without a bound on the values of the query no lower bound on $d$ alone follows.
+Keys built from the prefix with a one-coordinate midpoint code separate the alive keys from the dead ones by a single threshold at every time in exact arithmetic, so even $d=1$ meets the ordering condition of Theorem 3.1 with such keys.
+The argument does not apply to biases in which a later token acts on each key separately, as in Selective Attention, DCP and causal attention with lookahead keys (Anagnostidis et al., 2023; Leviathan et al., 2025; Song et al., 2026).
+The contribution of such a bias for key $j$ is not a function of the prefix up to $\sigma_{j}$ .
+
+## A.7 Proof of Proposition 3.3
+
+Fix a sequence of $\mathcal{F}_{r}$ and its final query.
+In the stack form the walk lives on the half-integer grid, so a dead position has $\bar{\phi}_{ts}\leq W_{s}-\tfrac{1}{2}$ and bias at most $-\beta/2$ , and an alive position has bias zero.
+The logit of a key position is its bias, and the logit of every other position, the query included, is its bias minus $M$ .
+So the alive keys have logit 0, the dead keys at most $-\beta/2$ and the other positions at most $-M$ .
+With $Z=|A|+R$ , at most $r-1$ dead keys and exactly $2r$ other positions,
+
+ $R=\sum_{\text{dead keys}}e^{b_{ts}}+\sum_{\text{other}}e^{b_{ts}-M}\leq(r-1)e^{-\beta/2}+2re^{-M}\leq\tfrac{\varepsilon}{2}+\tfrac{\varepsilon}{2}=\varepsilon.$ 
+
+Key $r$ is always alive, so $|A|\geq 1$ .
+All positions other than the alive keys then have total weight $R/Z\leq\varepsilon$ , and each alive key has weight $1/Z\geq 1/(|A|+\varepsilon)\geq(1-\varepsilon)/|A|$ .
+The increments are multiples of $\tfrac{1}{2}$ and $0\leq W\leq r$ , so the walk takes at most $2r+1$ values. $\square$ 
+
+Without the dot product the query position keeps the bias zero, the largest possible, so the field alone cannot meet the tolerance once $\varepsilon\leq 1/(|A|+1)$ .
+
+## A.8 Proof of Proposition 3.4
+
+First, $b_{ts}=\beta\min\bigl(0,\min_{u}(\phi_{u}-\psi_{s})\bigr)=-\beta\max\bigl(0,\max_{u}(\psi_{s}-\phi_{u})\bigr)=-\beta D^{\max}_{ts}$ .
+In Selective Attention the selection of token $u$ for key $s$ passes through a ReLU and is summed over the positions strictly before $t$ , and the first token and the key itself are not masked (Leviathan et al., 2025).
+With a selection head of the form $\omega(\psi_{s}-\phi_{u})$ and $\omega>0$ , the mask is therefore $F_{ts}=\sum_{s<u<t}\mathrm{relu}(\omega(\psi_{s}-\phi_{u}))=\omega D^{\mathrm{sum}}_{ts}$ .
+
+(i) An inserted step adds an element of at most $D^{\max}_{ts}$ to the set whose maximum is $D^{\max}_{ts}$ , so the maximum and the bias do not change, while $D^{\mathrm{sum}}_{ts}$ grows by the inserted dip.
+For tokens under (2) this is not automatic, since the increment of a token shifts every later level.
+If $\delta$ , $g$ and $h$ depend on the token alone, a block of tokens whose increments sum to zero and whose dips stay at most $D^{\max}_{ts}$ preserves the values of all other positions.
+
+(ii) Set $\psi_{s}=0$ and $t=s+m+1$ , and let every other $\phi_{v}$ with $s<v\leq t$ be at least zero.
+One step $u\in(s,t)$ with $\phi_{u}=-\eta$ gives $D^{\max}_{ts}=D^{\mathrm{sum}}_{ts}=\eta$ , and $m$ such steps give $D^{\max}_{ts}=\eta$ and $D^{\mathrm{sum}}_{ts}=m\eta$ .
+
+(iii) Let a multiset have maximum $x^{\ast}$ and other elements $x_{1},\dots,x_{k}$ .
+Starting from $\{x^{\ast}\}$ and inserting $x_{1},\dots,x_{k}$ one at a time never changes $\Gamma$ , because each inserted element is at most the maximum, which stays $x^{\ast}$ .
+So $\Gamma$ of the multiset equals $\Gamma(\{x^{\ast}\})$ . $\square$ 
+
+## A.9 Proof of Proposition 3.5
+
+The family is the graded-depth family of Section B.3.
+Key $j$ has level $L_{j}$ , with $L_{j}-L_{j-1}\in\{5,6,7\}$ , and a dip of depth $\eta$ consists of the dip tokens at levels $L_{j}-x$ for $x\in\{\eta,\eta-1,0\}$ (for $\eta=1$ the depths are $\{1,0,0\}$ ), its deepest token repeated $m_{j}\in\{1,2\}$ times.
+A head realises the target exactly on the keys when $\ell_{s}+\kappa\eta_{s}$ is the same for every key $s$ of the sequence.
+
+(a) Fix the level $L$ of the first key and a head of the class that realises the target exactly on every sequence whose first key has level $L$ .
+Let $f_{x}=\chi(\texttt{D}\langle L-x\rangle,\texttt{K}\langle L\rangle)\geq 0$ denote the contribution of the dip token at depth $x$ .
+Let two sequences differ only in the duration of the first key’s dip of depth $x$ , which is held once in one and twice in the other.
+The second has one more copy of the deepest token between key 1 and the query, so the logit of key 1 is lower by $f_{x}$ , while every later key keeps its logit and no target changes.
+Key 2 shows that the common value of $\ell_{s}+\kappa\eta_{s}$ is the same in both sequences, and key 1 then gives $f_{x}=0$ , for $x=1,2,3,4$ .
+Next let two sequences differ only in the first key’s dip, of depth 2 in one and depth 3 in the other.
+By the first step the dip tokens contribute $f_{0}$ to key 1 in both, every other token after key 1 is the same, and every later key keeps its logit.
+Exact realisation then requires $\ell_{1}+2\kappa=\ell_{1}+3\kappa$ , which contradicts $\kappa>0$ .
+
+(b) Let $\phi_{u}$ be the level of the token for dip and key tokens and a value above every level for all other tokens.
+Let $\psi_{s}$ be the level of key $s$ and $\beta=\kappa$ , and let the score between query and key be the same for every key.
+The tokens after key $s$ are its own dip, whose minimum level is $L_{s}-\eta_{s}$ , other tokens above every level, and later blocks at levels of at least $L_{s}+1$ .
+So the bias of key $s$ is $-\kappa\eta_{s}$ and the target is met exactly.
+Holding a step repeats a value already in the range, and an inserted dip of key $s$ that is no deeper adds values of at least $L_{s}-\eta_{s}$ after it and above every earlier level, so no range minimum changes.
+In (2) this is $\delta=0$ with token-dependent offsets $g$ and $h$ . $\square$ 
+
+Part (a) uses only sequences in which key 1 has a dip and a later key follows it.
+With fixed durations the class fits the targets exactly, with contributions $(0,1,1,2,2)\,\kappa$ of a dip token at depths 0 to 4, so only durations that vary for dips of the same depth separate the two.
+
+## A.10 Proof of Proposition 3.6
+
+In the two-walk family $\mathcal{G}_{r}$ every token carries one step for each of two walks.
+The key token has the steps $(1,1)$ , the four block tokens carry $(\pm\tfrac{1}{2},\pm\tfrac{1}{2})$ , and $\langle\mathrm{s}\rangle$ and ? carry $(0,0)$ .
+The sequence $x^{P^{(1)},P^{(2)}}$ has the shape of a ladder sequence, and block $i$ consists of two tokens whose first steps follow $P^{(1)}_{i}$ and whose second steps follow $P^{(2)}_{i}$ as in $\mathcal{F}_{r}$ .
+The alive key sets at the final query are therefore $A^{(h)}=\{j<r:P^{(h)}_{j}=1\}\cup\{r\}$ for $h=1,2$ , and the complementary part has $P^{(2)}=\lnot P^{(1)}$ .
+
+Let $k^{h}_{j}$ and $\rho^{h}_{j}$ denote the key and the positional bias of head $h$ at key $j$ , which do not depend on the sequence.
+Let $z_{j}=(k^{2}_{j},-k^{1}_{j})\in\mathbb{R}^{2d}$ and $\nu_{j}=\rho^{2}_{j}-\rho^{1}_{j}$ .
+Both heads subtract the same $F_{\sigma_{j}}$ , so with $Q=(q^{2},q^{1})$ the difference of the heads is
+
+ $\ell^{2}_{\sigma_{j}}-\ell^{1}_{\sigma_{j}}=\langle Q,z_{j}\rangle+\nu_{j}+(c^{2}-c^{1}),\qquad j=1,\dots,r.$ 
+
+(a) On an ordered sequence of the complementary part, let $x<r$ be alive under walk 2 and dead under walk 1, and $y<r$ the reverse.
+Head 2 gives $\ell^{2}_{\sigma_{x}}>\ell^{2}_{\sigma_{y}}$ and head 1 gives $\ell^{1}_{\sigma_{y}}>\ell^{1}_{\sigma_{x}}$ , so the difference is larger at $x$ than at $y$ .
+A threshold between the two groups then makes a function of $\mathcal{C}=\{j\mapsto\langle Q,z_{j}\rangle+\nu_{j}-\theta\}$ positive exactly on $\{j<r:P^{(1)}_{j}=0\}$ .
+
+(b) With tolerance $\varepsilon\leq 1/(2r+2)$ , Lemma A.1 applies to each head with its own alive set.
+Key $r$ is alive under both walks.
+For $x<r$ alive under walk 2 and dead under walk 1 the difference at $x$ exceeds that at $r$ by at least $\gamma_{\mathrm{D}}-\gamma_{\mathrm{A}}>0$ .
+For $y<r$ alive under walk 1 the difference at $r$ exceeds that at $y$ by the same amount.
+So $j\mapsto\langle Q,z_{j}-z_{r}\rangle+\nu_{j}-\nu_{r}$ , in which the offsets cancel, is positive exactly on $\{j<r:P^{(1)}_{j}=0\}$ .
+
+In both parts distinct sequences give distinct sign patterns on $\{1,\dots,r-1\}$ .
+The class of part (a) shatters no $2d+2$ points, because the vectors $(z_{j},1)\in\mathbb{R}^{2d+1}$ of any $2d+2$ points are linearly dependent and the argument of Theorem 3.1 applies.
+The class of part (b) shatters no $2d+1$ points for the same reason with the vectors $z_{j}-z_{r}\in\mathbb{R}^{2d}$ .
+By the Sauer–Shelah lemma (Sauer, 1972; Shelah, 1972) the classes have at most $N(r,d)$ and $N^{\prime}(r,d)$ sign patterns on $r-1$ points. $\square$ 
+
+The proof uses only that both heads subtract the same mask, which may depend arbitrarily on the sequence, and that the pair of heads is fixed in advance.
+It covers Selective Attention whose keys depend only on the token and the position, including RoPE at a common final query, and in part (a) a fixed positive scale of the mask in one head.
+It also covers the masks of DCP, which may remove a key completely.
+Every key that a counted sequence needs has a finite mask, because it is alive under one of the walks.
+In part (a) the two sequences in which one walk keeps every key are the exception, and the class $\mathcal{C}$ already contains their patterns.
+For keys and positional biases in general position and a mask chosen freely the counts $N(r,d)$ and $N^{\prime}(r,d)$ are attained, the second once the biases are large enough for the tolerance.
+
+## Appendix B One-layer probes
+
+## B.1 Common setup
+
+Every probe was a single attention layer on token embeddings of width 64, supervised at the final query, and Appendix D lists the settings of every probe.
+The values were fixed one-hot vectors of the key positions and the readout was the identity, so the output of the head was its weight on each key.
+The loss was the cross-entropy of these weights against the target.
+The deeper models of Table 5 add $L-1$ pre-norm blocks of width 64 with 4 heads and a feed-forward width of 256 in front of the supervised head.
+We trained with AdamW (0.9, 0.98), weight decay 0.01, batch 64, a warm-up of 200 steps followed by cosine decay to zero, gradient clipping at 1.0 and single precision, and we drew fresh training data at every step.
+Training lasted 4000 steps, and 16,000 steps on the graded-depth families.
+The seeds of the main runs were 1801 to 1815, and the sampled test sets used seeds that no tuning run had used.
+
+We declared the same search of 24 tuning runs for every method on the alive-set, graded-depth and two-walk families.
+FPA, FoX, Selective Attention and DCP crossed three learning rates in $\{10^{-3},3\times 10^{-3},10^{-2}\}$ and two tuning seeds with four values of one more setting.
+This setting was the definition of the minimum for FPA, the initial gate bias for FoX, the selection scale for Selective Attention and the initial bias of the interaction scores for DCP.
+The methods without such a setting searched twelve learning rates from $10^{-4}$ to $10^{-1}$ .
+A grid whose end was selected was extended once by a decade.
+Each competitor was tuned on its positive control and FPA on the setting where it can succeed, and we froze the chosen configurations with a hash before the main runs.
+After the pilots we fixed the definition of FPA as the straight-through minimum of Section 2 with a learned strength per head, and we selected its learning rate again.
+
+The search departed from the declaration in four ways.
+Grid extensions, remedies for positive controls and the second selection for FPA raised the number of tuning runs above 24 (Table 4).
+The configurations on the graded-depth families and that of Selective Attention with one mask per head came from exploratory runs instead of the declared search.
+These runs compared only the selection scales 1 and $1/3$ for Selective Attention on the graded depths.
+The learning rates of Selective Attention on the graded depths and of the variant with one mask per head lay at the upper end of their grids, which we did not extend.
+The sum of dips on the graded depths took the learning rate of FPA without a search of its own.
+Selective Attention with a shared mask used the scale $1/3$ , which tuning chose on the positive control of the two walks, on the two-walk and retrieval families.
+Unlike on the alive sets, no main run on these families used the scale 1 of its paper.
+After its one extension the selected learning rate still lay at an end of the grid in four cases.
+These were FPA and FPA with the sum of dips on the stack family, stick-breaking attention in retrieval and softmax attention with RoPE in variable assignment.
+
+Table 4: Tuning runs and GPU minutes of the search in the pilots on the two families whose comparisons rest on a declared search.
+A dagger marks a search that took more than 1.25 times the GPU time of the cheapest compared search of its family.
+We estimated the GPU minutes of runs that shared the GPU from a calibration of throughput.
+The configuration of Selective Attention with one mask per head came from later exploratory runs.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+ALiBi, attention with linear biases.
+NoPE, no positional encoding.
+RoPE, rotary position embedding.
+DCP, Dynamic Context Pruning.
+
+Family
+Method
+Runs
+GPU min
+
+Alive sets
+FPA†
+48
+46.3
+
+FoX†
+40
+28.9
+
+Selective Attention†
+40
+30.2
+
+Softmax + ALiBi
+28
+16.6
+
+Softmax + NoPE
+28
+16.3
+
+Softmax + RoPE
+24
+15.8
+
+Stick-breaking
+24
+16.5
+
+Two walks
+FPA
+36
+32.5
+
+Selective Attention, shared mask
+44
+32.6
+
+Selective Attention, one mask per head
+40
+30.0
+
+DCP†
+44
+66.7
+
+For every component we ran a one-sided exact McNemar test of FPA against the competitor on the per-seed successes, and a hypothesis was supported only when all its components rejected at $\alpha=0.05/7$ .
+The seven tests are the three tests of Section 4.1 and two tests of each of the two language-model hypotheses, of which we ran one each.
+At the tested settings of the alive-set and two-walk families, the counts of Appendix A rule out every success of the compared competitors.
+Each test on these families then depends only on the successes of FPA, with $p=2^{-k}$ for $k$ of them.
+The preregistered refutation of each probe hypothesis was a one-sided 99% Clopper–Pearson upper bound below $0.5$ on the success rate of FPA.
+On the alive-set and two-walk families a competitor run beyond these counts would also have refuted the hypothesis, unless an implementation error or, for two walks, a model outside the assumptions of Proposition 3.6 explained it.
+No run went beyond them, and no hypothesis was refuted.
+In these probes we trained the selection of Selective Attention with the gradient of a softplus in place of that of its ReLU, while the forward pass kept the ReLU of the paper.
+With the ReLU gradient the selections of several pilot heads closed at the start of training and never reopened.
+We checked the forward pass of our implementation element by element against a line-by-line transcription of the sketch in Figure 2 of the paper of Selective Attention.
+
+## B.2 Alive sets
+
+The ladder families of Section A.1 with $r\in\{6,10,14,18\}$ used the full set of $2^{r-1}$ sequences as their test set.
+The query at the final position came from a network that read the one-hot vectors of all tokens through a hidden layer of width 256 with the Gaussian error linear unit and an output of size $Hd$ .
+The query could thus depend arbitrarily on the prefix, as Theorem 3.1 allows.
+Every key had a learned offset per position and head, and FPA, FoX, Selective Attention and softmax attention also used RoPE.
+ALiBi added the fixed slope $2^{-8}$ of a single head, and NoPE and stick-breaking attention, which followed its paper, used the offsets alone.
+The deeper models of Table 5 had neither this query network nor these offsets.
+The field of FPA and the gates of FoX read only the token embedding.
+A test of the rank of the key logits confirmed that each competitor stayed in the class of the theorem.
+The positive controls with $d=r+2$ admit a construction in the class, keys equal to one-hot vectors of the key positions and queries equal to the indicator of the alive set.
+
+Table 5: Every cell of the alive-set family, as seeds out of 15 that ordered the alive keys above the dead keys on at least 90% of the sequences.
+Selective Attention appears with the selection scale 10 chosen in tuning and with the scale 1 of its paper.
+The last rows compare the level of the key with the level of the query, whose alive sets are always suffixes.
+A dash marks a cell that the design did not include.
+FPA, First Passage Attention.
+RoPE, rotary position embedding.
+NoPE, no positional encoding.
+ALiBi, attention with linear biases.
+FoX, Forgetting Transformer.
+
+Method ( $d=4$ , one layer)
+ $r=6$ 
+ $r=10$ 
+ $r=14$ 
+ $r=18$ 
+
+FPA
+15/15
+11/15
+12/15
+13/15
+
+Softmax + RoPE
+15/15
+0/15
+0/15
+0/15
+
+Softmax + NoPE
+14/15
+0/15
+0/15
+0/15
+
+Softmax + ALiBi
+14/15
+0/15
+0/15
+0/15
+
+FoX
+15/15
+0/15
+0/15
+0/15
+
+Selective Attention, scale 10
+15/15
+15/15
+13/15
+15/15
+
+Selective Attention, scale 1
+15/15
+15/15
+15/15
+15/15
+
+Stick-breaking attention
+15/15
+0/15
+0/15
+0/15
+
+Positive controls, $d=r+2$ 
+
+Softmax + RoPE
+—
+15/15
+15/15
+15/15
+
+Softmax + NoPE
+—
+15/15
+15/15
+15/15
+
+Softmax + ALiBi
+—
+15/15
+15/15
+15/15
+
+FoX
+—
+15/15
+15/15
+15/15
+
+Deeper models, $d=4$ in the last layer
+
+Softmax + RoPE, 2 layers
+—
+—
+15/15
+0/15
+
+Softmax + RoPE, 4 layers
+—
+—
+15/15
+15/15
+
+FoX, 2 layers
+—
+—
+15/15
+8/15
+
+FoX, 4 layers
+—
+—
+15/15
+15/15
+
+Level of the key against the level of the query ( $d=1$ )
+
+FPA, field only
+—
+12/15
+10/15
+—
+
+FPA, threshold of the query
+—
+0/15
+0/15
+—
+
+   on suffix alive sets only
+—
+—
+12/15
+—
+
+The four competitors in the class succeeded at $r=6$ , where $d=r-2$ allows every pattern, and failed on every seed at larger $r$ , while their positive controls succeeded on every seed.
+Two-layer softmax and FoX models learned the family at $r=14$ on every seed, at $r=18$ the two-layer softmax models failed on every seed and the two-layer FoX models succeeded on 8, and four-layer models learned both.
+A field-only FPA head with a dot product of dimension 1 learned the family on 12 seeds at $r=10$ and on 10 at $r=14$ . With the level of the query in place of the level of the key, as in StructFormer and PRPN, the same head succeeded on no seed, although it learned a family restricted to suffixes on 12 seeds.
+
+## B.3 Graded depths and varied durations
+
+Each sequence of the graded-depth family starts with $\langle\mathrm{s}\rangle$ and holds six keys whose tokens carry their levels, with consecutive levels 5, 6 or 7 apart.
+After each key come zero to three filler tokens, with probability 0.75 a dip, and zero to three fillers again, and the sequence ends with the query ?.
+A dip of depth $\eta\in\{1,2,3,4\}$ consists of three dip tokens whose levels lie $\eta$ , $\eta-1$ and $0$ below the key, in random order, and the target weight of key $j$ is proportional to $e^{-\eta_{j}}$ .
+The model had no positional information, its query came from the token ? alone, its keys came from their tokens alone, and its head dimension was 8.
+A seed fitted a test set when the weights on the keys, renormalised over the keys, were within total variation 0.05 of the target on at least 90% of the 2000 sequences.
+With fixed durations every deepest step lasted one step, and with varied durations each lasted one or two steps, drawn per dip.
+We drew the spacings of the levels, the fillers, the dips and their depths, orders and durations independently.
+
+Table 6: Graded depths with fixed and with varied durations, as seeds out of 15 that fitted the training distribution.
+The sum of dips replaces the minimum of FPA and keeps the same field.
+FPA, First Passage Attention.
+
+Model
+Fixed durations
+Varied durations
+
+FPA
+9/15
+13/15
+
+FPA, sum of dips
+15/15
+0/15
+
+Selective Attention
+15/15
+0/15
+
+The secondary test measured, on the seeds that fitted fixed durations, the change of the total variation when a deepest step was held two or three steps or a dip no deeper was inserted.
+The rule required both methods to fit fixed durations on 80% of the seeds, which FPA reached on only 9.
+After the pilots and before the main runs we decided that the deviation counts only the keys after the first one.
+The dip of the first key lies in the range of no other key, and the learned walks read its depth by summing increments.
+A separate family in which the levels follow the walk, built to check invariance on the side of FPA, was fitted by FPA and by its sum of dips on all 15 seeds.
+With every dip held 0 or 16 steps at its bottom instead of 4 to 8, the share of ordered sequences fell by at most 0.1 on 14 seeds of FPA and 10 of the sum of dips.
+Only FPA reached the preregistered line of 12 such seeds.
+
+## B.4 Two walks
+
+The two-walk family of Appendix A with $r=14$ has 8192 sequences in its complementary part, all of which formed the test set.
+The queries and keys had learned offsets per position and head, the final query came from the network of the alive-set family, and the fields of FPA read only the token embedding.
+The training data mixed uniform pairs of patterns (one half), complementary pairs (one quarter) and pairs in which one walk keeps every key (one eighth each).
+DCP used an interaction dimension of 2 and an $\alpha$ -sigmoid whose exponent rose from 1 to 2 during training.
+Its step function at inference can remove an alive key completely, so in the training loss only, we replaced a log-probability of exactly $-\infty$ by $-50$ .
+
+Table 7: Two walks with two heads of dimension 2, as seeds out of 15 that ordered the keys of both walks on at least 90% of the sequences.
+One mask per head is our variant of Selective Attention, in which every head computes its own selection.
+FPA, First Passage Attention.
+DCP, Dynamic Context Pruning.
+
+Model
+Complementary walks
+Identical walks
+
+FPA
+11/15
+—
+
+Selective Attention, shared mask
+0/15
+15/15
+
+Selective Attention, one mask per head
+13/15
+—
+
+DCP
+0/15
+13/15
+
+No run of a shared mask on the complementary part ordered more than 2,380 sequences or met the tolerance $1/30$ on more than 1,093, the bounds of Proposition 3.6.
+
+## B.5 Stack
+
+The stack family consists of random legal sequences of 40 operations, pushes of eight symbols and pops, with a stack depth of at most six.
+The target at the final query is uniform over the pushed items still on the stack, and the head dimension was 8.
+FPA succeeded on 14 seeds and FPA with the sum of dips on 11, and one-layer FoX, softmax attention with RoPE and Selective Attention succeeded on none.
+These competitors used the learning rates of an earlier check, and FoX used the default initialisation of its gates.
+We have no proof that they cannot learn the family in one layer, so we draw no comparison from them.
+
+## B.6 Retrieval among alive keys
+
+This task needs both parts of FPA at once.
+A sequence holds 16 slots and ends with a query for one name.
+Each slot is a key with a name in $\{0,\dots,5\}$ and a level in $\{1,\dots,8\}$ with probability 0.6 and a dip at a level otherwise, and zero or one filler follows it.
+A key is alive when no later dip falls below its level, and the queried name occurs four or five times with at least two alive occurrences whose margins differ.
+At least one dead occurrence precedes the first alive one and at least one lies between two alive ones, so neither a cut by position nor a choice by level alone solves the task.
+The target is uniform over the alive occurrences of the queried name.
+A seed succeeded when the head realised it with tolerance $0.1$ on at least 90% of the sequences, a rule that we chose after the pilots and before the main runs.
+Before any run we fitted strategies of each ablation in the hard limit on a sample of 8000 sequences.
+On a second sample of 2000 sequences from the same generator, separate from the test set of the main runs, the best that we found for any ablation reached $0.4905$ , below the preregistered line of $0.6$ .
+By that rule the results read as evidence that both the level of the key and retrieval by content are needed among these variants.
+
+Table 8: Retrieval among alive keys, as seeds out of 15 that succeeded.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+
+Model
+Seeds that succeed
+
+FPA
+15/15
+
+FPA without the level of the key ( $h\equiv 0$ )
+0/15
+
+FPA with the threshold of the query
+0/15
+
+FPA without content retrieval
+0/15
+
+FoX
+0/15
+
+Stick-breaking attention
+0/15
+
+Selective Attention
+13/15
+
+Softmax attention
+0/15
+
+## B.7 Tasks from earlier work
+
+We ran six published tasks at a smaller scale than their papers, so our numbers do not compare with theirs.
+Variable assignment follows Selective Attention (three variables, 1000 values, 32 assignments), and multi-query repeated associative recall (MQRAR) follows stick-breaking attention (64 keys, 256 key and value symbols).
+Flip-flop language modelling uses length 256 and a probability of 0.8 for the ignore instruction (Liu et al., 2023), and copying follows Selective Attention.
+Counting asks at every position how often its token occurred so far, and multi-query associative recall (MQAR) uses 16 pairs in sequences of 128 (Arora et al., 2024).
+The models were two-layer decoders of width 128 with two heads and a feed-forward width of 512, and a one-layer decoder of width 64 for flip-flop.
+FPA, FoX and Selective Attention used RoPE in addition to their mechanisms, although FoX uses none by default in its paper, and stick-breaking attention used no positional encoding, as in its paper.
+In variable assignment the other attention models used learned absolute positions in place of RoPE, as the paper of Selective Attention does.
+A long short-term memory network (LSTM) of the same depth and width served as a recurrent reference.
+Training lasted 4000 steps, and 8000 for MQAR, with a warm-up over the first 10% of the steps and weight decay on all parameters, although the papers of FoX and stick-breaking attention exempt the biases.
+A seed succeeded when its main accuracy reached $0.99$ , or for flip-flop when its error stayed at most $0.01$ .
+
+Table 9: Tasks from earlier work, as seeds out of 15 that succeeded.
+In variable assignment the softmax column used learned absolute positions in place of RoPE.
+MQRAR, multi-query repeated associative recall.
+MQAR, multi-query associative recall.
+FPA, First Passage Attention.
+RoPE, rotary position embedding.
+FoX, Forgetting Transformer.
+Sel. Att., Selective Attention.
+Stick-br., stick-breaking attention.
+LSTM, long short-term memory network.
+
+Task
+FPA
+Softmax + RoPE
+FoX
+Sel. Att.
+Stick-br.
+LSTM
+
+Variable assignment
+9/15
+0/15
+15/15
+2/15
+12/15
+15/15
+
+MQRAR
+0/15
+0/15
+0/15
+4/15
+0/15
+0/15
+
+Flip-flop
+15/15
+0/15
+15/15
+15/15
+0/15
+15/15
+
+Copying
+15/15
+15/15
+15/15
+15/15
+14/15
+15/15
+
+Counting
+15/15
+15/15
+15/15
+15/15
+15/15
+15/15
+
+MQAR
+0/15
+15/15
+14/15
+12/15
+15/15
+0/15
+
+MQAR, FPA without the bias in layer 1
+15/15
+—
+—
+—
+—
+—
+
+In pilot runs of two-layer FPA models on MQAR, the first layer learned to suppress the attention from each value to its own key.
+The previous-token head that starts the recall circuit therefore never formed.
+An exploratory inspection of the FPA language model found its previous-token heads in the second and third of its 12 layers.
+In these heads a large strength turned the bias into a narrow window, and the model copied as well as FoX did (Appendix C).
+Two exploratory checks, outside the preregistration, support this reading.
+Three- and four-layer FPA models failed MQAR on each of 4 seeds, and the same models without a bias in their first layer succeeded on each of 2 seeds.
+We also ran Selective Attention with the ReLU gradient of its paper in exploratory runs.
+It succeeded on 1, 3, 15, 15, 15 and 15 seeds of the six tasks in the order of Table 9, close to its results with the softplus gradient.
+
+## Appendix C Language models
+
+## C.1 Models, data and training
+
+All four models are pre-norm decoders with RMSNorm, a SwiGLU feed-forward network of width 2048, no biases and tied embeddings, with 12 layers of width 768 and 12 heads of dimension 64, following the 125M configuration of FoX (Lin et al., 2025a).
+Figures 22, 15 and 16 give the architecture and every setting.
+The vocabulary of 32,000 tokens gives 109.5M parameters for softmax attention and Selective Attention and 109.9M for FPA.
+FPA computes its field projection in single precision, uses no positional encoding and learns one strength per head.
+FoX uses the kernel of its authors without positional encoding and initialises its gate biases at zero, as its paper does for data-dependent gates.
+Selective Attention uses RoPE, and its selection has the ReLU gradient of its paper.
+Softmax attention uses RoPE with base 10,000.
+
+The training data was a chunk of SlimPajama (Soboleva et al., 2023) with every document wrapped in $\langle\mathrm{s}\rangle$ and $\langle/\mathrm{s}\rangle$ , and the validation and test sets were the first 20M tokens of its validation and test splits.
+The sources of SlimPajama come with their own terms of use and may include copyrighted text.
+We cut the training stream into non-overlapping windows of 2049 tokens, visited them in one fixed order for all four models and used each window at most once.
+Training ran 5,150 steps of 524,288 tokens, 2.70B tokens in total, with AdamW (0.9, 0.95), learning rate $2\times 10^{-3}$ after 512 warm-up steps and cosine decay to zero, weight decay 0.1 on the matrices, gradient clipping at 1.0 and half-precision autocast with loss scaling.
+All runs used one 12 GB partition of an NVIDIA Turing GPU (compute capability 7.5, without native bfloat16).
+Training took 23.8 hours for FPA, 21.5 for FoX, 38.9 for Selective Attention and 26.3 for softmax attention (Table 15).
+The evaluated model trained with an earlier version of the kernel of Section 4.3, which computes the same function (Appendix E).
+To time that kernel, we trained a second FPA model in an exploratory run of the same configuration with seed 2202, outside the preregistration.
+
+Figure 5 shows how the four models trained.
+FPA started more slowly than FoX and Selective Attention and had a higher validation loss at step 250.
+From step 500 on it had the lowest validation loss of the four at every evaluation.
+At the end its validation loss lay 0.020 nats below that of FoX, 0.006 below that of Selective Attention and 0.027 below that of softmax attention.
+
+Figure 5: Training of the four language models.
+(a) Training loss, averaged over 50 steps of 524,288 tokens, on a vertical axis that is logarithmic in the loss minus 2.75 nats.
+(b) Validation loss of each baseline minus that of FPA, on 1024 validation windows every 250 steps, so that positive values favour FPA.
+The triangles mark values beyond the axis, which were $-0.16$ for FoX at step 250 and $+0.46$ and $+0.25$ for softmax attention at steps 250 and 500.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+RoPE, rotary position embedding.
+
+## C.2 Evaluation and tests
+
+The test loss averaged the cross-entropy over the 20M test tokens in windows of 2048.
+WikiText-103 (Merity et al., 2017) used its test set, and PG-19 used up to four windows of 4096 tokens per test book and averaged the loss at positions 2048 to 4095 over 99 books.
+The passkey items hide a five-digit number in repeated filler text (Mohtashami and Jaggi, 2023), ten numbers at each of five depths, so 50 items at each of 1024, 2048, 3072 and 4096 tokens.
+The non-inferiority test resampled documents 10,000 times and compared the upper $1-\alpha$ quantile of the difference in test loss with $\ln 1.01$ .
+The extrapolation test resampled books and asked for an upper $1-\alpha/2$ quantile below zero, and the passkey test was an exact one-sided McNemar test at $\alpha/2$ on the items at 3072 and 4096.
+Evaluating in single precision changed the difference of the first test by less than $10^{-6}$ .
+
+## C.3 Amendments
+
+Three amendments changed the preregistration during the runs, and each was frozen before the result it affects existed.
+The first round of training, with a reference implementation of FPA at context 512, stopped before its first checkpoint, and the round reported here replaced it.
+The PG-19 evaluation first kept the carriage returns of the books, a token that the training data never contained, so we amended the extrapolation test to Unix newlines. We had seen the PG-19 losses of FPA and softmax attention at that point, but FoX, the comparator of the test, had not yet been evaluated.
+With carriage returns the test would also have supported FPA, with a difference of $-0.250$ nats.
+The carriage returns raised the loss of every model, by 1.34 to 1.97 nats on average in windows of 2048 tokens and most for softmax attention.
+Under both conventions FPA had the lowest loss beyond the training length (Figure 6).
+Selective Attention first trained with the softplus gradient of the probes.
+A preregistered check after 1000 steps favoured the ReLU gradient of its paper, and the reported model continued the run of that check, so it trained with the ReLU gradient from the start.
+Its mask and attention ran through a fused Triton kernel that we wrote for it, with a micro-batch of 2 instead of 4 and the same tokens per step.
+
+Figure 6: Loss by position on the PG-19 test books.
+Mean loss per bin of 64 positions in windows of 2048 and of 4096 tokens, up to four windows per book from 100 and 99 books.
+The top panels use Unix newlines, as the amended extrapolation test does, and the bottom panels keep the carriage returns of the books.
+The extrapolation test compared the positions 2048 to 4095 of panel (b).
+The vertical axes are logarithmic in the loss minus 3.1 nats in the top panels and 4.4 nats in the bottom panels, which spreads out the lowest losses.
+The models were trained with context 2048.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+RoPE, rotary position embedding.
+
+## C.4 Descriptive evaluations
+
+Table 10: FPA minus each baseline on the descriptive evaluations, with 95% bootstrap intervals in brackets.
+PG-19 losses come from windows of 16,384 tokens, passkey and NIAH (needle in a haystack) are accuracies on 50 items, and the downstream rows are zero-shot accuracies or log-likelihoods from the evaluation harness of Gao et al. (2024).
+Negative losses and positive accuracies favour FPA.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+RoPE, rotary position embedding.
+
+FPA minus
+FoX
+Selective Attention
+Softmax + RoPE
+
+PG-19 loss, 0–2k
+ $-$ 0.029 [ $-$ 0.033, $-$ 0.026]
+ $-$ 0.014 [ $-$ 0.024, $-$ 0.007]
+ $-$ 0.038 [ $-$ 0.050, $-$ 0.028]
+
+PG-19 loss, 2k–4k
+ $-$ 0.031 [ $-$ 0.037, $-$ 0.026]
+ $-$ 0.516 [ $-$ 0.540, $-$ 0.495]
+ $-$ 1.847 [ $-$ 1.939, $-$ 1.769]
+
+PG-19 loss, 4k–8k
+ $-$ 0.020 [ $-$ 0.027, $-$ 0.015]
+ $-$ 0.300 [ $-$ 0.317, $-$ 0.285]
+ $-$ 3.666 [ $-$ 3.806, $-$ 3.545]
+
+PG-19 loss, 8k–16k
+ $+$ 0.026 [ $+$ 0.019, $+$ 0.032]
+ $-$ 0.528 [ $-$ 0.557, $-$ 0.501]
+ $-$ 4.258 [ $-$ 4.428, $-$ 4.114]
+
+Passkey 8k
+ $+$ 0.80 [ $+$ 0.68, $+$ 0.90]
+ $+$ 1.00 [ $+$ 1.00, $+$ 1.00]
+ $+$ 1.00 [ $+$ 1.00, $+$ 1.00]
+
+Passkey 16k
+ $+$ 0.80 [ $+$ 0.68, $+$ 0.90]
+ $+$ 0.92 [ $+$ 0.84, $+$ 0.98]
+ $+$ 1.00 [ $+$ 1.00, $+$ 1.00]
+
+NIAH 4k, 1 needle
+ $-$ 0.06 [ $-$ 0.20, $+$ 0.08]
+ $+$ 0.12 [ $+$ 0.04, $+$ 0.22]
+ $+$ 0.12 [ $+$ 0.04, $+$ 0.22]
+
+NIAH 4k, 4 needles
+ $+$ 0.08 [ $-$ 0.06, $+$ 0.22]
+ $+$ 0.20 [ $+$ 0.10, $+$ 0.32]
+ $+$ 0.20 [ $+$ 0.10, $+$ 0.32]
+
+NIAH 8k, 1 needle
+ $-$ 0.06 [ $-$ 0.14, $+$ 0.00]
+ $+$ 0.04 [ $+$ 0.00, $+$ 0.10]
+ $+$ 0.04 [ $+$ 0.00, $+$ 0.10]
+
+NIAH 8k, 4 needles
+ $+$ 0.04 [ $-$ 0.06, $+$ 0.16]
+ $+$ 0.10 [ $+$ 0.02, $+$ 0.18]
+ $+$ 0.10 [ $+$ 0.02, $+$ 0.18]
+
+LAMBADA log-likelihood
+ $+$ 0.15 [ $+$ 0.11, $+$ 0.19]
+ $+$ 0.28 [ $+$ 0.23, $+$ 0.32]
+ $+$ 0.42 [ $+$ 0.37, $+$ 0.46]
+
+LAMBADA accuracy
+ $-$ 0.001 [ $-$ 0.010, $+$ 0.008]
+ $+$ 0.014 [ $+$ 0.004, $+$ 0.023]
+ $+$ 0.028 [ $+$ 0.019, $+$ 0.038]
+
+HellaSwag accuracy
+ $+$ 0.005 [ $-$ 0.001, $+$ 0.010]
+ $+$ 0.005 [ $-$ 0.000, $+$ 0.011]
+ $-$ 0.000 [ $-$ 0.006, $+$ 0.005]
+
+PIQA accuracy
+ $+$ 0.018 [ $+$ 0.003, $+$ 0.033]
+ $+$ 0.007 [ $-$ 0.008, $+$ 0.022]
+ $+$ 0.007 [ $-$ 0.008, $+$ 0.022]
+
+ARC-Easy accuracy
+ $+$ 0.003 [ $-$ 0.014, $+$ 0.019]
+ $+$ 0.010 [ $-$ 0.007, $+$ 0.027]
+ $+$ 0.013 [ $-$ 0.003, $+$ 0.029]
+
+ARC-Challenge accuracy
+ $-$ 0.002 [ $-$ 0.020, $+$ 0.016]
+ $-$ 0.004 [ $-$ 0.021, $+$ 0.014]
+ $-$ 0.009 [ $-$ 0.026, $+$ 0.009]
+
+WinoGrande accuracy
+ $-$ 0.028 [ $-$ 0.060, $+$ 0.006]
+ $-$ 0.026 [ $-$ 0.060, $+$ 0.009]
+ $-$ 0.022 [ $-$ 0.056, $+$ 0.013]
+
+Each needle-in-a-haystack item hides one or four sentences of the form “The pass key of name is number.” at random sentence boundaries in a passage of a PG-19 test book.
+The item then asks for the key of one name, and there were 50 items for each length and number of needles.
+The downstream tasks were LAMBADA (Paperno et al., 2016), HellaSwag (Zellers et al., 2019), PIQA (Bisk et al., 2020), ARC (Clark et al., 2018) and WinoGrande (Sakaguchi et al., 2020).
+At this scale all four models stayed close to chance on most of them, and most differences had intervals that contained zero.
+On the SlimPajama test set FPA had a lower loss than FoX at every position bucket of the window, by 0.008 to 0.022 nats.
+FPA retrieved every passkey at all six lengths, from 1024 to 16,384 tokens (Figure 3).
+FoX fell from 1.00 at 2048 tokens to 0.58 at 4096 and 0.20 beyond, and Selective Attention retrieved 0.80 at 2048 tokens and almost none beyond 3072.
+Softmax attention retrieved about half of the passkeys even within its training length.
+A probe during training measured the greedy accuracy on the second copy of a span every 1000 steps (Figure 7).
+At the end the four models copied 0.91 to 0.93 of the tokens at a gap of 0 tokens, 0.83 to 0.85 at 128 and 0.68 to 0.71 at 320, with softmax attention highest at every gap.
+
+Figure 7: Copying during training.
+Greedy accuracy on the second copy of a span of text at gaps of 0, 128 and 320 tokens between the two copies, every 1000 steps and at the last step.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+RoPE, rotary position embedding.
+
+Table 11: RULER and BABILong, mean accuracy over the 13 tasks of RULER and the five tasks qa1 to qa5 of BABILong, at the context lengths of the columns.
+All models were trained with context 2048.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+RoPE, rotary position embedding.
+
+RULER, 13 tasks
+BABILong, qa1–qa5
+
+Method
+4k
+8k
+16k
+0k
+4k
+
+FPA
+0.208
+0.202
+0.051
+0.082
+0.006
+
+FoX
+0.218
+0.117
+0.072
+0.078
+0.000
+
+Selective Attention
+0.005
+0.008
+0.043
+0.080
+0.000
+
+Softmax + RoPE
+0.002
+0.002
+0.000
+0.088
+0.000
+
+## C.5 A demonstration without a usable task
+
+We preregistered a zero-shot demonstration in generated text with five worlds, on scopes in Python code, on who saw which hidden object, on branches in a version history, on stop-loss orders and on a parenthetical remark about a novel.
+Each world had 200 items and two kinds of control items that any model with the needed reading skill should answer.
+One kind asks for the most recent mention of a candidate, and the other for an older mention that its content identifies.
+The preregistered rule made a world usable when at least two models answered both kinds above chance by an exact lower bound.
+No model did so in any world (Table 12), so no world was usable and we ran no test.
+Several models answered one kind of control item well and the other below chance.
+
+Table 12: Control items of the zero-shot demonstration, as accuracy over 200 items without inserted filler sentences.
+The recent items ask for the most recent mention and the older items for an older mention that its content identifies.
+Chance is 0.5, and bold marks an exact lower 95% bound above chance.
+A world needed two models with both kinds in bold.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+Sel. Att., Selective Attention.
+
+FPA
+FoX
+Sel. Att.
+Softmax
+
+World
+recent
+older
+recent
+older
+recent
+older
+recent
+older
+
+Scopes in Python code
+0.24
+0.66
+0.01
+0.86
+0.39
+0.77
+0.45
+0.52
+
+Who saw a hidden object
+0.52
+0.62
+0.47
+0.69
+0.41
+0.67
+0.69
+0.49
+
+Branches in a version history
+0.41
+0.60
+0.40
+0.60
+0.27
+0.73
+0.45
+0.56
+
+Stop-loss orders
+0.51
+0.59
+0.79
+0.33
+0.36
+0.41
+0.41
+0.53
+
+A parenthetical remark
+0.55
+0.56
+0.69
+0.30
+0.77
+0.38
+0.77
+0.33
+
+We report the design for completeness and draw no conclusion from it.
+
+## C.6 Observational analysis
+
+A preregistered analysis read the final FPA checkpoint on the SlimPajama test stream, on the CPU and without changing the model.
+For the alive sets it used the first 256 windows of 2048 tokens and the queries at positions from 1024 on.
+A key counted as dead when its bias was below $-10$ and as alive when its bias was at least $-1$ .
+For the brackets it used the first 256 windows inside one document with at least 32 bracket tokens, and it compared the walk with the bracket depth by a Spearman correlation after removing a linear trend in position from both.
+A null distribution came from 1000 cyclic shifts of the depth within each window, and the familywise test took the maximum over the 144 heads.
+
+The median head marked 96.5% of the keys as dead and 0.3% as alive.
+In 19 heads more than 10% of the alive sets were not suffixes, and in two heads of the first layer almost all were, with most of the attention on alive keys older than the newest dead key.
+In 60 heads the mean increment at opening brackets and at closing brackets had opposite signs.
+In 103 heads the median correlation lay outside the band of their own null distribution, against 1.44 expected by chance, and 82 heads passed the familywise test at $0.01$ , 81 of them with a positive correlation.
+The correlations were small, with a median absolute value of 0.032 over heads and a maximum of 0.248, and their significance comes from their consistency over 256 windows.
+The detrended correlation mixes the level of the depth with the order of positions within a level, so we read these numbers as descriptions, not as evidence that the model tracks brackets.
+
+Figure 8: The three preregistered windows of the observational analysis.
+Each column shows one window with the head that the preregistered rule chose for it, with layers and heads counted from 1.
+The top panels show the walk $W$ of that head, with the bracket depth shaded.
+The middle and bottom panels show the bias and the attention weight of every key at the last query of the window, with the alive keys marked, among them the query itself.
+Attention weights below $10^{-7}$ are drawn at that value.
+The walks of all three heads fall almost linearly, so their biases resemble that of FoX.
+FoX, Forgetting Transformer.
+
+Figure 8 shows the three windows that a fixed seed chose before the analysis, each with the head of the largest standardised contrast between opening and closing brackets in that window.
+The preregistration also placed the first window in the main text, and we moved it here for space.
+In window 268 the only alive key at the last query is the query itself, which receives 0.90 of the attention.
+
+Figure 4 looks at the steps of the walk instead of the walk itself.
+In window 268 the chosen head stepped up by 4.70 on average where the depth rose and down by 5.51 where it fell, against $-0.29$ at the other tokens.
+Over all 256 windows, 56 heads had increments of opposite signs at opening and closing brackets together with a familywise significant correlation.
+Figure 9 shows the same alignment in the two other windows, with steps about ten times smaller.
+
+Figure 9: Steps of the walk at brackets in the two other preregistered windows.
+Increments $\delta_{t}$ of layer 1, head 6, the head that the rule chose for both windows, along the whole window, with the bracket depth shaded and darker where brackets nest.
+The steps are about ten times smaller than in Figure 4 but keep their signs, with means of $+0.41$ and $+0.38$ where the depth rises and $-0.50$ and $-0.51$ where it falls.
+
+Figure 10 shows the share of alive keys for every head of the final model.
+Most heads keep a few keys alive, and a few heads keep nearly all of them.
+The 19 heads whose alive sets are often not suffixes lie in nine of the twelve layers, and their shares of alive keys range from 0.3% to 92%.
+Figure 11 counts where keys die.
+In the median head the share of deaths at $\langle\mathrm{s}\rangle$ and $\langle/\mathrm{s}\rangle$ was 6.6 times their share of the tokens.
+We took as local the 95 heads with a share of alive keys below 0.03.
+On the 12 windows of the exploratory checks of Section C.7, this threshold agrees with a median alive span below 64 tokens for 138 of the 144 heads of the final model.
+Averaged over these heads, a token killed 0.98 keys per occurrence, about one for each new token.
+The end-of-document token killed 15 keys, and capitalised words without a space before them killed 4.5 to 8.2.
+
+Figure 10: Alive keys of every head in the final FPA model.
+Each cell gives the percentage of keys with a bias of at least $-1$ over the queries from position 1024 on in 256 test windows, with layers and heads counted from 1.
+Dots mark the 19 heads whose alive sets are not suffixes at more than 10% of the queries.
+FPA, First Passage Attention.
+
+Figure 11: Where keys die in the final FPA model.
+Keys killed per occurrence of a token, averaged over the 95 local heads, for the 15 tokens with the highest rate among those occurring at least 30 times in 256 test windows.
+A visible space marks a token that starts with a space, and the dashed line is the mean over all tokens.
+FPA, First Passage Attention.
+
+## C.7 Exploratory checks at three checkpoints
+
+We inspected the FPA model at steps 1500 and 3250 of 5150 during training and at its final checkpoint, always on the same 12 validation windows of 2048 tokens.
+These checks were exploratory and outside every preregistered test.
+They used the reference implementation in single precision on the CPU and the thresholds of Section C.6, and the figures redraw the numbers recorded at the time.
+The figures show the final checkpoint and add the two earlier steps where training changed the result.
+Table 13 summarises the three checks.
+
+Table 13: Three checks of the FPA language model, at steps 1500 and 3250 of 5150 and at the final step, on the same 12 validation windows of 2048 tokens.
+Local, middle and global heads have median alive spans below 64 tokens, from 64 to 1023 tokens and from 1024 on.
+Alive sets count as often not suffixes when at least 20% of the queries have an alive key older than a dead one.
+Document heads keep at least 80% of the keys within a document and at most 5% across documents.
+The copying items differ from those of Figure 7.
+FPA, First Passage Attention.
+
+Step 1500
+Step 3250
+Step 5150
+
+Mean loss over the 12 windows
+3.162
+2.917
+2.821
+
+Mean loss with the bias of every layer removed
+6.591
+7.335
+7.828
+
+Loss increase with alive sets forced into suffixes
+ $+$ 0.032
+ $+$ 0.031
+ $+$ 0.032
+
+   windows with a positive increase
+12 of 12
+12 of 12
+12 of 12
+
+Local, middle and global heads
+90, 22, 32
+90, 20, 34
+90, 20, 34
+
+Heads whose alive sets are often not suffixes
+21
+15
+14
+
+Heads whose walk is not monotone
+106
+109
+112
+
+Document heads
+7
+9
+9
+
+Copying accuracy, gap of 0 tokens
+0.89
+0.93
+0.93
+
+Copying accuracy, gap of 320 tokens
+0.78
+0.82
+0.84
+
+Copying accuracy, gap of 1000 tokens
+0.61
+0.63
+0.65
+
+Removing the bias of every layer raised the loss on the 12 windows by 3.43, 4.42 and 5.01 nats at the three steps.
+On the first four windows the first layer carried most of this increase, and its part grew from 1.49 to 2.67 and 3.48 nats (Figure 12).
+At the final step the loss without the bias rose with position from 6.1 to 8.7 nats, while with the bias it fell from 3.9 to 2.9 (Figure 13).
+Forcing the alive sets into suffixes, the sets that a forget gate can express, raised the loss on all 12 windows at every step, by 0.032, 0.031 and 0.032 nats on average (Figure 14).
+
+Figure 12: The bias removed at three checkpoints of the FPA model.
+Loss increase on the first four validation windows when the bias of all layers or of one layer is set to zero, at steps 1500, 3250 and 5150, the last step of training, on a logarithmic axis.
+FPA, First Passage Attention.
+
+Figure 13: Loss by position at three checkpoints.
+(a) Loss per bin of 64 positions over the 12 validation windows, with the bias and with the bias of every layer removed.
+(b) Loss increase when the alive sets of every head are forced into suffixes, the sets that a forget gate can express.
+
+Figure 14: Alive sets forced into suffixes, per validation window.
+Loss increase on each of the 12 windows at steps 1500, 3250 and 5150, with the means of 0.032, 0.031 and 0.032 nats as dashed lines.
+
+Figure 15 shows the median alive span of every head of the final model.
+Of the 144 heads, 90 kept keys alive for fewer than 64 positions, 20 for 64 to 1023 and 34 for longer, the same counts as at step 3250.
+Between steps 1500 and 3250 the spans of 17 heads changed by a factor of two or more, and between step 3250 and the end only those of two heads did.
+Averaged over the local heads, a token killed about one key per occurrence at every step, 0.99, 0.98 and 0.98 (Figure 16).
+The six tokens that killed most were the same at all three steps, and their rates grew during training, from 1.90 to 2.55 for a newline and from 3.17 to 3.84 for the token The without a space before it.
+
+Figure 15: Median alive span of every head in the final FPA model.
+Spans over the queries 1024 to 2047 of the 12 validation windows, with layers and heads counted from 1.
+Triangles mark the 21 heads whose span grew or shrank by a factor of two or more since step 1500.
+FPA, First Passage Attention.
+
+Figure 16: Where keys die at three checkpoints.
+Keys killed per occurrence of a token, averaged over the 90 local heads of each step, those with a median alive span below 64 tokens.
+The bars give the final step for its 15 tokens with the highest rate among those occurring at least 30 times in the 12 validation windows.
+Markers give steps 1500 and 3250 where the token was among the 15 highest at that step.
+A visible space marks a token that starts with a space, \n is the newline, and the dashed line is the mean over all tokens at the final step.
+
+In every layer of the final model the attention that queries paid to earlier documents stayed between 0.002 and 0.10 with the bias (Figure 17).
+Without the bias it rose to 0.10 to 0.21, against 0.42 for weights spread evenly over the visible keys.
+Figure 18 shows, for heads that we selected by inspection, the share of keys of each token class that stayed alive 256 positions later.
+Layer 1, head 10 kept capitalised words (0.93) and word continuations (0.83) but no digits.
+Its alive keys therefore do not form a suffix, which no forget gate can produce.
+The document heads kept nearly every key within a document and none across a document boundary.
+
+Figure 17: Attention on earlier documents at three checkpoints.
+Attention that queries pay to the keys of earlier documents, averaged over the heads of each layer, with the bias and with the bias of every layer removed.
+The dotted line is the share that weights spread evenly over the visible keys would give.
+
+Figure 18: Retention by token class in the final FPA model.
+Share of the keys of each class that are still alive 256 positions later, for pairs of key and query in one document, and in the last column for pairs across a document boundary.
+Content heads lie above the line and the document heads of step 3250 below it, with layers and heads counted from 1.
+By the final step layer 9, head 5 kept only 76% of the keys within a document and no longer counted as a document head.
+FPA, First Passage Attention.
+
+Figures 19, 20 and 21 show the bias of three heads of the final model on stretches of 64 tokens.
+Layer 1, head 1 let groups of keys stop being alive at the end of a statement and at newlines, dots and underscores in C++ code.
+Layer 1, head 10 let articles, prepositions and punctuation lose their weight at the next token in a news report and kept content words.
+Layer 4, head 9 removed the previous document at its end-of-document token.
+Copying improved during training (Table 13).
+The ablations show that the trained FPA model relies on these structures, not that a model trained with FoX could not reach the same function in another way.
+
+Figure 19: The bias of layer 1, head 1 on C++ code in the final FPA model.
+Weight factor $e^{b_{ts}}$ of every key $s$ for every query $t$ at positions 1100 to 1163 of validation window 0, with factors below 0.02 left white.
+A key is alive while its factor is at least $e^{-1}$ .
+Groups of keys stop being alive at once, nine at the end of a statement and three to six at newlines, dots and underscores.
+FPA, First Passage Attention.
+
+Figure 20: The bias of layer 1, head 10 on a news report in the final FPA model.
+Weight factor $e^{b_{ts}}$ at positions 1100 to 1163 of validation window 680, with factors below 0.02 left white.
+Articles, prepositions, punctuation and newlines stop being alive at the next token, while content words such as said and page stay alive to the end of the stretch.
+FPA, First Passage Attention.
+
+Figure 21: The bias of layer 4, head 9 at a document boundary in the final FPA model.
+Weight factor $e^{b_{ts}}$ at positions 233 to 296 of validation window 680, with factors below 0.02 left white.
+At the end-of-document token 36 of the 39 earlier keys of the stretch stop being alive, and at the start-of-document token the others do.
+No key of the stretch before the boundary stays alive in the next document.
+FPA, First Passage Attention.
+
+## Appendix D Architectures and training configurations
+
+This appendix collects the architectures, the hyperparameters and the searches of all experiments in one place, with every value read from the records of the runs.
+
+## D.1 Architecture
+
+All our models are causal decoders with pre-norm blocks, and the methods differ only in the bias that each attention layer adds to its logits (Table 14).
+Figure 22 shows the FPA model down to the operations of one head.
+FPA computes its three scalars per head with one linear map from the same normalised input as the queries, keys and values.
+The walk sums the increments over positions, the range minimum runs over the positions after each key, and the strength turns the depth of the deepest dip into the bias.
+The bias enters every head of every layer before the softmax, and FPA uses no other positional information.
+In training the forward pass takes the hard minimum and the backward pass the gradient of a soft minimum with $\tau=1$ (Section 2).
+Our kernel computes the range minimum in blocks of 64 positions without a matrix of size $T\times T$ (Appendix E).
+
+(a)InputsTokenEmbedding $L\times$ RMSNormMulti-HeadAttention $+$ RMSNormSwiGLUFeed Forward $+$ RMSNormLinearSoftmaxOutput Probabilities(b) $x$ LinearLinearLinearLinearFirst PassageAttention $H$ $V$ $K$ $Q$ $\delta,g,h$ ConcatLinear(c) $V$ $Q$ $K$ $g$ $\delta$ $h$ MatMulScale $+$ MaskSoftMaxMatMulCumSum $+$ RangeMin $+$ Sub $\min(0,\cdot)$ $\times$ $\beta$ $W$ $\phi$ $\bar{\phi}$ $\psi$ $B$ 
+
+Figure 22: Architecture of the FPA language model.
+(a) Pre-norm decoder with $L=12$ blocks of width 768.
+(b) Multi-head attention with $H=12$ heads of dimension $d=64$ , in which a fourth linear map gives every head its increments $\delta$ and offsets $g$ and $h$ .
+(c) One head, in which the bias $B$ with the entries $b_{ts}$ joins the scaled scores before the causal mask.
+RangeMin returns $\bar{\phi}_{ts}=\min_{s<u\leq t}\phi_{u}$ for every query $t$ and key $s$ , and Sub returns $\bar{\phi}_{ts}-\psi_{s}$ .
+The parts of FPA are orange, and the one-layer probes use the attention of panel (b) alone on token embeddings.
+FPA, First Passage Attention.
+RMSNorm, root mean square normalisation.
+SwiGLU, gated linear unit with the Swish activation.
+
+Table 14: Bias that each method adds to the logit $q_{t}^{\top}k_{s}/\sqrt{d}$ of key $s$ at query $t$ , with the parameters that it adds to a layer of width $D=768$ with $H=12$ heads and its positional encoding in the language models.
+FoX has one gate $f_{u}$ per head with a weight vector $w$ , a bias $c$ and the logistic function $\sigma$ .
+Selective Attention takes $q^{(1)}$ and $k^{(1)}$ from its first head, shares the bias among all heads and never masks the start token.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+Sel. Att., Selective Attention.
+RoPE, rotary position embedding.
+
+Method
+Bias $b_{ts}$ added to the logit
+Parameters per layer
+Positions
+
+FPA
+ $\beta\min\bigl(0,\min_{s<u\leq t}\phi_{u}-\psi_{s}\bigr)$ with $\phi=W+g$ , $\psi=W+h$ 
+ $3H(D+1)+H=27{,}696$ 
+none
+
+FoX
+ $\sum_{s<u\leq t}\log f_{u}$ with $f_{u}=\sigma(w^{\top}x_{u}+c)$ 
+ $H(D+1)=9{,}228$ 
+none
+
+Sel. Att.
+ $-\sum_{s<u<t}\max\bigl(0,\,q_{u}^{(1)\top}k_{s}^{(1)}/\sqrt{d}\bigr)$ 
+0
+RoPE
+
+Softmax
+0
+0
+RoPE
+
+## D.2 Language models
+
+Table 15 describes the four language models and Table 16 their common training.
+All four used the same data in the same order, the same schedule and the hyperparameters of the 125M recipe of FoX, without a search.
+They differ in the attention, its positional encoding, its kernel and the split of each batch into micro-batches, which changes the gradient only through rounding.
+
+Table 15: The four language models.
+Parameters count the tied embeddings once.
+Throughput and time cover the whole run of 5150 steps with its validations and checkpoints on the GPU of Appendix C.
+For FPA, throughput, time and memory come from an exploratory run of the same configuration with seed 2202 and the kernel of Section 4.3, outside the preregistration.
+Table 3 instead gives the throughput that we measured in the benchmark over 12 training steps after 8 steps of warm-up.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+Sel. Att., Selective Attention.
+MLP, multilayer perceptron.
+SwiGLU, gated linear unit with the Swish activation.
+RMSNorm, root mean square normalisation.
+RoPE, rotary position embedding.
+SDPA, the scaled dot-product attention of PyTorch.
+GPU, graphics processing unit.
+GiB, gibibyte.
+
+FPA
+FoX
+Sel. Att.
+Softmax
+
+Parameters
+109,862,208
+109,640,592
+109,529,856
+109,529,856
+
+   of the attention mechanism
+332,352
+110,736
+0
+0
+
+Layers and width
+12 and 768
+
+Heads $\times$ head dimension
+12 $\times$ 64
+
+MLP
+SwiGLU with hidden width 2048
+
+Normalisation
+RMSNorm before each sublayer and before the output layer
+
+Linear layers
+without biases, except the field projection of FPA and the gates of FoX
+
+Vocabulary
+32,000, input and output embeddings tied
+
+Positional encoding
+none
+none
+RoPE
+RoPE
+
+Attention kernel
+ours, Triton
+of FoX, Triton
+ours, Triton
+SDPA
+
+Micro-batch $\times$ accumulation
+4 $\times$ 64
+4 $\times$ 64
+2 $\times$ 128
+4 $\times$ 64
+
+Tokens per second
+31,473
+34,870
+19,298
+28,517
+
+Training time (hours)
+23.8
+21.5
+38.9
+26.3
+
+Peak GPU memory (GiB)
+9.3
+9.0
+5.8
+9.2
+
+Table 16: Training of the language models, the same for all four.
+FPA, First Passage Attention.
+Sel. Att., Selective Attention.
+FoX, Forgetting Transformer.
+ReLU, rectified linear unit.
+
+Setting
+Value
+
+Data
+SlimPajama, windows of 2049 tokens in one fixed order, each used at most once
+
+Tokenizer
+that of Mistral 7B, 32,000 tokens
+
+Context
+2048 tokens
+
+Batch
+256 windows, 524,288 tokens
+
+Steps
+5150, 2.70B tokens
+
+Optimiser
+AdamW with $(0.9,0.95)$ 
+
+Learning rate
+ $2\times 10^{-3}$ , linear warm-up over 512 steps, cosine decay to 0
+
+Weight decay
+0.1 on weight matrices and embeddings, none on gains, biases and strengths
+
+Gradient clipping
+1.0
+
+Precision
+half-precision autocast with loss scaling, the field of FPA and the selection of Sel. Att. in single precision
+
+Initialisation
+embeddings $\mathcal{N}(0,0.02^{2})$ , linear layers as in PyTorch, $\beta=1$ in FPA, gate bias 0 in FoX
+
+Minimum of FPA
+hard in the forward pass, gradient of the soft minimum with $\tau=1$ 
+
+Selection of Sel. Att.
+gradient of the ReLU, as in its paper
+
+Seed
+2201 for the initialisation and the order of the data, in all models
+
+Validation
+every 250 steps on 1024 windows
+
+Hyperparameter search
+none, the 125M recipe of FoX in all models
+
+## D.3 Software and compute
+
+All runs used PyTorch 2.5.1 with CUDA 12.1 and Triton 3.1.0 under Python 3.12 on the GPU of Appendix C.
+The preregistered batch of probes and tasks had 1,815 runs, 15 seeds in each of 121 settings, which took 73.5 hours summed over the runs.
+Training the four language models with the kernels of Table 15 took 110.5 hours.
+
+## D.4 One-layer probes and tasks from earlier work
+
+Table 17 gives the training of the probes of Appendix B and of the small decoders of Section B.7, and Tables 18 and 19 give their models.
+Table 20 gives the declared search, and Table 21 the configurations of the reported runs.
+The pilots selected these configurations by the rules of Appendix B, and a file with a hash froze them before the reported runs.
+
+Table 17: Training of the one-layer probes and of the tasks from earlier work.
+FPA, First Passage Attention.
+MQAR, multi-query associative recall.
+
+One-layer probes
+Tasks from earlier work
+
+Optimiser
+AdamW with $(0.9,0.98)$ , weight decay 0.01 on every parameter
+
+Batch
+64 sequences, drawn afresh at every step
+
+Steps
+4000, 16,000 on the graded depths
+4000, 8000 for MQAR
+
+Warm-up
+200 steps
+10% of the steps
+
+Schedule
+cosine decay to 0, gradient clipping at 1.0
+
+Precision
+single
+
+Loss
+cross-entropy of the weights at the final query
+cross-entropy at the target positions
+
+Width
+64, the token embedding
+128, and 64 for flip-flop
+
+Seeds
+1801 to 1815 for the reported runs, 1616 to 1619 for tuning
+
+FPA
+straight-through minimum with $\tau=1$ , initial strength $\beta=1$ per head
+
+Table 18: Models of the one-layer probes, with one supervised attention layer on token embeddings of width 64 and the head dimension $d$ .
+On the alive sets every key has a learned offset per position and head, FPA, FoX, Selective Attention and softmax attention add RoPE, ALiBi adds its fixed slope, and NoPE and stick-breaking attention use the offsets alone.
+The positive controls of the alive sets use $d=r+2$ , and the field-only FPA of Table 5 uses $d=1$ without positional information.
+The two- and four-layer models put one or three pre-norm blocks with 4 heads and an MLP of width 256 before the supervised layer.
+On the alive sets and the two walks an MLP of the one-hot sequence with a hidden layer of width 256 gives the final query.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+RoPE, rotary position embedding.
+ALiBi, attention with linear biases.
+NoPE, no positional encoding.
+MLP, multilayer perceptron.
+
+Family
+Heads $\times$ $d$ 
+Positions
+Final query
+Steps
+Test set
+
+One-layer probes, width 64
+
+Alive sets
+1 $\times$ 4
+key offsets, RoPE or ALiBi
+MLP of the sequence
+4000
+all $2^{r-1}$ 
+
+   two and four layers
+1 $\times$ 4
+RoPE
+last token
+4000
+all $2^{r-1}$ 
+
+Graded depths
+1 $\times$ 8
+none
+token ?
+16,000
+2,000 per set
+
+Two walks
+2 $\times$ 2
+query and key offsets
+MLP of the sequence
+4000
+8,192
+
+Stack
+1 $\times$ 8
+RoPE
+last token
+4000
+1,000
+
+Retrieval
+1 $\times$ 8
+none
+query token
+4000
+2,000
+
+Table 19: Models of the tasks from earlier work, decoders with LayerNorm before each sublayer, an MLP with the Gaussian error linear unit, tied embeddings initialised as $\mathcal{N}(0,0.02^{2})$ and the head dimension $d$ .
+The last three columns give the parameters of FPA, of softmax attention with RoPE and of an LSTM of the same depth and width.
+In variable assignment the attention models use learned absolute positions, elsewhere RoPE, and stick-breaking attention uses none.
+Variable assignment also has 2000 test sequences with only two values, and flip-flop 10,000 sparse and 2000 dense ones.
+MLP, multilayer perceptron.
+MQRAR, multi-query repeated associative recall.
+MQAR, multi-query associative recall.
+FPA, First Passage Attention.
+RoPE, rotary position embedding.
+LSTM, long short-term memory network.
+
+Task
+Layers $\times$ width
+Heads $\times$ $d$ 
+MLP
+Positions
+Steps
+Test sequences
+FPA
+Softmax
+LSTM
+
+Variable assignment
+2 $\times$ 128
+2 $\times$ 64
+512
+learned
+4000
+2,000
+534,672
+533,120
+393,088
+
+MQRAR
+2 $\times$ 128
+2 $\times$ 64
+512
+RoPE
+4000
+2,000
+462,992
+461,440
+329,856
+
+Flip-flop
+1 $\times$ 64
+2 $\times$ 32
+256
+RoPE
+4000
+2,000
+50,632
+50,240
+33,664
+
+Copying
+2 $\times$ 128
+2 $\times$ 64
+512
+RoPE
+4000
+2,000
+399,888
+398,336
+266,752
+
+Counting
+2 $\times$ 128
+2 $\times$ 64
+512
+RoPE
+4000
+2,000
+407,696
+406,144
+274,560
+
+MQAR
+2 $\times$ 128
+2 $\times$ 64
+512
+RoPE
+8000
+2,000
+1,445,904
+1,444,352
+1,312,768
+
+Table 20: Declared search of the probes and of the tasks from earlier work.
+Each configuration ran with two tuning seeds, later four, and a grid whose end was selected was extended once by a decade (Table 4 counts the runs).
+The 12 learning rates are equally spaced on a logarithmic scale and served softmax attention with RoPE, NoPE or ALiBi and stick-breaking attention on the alive sets.
+After the pilots the straight-through minimum replaced the four definitions of FPA, and its learning rate was selected again.
+On retrieval FoX and Selective Attention kept the settings selected on the alive sets and the two walks, on the stack they used the default initialisation of PyTorch and the scale 1, and on the tasks from earlier work the gate bias 0 and the scale 1.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+Sel. Att., Selective Attention.
+DCP, Dynamic Context Pruning.
+RoPE, rotary position embedding.
+NoPE, no positional encoding.
+ALiBi, attention with linear biases.
+
+Method
+Second setting
+Values
+Learning rates
+Runs
+
+Alive sets, graded depths and two walks, per method and family
+
+FPA
+definition of the minimum
+hard, soft with $\tau=1$ , annealed, soft then hard
+ $\{1,3,10\}\times 10^{-3}$ 
+24
+
+FoX
+initial bias of the gates
+0, 2, 4, 6
+ $\{1,3,10\}\times 10^{-3}$ 
+24
+
+Sel. Att.
+selection scale $\omega$ 
+1, 1/3, 3, 10
+ $\{1,3,10\}\times 10^{-3}$ 
+24
+
+DCP
+initial interaction bias
+2, 0, 4, 8
+ $\{1,3,10\}\times 10^{-3}$ 
+24
+
+Softmax, stick-breaking
+none
+
+12 from $10^{-4}$ to $10^{-1}$ 
+24
+
+Stack, retrieval, ablations and deeper models, per method and family
+
+Every method
+fixed
+
+ $\{1,3,10\}\times 10^{-3}$ 
+6
+
+Tasks from earlier work, per method and task
+
+Every method
+fixed
+
+ $\{1,3,10\}\times 10^{-3}$ 
+6
+
+Table 21: Learning rates of the reported runs, with the second setting in brackets, namely the initial gate bias of FoX, the selection scale of Selective Attention and the initial bias of the interaction scores of DCP.
+The alive sets used one configuration for every $r$ and, for the competitors, for their positive controls.
+Selective Attention with the scale 1 of its paper used $10^{-3}$ on the alive sets, and with one mask per head the scale 3 and $3\times 10^{-2}$ on the two walks.
+The two- and four-layer models of FoX and of softmax attention used $3\times 10^{-3}$ and $10^{-2}$ .
+FPA used $3\times 10^{-3}$ with the field only and $10^{-2}$ with the level of the query on the alive sets.
+On retrieval it used $3\times 10^{-3}$ without the level of the key, $3\times 10^{-2}$ with the level of the query and $10^{-3}$ without content, and on MQAR $10^{-3}$ without a bias in its first layer.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+Sel. Att., Selective Attention.
+DCP, Dynamic Context Pruning.
+RoPE, rotary position embedding.
+NoPE, no positional encoding.
+ALiBi, attention with linear biases.
+MQRAR, multi-query repeated associative recall.
+MQAR, multi-query associative recall.
+LSTM, long short-term memory network.
+
+Alive sets
+Graded depths
+Two walks
+Stack
+Retrieval
+
+FPA
+0.03
+0.003
+0.001
+0.1
+0.01
+
+FPA, sum of dips
+
+0.003
+
+0.1
+
+FoX
+0.03 (6)
+
+0.003
+0.03 (6)
+
+Sel. Att.
+0.03 (10)
+0.03 (1)
+0.03 (1/3)
+0.001 (1)
+0.03 (1/3)
+
+DCP
+
+0.01 (0)
+
+Softmax with RoPE
+0.0534
+
+0.001
+
+Softmax with NoPE
+0.0152
+
+0.003
+
+ALiBi
+0.00433
+
+Stick-breaking
+0.0152
+
+0.1
+
+Variable assignment
+MQRAR
+Flip-flop
+Copying
+Counting
+MQAR
+
+FPA
+0.001
+0.001
+0.01
+0.003
+0.01
+0.0003
+
+FoX
+0.001 (0)
+0.003 (0)
+0.01 (0)
+0.003 (0)
+0.01 (0)
+0.001 (0)
+
+Sel. Att.
+0.003 (1)
+0.001 (1)
+0.001 (1)
+0.003 (1)
+0.01 (1)
+0.003 (1)
+
+Softmax with RoPE
+0.0001
+0.001
+0.001
+0.01
+0.01
+0.001
+
+Stick-breaking
+0.001
+0.001
+0.01
+0.01
+0.001
+0.003
+
+LSTM
+0.01
+0.003
+0.01
+0.01
+0.01
+0.003
+
+## Appendix E Kernel and cost
+
+Our kernel computes FPA with its straight-through minimum in fused Triton kernels on a grid of blocks of 64 positions shared by queries and keys.
+For a query block and an earlier key block the forward pass forms the range minimum from the suffix minima of the key block, the minimum over the blocks in between and the prefix minima of the query block.
+It runs the longest query blocks first.
+The backward pass needs the gradient of the soft minimum, whose normaliser has the same three parts.
+It computes the gradient of the field in four parts, for the positions in the key block, in the query block, in the blocks in between and in the diagonal block.
+All exponentials are powers of two of quantities in the log-two domain, the key side works on transposed tiles, and no value is added atomically, so the gradients are deterministic.
+The evaluated FPA language model trained with an earlier version of this kernel.
+Against a reference implementation in double precision, that version had relative errors of at most $5.1\times 10^{-4}$ on the GPU, except $3.3\times 10^{-3}$ in the gradient of the strength for tied values of the field.
+In exploratory checks the current version had the same largest errors, and at most $6.7\times 10^{-4}$ in backward passes over 4096 and 8192 positions.
+In 200 exploratory training steps the two versions differed less than one version did under a different order of summing its micro-batches.
+
+The benchmark ran on the GPU of Appendix C in half precision, with every method timed in the same process and a probe for contention before and after each part.
+Table 22 lists one attention layer at five shapes, and Table 23 the eviction of keys whose bias fell below a threshold.
+The bias of FoX inside our kernel took 1.05 times as long as the kernel of FoX, so the extra time of FPA in Table 3 comes from the operations that FPA adds.
+The decoding times of Table 3 hardly changed with the length of the prompt, from 1024 to 16,384 tokens, because fixed costs dominate at batch size 1.
+Our decoding code for Selective Attention also keeps a single-precision copy of the selection key, which raises its measured cache to 76,848 bytes per position, whereas Table 3 counts the 73,776 bytes that its definition needs.
+
+Table 22: One attention layer with 12 heads of dimension 64 at batch $\times$ length, in milliseconds (medians of 20 rounds).
+The ratios in Section 4.3 are medians over the rounds of the ratio within each round.
+SDPA, the scaled dot-product attention of PyTorch, with its memory-efficient kernel on this GPU.
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+Sel. Att., Selective Attention.
+
+Forward, ms
+Forward and backward, ms
+
+Shape
+FPA
+FoX
+SDPA
+Sel. Att.
+FPA
+FoX
+SDPA
+Sel. Att.
+
+16 $\times$ 512
+0.37
+0.34
+0.27
+0.67
+1.76
+1.13
+1.64
+3.54
+
+8 $\times$ 1024
+0.51
+0.47
+0.46
+1.12
+2.61
+1.68
+2.50
+5.79
+
+4 $\times$ 2048
+0.78
+0.74
+0.87
+2.00
+4.31
+2.87
+4.42
+10.45
+
+2 $\times$ 4096
+1.33
+1.27
+1.68
+3.75
+7.76
+5.47
+8.14
+19.50
+
+1 $\times$ 8192
+2.39
+2.33
+3.30
+7.29
+15.19
+10.45
+15.79
+37.37
+
+Table 23: Eviction of the keys whose bias fell below $-\theta$ (FPA and FoX) or whose mask rose above $\theta$ (Selective Attention), with the loss change in nats per token and the share of keys kept on SlimPajama test windows.
+Softmax attention used a sliding window of the mean size that FPA keeps.
+Block skipping is the pruning of Lin et al. (2025b).
+FPA, First Passage Attention.
+FoX, Forgetting Transformer.
+Sel. Att., Selective Attention.
+
+Length 2048
+Length 8192
+
+Method
+Rule
+loss change
+kept
+loss change
+kept
+
+FPA
+bias $\leq-5$ 
+ $+$ 0.0063
+29%
+ $+$ 0.0054
+23%
+
+bias $\leq-10$ 
+ $+$ 0.0004
+34%
+ $+$ 0.0005
+26%
+
+bias $\leq-20$ 
+ $+$ 0.0001
+41%
+0.0000
+30%
+
+FoX
+bias $\leq-5$ 
+ $+$ 0.1836
+13%
+ $+$ 0.2675
+6%
+
+bias $\leq-10$ 
+ $+$ 0.0195
+15%
+ $+$ 0.0227
+7%
+
+bias $\leq-20$ 
+ $+$ 0.0059
+19%
+ $+$ 0.0055
+9%
+
+block skipping, 10
+ $+$ 0.0007
+24%
+ $+$ 0.0007
+10%
+
+Sel. Att.
+mask $\geq 5$ 
+ $+$ 0.0001
+33%
+ $-$ 0.0006
+15%
+
+mask $\geq 10$ 
+0.0000
+44%
+0.0000
+22%
+
+Softmax
+window, mean size of FPA
+ $+$ 0.1151
+43%
+ $-$ 2.8178
+36%
+
+the same $+$ first key
+ $+$ 0.0559
+43%
+ $-$ 2.8077
+36%
+
+Beyond the training length, softmax attention without eviction diverged, so its sliding windows lowered its loss at length 8192.
+FPA retrieved every passkey at 8192 and 16,384 tokens under every threshold, with 24% to 27% of its cache, whereas the windows of softmax attention retrieved at most 20%.

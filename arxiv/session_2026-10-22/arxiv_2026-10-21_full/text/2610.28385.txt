@@ -1,0 +1,4325 @@
+## RACE: RoPE-Aligned Attention Compression Based on Query-Key Activation Energies
+
+Irene Tenison1,
+Abdulrahman Alabdulkareem1,
+Daniel Karl I. Weidele2,
+
+Nima Dehmamy2,
+Dan Gutfreund2
+
+1MIT CSAIL
+  2MIT-IBM Computing Research Lab
+
+††thanks: Contact: itenison@mit.edu
+
+Abstract
+
+Head-dimension compression can reduce the memory required by the
+key-value (KV) cache, but existing methods often reconstruct
+full-dimensional representations during inference, adding significant decoding FLOPs overhead. We formalize the design considerations for converting pretrained attention into a natively reduced-dimensional form that reduces both KV-cache storage and attention computation using a calibration set. Specifically, we consider reductions that (1) apply a shared projection to queries and keys so that they remain in a common reduced feature space, (2) derive this projection jointly from query and key activations to better preserve their interaction, and (3) are compatible with the pretrained RoPE transformation. To obtain a reconstruction-free realization of this reduction, we restrict it to coordinate selection and theoretically show that RoPE compatibility then holds if and only if complete rotary pairs are retained. Building on this characterization, we introduce RACE
+(RoPE-Aligned Attention Compression based on
+activation Energy), a post-training method that selects rotary
+pairs using their joint query-key activation energy. We theoretically
+show that this criterion minimizes a separable, calibration-dependent
+upper bound on post-RoPE query-key product approximation error. The
+resulting reductions are folded into the model weights and require
+neither runtime reconstruction nor specialized kernels. Across three model families and different compression levels, RACE outperforms structured
+pruning and remains competitive with reconstruction-based methods on language-modeling, zero-shot, and long-context tasks. At 50% KV-cache retention and 256K context, RACE reduces total
+inference FLOPs by 47.8%, yielding $1.79\times$ higher throughput,
+43.2% lower time-to-first-token (TTFT), and 28.1% lower allocated GPU memory in comparison to an uncompressed model. We also show that RACE is compatible with token eviction or compaction as well as quantization based KV-cache compression methods.
+
+## 1 Introduction
+
+Autoregressive language-model inference is increasingly constrained by the key-value (KV) cache, especially at long contexts. Each attention layer stores a key and value vector for every preceding token, so cache memory grows linearly with context length and with the dimensionality of the cached representations. Reducing the key and value head dimensions offers the possibility of decreasing both KV-cache memory and native attention computation. Realizing these savings is more difficult than merely storing a low-dimensional encoding. Several head-dimension compression methods project keys and values into compact representations but reconstruct full-dimensional keys during inference to effectively apply rotary positional embeddings (RoPE) (Saxena et al., 2024; Chang et al., 2025). Such methods reduce cache storage but introduce decompression and additional arithmetic into the attention path during inference. To obtain the full benefit of head-dimension compression, the attention layer itself must operate directly in the reduced dimensions.
+
+This raises a more fundamental question: when can a pretrained RoPE-based attention layer be converted into a natively lower-dimensional attention layer without reconstructing the discarded coordinates? Since attention logits depend on the post-RoPE product $QK^{\top}$ , we view head-dimension reduction as an approximate matrix multiplication (AMM) problem along the shared feature dimension. However, preserving this interaction in the post-RoPE space is not sufficient for native inference. It must be realizable before RoPE. This imposes an additional structural constraint that the reduction must commute with the pretrained rotary transformation. We characterize this condition exactly for coordinate-selection reductions.
+
+These observations define an admissible family of native Q/K reductions: queries and keys can share a reduced feature space, and the reduction must respect the pretrained RoPE structure. The remaining question is which admissible dimensions to retain. We introduce RACE, which ranks complete rotary pairs using joint activation energy for each RoPE pair $m$ , $E_{m}=\|Q_{m}\|_{F}^{2}+\|K_{m}\|_{F}^{2}$ , and retains the highest-energy pairs. This criterion minimizes a separable, calibration-dependent upper bound on post-RoPE query-key product approximation error. The resulting Q/K reduction, together with a calibrated value subspace, is folded into the attention projections, enabling RoPE, caching, and attention to operate entirely in the reduced dimensions without runtime reconstruction or specialized kernels. Summarizing our contributions:
+
+• 
+
+Constrained-AMM formulation. We formulate native attention compression as preservation of the post-RoPE query-key product subject to pre-RoPE realizability constraint.
+
+• 
+
+Structural Characterization.
+We prove that a coordinate-selection reduction can commute with the pretrained RoPE if and only if it retains complete rotary pairs,
+characterizing the admissible family of coordinate reductions.
+
+• 
+
+Forward-only pair selection within the family. RACE ranks RoPE pairs using joint query-key activation energy, minimizing a separable calibration-dependent upper bound.
+
+• 
+
+Empirical validation. Across multiple model families and compression levels, RACE remains competitive with reconstruction-based methods while reducing KV-cache memory, attention cost, parameters, TTFT, and runtime overhead without specialized kernels.
+
+Figure 1: Quality-efficiency trade-off across KV-cache retention levels on Llama-3.2-3B-Instruct. Left: average zero-shot accuracy. Right: relative decoding FLOPs on a logarithmic scale, normalized to full attention ( $1\times$ ). The dashed line represent the uncompressed model. RAP and Thin Keys have decoding FLOPs that overlap those of RACE, while Thin Keys’ accuracy falls below the displayed y-axis. RACE combines accuracy competitive with reconstruction-based methods with the low decoding cost of native dimensional reduction.
+
+Table 1: 
+Comparison of head-dimension KV-cache compression methods.
+RACE combines a shared, jointly selected, RoPE-compatible Q/K reduction
+with native reduced-dimensional execution. FLOPs are normalized to full attention. See A.4 for
+derivations of FLOPs.
+
+Excecution
+Q/K Reduction Criterion
+Efficiency
+
+Method
+
+Reconst-
+
+ruction free
+
+Custom-
+
+Kernel free
+
+Fwd.-only
+
+Calibration
+
+Shared
+
+Q/K Map
+
+Joint Q/K
+
+Signal
+
+Native
+
+RoPE
+
+KV Cache
+
+Retained
+
+Attn. Params
+
+Retained
+
+Prefill
+
+FLOPs
+
+Decode
+
+FLOPs
+
+Attention (Vaswani et al., 2017)
+-
+-
+-
+-
+-
+-
+100%
+100%
+ $\times$ 1
+ $\times$ 1
+
+EigenAttention (Saxena et al., 2024)
+✗
+✓
+✓
+✗
+✓
+✗
+50%
+69.8%
+ $\times$ 0.75
+ $\times$ 11.42
+
+PALU (Chang et al., 2025)
+✗
+✗
+✓
+✗
+✗
+✗
+50%
+58.3%
+ $\times$ 0.75
+ $\times$ 21.92
+
+Thin Keys (Yao et al., 2026)
+✓
+✓
+✓
+✗
+✗
+✗
+75%
+50%
+ $\times$ 0.75
+ $\times$ 0.75
+
+RAP (Xin et al., 2026)
+✓
+✓
+✗
+✓
+✗
+✓
+50%
+50%
+ $\times$ 0.5
+ $\times$ 0.5
+
+RACE (Ours)
+✓
+✓
+✓
+✓
+✓
+✓
+50%
+50%
+ $\times$ 0.5
+ $\times$ 0.5
+
+## 2 Related Work
+
+Compression along other KV-cache axes.
+
+KV-cache memory can be reduced along the token, precision, or head-dimension
+axes as shown in Fig. 8. Token-level methods reduce the number of cached positions ( $S$ in Eq.7), through eviction, retention, or compaction
+(Zhang et al., 2023; Xiao et al., 2024; Li et al., 2024; Cai et al., 2024; Fu et al., 2025; Shi et al., 2025). Quantization methods instead reduce the number of
+bits used for each cached element, ( $b$ in Eq.7),
+(Liu et al., 2024; Hooper et al., 2024; Wang et al., 2025). Our method preserves the
+retained token positions and reduces the number of elements in every key and
+value vector. It is therefore complementary to both token reduction and
+quantization; we evaluate representative combinations in
+Sec. 4.3.
+
+Head-dimension KV-cache compression.
+
+Head-dimension methods reduce the width of the cached representations ( $d_{k}$ and $d_{v}$ in Eq.7) for keys and values respectively.
+EigenAttention (Saxena et al., 2024) derives low-rank subspaces from
+calibrated activations, whereas PALU (Chang et al., 2025) factorizes attention
+projection weights. The dense low-rank compression subspaces in these and similar methods are not generally invariant under the pretrained
+RoPE transformation and so these methods recover full-dimensional keys before applying RoPE. This can be compute-intense and so, methods like PALU (Chang et al., 2025) mitigate this by using a custom kernel that does not materialize the full-dimensional reconstructed key tensor. However the inference FLOPs remains dominated by the dense reconstruction basis.
+
+Thin Keys (Yao et al., 2026) avoids key reconstruction by
+reducing the shared Q/K dimension, but retains all dimensions of Values. A concurrent preprint, RAP (Xin et al., 2026), performs RoPE-aligned structured parameter pruning using empirical-Fisher scores computed from gradients of $W_{K}$ and arrives at a similar RoPE-aligned native architecture from a different starting point to RACE. While RAP approaches the problem as structured parameter pruning, RACE begins from the problem of constrained-AMM as shown in Sec.3.1. The methods can therefore produce similar reduced-dimensional architectures, but differ in their compression objective and calibration signal. Additionally, our calibration is forward-only and does not depend on a task loss or the batch-sensitivity of Fisher estimates (Tenison et al., 2026). Figure 1 compares our solution to previous techniques in terms of accuracy and FLOPs across a range of compression levels.
+
+Methods including MatryoshkaKV (Lin et al., 2025), STAR-KV
+(Bhatnagar et al., 2026), ThinK (Xu et al., 2025), and OjaKV
+(Zhu et al., 2026) additionally study heterogeneous ranks or
+input-dependent compression. These methods primarily
+address where or when to allocate compression across layers,
+heads, or inputs. Our work instead addresses how to construct a fixed,
+RoPE-compatible reduced representation that operates natively without runtime
+selection, adaptation, or full-dimensional reconstruction.
+
+Figure 2: Native attention compression along the head-dimension. Reconstruction-based methods (right) may cache low-dimensional representations yet return to the original feature dimension during inference. This is often done using $A_{K}^{low}$ and $B_{K}^{low}$ that are decomposition of $W_{K}$ . We instead seek a native reduction (left) that can be applied before RoPE and folded into the pretrained projections, so that attention is executed natively in the reduced dimension. Dashed boxes indicate the corresponding full-dimensional operations.
+
+## 3 Method
+
+Problem Formulation.
+
+Consider an attention head with pre-RoPE activations
+ $Q,K\in\mathbb{R}^{S\times d_{k}}$ and
+ $V\in\mathbb{R}^{S\times d_{v}}$ .
+Given target dimensions $r_{k}<d_{k}$ and $r_{v}<d_{v}$ , we seek
+reduced-dimensional representations
+
+ $Q^{\prime}=QP_{Q},\qquad K^{\prime}=KP_{K},\qquad V^{\prime}=VP_{V},$ 
+
+(1)
+
+with $P_{Q},P_{K}\in\mathbb{R}^{d_{k}\times r_{k}}$ and
+ $P_{V}\in\mathbb{R}^{d_{v}\times r_{v}}$ , such that the resulting layer
+stores only $K^{\prime}$ and $V^{\prime}$ in the KV cache and performs attention
+directly in dimensions $r_{k}$ and $r_{v}$ , without reconstructing the
+discarded coordinates at inference.
+
+For native reduced-dimensional execution, the Q/K reductions must
+ultimately be applied to the pre-RoPE activations so that they can be
+folded into the query and key projection weights. However, the quantity
+that determines attention logits is the post-RoPE query-key product.
+We therefore first characterize the low-dimensional Q/K representation
+that preserves this interaction, and then determine when it can be
+realized equivalently before RoPE. Finally we introduce RACE, a criterion that satifies these conditions and effectively convert a pretrained attention to a natively reduced-dimensional attention.
+
+## 3.1 Native Attention Compression as Constrained AMM
+
+Let $\widetilde{Q}=\operatorname{RoPE}(Q),\widetilde{K}=\operatorname{RoPE}(K)$ .
+Since attention logits depend on the post-RoPE product
+ $\widetilde{Q}\widetilde{K}^{\top}$ , we formulate Q/K head-dimension
+reduction as an approximate matrix multiplication (AMM) problem.
+We are seeking a column-orthonormal reduction
+ $P\in\mathbb{R}^{d_{k}\times r_{k}}$ such that,
+
+ $(\widetilde{Q}P)(\widetilde{K}P)^{\top}=\widetilde{Q}PP^{\top}\widetilde{K}^{\top}\approx\widetilde{Q}\widetilde{K}^{\top}.$ 
+
+(2)
+
+This is consistent with classical matrix-sketching and AMM results,
+where a common lower-dimensional map is applied along the shared
+dimension of the two operands
+(Woodruff, 2014; Cohen et al., 2016). Detailed explanation is given in A.5.
+
+This view motivates two design principles. First, queries and keys should be represented in a shared low-dimensional subspace, since their
+interaction is evaluated along the same feature dimension. We therefore
+seek a common reduction $P_{QK}$ for both operands. Second, when this
+subspace is chosen from calibration data, its selection criterion should
+reflect both matrices whose product is being approximated. Because the
+target interaction depends jointly on $\widetilde{Q}$ and $\widetilde{K}$ ,
+we construct $P_{QK}$ from statistics of both query and key activations
+rather than either operand in isolation as in the concurrent work, RAP(Xin et al., 2026) or ThinKeys(Yao et al., 2026). This is validated empirically in Fig.12.
+
+These observations specify how the Q/K interaction should be reduced, but not yet whether the reduction can be executed natively before RoPE to get the desired systems benefits. Applying $P_{QK}$ only after RoPE would still require full-dimensional query and key projections and full-dimensional rotary encoding, reducing the KV cache width without fully reducing the attention computation as in reconstruction-based methods. Native execution therefore requires the shared reduction to be realizable before RoPE. Section 3.1 establishes how the query-key interaction should be reduced, but not whether the shared reduction can be realized before RoPE. Section 3.2 characterizes the additional structural condition under which this is possible.
+
+## 3.2 RoPE-Compatible Query–Key Reduction
+
+Section 3.1 motivates representing queries and keys
+through a shared low-dimensional map. To apply this reduction
+before RoPE, it must preserve the corresponding blocks of the
+pretrained rotary transformation as detailed in A.3.
+
+Let $R_{t}=\operatorname{diag}(R_{1,t},\ldots,R_{M,t})\in\mathbb{R}^{d_{k}\times d_{k}}$ 
+be the pretrained RoPE operator at position $t$ , where each
+ $R_{m,t}\in\mathbb{R}^{2\times 2}$ acts on one rotary pair. For a retained
+pair set $\mathcal{S}\subseteq\{1,\ldots,M\}$ , define $R_{t}^{(\mathcal{S})}=\operatorname{diag}(R_{m,t}:m\in\mathcal{S})\in\mathbb{R}^{r_{k}\times r_{k}}.$ 
+Thus, $R_{t}^{(\mathcal{S})}$ is the restriction of the original pretrained
+operator to the retained pairs. We say that a reduction
+ $P_{QK}\in\mathbb{R}^{d_{k}\times r_{k}}$ is RoPE-compatible if
+
+ $R_{t}P_{QK}=P_{QK}R_{t}^{(\mathcal{S})}\qquad\text{for all }t.$ 
+
+(3)
+
+This condition ensures that applying the reduction before RoPE is equivalent to applying full-dimensional RoPE and then restricting to the retained coordinates. Consequently, query/key projection, rotary encoding, and attention can all be performed directly in dimension $r_{k}$ . A simple admissible family of $P_{QK}$ is obtained by retaining complete RoPE pairs. The following theorem shows that this family exactly characterizes RoPE-compatible coordinate-selection reductions.
+
+Theorem 1 (RoPE-compatible coordinate selection).
+
+Suppose for every rotary pair $m$ , there exists a position $t$ such that $\sin\phi_{m,t}\neq 0$ . A coordinate-selection matrix $P_{QK}\in\mathbb{R}^{d_{k}\times r_{k}}$ 
+satisfies Eq. 3 for all $t$ if and only if
+it selects exactly the coordinates belonging to a union of complete
+rotary pairs indexed by $\mathcal{S}\subseteq\{1,\ldots,M\}$ ,
+with the selected coordinates ordered consistently with
+ $R_{t}^{(\mathcal{S})}$ .
+
+The proof is provided in A.6. The remaining question is which admissible pairs should be retained. Section 3.3 introduces a calibration criterion for ranking the admissible pairs.
+
+## 3.3 Calibration-Guided Selection Within the RoPE-Compatible Family
+
+Section 3.2 characterizes a family of structurally valid native reductions by restricting selection to complete RoPE pairs. What remains is no longer a compatibility question, but a ranking question over this admissible pairs to determine what pairs should be retained. Because the approximation target in Section 3.1 depends on both queries and keys, we rank candidate pairs using a joint calibration statistic over the two operands.
+
+Let $\mathcal{P}_{\mathrm{rope}}=\{(i_{m},j_{m})\}_{m=1}^{M}$ 
+denote the RoPE pairs of an attention head, and let $Q_{m}=Q_{:,\{i_{m},j_{m}\}},K_{m}=K_{:,\{i_{m},j_{m}\}}$ .
+We assign pair $m$ the joint query-key energy
+
+ $E_{m}=\|Q_{m}\|_{F}^{2}+\|K_{m}\|_{F}^{2}.$ 
+
+(4)
+
+For target dimension $r_{k}$ , we retain the $r_{k}/2$ pairs with the
+largest energies, $\mathcal{S}=\operatorname{TopK}_{m\in[M]}\left(E_{m},\frac{r_{k}}{2}\right)$ 
+and construct $P_{QK}=[e_{i}]_{i\in\mathcal{I}_{QK}}$ where $\mathcal{I}_{QK}=\bigcup_{m\in\mathcal{S}}\{i_{m},j_{m}\}.$ 
+
+The following result provides a calibration-dependent justification for
+this selection rule.
+
+Proposition 1 (Pair-energy approximation bound).
+
+Let
+ $\widetilde{Q}=\operatorname{RoPE}(Q)$ and
+ $\widetilde{K}=\operatorname{RoPE}(K)$ , and let
+ $\widetilde{Q}_{m},\widetilde{K}_{m}$ denote the coordinates associated with
+RoPE pair $m$ . For any retained pair set
+ $\mathcal{S}$ ,
+
+ $\left\|\widetilde{Q}\widetilde{K}^{\top}-\sum_{m\in\mathcal{S}}\widetilde{Q}_{m}\widetilde{K}_{m}^{\top}\right\|_{F}\leq\sum_{m\notin\mathcal{S}}\left\|\widetilde{Q}_{m}\right\|_{F}\left\|\widetilde{K}_{m}\right\|_{F}\leq\frac{1}{2}\sum_{m\notin\mathcal{S}}E_{m}.$ 
+
+(5)
+
+Consequently, among all subsets containing the same number of complete
+RoPE pairs, selecting the pairs with the largest $E_{m}$ minimizes the separable upper bound in Eq. 5. Proof of this proposition is given in A.6. Proposition 1 does not imply that the selected
+pair set minimizes the exact post-RoPE query-key product error. Rather, it shows
+that the proposed top-energy rule exactly minimizes a worst-case, separable calibration-dependent upper bound in the right-hand side of
+Eq. 5. We use this result as a tractable forward-only criterion for choosing within the RoPE-compatible family.
+We evaluate the robustness of this
+calibration-dependent selection empirically in
+Section 4.5.
+
+Value compression.
+
+Values are not subject to RoPE, so we follow the standard low-rank activation projection used in prior head-dimension compression methods (Saxena et al., 2024). Given calibration activations
+ $V\in\mathbb{R}^{S_{\mathrm{cal}}\times d_{v}}$ , we retain the top- $r_{v}$ right singular vectors
+ $P_{V}\in\mathbb{R}^{d_{v}\times r_{v}}$ and compute $V^{\prime}=VP_{V}.$ 
+
+Algorithm 1 RACE: Post-Training RoPE-Aligned Attention Compression
+
+ 0:
+
+  Pretrained model $\mathcal{M}$ , calibration set $\mathcal{D}_{\mathrm{cal}}$ ,
+target dimensions $r_{k},r_{v}$ 
+
+ 1:
+
+  for each attention layer do
+
+ 2:
+
+   Collect post-RoPE $Q,K,V$ activations on $\mathcal{D}_{\mathrm{cal}}$ 
+
+ 3:
+
+   For RoPE pairs, compute $E_{m}=\|Q_{m}\|_{F}^{2}+\|K_{m}\|_{F}^{2}$ 
+
+ 4:
+
+   Construct $P_{QK}$ that selects the top- $r_{k}/2$ pairs based on $E_{m}$ 
+
+ 5:
+
+   Fold in $P_{QK}$ . $W_{Q}^{\mathrm{fold}}=W_{Q}P_{QK};W_{K}^{\mathrm{fold}}=W_{K}P_{QK}$ 
+
+ 6:
+
+   Compute the top- $r_{v}$ right singular vectors of V to get $P_{V}$ 
+
+ 7:
+
+   Fold in $P_{V}$ . $W_{V}^{\mathrm{fold}}=W_{V}P_{V};W_{O}^{\mathrm{fold}}=P_{V}^{\top}W_{O}$ 
+
+ 8:
+
+  end for
+
+ 9:
+
+  Optional: recover performance of $\mathcal{M}^{\prime}$ from $\mathcal{M}$ 
+
+ 10:
+
+  return Native attention-compressed model $\mathcal{M}^{\prime}$ 
+
+## 3.4 Folding into Native Reduced-Dimensional Attention
+
+Having obtained the RoPE-compatible query-key selector $P_{QK}$ and the value subspace $P_{V}$ , we fold both transformations directly into
+the pretrained attention projections. For queries and keys,
+
+ $Q^{\prime}=XW_{Q}^{\mathrm{fold}},K^{\prime}=XW_{K}^{\mathrm{fold}}\qquad\text{where,}\qquad W_{Q}^{\mathrm{fold}}=W_{Q}P_{QK},W_{K}^{\mathrm{fold}}=W_{K}P_{QK}.$ 
+
+(6)
+
+ $Q^{\prime}$ and $K^{\prime}$ are
+ $r_{k}$ -dimensional queries and keys to which the restricted RoPE operator from
+Section 3.2 is applied. Hence, neither the discarded
+query/key coordinates nor a full-dimensional RoPE representation is
+materialized during inference.
+
+For values, we similarly fold the calibrated subspace into the value
+and output projections - $W_{V}^{\mathrm{fold}}=W_{V}P_{V},W_{O}^{\mathrm{fold}}=P_{V}^{\top}W_{O}$ and $V^{\prime}=XW_{V}^{\mathrm{fold}},Y^{\prime}=(A^{\prime}V^{\prime})W_{O}^{\mathrm{fold}}$ 
+where $A^{\prime}$ is computed entirely in the reduced dimension
+ $r_{k}$ using the retained RoPE pairs.
+
+(a) Llama-3.2-3B-Instruct Perplexity
+
+(b) Llama-3.2-3B-Instruct Average zero-shot accuracy
+
+(c) Llama-3.2-3B-Instruct LongBench Score
+
+(d) Qwen2.5-7B Perplexity
+
+(e) Qwen2.5-7B Average zero-shot accuracy
+
+(f) Qwen2.5-7B LongBench Score
+
+Figure 3: Quality across KV-cache retention ratios on
+Llama-3.2-3B-Instruct (Top) and Qwen2.5-7B (Bottom). WikiText perplexity (lower is better), and mean accuracy across 15 zero-shot tasks and mean LongBench score on 16 english tasks (higher is better). 
+
+This folding converts the original pretrained attention layer into a
+native architecture with query/key dimension $r_{k}$ and value dimension
+ $r_{v}$ . The resulting model stores only reduced-dimensional keys and
+values and performs RoPE, query-key comparison, value aggregation, and
+output projection without reconstructing the discarded dimensions. Consequently, the reduction decreases KV-cache storage, attention
+arithmetic, and attention projection parameters simultaneously.
+
+Recovery.
+
+For aggressive compression, we recommend a short one-time post-fold recovery stage using KL distillation from the uncompressed model (Fig. 10). We update the reduced attention parameters $W_{Q}^{\mathrm{fold}},W_{K}^{\mathrm{fold}},W_{V}^{\mathrm{fold}},W_{O}^{\mathrm{fold}}$ while keeping the rest of the model frozen. Recovery is performed directly on the natively compressed checkpoint using 1M FineWeb-Edu tokens. Its effect is modest at upto 75% KV retention but substantial at 50%, where it restores much of the performance. Therefore, while moderate compression requires little or no adaptation; for 50% retention, we recommend a short one-time recovery stage for RACE and RAP.
+
+## 4 Experiments and Results
+
+Implementation Details.
+
+We implement RACE in PyTorch and Hugging Face Transformers. Calibration
+uses 32,768 FineWeb-Edu tokens, with statistics and SVDs computed in
+FP32 during calibration and inference is performed in BF16. We respect each architecture’s
+physical rotary-pair layout and retain the original frequency indices
+and RoPE scaling rules; selected pairs are not re-indexed as consecutive
+frequencies. Compressed checkpoints
+resize the attention projections and cache dimensions while maintaining the $\frac{1}{\sqrt{d_{k}}}$ scaling, and run using
+standard layers and PyTorch attention operations. Thus,
+RACE requires no specialized CUDA/Triton kernel. While all the results in Sec.4 were reported with SDPA attention backend, Tab.2 shows systems results with eager and flash attention backends. Although different kernels optimize for wall-clock time, the number of FLOPs remian the same. Although optional, all the results of RACE and the concurrent work, RAP involve recovery with
+KL-distillation over approximately 1M FineWeb-Edu tokens as detailed in A.7.
+
+## 4.1 Quality at Matched KV-Cache Budgets
+
+We evaluate Qwen2.5-7B,
+Llama-3.2-3B-Instruct, and Granite-4.1-3B against RoPE-compatible implementations of
+PALU-GLRD (Chang et al., 2025), EigenAttention(Saxena et al., 2024), Thin Keys(Yao et al., 2026) and concurrent work,
+RAP (Xin et al., 2026). The full results are shown in Table 3 in the Appendix. Fig.3 shows the same on Qwen2.5-7B and
+Llama-3.2-3B-Instruct for RACE, the concurrent work and structured pruning baseline: RAP, and the reconstruction-based baseline: PALU. We finetune reduced attention weights of both RAP and RACE for 1M tokens of FineWeb-Edu using KL distillation from the respective uncompressed model for fair comparison. We report
+WikiText perplexity, mean accuracy across 15 zero-shot tasks (Tab.3), and LongBench score average over 16 English tasks (Tab.4). At 75% KV-cache retention, RACE preserves 98.5%, 96.5%, and 97.5%
+of the uncompressed zero-shot accuracy on Qwen, Granite, and Llama,
+respectively. Across compression
+levels, on Llama and Qwen models (Figure 3), RACE closely matches PALU on
+zero-shot accuracy and LongBench without runtime reconstruction. RACE consistently outperforms RAP. RACE also achieves the lowest perplexity at 50%
+and 75% retention.
+
+## 4.2 Measured Systems Benefits
+
+(a) Prefill throughput speedup
+
+(b) Decode throughput speedup
+
+(c) Overall throughput speedup
+
+(d) Time to first token
+
+(e) GPU allocated memory
+
+(f) Total inference FLOPs
+
+Figure 4: 
+Long-context inference efficiency on
+Llama-3.2-3B-Instruct.
+The top row reports prefill, decoding, and overall throughput
+speedups over the uncompressed model (higher is better). The bottom row reports time to first token, allocated GPU memory, and total inference
+FLOPs (lower is better). Results are shown at 75% and 50% KV-cache retention
+for prompt lengths of 64K, 128K, and 256K tokens, with the
+output length fixed at 128 tokens. These results are average over 10 runs.
+
+Reducing KV-cache storage does not automatically reduce inference cost. As discussed in Section 1, this requires native reduced attention. Such native reduced attention methods like RACE eliminates reconstruction at the architectural level, exposing standard reduced-dimensional attention operations that can be supported by general-purpose backends. Figure 4 shows that these measured gains become larger with prompt length as attention accounts for a greater fraction of inference cost. At 256K tokens, 50% retention achieves $1.76\times$ , $1.90\times$ , and $1.79\times$ prefill, decoding, and overall throughput speedups, respectively. It also reduces TTFT by 43.22%, allocated GPU memory by 28.06%, and total inference FLOPs by 47.75% relative to the uncompressed model. The end-to-end memory reduction is smaller than the 50% KV-cache reduction because total allocated memory also includes model parameters, activations, and other components unaffected by the proposed method. Figure.11 shows the memory reduction with compression on total model parameters, attention parameters and KV cache. While parameter memory is unaffected by sequence length, KV Cache memory grows with it.
+
+## 4.3 Compatibility with Token-Dimension Compression and Quantization
+
+RACE reduces the KV-cache feature dimension or head dimension and can therefore be combined with methods that compress its token dimension or numerical precision. We apply 75% RACE retention before H $2$ O and SnapKV token compression and KIVI quantization, each with a 50% cache footprint, yielding 37.5% combined retention. Figure 6 shows that applying RACE to an already compressed model causes greater degradation than applying it to the uncompressed model, indicating that the effects of the two compression stages are not independent. Nevertheless, the combinations provide an additional 25% reduction in cache size and feature-dependent attention FLOPs as well as attention parameters. The degradation is smaller with KIVI, particularly in perplexity, suggesting that RACE is especially complementary to quantization. Overall, RACE can augment existing KV-cache methods with further memory, bandwidth, and, for token compression, decoding-FLOP reductions.
+
+Figure 5: 
+Composing RACE with token-level compression and quantization.
+Combining RACE with H2O, SnapKV, and KIVI further reduces total KV-cache
+retention. We report average zero-shot accuracy (left; higher is better) over 5 tasks as described in 5
+and WikiText perplexity (right; lower is
+better).
+
+Figure 6: 
+Effect of calibration data on compressed-model quality.
+Values show change on evaluation with the respective calibration data relative to FineWeb-Edu calibration.
+
+## 4.4 Effect of Calibration Data
+
+Our selection criterion explained in Section 3.3 is derived from a calibration-dependent upper bound on the query-key approximation error, so the retained subspace is expected to reflect the calibration distribution. Figure 6 evaluates this dependence by varying the calibration dataset and reporting performance relative to FineWeb-Edu calibration. Note that for WikiText, the perplexity change is sign-inverted so that positive values consistently denote improvement. Using the same dataset as the downstream task generally gives the strongest results - upto +5.4% on the evaluated datasets with respect to calibration on FineWen-Edu, and calibration on a related task family may also improve performance as observed in evaluation on arc-c with calibration on SciQ. However, the differences are modest $(<6\%)$ for most tasks. Therefore, FineWeb-Edu remains a strong generic calibration source, especially when in-distribution task-specific samples are unavailable or the downstream task family is unknown.
+
+## 4.5 Ablation: Selection Criteria
+
+Energy
+
+(Ours)
+
+Magnitude
+
+Attn.
+
+Product
+
+Grad.
+
+Fisher
+
+Backprop-free
+✓
+✓
+✓
+✗
+
+Task-loss-free
+✓
+✓
+✓
+✗
+
+Explicit
+
+ $O(S^{2})$ scoring
+
+✗
+✗
+✓
+✗
+
+Time (sec)
+2.717
+2.925
+11.616
+8.290
+
+Throughput
+
+(tok./sec)
+
+12061.6
+11202.4
+2821
+3952.7
+
+Memory (GB)
+6.142
+6.142
+10.592
+9.218
+
+(a) Calibration cost of alternative data-dependent RoPE-pair scoring criteria.
+
+(b) Perplexity under alternative pair-selection criteria.
+
+(c) Compression behavior of wide, standard, & narrow heads.
+
+Figure 7: 
+Analysis of RoPE-pair selection and compression structure.
+(a) Computational requirements of RoPE-compatible scoring
+criteria.
+(b) Perplexity under alternative pair-selection criteria.
+All methods retain complete RoPE pairs.
+(c) Effect of attention-head width at matched model size across
+compression ratios.
+
+The shared Q/K reduction and Rope-compatibility constraint define a family of native coordinate reductions; the remaining options are on how to rank candidate rotary pairs. We first compare RACE’s joint Q/K
+activation energy with otherwise identical Q-only and K-only selectors. As
+shown in Fig. 7(b), K-only selection degrades
+perplexity more strongly, while joint Q/K selection performs best overall. A similar result was observed for Q-only (Table 6). This
+is consistent with preservation of the query-key interaction: the average
+normalized error
+ $\|QK^{\top}-Q_{\mathcal{S}}K_{\mathcal{S}}^{\top}\|_{F}/\|QK^{\top}\|_{F}$ 
+is $0.1159$ , $0.1120$ , and $0.1051$ for Q-only, K-only, and joint Q/K
+selection, respectively.
+
+We further compare RACE with random, magnitude, attention-product, and
+gradient-Fisher scoring. Random selection is data-oblivious; energy(RACE), magnitude and
+attention-product use joint Q/K forward statistics; and gradient-Fisher uses
+joint Q/K gradients from backward-pass on the calibration data. RACE achieves the lowest perplexity across the evaluated
+retention ratios among these selectors. Table 7(a) further compares calibration cost of methods that uses Rope-compatible shared joint Q/K statistics for selection.
+Attention-product scoring explicitly incurs $O(S^{2})$ computation and
+gradient-Fisher requires backpropagation and a task loss. Accordingly,
+athese methods incur substantially higher calibration
+time and peak memory. Joint QK energy selection therefore offers a favorable
+trade-off between perfromance and calibration cost.
+
+## 4.6 Towards Models with Fewer and Wider Heads
+
+If post-training attention compression is anticipated at deployment time,
+larger head dimensions may be a useful architectural choice during
+pretraining. We study three matched $\sim 245$ M-parameter GPT-NeoX-style
+models pretrained from scratch on FineWeb-Edu for 2.5B tokens:
+wide ( $4\times 256$ ), standard ( $8\times 128$ ), and
+narrow ( $16\times 64$ ). All three reach comparable uncompressed
+WikiText validation perplexity. Figure 7(c) shows that wider-head models
+retain perplexity more effectively under aggressive RACE compression. At each
+retention ratio, the models have approximately matched aggregate retained
+attention dimension, KV-cache memory, attention FLOPs, and compressed
+attention parameter count; the primary difference is how this capacity is
+partitioned across heads. Wider heads expose more RoPE pairs from which RACE
+can select, providing greater flexibility in structured dimensional reduction.
+Thus, when post-training attention compression is a foreseeable deployment
+requirement, allocating attention width across fewer, wider heads during
+pretraining may yield a more favorable quality-efficiency trade-off.
+
+## 5 Conclusion
+
+In this work, we study when and how pretrained RoPE attention can be converted into a natively
+lower-dimensional form that reduces KV-cache storage, attention computation,
+and parameters without runtime reconstruction. Viewing Q/K compression as
+constrained approximate matrix multiplication motivates a shared reduction
+derived jointly from queries and keys. This reduction has to be RoPE-compatible to enable reconstruction-free compression. We further show that, for
+coordinate-selection reductions family, RoPE compatibility holds if and only if
+complete rotary pairs are retained. RACE selects within this admissible family using joint Q/K activation energy,
+a forward-only criterion that minimizes a separable calibration-dependent upper
+bound on post-RoPE product error. The resulting reductions are folded directly
+into the projection weights, enabling attention to execute entirely in the
+compressed dimensions without specialized kernels. Across multiple model
+families and compression levels, RACE outperforms evaluated reconstruction-free baselines and remains competitive with
+reconstruction-based methods while reducing KV-cache memory, attention cost,
+and latency.
+
+## AI use statement
+
+We used generative AI tools to assist with editing portions of the manuscript, retrieving related works, generating and debugging experimental and plotting code, and formatting figures and tables. We also used AI tools to discuss and refine aspects of theoretical presentation and interpretation of experimental results. All AI-assisted technical suggestions, mathematical arguments, code, and interpretations were independently reviewed and verified by the authors against the underlying derivations, implementations, and experimental outputs. No AI generated datasets were used in this work. We take responsibility for the final content of this work, including all text, claims, code, and artifacts produced with AI assistance.
+
+## Ethics statement
+
+The proposed method is intended to reduce the memory and computational cost of long-context inference, which may improve the accessibility and efficiency of deploying language models. As with other efficiency techniques, however, reducing inference cost can also lower the barrier to large-scale model deployment; the downstream societal effects therefore depend on how the resulting models are used. Our work does not modify model objectives, safety mechanisms, or training data, and we do not make claims about changes to model safety, fairness, or robustness beyond the evaluated performance metrics
+
+## Reproducibility statement
+
+We provide sufficient implementation and experimental details to reproduce the results in this work. A.7 specifies the RACE calibration and folding procedure, RoPE-pair handling, value compression, optional KL-based recovery, model and benchmark configurations, long-context evaluation settings, hardware/software environment, precision, number of tokens, kernels, and analytical FLOP derivations. Detailed per-task results, selector ablations, recovery settings, and systems measurements are also provided in the A.8.
+
+## References
+
+Bhatnagar et al. (2026)
+P. Bhatnagar, A. Moradifirouzabadi, S. Yang, S. Lee, J. Choi, and M. Kang
+
+STAR-kv: low-rank kv cache compression via soft thresholding for adaptive rank control.
+
+External Links: 2606.08382,
+Link
+
+Cited by: §2.
+
+Cai et al. (2024)
+Z. Cai, Y. Zhang, B. Gao, Y. Liu, T. Liu, K. Lu, W. Xiong, Y. Dong, B. Chang, J. Hu, and W. Xiao
+
+PyramidKV: dynamic kv cache compression based on pyramidal information funneling.
+
+arXiv preprint arXiv:2406.02069.
+
+Cited by: §2.
+
+Chang et al. (2025)
+C. Chang, W. Lin, C. Lin, C. Chen, Y. Hu, P. Wang, N. Huang, L. Ceze, M. S. Abdelfattah, and K. Wu
+
+Palu: kv-cache compression with low-rank projection.
+
+In International Conference on Learning Representations,
+
+Cited by: §A.4,
+Table 1,
+§1,
+§2,
+§4.1.
+
+Cohen et al. (2016)
+M. B. Cohen, J. Nelson, and D. P. Woodruff
+
+Optimal approximate matrix product in terms of stable rank.
+
+In 43rd International Colloquium on Automata, Languages,
+and Programming (ICALP 2016),
+
+Leibniz International Proceedings in Informatics, Vol. 55, pp. 11:1–11:14.
+
+External Links: Document
+
+Cited by: §A.5,
+§3.1.
+
+Fu et al. (2025)
+Y. Fu, Z. Cai, A. Asi, W. Xiong, Y. Dong, and W. Xiao
+
+Not all heads matter: a head-level kv cache compression method with integrated retrieval and reasoning.
+
+In International Conference on Learning Representations,
+
+Cited by: §2.
+
+Hooper et al. (2024)
+C. Hooper, S. Kim, H. Mohammadzadeh, M. W. Mahoney, Y. S. Shao, K. Keutzer, and A. Gholami
+
+KVQuant: towards 10 million context length llm inference with kv cache quantization.
+
+arXiv preprint arXiv:2401.18079.
+
+Cited by: §2.
+
+Li et al. (2024)
+Y. Li, Y. Huang, B. Yang, B. Venkitesh, A. Locatelli, H. Ye, T. Cai, P. Lewis, and D. Chen
+
+SnapKV: llm knows what you are looking for before generation.
+
+arXiv preprint arXiv:2404.14469.
+
+Cited by: §2.
+
+Lin et al. (2025)
+B. Lin, Z. Zeng, Z. Xiao, S. Kou, T. Hou, X. Gao, H. Zhang, and Z. Deng
+
+MatryoshkaKV: adaptive KV compression via trainable orthogonal projection.
+
+In The Thirteenth International Conference on Learning Representations,
+
+External Links: Link
+
+Cited by: §2.
+
+Liu et al. (2024)
+Z. Liu, J. Yuan, H. Jin, S. Zhong, Z. Xu, V. Braverman, B. Chen, and X. Hu
+
+KIVI: a tuning-free asymmetric 2bit quantization for kv cache.
+
+arXiv preprint arXiv:2402.02750.
+
+Cited by: §2.
+
+Saxena et al. (2024)
+U. Saxena, G. Saha, S. Choudhary, and K. Roy
+
+Eigen attention: attention in low-rank space for kv cache compression.
+
+In Findings of the Association for Computational Linguistics: EMNLP 2024,
+
+pp. 15332–15344.
+
+Cited by: Table 1,
+§1,
+§2,
+§3.3,
+§4.1.
+
+Shi et al. (2025)
+D. Shi, Y. Fu, X. Yuan, Z. Yu, H. You, S. Li, X. Dong, J. Kautz, P. Molchanov, and Y. C. Lin
+
+LaCache: ladder-shaped kv caching for efficient long-context modeling of large language models.
+
+In International Conference on Machine Learning,
+
+Cited by: §2.
+
+Su et al. (2024)
+J. Su, Y. Lu, S. Pan, A. Murtadha, B. Wen, and Y. Liu
+
+RoFormer: enhanced transformer with rotary position embedding.
+
+Neurocomputing 568, pp. 127063.
+
+Cited by: §A.3.
+
+Tenison et al. (2026)
+I. Tenison, S. Chatterjee, F. Kawsar, and M. Malekzadeh
+
+AdaBet: gradient-free layer selection for efficient training of deep neural networks.
+
+In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+
+Cited by: §2.
+
+Vaswani et al. (2017)
+A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, L. Kaiser, and I. Polosukhin
+
+Attention is all you need.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: Table 1.
+
+Wang et al. (2025)
+H. Wang, L. Han, K. Xu, and A. Srivastava
+
+SQuat: subspace-orthogonal kv cache quantization.
+
+In Conference on Language Modeling,
+
+Cited by: §2.
+
+Woodruff (2014)
+D. P. Woodruff
+
+Sketching as a tool for numerical linear algebra.
+
+Foundations and Trends in Theoretical Computer Science 10 (1–2), pp. 1–157.
+
+Cited by: §3.1.
+
+Xiao et al. (2024)
+G. Xiao, Y. Tian, B. Chen, S. Han, and M. Lewis
+
+Efficient streaming language models with attention sinks.
+
+In International Conference on Learning Representations,
+
+Cited by: §2.
+
+Xin et al. (2026)
+J. Xin, T. Lyu, D. Keyes, H. Ltaief, and M. Canini
+
+RAP: kv-cache compression via rope-aligned pruning.
+
+External Links: 2602.02599,
+Link
+
+Cited by: Table 1,
+§2,
+§3.1,
+§4.1.
+
+Xu et al. (2025)
+Y. Xu, Z. Jie, H. Dong, L. Wang, X. Lu, A. Zhou, A. Saha, C. Xiong, and D. Sahoo
+
+ThinK: thinner key cache by query-driven pruning.
+
+In The Thirteenth International Conference on Learning Representations,
+
+External Links: Link
+
+Cited by: §2.
+
+Yao et al. (2026)
+H. Yao, X. Chen, A. Murtadha, and G. Wang
+
+Thin keys, full values: reducing kv cache via low-dimensional attention selection.
+
+External Links: 2603.04427,
+Link
+
+Cited by: Table 1,
+§2,
+§3.1,
+§4.1.
+
+Zhang et al. (2023)
+Z. Zhang, Y. Sheng, T. Zhou, T. Chen, L. Zheng, R. Cai, Z. Song, Y. Tian, C. Ré, C. Barrett, Z. Wang, and B. Chen
+
+H2O: heavy-hitter oracle for efficient generative inference of large language models.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §2.
+
+Zhu et al. (2026)
+Y. Zhu, D. H. Yang, M. M. Amiri, K. Murugesan, T. Pedapati, and P. Chen
+
+OjaKV: context-aware online low-rank KV cache compression.
+
+In Findings of the Association for Computational Linguistics: ACL 2026, M. Liakata, V. P. Moreira, J. Zhang, and D. Jurgens (Eds.),
+
+San Diego, California, United States, pp. 10161–10178.
+
+External Links: Link,
+Document,
+ISBN 979-8-89176-395-1
+
+Cited by: §2.
+
+## Appendix A Appendix
+
+## A.1 Axes of KV-Cache Compression
+
+Figure 8: Token- and head- dimension KV-cache compression. Token-level methods reduce the number of retained cache entries N, whereas head-dimension methods reduce the dimensionality of each cached representation. These approaches act on orthogonal axes of the KV cache and can be combined.
+
+For a model with $L$ layers, batch size $B$ , context length $S$ , $H_{kv}$ 
+key–value heads, key dimension $d_{k}$ , value dimension $d_{v}$ , and $b$ bytes per
+element, the KV-cache memory is
+
+ $M_{\mathrm{KV}}=BLSH_{kv}(d_{k}+d_{v})b.$ 
+
+This expression exposes three independent factors that can be targeted by
+compression.
+
+Token-level methods reduce $S$ by evicting, retaining, or consolidating cached
+positions. Head-dimension methods reduce $d_{k}$ and $d_{v}$ for each retained
+position. Quantization reduces $b$ , the storage precision of each element.
+As illustrated in Figure 8, these approaches operate on
+different factors of the cache size and can therefore be applied independently
+or jointly. In particular, combining token and head-dimension compression
+changes the cache size to
+
+ $M_{\mathrm{KV}}^{\prime}=BLS^{\prime}H_{kv}(r_{k}+r_{v})b,$ 
+
+where $S^{\prime}\leq S$ , $r_{k}\leq d_{k}$ , and $r_{v}\leq d_{v}$ .
+
+## A.2 Attention and KV caching.
+
+For hidden states $X\in\mathbb{R}^{S\times d_{\mathrm{model}}}$ and attention weights $W_{Q},W_{K}\in\mathbb{R}^{d_{\mathrm{model}}\times d_{k}}$ and $W_{V}\in\mathbb{R}^{d_{\mathrm{model}}\times d_{v}}$ , an attention
+layer computes $Q=XW_{Q},\qquad K=XW_{K},\qquad V=XW_{V}$ .
+For each head, let $Q_{h},K_{h}\in\mathbb{R}^{S\times d_{k}}$ and
+ $V_{h}\in\mathbb{R}^{S\times d_{v}}$ . Its output is $O_{h}=A_{h}V_{h}=\operatorname{softmax}\!\left(\frac{Q_{h}K_{h}^{\top}}{\sqrt{d_{k}}}\right)V_{h}.$ 
+During autoregressive decoding, previously computed keys and values are stored
+in the KV cache. For $L$ layers, batch size $B$ , context length $S$ , $H_{kv}$ 
+KV heads, $H_{q}$ 
+Q heads, and $b$ bytes per element, its memory is
+
+ $M_{\mathrm{KV}}=BLSH_{kv}(d_{k}+d_{v})b.$ 
+
+(7)
+
+Thus, reducing $d_{k}$ and $d_{v}$ decreases cache memory without removing cached
+tokens. It also reduces the query-key and attention-value products, whose
+context-dependent decoding costs scale as
+ $\mathcal{O}(BSH_{q}d_{k})$ and $\mathcal{O}(BSH_{q}d_{v})$ , respectively. Their prefill costs scale as $\mathcal{O}(BS^{2}H_{q}d_{k})$ and $\mathcal{O}(BS^{2}H_{q}d_{v})$ , respectively. Complete
+FLOP expressions are provided in A.4.
+
+## A.3 RoPE-Compatible Reduction
+
+Rotary positional embeddings.
+
+RoPE partitions the rotary query and key dimensions into coordinate pairs and
+applies a position-dependent two-dimensional rotation to each pair
+(Su et al., 2024). For the pair associated with frequency $\theta_{i}$ at
+position $t$ ,
+
+ $R_{i}(t)=\begin{bmatrix}\cos(t\theta_{i})&-\sin(t\theta_{i})\\
+\sin(t\theta_{i})&\cos(t\theta_{i})\end{bmatrix}.$ 
+
+Although implementations may store paired coordinates consecutively or across
+two halves of the head dimension, the two coordinates remain coupled by the
+rotation. A coordinate-selection method can therefore preserve the pretrained
+RoPE operation without reconstruction only if it retains or removes complete
+rotary pairs. Architectures with partial RoPE additionally contain non-rotary
+coordinates, which need not satisfy this pairwise constraint.
+
+Logical pairs and physical coordinate layouts.
+
+Let $d_{\mathrm{rot}}\leq d_{k}$ denote the number of query and key coordinates
+to which RoPE is applied, and let $M=d_{\mathrm{rot}}/2$ . We represent the
+logical rotary pairs as
+
+ $\mathcal{P}_{\mathrm{rope}}=\{(i_{m},j_{m})\}_{m=1}^{M},$ 
+
+where $(i_{m},j_{m})$ identifies the two physical coordinates rotated using the
+ $m$ -th rotary frequency. The mapping from logical pairs to physical coordinates
+depends on the model implementation. With one-based indexing, common layouts
+include
+
+ $(i_{m},j_{m})=\begin{cases}(2m-1,\,2m),&\text{adjacent-pair layout},\\
+(m,\,m+M),&\text{split-half layout}.\end{cases}$ 
+
+The former is used by GPT-J-style rotary implementations, whereas the latter
+is used by LLaMA-style implementations. Our selection operates on these
+logical pairs rather than on neighboring memory locations, so the same
+procedure applies to either layout after constructing the appropriate pair
+map.
+
+Restriction of the original RoPE operator.
+
+Let $\mathcal{S}\subseteq[M]$ be the retained set of rotary pairs and let
+ $P_{\mathcal{S}}\in\{0,1\}^{d_{k}\times 2|\mathcal{S}|}$ contain the standard
+basis vectors corresponding to both coordinates of every pair in
+ $\mathcal{S}$ . The reduced RoPE operator is formed by retaining the original
+rotation block associated with each selected pair:
+
+ $R_{t}^{(\mathcal{S})}=\bigoplus_{m\in\mathcal{S}}R_{t,m}.$ 
+
+Provided that the columns of $P_{\mathcal{S}}$ and the blocks of
+ $R_{t}^{(\mathcal{S})}$ use the same pair ordering,
+
+ $R_{t}P_{\mathcal{S}}=P_{\mathcal{S}}R_{t}^{(\mathcal{S})}.$ 
+
+Consequently, for row-wise query activations,
+
+ $(QR_{t})P_{\mathcal{S}}=(QP_{\mathcal{S}})R_{t}^{(\mathcal{S})},$ 
+
+and analogously for keys. Thus, selecting coordinates before RoPE and applying
+the restricted operator produces exactly the selected coordinates of the
+original RoPE output. This is an algebraic restriction of the pretrained
+operator, not an approximation introduced by the reduced-dimensional
+implementation.
+
+Preserving pretrained rotary frequencies.
+
+Reducing the query–key dimension must not cause the rotary frequencies to be
+recomputed from the new dimension $r_{k}$ . Standard RoPE implementations derive
+frequencies from their original rotary dimension; reinitializing RoPE with
+ $r_{k}$ would generally assign different angles to the retained coordinates and
+would therefore alter the pretrained positional encoding. Instead, for every
+retained pair $m\in\mathcal{S}$ , we copy its original frequency $\theta_{m}$ :
+
+ $\bm{\theta}^{(\mathcal{S})}=[\theta_{m}]_{m\in\mathcal{S}}.$ 
+
+The selected pairs may be stored in score order or original-coordinate order,
+provided that the queries, keys, and frequencies use the same ordering. In our
+implementation, we retain the original pair order after selection to make the
+folded checkpoints deterministic.
+
+For models using scaled RoPE, the same principle applies: the model’s original
+position-dependent frequency transformation and any associated attention
+scaling are preserved, and only the entries corresponding to selected pairs
+are gathered. This avoids silently replacing the pretrained positional
+encoding with a new reduced-dimensional frequency schedule.
+
+Partial RoPE.
+
+Some architectures apply RoPE to only
+ $d_{\mathrm{rot}}<d_{k}$ coordinates. Let
+ $\mathcal{I}_{\mathrm{NoPE}}$ denote the complementary non-rotary coordinates.
+The complete-pair constraint is imposed only on
+ $\mathcal{P}_{\mathrm{rope}}$ ; non-rotary coordinates may be selected
+individually. If $\mathcal{J}\subseteq\mathcal{I}_{\mathrm{NoPE}}$ is the
+retained non-rotary set, the complete selector is
+
+ $P_{QK}=\left[P_{\mathcal{S}}\;P_{\mathcal{J}}\right],\qquad r_{k}=2|\mathcal{S}|+|\mathcal{J}|,$ 
+
+and the corresponding reduced positional operator is
+
+ $R_{t}^{(\mathcal{S},\mathcal{J})}=R_{t}^{(\mathcal{S})}\oplus I_{|\mathcal{J}|}.$ 
+
+The identity block leaves the retained non-rotary coordinates unchanged.
+Hence, the same commutation relation holds for architectures with full or
+partial RoPE.
+
+Grouped-query attention.
+
+Under grouped-query attention, several query heads attend to a shared key head.
+For each KV head $g$ , let $\mathcal{G}_{g}$ denote its associated query heads. We
+compute the Q/K pair statistics jointly over the key activations of head $g$ 
+and the query activations from all heads in $\mathcal{G}_{g}$ . A single pair set
+ $\mathcal{S}_{g}$ is then applied to the shared key head and to every query head
+in its group. This ensures that each query and the key cache against which it
+is evaluated use identical retained coordinates and rotary frequencies. Pair
+sets may differ across KV heads, but they cannot differ among query heads that
+interact with the same cached key representation.
+
+Implementation consequence.
+
+After selection, the columns indexed by $P_{QK}$ are folded into $W_{Q}$ and
+ $W_{K}$ , and the RoPE module is restricted to the corresponding original
+frequencies. The resulting layer produces $r_{k}$ -dimensional queries and keys
+directly. Neither the discarded coordinates nor a full-dimensional RoPE output
+is materialized during prefill or decoding.
+
+## A.4 Inference FLOPs Analysis
+
+We analyze the attention-related floating-point operations (FLOPs) incurred during prefill and autoregressive decoding. We count a multiply-add as two FLOPs and omit element-wise operations such as softmax, normalization, and RoPE, which are lower-order relative to the matrix multiplications considered here.
+
+Let $B$ denote the batch size, $S$ the context length, $d$ the model hidden dimension, $H_{q}$ the number of query heads, and $H_{\mathrm{kv}}$ the number of key-value heads. The original query/key and value head dimensions are $d_{k}$ and $d_{v}$ , respectively. After compression, their corresponding dimensions are
+ $r_{k}$ and $r_{v}$ .
+
+For prefill, projections are applied to all $S$ input tokens and attention is computed over an $S\times S$ attention matrix. For decoding, we report the FLOPs for generating one new token given a cache of $S$ previous tokens.
+
+Full Attention
+
+For standard attention, the query, key, and value projections during prefill cost
+
+ $F_{\mathrm{proj}}^{\mathrm{pre}}=2BSd\left(H_{q}d_{k}+H_{\mathrm{kv}}d_{k}+H_{\mathrm{kv}}d_{v}\right).$ 
+
+(8)
+
+The query-key product and attention-value product cost
+
+ $\displaystyle F_{QK}^{\mathrm{pre}}$ 
+ $\displaystyle=2BS^{2}H_{q}d_{k},$ 
+
+(9)
+
+ $\displaystyle F_{AV}^{\mathrm{pre}}$ 
+ $\displaystyle=2BS^{2}H_{q}d_{v},$ 
+
+(10)
+
+and the output projection costs
+
+ $F_{O}^{\mathrm{pre}}=2BSH_{q}d_{v}d.$ 
+
+(11)
+
+Thus,
+
+ $F_{\mathrm{Full}}^{\mathrm{pre}}=2BSd\left(H_{q}d_{k}+H_{\mathrm{kv}}d_{k}+H_{\mathrm{kv}}d_{v}\right)+2BS^{2}H_{q}(d_{k}+d_{v})+2BSH_{q}d_{v}d.$ 
+
+(12)
+
+During decoding, projections are required only for the newly generated token:
+
+ $F_{\mathrm{proj}}^{\mathrm{dec}}=2Bd\left(H_{q}d_{k}+H_{\mathrm{kv}}d_{k}+H_{\mathrm{kv}}d_{v}\right).$ 
+
+(13)
+
+The query attends to all $S$ cached keys and values, giving
+
+ $\displaystyle F_{QK}^{\mathrm{dec}}$ 
+ $\displaystyle=2BSH_{q}d_{k},$ 
+
+(14)
+
+ $\displaystyle F_{AV}^{\mathrm{dec}}$ 
+ $\displaystyle=2BSH_{q}d_{v},$ 
+
+(15)
+
+while the output projection costs
+
+ $F_{O}^{\mathrm{dec}}=2BH_{q}d_{v}d.$ 
+
+(16)
+
+Therefore,
+
+ $F_{\mathrm{Full}}^{\mathrm{dec}}=2Bd\left(H_{q}d_{k}+H_{\mathrm{kv}}d_{k}+H_{\mathrm{kv}}d_{v}\right)+2BSH_{q}(d_{k}+d_{v})+2BH_{q}d_{v}d.$ 
+
+(17)
+
+For long contexts, the cache-length-dependent term dominates:
+
+ $F_{\mathrm{Full,LC}}^{\mathrm{dec}}\simeq 2BSH_{q}(d_{k}+d_{v}).$ 
+
+(18)
+
+EigenAttention with RoPE
+
+EigenAttention projects attention representations K and V into learned low-dimensional subspaces. In its RoPE-compatible formulation, compressed keys must be decompressed into the original dimension, which is RoPE-compatible, before query-key attention.
+
+During prefill, the projection costs
+
+ $F_{proj}^{\mathrm{pre}}=2BSd(H_{q}d_{k}+H_{kv}r_{k}+H_{kv}r_{V}).$ 
+
+(19)
+
+Transforming the compressed keys to the original key space costs
+
+ $F_{K,\mathrm{rec}}^{\mathrm{pre}}=2BSH_{\mathrm{kv}}r_{k}d_{k}.$ 
+
+(20)
+
+Since queries and reconstructed keys interact in the original key dimension,
+the query-key product is the same as full attention. The value representation remains compressed to dimension $r_{v}$ , giving
+
+ $F_{AV}^{\mathrm{pre}}=2BS^{2}H_{q}r_{v}\qquad F_{O}^{\mathrm{pre}}=2BSH_{q}r_{v}d.$ 
+
+(21)
+
+Thus, the prefill cost is
+
+ $F_{\mathrm{Eigen}}^{\mathrm{pre}}=2BS\left[d(H_{q}d_{k}+H_{kv}r_{k}+H_{kv}r_{V})+H_{\mathrm{kv}}r_{k}d_{k}+SH_{q}(d_{k}+r_{v})+H_{q}r_{v}d\right]$ 
+
+(22)
+
+During decoding, all $S$ cached compressed keys must be reconstructed before
+RoPE, giving
+
+ $F_{proj}^{\mathrm{dec}}=2Bd(H_{q}d_{k}+H_{kv}r_{k}+H_{kv}r_{V}).\qquad F_{K,\mathrm{rec}}^{\mathrm{dec}}=2BSH_{\mathrm{kv}}r_{k}d_{k}.$ 
+
+(23)
+
+The subsequent query-key, attention-value operations, and output cost
+
+ $F_{QK}^{\mathrm{dec}}=2BSH_{q}d_{k}\qquad F_{AV}^{\mathrm{dec}}=2BSH_{q}r_{v},\qquad F_{O}^{\mathrm{dec}}=2BH_{q}r_{v}d.$ 
+
+(24)
+
+Therefore, the cache-length-dependent cost of generating one token is
+
+ $F_{\mathrm{Eigen,LC}}^{\mathrm{dec}}=2BS\left[H_{\mathrm{kv}}r_{k}d_{k}+H_{q}(d_{k}+r_{v})\right].$ 
+
+(25)
+
+This additional $O(BSH_{kv}r_{k}d_{k})$ term arises from reconstructing cached keys
+into the RoPE-compatible space.
+
+PALU with G-LRD and RoPE
+
+PALU (Chang et al., 2025) applies group-head low-rank decomposition
+(G-LRD) to the key and value projection matrices. Let $s$ denote the
+number of KV heads in each group and
+ $G=\frac{H_{\mathrm{kv}}}{s}$ 
+the number of groups. For each key group $g$ , PALU factorizes the
+concatenated projection of $s$ heads as
+
+ $W_{K}^{(g)}\approx A_{K}^{(g)}B_{K}^{(g)},$ 
+
+where
+
+ $A_{K}^{(g)}\in\mathbb{R}^{d\times r_{k}^{(g)}},\qquad B_{K}^{(g)}\in\mathbb{R}^{r_{k}^{(g)}\times sd_{k}}.$ 
+
+The intermediate representation produced by $A_{K}^{(g)}$ is stored in the KV cache. For RoPE-based attention, the cached key latent is reconstructed to the original $sd_{k}$ -dimensional group representation before applying RoPE and computing attention.
+
+Assuming uniform group ranks
+ $r_{k}^{(g)}=r_{k}^{G}$ and $r_{v}^{(g)}=r_{v}^{G}$ , the Q/K/V projection cost
+during prefill is
+
+ $F_{\mathrm{proj}}^{\mathrm{pre}}=2BSd\left(H_{q}d_{k}+Gr_{k}^{G}+Gr_{v}^{G}\right).$ 
+
+(26)
+
+For one decoding step,
+
+ $F_{\mathrm{proj}}^{\mathrm{dec}}=2Bd\left(H_{q}d_{k}+Gr_{k}^{G}+Gr_{v}^{G}\right).$ 
+
+(27)
+
+For each group, reconstructing $S$ cached key latents from dimension $r_{k}^{G}$ to $sd_{k}$ costs $2BSr_{k}^{G}sd_{k}$ . Across all $G$ groups,
+
+ $\displaystyle F_{K,\mathrm{rec}}^{\mathrm{pre}}=2BSGr_{k}^{G}sd_{k}=2BSH_{\mathrm{kv}}r_{k}^{G}d_{k}.$ 
+
+(28)
+
+The same cache-wide reconstruction is required for each decoding step:
+
+ $F_{K,\mathrm{rec}}^{\mathrm{dec}}=2BSH_{\mathrm{kv}}r_{k}^{G}d_{k}.$ 
+
+(29)
+
+Because reconstructed keys have the original head dimension $d_{k}$ ,
+the query-key products and value products cost
+
+ $\displaystyle F_{QK}^{\mathrm{pre}}=2BS^{2}H_{q}d_{k},\qquad F_{QK}^{\mathrm{dec}}=2BSH_{q}d_{k}.$ 
+
+(30)
+
+ $\displaystyle F_{AV}^{\mathrm{pre}}=2BS^{2}Gr_{V}^{G},\qquad F_{AV}^{\mathrm{dec}}=2BSGr_{V}^{G}.$ 
+
+(31)
+
+PALU folds the value-side reconstruction into the output projection, so attention-value aggregation can be performed in the grouped latent value space. Let the total latent value width across all groups be $d_{V}^{\mathrm{latent}}=Gr_{v}^{G}$ . The precise arithmetic depends on the mapping between query heads and value groups; we therefore retain the value-side latent width explicitly.
+
+The fused output projection maps the concatenated latent value
+representation back to the model dimension, giving
+
+ $\displaystyle F_{O}^{\mathrm{pre}}=2BS\,Gr_{v}^{G}d,\qquad F_{O}^{\mathrm{dec}}=2B\,Gr_{v}^{G}d.$ 
+
+(32)
+
+The prefill cost is
+
+ $F_{PALU}^{pre}=2BS\left[d\left(H_{q}d_{k}+Gr_{k}^{G}+Gr_{v}^{G}\right)+H_{\mathrm{kv}}r_{k}^{G}d_{k}+SH_{q}d_{k}+Gr_{V}^{G}(S+d)\right].$ 
+
+(33)
+
+Ignoring the $S$ -independent projection and output terms, the dominant
+cache-length-dependent decoding cost is
+
+ $F_{\mathrm{Palu,LC}}^{\mathrm{dec}}\simeq 2BS\left(H_{\mathrm{kv}}r_{k}^{G}d_{k}+H_{q}d_{k}+Gr_{v}^{G}\right).$ 
+
+(34)
+
+Ours
+
+Our method reduces the architectural query/key and value head dimensions to
+ $r_{k}$ and $r_{v}$ , respectively. All compression transformations are folded into
+the query, key, value, and output projection matrices. Consequently, neither
+key nor value reconstruction is required during inference. The native-reduced dimensional attention FLOPs are as follows
+
+During prefill,
+
+ $F_{\mathrm{Ours}}^{\mathrm{pre}}=2BSd\left(H_{q}r_{k}+H_{\mathrm{kv}}r_{k}+H_{\mathrm{kv}}r_{v}\right)+2BS^{2}H_{q}(r_{k}+r_{v})+2BSH_{q}r_{v}d.$ 
+
+(35)
+
+During decoding,
+
+ $F_{\mathrm{Ours}}^{\mathrm{dec}}=2Bd\left(H_{q}r_{k}+H_{\mathrm{kv}}r_{k}+H_{\mathrm{kv}}r_{v}\right)+2BSH_{q}(r_{k}+r_{v})+2BH_{q}r_{v}d.$ 
+
+(36)
+
+The cache-length-dependent decoding cost is therefore
+
+ $F_{\mathrm{Ours,LC}}^{\mathrm{dec}}\simeq 2BSH_{q}(r_{k}+r_{v}).$ 
+
+(37)
+
+For $d_{k}=d_{v}$ and $r_{k}=r_{v}=d_{k}/2$ , this term is exactly half that of
+full attention:
+
+ $\frac{F_{\mathrm{Ours,LC}}^{\mathrm{dec}}}{F_{\mathrm{Full,LC}}^{\mathrm{dec}}}=\frac{r_{k}+r_{v}}{d_{k}+d_{v}}=\frac{1}{2}.$ 
+
+(38)
+
+RAP follows similar compressed attention as Ours and therefore the prefill and decoding FLOPs would be alike. Similarly, Think Keys Full Values also compresses attention while keeping Values in full dimension $r_{v}=d_{v}$ .
+
+## A.4.1 Derivation of Table 1
+
+Table 1 compares methods under the representative grouped-query attention configuration $d=1536$ , $H_{q}=6$ , $H_{kv}=2$ , and $d_{k}=d_{v}=128$ . For RACE, RAP, and EigenAttention, we use $r_{k}=r_{v}=64$ , while Thin Keys uses $r_{k}=64$ and $r_{v}=128$ . For PALU G-LRD, the two KV heads form a single group ( $G=1$ , $s=2$ ) with group ranks $r_{k}^{G}=r_{v}^{G}=128$ ; these ranks are defined per group rather than per head. We count a multiply–add as two FLOPs and omit elementwise operations. For prefill, we report the coefficient of the dominant $O(S^{2})$ attention computation, while for single-token decoding, we report all operations that scale linearly with the cached sequence length $S$ . Common factors such as $2BS^{2}$ for prefill and $2BS$ for decoding therefore cancel in the normalized ratios. This convention captures the distinction between native dimensional reduction, where attention is performed directly in the compressed representation, and reconstruction-based methods, which incur additional cache-length-dependent work during decoding.
+
+RACE, RAP, and Thin Keys.
+
+Both methods execute attention natively with $r_{k}=r_{v}=64$ , without reconstructing the discarded dimensions. Their cache retention is
+
+ $\rho_{\mathrm{cache}}=\frac{H_{kv}(r_{k}+r_{v})}{H_{kv}(d_{k}+d_{v})}=\frac{64+64}{128+128}=0.5.$ 
+
+The same dimensional reduction applies to the Q, K, V, and output projections, giving $P_{\mathrm{native}}/P_{\mathrm{full}}=0.5$ . Since both the query–key and attention–value products are evaluated directly in dimensions $r_{k}$ and $r_{v}$ , the normalized dominant prefill and decoding costs are also
+
+ $\rho_{\mathrm{prefill}}=\rho_{\mathrm{decode}}=\frac{H_{q}(r_{k}+r_{v})}{H_{q}(d_{k}+d_{v})}=0.5.$ 
+
+For the Thin Keys baseline, $r_{v}=128$ as they do not compress values. This gives $\rho_{cache}=0.75$ and $\rho_{prefill}=\rho_{decode}=0.75$ .
+
+EigenAttention.
+
+EigenAttention stores keys and values in reduced dimensions
+ $r_{k}=r_{v}=64$ , giving 50% KV-cache retention. Following the
+parameter-counting convention in Table 1, we count the compressed
+projections together with the learned key and value bases:
+
+ $\displaystyle P_{\text{Eigen}}$ 
+ $\displaystyle=d\left(H_{q}d_{k}+H_{kv}r_{k}+H_{kv}r_{v}+H_{q}r_{v}\right)+H_{kv}(r_{k}d_{k}+r_{v}d_{v}).$ 
+
+(39)
+
+For the representative configuration used for parameter counting,
+ $d=1536$ , $H_{q}=H_{kv}=6$ , $d_{k}=d_{v}=128$ , and
+ $r_{k}=r_{v}=64$ , this gives
+
+ $\frac{P_{\text{Eigen}}}{P_{\text{full}}}=0.698$ 
+
+During prefill, key reconstruction scales as $O(S)$ , while the
+query-key and attention-value products scale as $O(S^{2})$ . Hence,
+asymptotically the dominant prefill cost is
+
+ $\rho_{\text{prefill}}^{\text{Eigen}}=\frac{H_{q}(d_{k}+r_{v})}{H_{q}(d_{k}+d_{v})}=\frac{128+64}{128+128}=0.75.$ 
+
+For decoding, however, every cached compressed key must be mapped back
+to the original key dimension before query-key attention. The
+cache-length-dependent cost $F_{\text{Eigen,LC}}^{\text{dec}}\simeq 2BS\left[H_{kv}r_{k}d_{k}+H_{q}(d_{k}+r_{v})\right].$ 
+Normalizing by full attention,
+ $F_{\text{Full,LC}}^{\text{dec}}=2BSH_{q}(d_{k}+d_{v}),$ 
+gives
+
+ $\rho_{\text{decode}}^{\text{Eigen}}=\frac{H_{kv}r_{k}d_{k}+H_{q}(d_{k}+r_{v})}{H_{q}(d_{k}+d_{v})}=11.42.$ 
+
+PALU.
+
+PALU G-LRD jointly compresses groups of KV heads. For the parameter
+comparison in Table 1, we use $H_{kv}=2$ heads divided into
+ $G=1$ groups of $s=2$ heads, with group ranks
+ $r_{k}^{G}=r_{v}^{G}=128$ . The resulting cache stores
+
+ $C_{\text{PALU}}=G(r_{k}^{G}+r_{v}^{G})=3(128+128)=768$ 
+
+scalars per token, corresponding to 50% of the full KV cache.
+
+Following the parameter-counting convention in Table 1, we count the
+query projection, both low-rank factor matrices for the grouped key and
+value projections, and the fused value-output map:
+ $P_{\text{PALU}}=dH_{q}d_{k}+Gr_{k}^{G}(d+sd_{k})+Gr_{v}^{G}(d+sd_{v})+dGr_{v}^{G}$ 
+which gives
+
+ $\frac{P_{\text{PALU}}}{P_{\text{full}}}=0.583.$ 
+
+PALU reconstructs cached keys into the original key dimension before
+query-key attention, while value aggregation is performed directly in
+the grouped latent value space. Consequently, the dominant
+cache-length-dependent decoding cost is
+
+ $F_{\text{PALU,LC}}^{\text{dec}}\simeq 2BS\left[H_{kv}r_{k}^{G}d_{k}+H_{q}d_{k}+Gr_{v}^{G}\right].$ 
+
+Normalizing by full attention gives
+
+ $\rho_{\text{decode}}^{\text{PALU}}=\frac{H_{kv}r_{k}^{G}d_{k}+H_{q}d_{k}+Gr_{v}^{G}}{H_{q}(d_{k}+d_{v})}.=21.92.$ 
+
+Fore prefill,
+
+ $\rho_{\text{prefill}}^{\text{PALU}}=\frac{H_{q}d_{k}+Gr_{v}^{G}}{H_{q}(d_{k}+d_{v})}.=0.75$ 
+
+## A.5 Approximate Matrix Multiplication View of Attention Compression
+
+This section formalizes the connection between head-dimension compression and
+approximate matrix multiplication (AMM), and clarifies how our
+RoPE-constrained coordinate selection relates to existing sampling-based AMM
+results.
+
+AMM formulation.
+
+Consider a single attention head with post-RoPE query and key matrices $Q,K\in\mathbb{R}^{S\times d_{k}}$ .
+The pre-softmax attention interaction is $L=QK^{\top}$ .
+
+Following the standard AMM formulation, let
+
+ $A=Q^{\top}\in\mathbb{R}^{d_{k}\times S},\qquad B=K^{\top}\in\mathbb{R}^{d_{k}\times S},$ 
+
+so that $A^{\top}B=QK^{\top}$ .
+Given a dimensionality-reducing operator $\Pi\in\mathbb{R}^{r_{k}\times d_{k}}$ ,
+AMM replaces this product by
+
+ $(\Pi A)^{\top}(\Pi B)=Q\Pi^{\top}\Pi K^{\top}.$ 
+
+(40)
+
+Thus, dimensionality reduction along the shared row dimension of $A$ and $B$ 
+is exactly dimensionality reduction along the head-feature dimension of
+ $Q$ and $K$ .
+
+Stable-rank AMM.
+
+For conforming matrices $A$ and $B$ , (Cohen et al., 2016)
+define a $(k,\epsilon)$ spectral-norm AMM property of the form
+
+ $\left\|(\Pi A)^{\top}(\Pi B)-A^{\top}B\right\|_{2}\leq\epsilon\sqrt{\left(\|A\|_{2}^{2}+\frac{\|A\|_{F}^{2}}{k}\right)\left(\|B\|_{2}^{2}+\frac{\|B\|_{F}^{2}}{k}\right)}.$ 
+
+(41)
+
+They show that suitable oblivious embeddings can satisfy this property using
+
+ $m=\mathcal{O}\left(\frac{k+\log(1/\delta)}{\epsilon^{2}}\right)$ 
+
+rows with probability at least $1-\delta$ .
+
+The stable rank of a matrix $A$ is
+
+ $\operatorname{sr}(A)=\frac{\|A\|_{F}^{2}}{\|A\|_{2}^{2}}.$ 
+
+(42)
+
+Setting
+
+ $k\gtrsim\max\{\operatorname{sr}(A),\operatorname{sr}(B)\}$ 
+
+makes the Frobenius-to-spectral terms in
+Eq. equation 41 controlled by the corresponding spectral norms.
+Consequently, the required sketch dimension can scale with the effective
+spectral dimension of the operands rather than their ambient dimension.
+Applied to attention with $A=Q^{\top}$ and $B=K^{\top}$ , this provides theoretical
+motivation for reducing $d_{k}$ when the query and key activations have low
+stable rank.
+
+From row sampling in AMM to feature selection in attention.
+
+AMM sampling methods act on the shared row dimension of the two operands.
+Under the identification $A=\widetilde{Q}^{\top};B=\widetilde{K}^{\top}$ 
+the rows of $A$ and $B$ correspond to the feature dimensions of
+ $\widetilde{Q}$ and $\widetilde{K}$ . Let
+
+ $P_{\mathcal{I}}=[e_{i_{1}},\ldots,e_{i_{r}}]\in\{0,1\}^{d_{k}\times r_{k}}$ 
+
+select the coordinate set $\mathcal{I}$ , and take
+ $\Pi=P_{\mathcal{I}}^{\top}$ . The AMM approximation then becomes
+
+ $\displaystyle(\Pi A)^{\top}(\Pi B)$ 
+ $\displaystyle=\widetilde{Q}P_{\mathcal{I}}P_{\mathcal{I}}^{\top}\widetilde{K}^{\top}$ 
+
+(43)
+
+ $\displaystyle=(\widetilde{Q}P_{\mathcal{I}})(\widetilde{K}P_{\mathcal{I}})^{\top}.$ 
+
+Thus, row selection in AMM is exactly feature selection in attention,
+with the same selection matrix applied to queries and keys.
+
+Equation 43 motivates two design choices. First,
+queries and keys should use an identical reduction $P_{\mathcal{I}}$ or in the context of RACE, $P_{QK}$ rather than
+independently constructed maps $P_{Q}$ and $P_{K}$ .
+
+Separate maps
+would produce $(\widetilde{Q}P_{Q})(\widetilde{K}P_{K})^{\top}=\widetilde{Q}P_{Q}P_{K}^{\top}\widetilde{K}^{\top},$ 
+which is not the shared-sketch AMM approximation
+ $\widetilde{Q}P_{QK}P_{QK}^{\top}\widetilde{K}^{\top}$ .
+
+Second, because the approximation target is the joint product
+ $\widetilde{Q}\widetilde{K}^{\top}$ , a data-dependent choice of
+ $P_{QK}$ should account for both operands. Selecting dimensions using
+only query or only key statistics can discard features that have low
+importance for one operand but materially affect their interaction.
+
+These observations determine the form of the reduction - a common,
+jointly informed Q/K selector, but not its precise selection rule.
+General AMM results show that appropriately chosen subsets of the shared
+dimension can preserve matrix products. RACE further restricts this
+family to selectors that are compatible with RoPE and derives an
+activation-energy criterion for choosing among them.
+
+Relation to our selector.
+
+RACE’s compression operator is a more restricted member of this general family.
+For each attention head, we use an unweighted binary selection matrix
+ $P_{QK}=[e_{i}]_{i\in\mathcal{I}_{QK}}$ ,
+where $\mathcal{I}_{QK}$ is chosen from calibration activations. Unlike the general data-dependent sampling operators covered by AMM theory, our selector must additionally satisfy the structural constraints induced by RoPE. Specifically, if $\mathcal{P}_{\mathrm{rope}}=\{(i_{m},j_{m})\}_{m=1}^{M}$ 
+denotes the rotary coordinate pairs, then
+
+ $\mathcal{I}_{QK}=\bigcup_{m\in\mathcal{S}}\{i_{m},j_{m}\},\qquad|\mathcal{S}|=\frac{r_{k}}{2}.$ 
+
+(44)
+
+The selected set is therefore a union of complete two-dimensional rotary
+blocks.
+
+Energy-based selection and scope of the guarantee.
+
+The AMM results above establish that low-dimensional and sampling-based
+representations capable of preserving matrix products exist under appropriate
+conditions. They do not imply that every coordinate subset, or specifically
+our RoPE-constrained subset, satisfies the same AMM bound.
+
+Our method chooses among the admissible RoPE pairs using calibration energy.
+For pair $(i_{m},j_{m})$ , we define
+
+ $E_{m}=\|Q_{:,i_{m}}\|_{2}^{2}+\|Q_{:,j_{m}}\|_{2}^{2}+\|K_{:,i_{m}}\|_{2}^{2}+\|K_{:,j_{m}}\|_{2}^{2},$ 
+
+(45)
+
+and retain the $r_{k}/2$ highest-energy pairs. This criterion favors coordinates
+that carry substantial query/key activation energy while remaining compatible
+with RoPE.
+
+We therefore use stable-rank AMM and sampling-based AMM as theoretical
+motivation for reducing the shared query–key dimension, rather than claiming
+a direct AMM guarantee for the proposed energy-based selector. The exact
+property guaranteed by our construction is structural: selecting complete
+rotary pairs permits RoPE and attention to be executed natively in the reduced
+space.
+
+## A.6 Proofs
+
+Proof of Theorem 1.
+
+[RoPE-compatible coordinate selection]
+
+Proof.
+
+Suppose $P_{QK}$ selects exactly the coordinates belonging to the
+complete rotary pairs indexed by
+ $\mathcal{S}\subseteq\{1,\ldots,M\}$ , with its columns ordered
+consistently with the blocks of $R_{t}^{(\mathcal{S})}$ .
+Since
+
+ $R_{t}=\operatorname{diag}(R_{1,t},\ldots,R_{M,t})$ 
+
+acts independently on each rotary pair, applying $R_{t}$ to the selected
+coordinates applies precisely the blocks $R_{m,t}$ for $m\in\mathcal{S}$ .
+Therefore,
+
+ $R_{t}P_{QK}=P_{QK}\operatorname{diag}(R_{m,t}:m\in\mathcal{S})=P_{QK}R_{t}^{(\mathcal{S})}$ 
+
+for every $t$ . Hence $P_{QK}$ is RoPE-compatible.
+
+Conversely, suppose
+
+ $R_{t}P_{QK}=P_{QK}R_{t}^{(\mathcal{S})}\qquad\text{for all }t.$ 
+
+The right-hand side lies in $\operatorname{col}(P_{QK})$ , and therefore
+
+ $R_{t}\operatorname{col}(P_{QK})\subseteq\operatorname{col}(P_{QK})\qquad\text{for all }t.$ 
+
+Thus, the coordinate subspace selected by $P_{QK}$ must be invariant
+under every $R_{t}$ .
+
+Consider any rotary pair $(i_{m},j_{m})$ . Suppose, for contradiction, that
+ $P_{QK}$ selects $i_{m}$ but not $j_{m}$ . Then
+ $e_{i_{m}}\in\operatorname{col}(P_{QK})$ , whereas
+ $e_{j_{m}}\notin\operatorname{col}(P_{QK})$ .
+For the $m$ -th rotary block,
+
+ $R_{m,t}=\begin{bmatrix}\cos\phi_{m,t}&-\sin\phi_{m,t}\\
+\sin\phi_{m,t}&\cos\phi_{m,t}\end{bmatrix},$ 
+
+so, up to the coordinate convention for the pair,
+
+ $R_{t}e_{i_{m}}=\cos\phi_{m,t}\,e_{i_{m}}+\sin\phi_{m,t}\,e_{j_{m}}.$ 
+
+By assumption, pair $m$ undergoes a nontrivial rotation for at least one
+position, so there exists $t$ such that
+ $\sin\phi_{m,t}\neq 0$ . For this $t$ , $R_{t}e_{i_{m}}$ has a nonzero
+component along $e_{j_{m}}$ and therefore
+
+ $R_{t}e_{i_{m}}\notin\operatorname{col}(P_{QK}),$ 
+
+contradicting the invariance established above.
+
+The same argument applies if $j_{m}$ is selected but $i_{m}$ is not.
+Hence, for every rotary pair, either both coordinates are selected or
+neither is selected. Therefore the coordinates selected by $P_{QK}$ 
+form a union of complete rotary pairs, indexed by some
+ $\mathcal{S}\subseteq\{1,\ldots,M\}$ .
+
+∎
+
+Proof of Proposition 1.
+
+[Error bound for RoPE-pair truncation]
+
+Proof.
+
+Partition the post-RoPE query and key matrices into RoPE-aligned coordinate pairs,
+
+ $\widetilde{Q}=[\widetilde{Q}_{1},\ldots,\widetilde{Q}_{M}],\qquad\widetilde{K}=[\widetilde{K}_{1},\ldots,\widetilde{K}_{M}],$ 
+
+where each
+
+ $\widetilde{Q}_{m},\widetilde{K}_{m}\in\mathbb{R}^{S\times 2}.$ 
+
+Because matrix multiplication along the feature dimension decomposes additively
+across these blocks,
+
+ $\widetilde{Q}\widetilde{K}^{\top}=\sum_{m=1}^{M}\widetilde{Q}_{m}\widetilde{K}_{m}^{\top}.$ 
+
+For a retained pair set $\mathcal{S}\subseteq[M]$ , the corresponding truncated
+product is
+
+ $\widetilde{Q}_{\mathcal{S}}\widetilde{K}_{\mathcal{S}}^{\top}=\sum_{m\in\mathcal{S}}\widetilde{Q}_{m}\widetilde{K}_{m}^{\top}.$ 
+
+Hence the truncation error would be,
+
+ $\widetilde{Q}\widetilde{K}^{\top}-\widetilde{Q}_{\mathcal{S}}\widetilde{K}_{\mathcal{S}}^{\top}=\sum_{m\notin\mathcal{S}}\widetilde{Q}_{m}\widetilde{K}_{m}^{\top}.$ 
+
+(46)
+
+Applying the triangle inequality for the Forbenius norm gives
+
+ $\displaystyle\left\|\widetilde{Q}\widetilde{K}^{\top}-\widetilde{Q}_{\mathcal{S}}\widetilde{K}_{\mathcal{S}}^{\top}\right\|_{F}$ 
+ $\displaystyle\leq\sum_{m\notin\mathcal{S}}\left\|\widetilde{Q}_{m}\widetilde{K}_{m}^{\top}\right\|_{F}.$ 
+
+(47)
+
+Since for any conforming matrices $A$ and $B$ , $\left\|AB^{T}\right\|_{F}\leq\left\|A\right\|_{F}\left\|B\right\|_{F}$ , the above equation can be written as
+
+ $\displaystyle\left\|\widetilde{Q}\widetilde{K}^{\top}-\widetilde{Q}_{\mathcal{S}}\widetilde{K}_{\mathcal{S}}^{\top}\right\|_{F}$ 
+ $\displaystyle\leq\sum_{m\notin\mathcal{S}}\left\|\widetilde{Q}_{m}\right\|_{F}\left\|\widetilde{K}_{m}\right\|_{F}.$ 
+
+(48)
+
+Finally, by the arithmetic–geometric mean inequality, we obtain
+
+ $\|\widetilde{Q}_{m}\|_{F}\|\widetilde{K}_{m}\|_{F}\leq\frac{1}{2}\left(\|\widetilde{Q}_{m}\|_{F}^{2}+\|\widetilde{K}_{m}\|_{F}^{2}\right)=\frac{1}{2}E_{m}.$ 
+
+(49)
+
+Combining the above inequalities yields
+
+ $\boxed{\left\|\widetilde{Q}\widetilde{K}^{\top}-\widetilde{Q}_{\mathcal{S}}\widetilde{K}_{\mathcal{S}}^{\top}\right\|_{2}\leq\sum_{m\notin\mathcal{S}}\left\|\widetilde{Q}_{m}\right\|_{F}\left\|\widetilde{K}_{m}\right\|_{F}\leq\frac{1}{2}\sum_{m\notin\mathcal{S}}E_{m}.}$ 
+
+(50)
+
+For a fixed budget $|\mathcal{S}|=k$ , minimizing the right-hand side is
+equivalent to maximizing
+
+ $\sum_{m\in\mathcal{S}}E_{m}.$ 
+
+Therefore, the subset consisting of the $k$ largest-energy RoPE pairs
+minimizes this upper bound among all subsets of $k$ pairs.
+ $\square$ 
+
+Evaluation in the pre- or post-RoPE space
+
+Because each RoPE pair is transformed by an orthogonal $2\times 2\ $ rotation,
+
+ $\left\|\widetilde{Q}_{m}\right\|_{F}=\left\|Q_{m}\right\|_{F}\qquad\left\|\widetilde{K}_{m}\right\|_{F}=\left\|K_{m}\right\|_{F}$ 
+
+Hence,
+
+ $E_{m}=\left\|\widetilde{Q}_{m}\right\|_{F}^{2}+\left\|\widetilde{K}_{m}\right\|_{F}^{2}=\left\|Q_{m}\right\|_{F}^{2}+\left\|K_{m}\right\|_{F}^{2}$ 
+
+∎
+The pair-energy criterion can therefore be evaluated equivalently in the pre- or post-RoPE space. The implementation accumulates the joint Q/K second moment and ranks each pair by the sum of its two diagonal entries, which is proportional to this $E_{m}$ . In pour implementations we use the post-RoPE values for the calibration.
+
+Connection to attention-output perturbation.
+
+Let
+
+ $Z=\frac{\widetilde{Q}\widetilde{K}^{\top}}{\sqrt{d_{k}}},\qquad Z_{\mathcal{S}}=\frac{\widetilde{Q}_{\mathcal{S}}\widetilde{K}_{\mathcal{S}}^{\top}}{\sqrt{d_{k}}}.$ 
+
+The Jacobian of softmax at a probability vector $p$ is
+ $\operatorname{diag}(p)-pp^{\top}$ , whose spectral norm is at most
+ $1/2$ . Applying this result row-wise gives
+
+ $\|A-A_{\mathcal{S}}\|_{F}\leq\frac{1}{2}\|Z-Z_{\mathcal{S}}\|_{F}.$ 
+
+Because $Z-Z_{\mathcal{S}}\in\mathbb{R}^{S_{\mathrm{cal}}\times S_{\mathrm{cal}}}$ ,
+
+ $\displaystyle\|Z-Z_{\mathcal{S}}\|_{F}$ 
+ $\displaystyle\leq\sqrt{S_{\mathrm{cal}}}\,\|Z-Z_{\mathcal{S}}\|_{2}$ 
+
+ $\displaystyle=\frac{\sqrt{S_{\mathrm{cal}}}}{\sqrt{d_{k}}}\left\|\widetilde{Q}\widetilde{K}^{\top}-\widetilde{Q}_{\mathcal{S}}\widetilde{K}_{\mathcal{S}}^{\top}\right\|_{2}.$ 
+
+For fixed values $V$ ,
+
+ $\displaystyle\|AV-A_{\mathcal{S}}V\|_{F}$ 
+ $\displaystyle\leq\|A-A_{\mathcal{S}}\|_{F}\|V\|_{2}$ 
+
+ $\displaystyle\leq\frac{\sqrt{S_{\mathrm{cal}}}\|V\|_{2}}{4\sqrt{d_{k}}}\sum_{m\notin\mathcal{S}}E_{m},$ 
+
+where the final inequality follows from
+Proposition 1.
+
+More generally, if the downstream calibration loss is locally
+ $L_{\mathrm{down}}$ -Lipschitz with respect to the attention output,
+then
+
+ $\left|\mathcal{L}_{\mathrm{down}}(AV)-\mathcal{L}_{\mathrm{down}}(A_{\mathcal{S}}V)\right|\leq L_{\mathrm{down}}\frac{\sqrt{S_{\mathrm{cal}}}\|V\|_{2}}{4\sqrt{d_{k}}}\sum_{m\notin\mathcal{S}}E_{m}.$ 
+
+This is a conditional, calibration-dependent bound and does not imply
+that energy selection globally minimizes language-model loss.
+
+## A.7 Implementation Details
+
+Software and model execution.
+
+We implement RACE in PyTorch and Hugging Face Transformers. Our implementation
+supports GPT-NeoX, Llama, Qwen2, Pythia, and Granite-style attention modules,
+including both multi-head and grouped-query attention. Although all models reported in the main paper use full-RoPE or RoPE applied to all dimensions, our implementation supports partial RoPE as well by applying pairwise selection only within the rotary-encoded subspace while leaving any non-rotary dimensions unconstrained by the RoPE-pair requirement. Pre-trained models are loaded and
+evaluated in BF16 on GPU, while calibration statistics and projection
+construction use higher-precision accumulation during calibration. The folded compressed model
+uses standard attention operations and does not require a custom CUDA or
+Triton kernel. Unless otherwise stated, we use PyTorch scaled dot-product
+attention (SDPA) for the compressed runtime. The implementation also supports
+eager attention and FlashAttention-3 as shown below.
+
+Table 2: 
+Comparison of methods that compress KV Cache along head dimension.
+RACE operates natively in the reduced dimensions without reconstruction.
+See A.4.1 for the derivations.
+
+Total Inference
+
+TFLOPs
+
+TTFT
+
+(ms)
+
+Prefill
+
+T.put (tok/sec)
+
+Decode
+
+T.put (tok/sec)
+
+Total
+
+T.put (tok/sec)
+
+GPU
+
+Memory (GB)
+
+Eager
+3.973
+41.051
+13937
+45.186
+224.44
+5.884
+
+SDPA
+3.973
+28.854
+17755.36
+56.864
+282.904
+5.882
+
+Flash Attention 3
+3.973
+34.170
+15054
+46.23
+230.127
+5.882
+
+Furthermore, PALU rely on method-specific execution paths for efficient inference, including custom fused kernels. We were unable to reliably reproduce these optimized kernels in our hardware/software environment and therefore avoid presenting potentially misleading wall-clock comparisons. Instead, we compare algorithmic attention FLOPs across methods and measure RACE end-to-end using standard PyTorch attention backends. This separates implementation-specific kernel efficiency from the architectural distinction that RACE performs attention directly in the reduced dimensions without runtime reconstruction. The original rotary-frequency indices and the model’s RoPE scaling rule are
+preserved; selected frequencies are not re-indexed as consecutive frequencies.
+For grouped-query attention (GQA), all query heads associated with a given KV
+head use the same selected key subspace. For partial RoPE models like Pythia models, the RoPE pairs are considered as pairs and the non-RoPE dimesnisons are paired with adjacent dimensions as in interleaved RoPE as shown in Figure 9.
+
+Calibration in RACE.
+
+For each attention layer, we collect query and key activations after the
+pretrained RoPE transformation. Our implementation also support calibration with pre-RoPE queries and keys and we also show that they are equivalent in A.6. We preserve the physical rotary-pair layout of
+the original architecture rather than assuming that adjacent tensor
+coordinates necessarily form a rotary pair. For each rotary pair $m$ , we
+accumulate the joint activation-energy score as in Eq.4
+and retain the $r_{k}/2$ highest-scoring pairs. Selection is performed
+independently for each layer and attention head (or KV head under grouped-query
+attention), subject to retaining both coordinates of every selected RoPE pair.
+
+Figure 9: 
+Representative RACE $P_{QK}$ and $P_{V}$ matrices before folding.
+Left: Each column corresponds to one compressed Q/K coordinate and each row to an
+original head coordinate. Nonzero entries indicate the coordinates retained by
+ $P_{QK}$ . Right: Each column corresponds to one compressed V coordinate and each row to an
+original head coordinate.
+
+Note that models like Llama, Qwen, and Granite have full RoPE where all dimensions have RoPE and in such cases the sequential selection shown in 9 Left will not be present. Such models also have sequential RoPE $[x_{0},x_{d/2}],[x_{1},x_{d/2+1}],\dots$ . Our implementations supports both sequential and interleaved $[x_{0},x_{1}],[x_{2},x_{3}],\dots$ RoPE models. The values are not subject to RoPE. We employ $P_{v}$ , the right signular vectors of V for the compression. This do not follow selection as shown in Figure 9 Right.
+
+Optional post-compression recovery.
+
+RACE is a post-training compression method and can be evaluated immediately after constructing and folding the reduced Q/K and V subspaces into the pretrained attention projections. At aggressive compression ratios, however, this discrete change in attention dimensionality can perturb the pretrained representation enough that a short optimization stage is highly beneficial. Although optional, all results in the main paper involve this recovery. Following folding, we use the original uncompressed checkpoint as a frozen teacher and optimize the compressed model using KL distillation on FineWeb data. The implementation uses a temperature of $T=2$ and minimizes the divergence between the teacher and compressed-model output distributions. We train for 250 optimizer steps with sequences of length 512, a micro-batch size of 2, and gradient accumulation over 4 micro-batches, corresponding to approximately $1.0$ M training tokens.
+
+Figure 10 separates the effect of this recovery from the compression procedure itself by reporting both the directly folded models (“w/o FT”) and their recovered counterparts. At 75% and 87.5% KV-cache retention, the directly compressed models are already relatively close to their recovered versions, indicating that moderate dimensionality reduction introduces limited disruption. In contrast, at 50% retention, both RACE and RAP experience substantially larger degradation without recovery, particularly in perplexity. The optimization stage is not necessary to define or execute the compressed model. RACE produces a valid reconstruction-free reduced-dimensional attention layer immediately after folding. Rather, recovery provides an optional mechanism for adapting the pretrained weights when the dimensionality change becomes sufficiently aggressive. Moreover, the same recovery procedure also substantially improves RAP, suggesting that much of the recoverable degradation at aggressive compression reflects adaptation to the compressed representation rather than a method-specific training advantage.
+
+(a) Llama-3.2-3B-Instruct Perplexity
+
+(b) Llama-3.2-3B-Instruct Average zero-shot accuracy
+
+(c) Qwen2.5 7B Perplexity
+
+(d) Qwen2.5 7B Average zero-shot accuracy
+
+Figure 10: Effect of optional post-compression recovery. Perplexity and average zero-shot accuracy before and after a short recovery stage for RACE and RAP at different KV-cache retention ratios. “w/o FT” denotes the folded compressed checkpoint evaluated directly, while the solid curves apply post-fold KL distillation from the uncompressed model. Recovery has little effect at mild compression but substantially restores performance at 50% retention, particularly in perplexity.
+
+Systems Details
+
+All systems experiments were conducted on a single NVIDIA H100 80GB HBM3 GPU. The machine used NVIDIA driver 590.48.01 with CUDA 13.1, and all reported memory, latency, throughput, and FLOP-related measurements were collected on this hardware configuration. Unless otherwise noted, experiments were run on a single GPU without model parallelism using SDPA kernels, so comparisons between the base model and compressed variants reflect changes induced by the compression method rather than differences in hardware allocation.
+
+(a) Total Parameter Memory
+
+(b) Attention Parameter Memory
+
+(c) KV Cache Memory
+
+Figure 11: Memory scaling of RACE with context length. Total model parameter memory (left), attention-parameter memory (center), and KV-cache memory (right) for the base model and RACE at 75% and 50% KV retention across 64K–256K-token contexts. Parameter memory is independent of sequence length and decreases after folding the reduced-dimensional projections, while KV-cache memory scales with context length; RACE correspondingly reduces both the fixed attention-parameter footprint and the context-dependent cache footprint.
+
+## A.8 Results
+
+Table 3: Detailed quality results for head-dimension compression.
+We report WikiText perplexity and per-task zero-shot accuracy across the
+evaluated model families and KV-cache retention ratios. The final column reports
+the average zero-shot accuracy across tasks. For each KV Cache compression level per model, we highlight the best performing perplexity and average zero-shot accuracy. RACE is comparable to reconstruction-based methods while not requiring the reconstruction or the additional FLOPs.
+
+Completion
+Reasoning
+Knowledge QA
+Understanding
+Truth
+Specialized Knowledge
+
+Method
+
+KV
+
+Cache
+
+QK
+
+Dim.
+
+V
+
+Dim.
+
+Wiki
+
+(ppl)
+
+lambada
+hella
+piqa
+wino
+arc_e
+sciq
+obqa
+arc_c
+boolq
+race
+
+truth
+
+fulqa
+
+college
+
+_CS
+
+college_
+
+Phy
+
+prof
+
+_law
+
+HS_
+
+psych
+
+Avg
+
+Qwen2.5 7B
+
+Base
+100%
+128
+128
+10.976
+0.706
+0.795
+0.784
+0.707
+0.759
+0.960
+0.460
+0.495
+0.845
+0.418
+0.524
+0.700
+0.480
+0.529
+0.897
+0.671
+
+87.50%
+112
+112
+11.438
+0.696
+0.791
+0.771
+0.703
+0.772
+0.954
+0.456
+0.504
+0.839
+0.421
+0.457
+0.710
+0.500
+0.511
+0.881
+0.664
+
+87.50%
+96
+128
+11.080
+0.693
+0.797
+0.780
+0.711
+0.782
+0.956
+0.462
+0.514
+0.844
+0.414
+0.516
+0.700
+0.490
+0.512
+0.883
+0.670
+
+75%
+96
+96
+12.290
+0.687
+0.782
+0.756
+0.703
+0.777
+0.953
+0.460
+0.508
+0.838
+0.414
+0.411
+0.660
+0.451
+0.486
+0.868
+0.650
+
+75%
+64
+128
+11.325
+0.695
+0.793
+0.774
+0.706
+0.790
+0.964
+0.470
+0.525
+0.853
+0.410
+0.532
+0.660
+0.471
+0.521
+0.862
+0.668
+
+PALU
+50%
+64
+64
+17.240
+0.639
+0.746
+0.662
+0.683
+0.703
+0.941
+0.392
+0.452
+0.789
+0.393
+0.430
+0.600
+0.402
+0.408
+0.828
+0.605
+
+87.50%
+112
+112
+10.178
+0.702
+0.797
+0.783
+0.723
+0.790
+0.961
+0.458
+0.538
+0.838
+0.405
+0.500
+0.630
+0.471
+0.507
+0.899
+0.667
+
+87.50%
+96
+128
+9.602
+0.713
+0.803
+0.792
+0.729
+0.757
+0.951
+0.460
+0.506
+0.843
+0.415
+0.561
+0.690
+0.490
+0.533
+0.892
+0.676
+
+75%
+96
+96
+11.043
+0.666
+0.793
+0.768
+0.713
+0.757
+0.953
+0.454
+0.497
+0.811
+0.398
+0.500
+0.590
+0.461
+0.480
+0.862
+0.647
+
+75%
+64
+128
+10.080
+0.715
+0.804
+0.783
+0.702
+0.722
+0.949
+0.462
+0.495
+0.829
+0.398
+0.545
+0.650
+0.431
+0.497
+0.884
+0.658
+
+Eigen
+
+Attention
+
+50%
+64
+64
+21.050
+0.376
+0.747
+0.647
+0.619
+0.617
+0.897
+0.410
+0.398
+0.636
+0.369
+0.429
+0.330
+0.275
+0.374
+0.659
+0.519
+
+87.50%
+96
+128
+30.547
+0.294
+0.733
+0.634
+0.547
+0.669
+0.847
+0.330
+0.416
+0.650
+0.321
+0.390
+0.210
+0.314
+0.275
+0.428
+0.470
+
+Thin Keys
+
+Full Values
+
+75%
+64
+128
+50.975
+0.284
+0.737
+0.611
+0.544
+0.687
+0.834
+0.376
+0.436
+0.611
+0.298
+0.419
+0.250
+0.314
+0.250
+0.363
+0.467
+
+87.50%
+112
+112
+10.743
+0.691
+0.794
+0.782
+0.708
+0.739
+0.961
+0.450
+0.466
+0.843
+0.393
+0.517
+0.660
+0.441
+0.500
+0.884
+0.655
+
+87.50%
+96
+128
+10.594
+0.705
+0.794
+0.784
+0.707
+0.753
+0.963
+0.432
+0.482
+0.854
+0.407
+0.528
+0.680
+0.402
+0.507
+0.888
+0.659
+
+75%
+96
+96
+12.023
+0.648
+0.788
+0.769
+0.680
+0.701
+0.963
+0.438
+0.455
+0.806
+0.391
+0.515
+0.600
+0.412
+0.450
+0.809
+0.628
+
+75%
+64
+128
+12.011
+0.630
+0.789
+0.769
+0.611
+0.762
+0.963
+0.442
+0.493
+0.774
+0.389
+0.498
+0.680
+0.401
+0.402
+0.741
+0.623
+
+RAP
+50%
+64
+64
+14.691
+0.485
+0.747
+0.707
+0.605
+0.758
+0.948
+0.396
+0.444
+0.758
+0.341
+0.403
+0.430
+0.303
+0.305
+0.606
+0.549
+
+87.50%
+112
+112
+10.254
+0.704
+0.794
+0.777
+0.724
+0.817
+0.967
+0.462
+0.538
+0.849
+0.411
+0.507
+0.670
+0.510
+0.518
+0.886
+0.676
+
+87.50%
+96
+128
+10.259
+0.715
+0.799
+0.781
+0.707
+0.794
+0.961
+0.470
+0.517
+0.846
+0.409
+0.524
+0.680
+0.490
+0.529
+0.884
+0.674
+
+75%
+96
+96
+10.968
+0.668
+0.794
+0.765
+0.722
+0.838
+0.963
+0.456
+0.562
+0.825
+0.392
+0.480
+0.630
+0.451
+0.481
+0.872
+0.660
+
+75%
+64
+128
+10.916
+0.690
+0.795
+0.764
+0.687
+0.789
+0.957
+0.454
+0.510
+0.832
+0.394
+0.521
+0.640
+0.520
+0.495
+0.858
+0.661
+
+RACE (Ours)
+50%
+64
+64
+13.538
+0.562
+0.785
+0.713
+0.656
+0.748
+0.944
+0.438
+0.475
+0.769
+0.385
+0.464
+0.470
+0.403
+0.419
+0.770
+0.600
+
+Granite 4.100 3B
+
+Base
+100%
+64
+64
+11.578
+0.662
+0.794
+0.746
+0.695
+0.790
+0.960
+0.434
+0.504
+0.751
+0.366
+0.476
+0.570
+0.461
+0.414
+0.813
+0.629
+
+87.50%
+48
+64
+11.775
+0.671
+0.796
+0.736
+0.693
+0.780
+0.958
+0.426
+0.502
+0.736
+0.380
+0.466
+0.530
+0.490
+0.419
+0.806
+0.626
+
+75%
+48
+48
+13.615
+0.626
+0.787
+0.738
+0.679
+0.736
+0.949
+0.430
+0.500
+0.626
+0.385
+0.471
+0.520
+0.412
+0.380
+0.772
+0.601
+
+75%
+32
+64
+11.918
+0.675
+0.799
+0.731
+0.693
+0.776
+0.957
+0.426
+0.500
+0.748
+0.376
+0.468
+0.540
+0.490
+0.422
+0.818
+0.628
+
+PALU
+50%
+32
+32
+17.483
+0.539
+0.760
+0.646
+0.628
+0.652
+0.914
+0.412
+0.445
+0.708
+0.362
+0.456
+0.440
+0.333
+0.332
+0.642
+0.551
+
+87.50%
+48
+64
+11.775
+0.671
+0.796
+0.736
+0.693
+0.779
+0.958
+0.426
+0.502
+0.736
+0.379
+0.466
+0.53
+0.49
+0.419
+0.806
+0.626
+
+75%
+48
+48
+13.481
+0.577
+0.785
+0.723
+0.657
+0.757
+0.952
+0.416
+0.513
+0.729
+0.376
+0.440
+0.56
+0.421
+0.360
+0.761
+0.601
+
+75%
+32
+64
+29.25
+0.162
+0.724
+0.545
+0.539
+0.566
+0.765
+0.37
+0.354
+0.388
+0.301
+0.429
+0.35
+0.186
+0.255
+0.196
+0.408
+
+Eigen
+
+Attention
+
+50%
+32
+32
+23.361
+0.313
+0.744
+0.587
+0.588
+0.641
+0.874
+0.388
+0.387
+0.646
+0.343
+0.411
+0.27
+0.157
+0.265
+0.365
+0.465
+
+87.50%
+48
+64
+26.024
+0.221
+0.719
+0.586
+0.517
+0.643
+0.813
+0.356
+0.357
+0.583
+0.294
+0.395
+0.230
+0.235
+0.257
+0.215
+0.428
+
+Thin Keys
+
+Full Values
+
+75%
+32
+64
+40.573
+0.152
+0.694
+0.544
+0.531
+0.560
+0.760
+0.340
+0.315
+0.603
+0.286
+0.432
+0.220
+0.206
+0.244
+0.194
+0.405
+
+87.50%
+48
+64
+11.928
+0.642
+0.791
+0.732
+0.678
+0.784
+0.942
+0.430
+0.478
+0.777
+0.382
+0.469
+0.530
+0.490
+0.396
+0.782
+0.620
+
+75%
+48
+48
+12.795
+0.575
+0.782
+0.712
+0.662
+0.755
+0.948
+0.424
+0.453
+0.759
+0.373
+0.467
+0.340
+0.373
+0.357
+0.672
+0.577
+
+75%
+32
+64
+13.963
+0.563
+0.780
+0.706
+0.639
+0.754
+0.945
+0.428
+0.449
+0.724
+0.344
+0.438
+0.270
+0.275
+0.273
+0.444
+0.535
+
+RAP
+50%
+32
+32
+17.766
+0.359
+0.700
+0.641
+0.588
+0.684
+0.914
+0.350
+0.403
+0.605
+0.344
+0.405
+0.190
+0.206
+0.243
+0.262
+0.460
+
+87.50%
+48
+64
+12.092
+0.633
+0.789
+0.733
+0.672
+0.783
+0.961
+0.436
+0.491
+0.752
+0.348
+0.456
+0.510
+0.491
+0.438
+0.819
+0.621
+
+75%
+48
+48
+13.148
+0.611
+0.787
+0.718
+0.670
+0.773
+0.957
+0.432
+0.482
+0.735
+0.355
+0.441
+0.500
+0.462
+0.406
+0.782
+0.607
+
+75%
+32
+64
+13.041
+0.586
+0.776
+0.687
+0.659
+0.763
+0.957
+0.426
+0.480
+0.757
+0.363
+0.430
+0.430
+0.373
+0.344
+0.622
+0.577
+
+RACE (Ours)
+50%
+32
+32
+16.210
+0.516
+0.757
+0.647
+0.586
+0.686
+0.918
+0.418
+0.417
+0.683
+0.337
+0.462
+0.380
+0.295
+0.322
+0.624
+0.537
+
+Llama 3.200 3B Instruct
+
+Base
+100%
+128
+128
+13.397
+0.659
+0.757
+0.706
+0.680
+0.681
+0.932
+0.360
+0.460
+0.784
+0.410
+0.496
+0.470
+0.353
+0.463
+0.769
+0.599
+
+87.50%
+112
+112
+13.818
+0.649
+0.756
+0.703
+0.680
+0.657
+0.933
+0.374
+0.463
+0.776
+0.411
+0.467
+0.480
+0.333
+0.442
+0.761
+0.592
+
+87.50%
+96
+128
+13.561
+0.656
+0.754
+0.705
+0.680
+0.670
+0.935
+0.370
+0.445
+0.775
+0.409
+0.487
+0.470
+0.343
+0.450
+0.772
+0.595
+
+75%
+96
+96
+14.719
+0.637
+0.742
+0.689
+0.670
+0.653
+0.918
+0.382
+0.452
+0.773
+0.414
+0.446
+0.450
+0.382
+0.415
+0.754
+0.585
+
+75%
+64
+128
+14.395
+0.638
+0.757
+0.688
+0.677
+0.653
+0.933
+0.380
+0.423
+0.757
+0.417
+0.478
+0.440
+0.333
+0.424
+0.749
+0.583
+
+PALU
+50%
+64
+64
+22.435
+0.543
+0.695
+0.594
+0.635
+0.591
+0.904
+0.344
+0.371
+0.739
+0.394
+0.440
+0.400
+0.235
+0.331
+0.613
+0.522
+
+87.50%
+112
+112
+14.618
+0.633
+0.745
+0.701
+0.676
+0.702
+0.924
+0.362
+0.464
+0.769
+0.411
+0.470
+0.430
+0.314
+0.433
+0.767
+0.587
+
+87.50%
+96
+128
+13.557
+0.655
+0.757
+0.706
+0.684
+0.684
+0.932
+0.360
+0.469
+0.792
+0.413
+0.502
+0.490
+0.333
+0.444
+0.760
+0.599
+
+75%
+96
+96
+16.347
+0.590
+0.743
+0.672
+0.667
+0.701
+0.927
+0.366
+0.446
+0.764
+0.409
+0.447
+0.440
+0.324
+0.409
+0.736
+0.576
+
+75%
+64
+128
+14.552
+0.660
+0.758
+0.691
+0.669
+0.689
+0.939
+0.364
+0.457
+0.757
+0.420
+0.484
+0.400
+0.382
+0.413
+0.756
+0.589
+
+Eigen
+
+Attention
+
+50%
+64
+64
+30.778
+0.296
+0.702
+0.547
+0.594
+0.594
+0.888
+0.332
+0.350
+0.645
+0.366
+0.404
+0.340
+0.294
+0.298
+0.494
+0.476
+
+87.50%
+96
+128
+56.350
+0.084
+0.587
+0.399
+0.514
+0.381
+0.586
+0.294
+0.266
+0.616
+0.271
+0.447
+0.220
+0.255
+0.257
+0.202
+0.359
+
+Thin Keys
+
+Full Values
+
+75%
+64
+128
+84.815
+0.070
+0.593
+0.383
+0.497
+0.372
+0.563
+0.284
+0.258
+0.601
+0.269
+0.444
+0.250
+0.275
+0.252
+0.217
+0.355
+
+87.50%
+112
+112
+15.339
+0.605
+0.740
+0.681
+0.656
+0.649
+0.933
+0.374
+0.428
+0.764
+0.429
+0.486
+0.430
+0.304
+0.419
+0.712
+0.574
+
+87.50%
+96
+128
+14.685
+0.611
+0.750
+0.683
+0.642
+0.672
+0.935
+0.372
+0.438
+0.762
+0.411
+0.480
+0.380
+0.353
+0.413
+0.675
+0.572
+
+75%
+96
+96
+15.226
+0.570
+0.742
+0.665
+0.607
+0.649
+0.934
+0.370
+0.425
+0.757
+0.415
+0.467
+0.360
+0.255
+0.372
+0.639
+0.548
+
+75%
+64
+128
+15.218
+0.572
+0.731
+0.654
+0.620
+0.633
+0.927
+0.362
+0.415
+0.728
+0.413
+0.462
+0.350
+0.343
+0.373
+0.558
+0.543
+
+RAP
+50%
+64
+64
+18.540
+0.309
+0.716
+0.583
+0.574
+0.598
+0.898
+0.340
+0.361
+0.563
+0.314
+0.435
+0.270
+0.275
+0.258
+0.407
+0.460
+
+87.50%
+112
+112
+13.884
+0.643
+0.756
+0.696
+0.672
+0.695
+0.925
+0.362
+0.459
+0.768
+0.418
+0.473
+0.470
+0.324
+0.451
+0.758
+0.591
+
+87.50%
+96
+128
+13.755
+0.639
+0.760
+0.699
+0.681
+0.691
+0.927
+0.362
+0.451
+0.772
+0.429
+0.489
+0.480
+0.343
+0.435
+0.754
+0.594
+
+75%
+96
+96
+14.520
+0.616
+0.753
+0.682
+0.667
+0.700
+0.925
+0.362
+0.447
+0.760
+0.420
+0.457
+0.480
+0.333
+0.421
+0.738
+0.584
+
+75%
+64
+128
+14.780
+0.615
+0.755
+0.675
+0.648
+0.690
+0.916
+0.350
+0.435
+0.750
+0.403
+0.489
+0.450
+0.324
+0.387
+0.684
+0.571
+
+RACE (Ours)
+50%
+64
+64
+16.016
+0.499
+0.740
+0.625
+0.586
+0.622
+0.885
+0.360
+0.381
+0.689
+0.373
+0.454
+0.340
+0.333
+0.371
+0.556
+0.522
+
+Table 4: Per-task results of Qwen2.5 7B and Llama3.2 3B Instruct on LongBench.
+We report zero shot longbench score across the
+evaluated model families and KV-cache retention ratios. The final column reports
+the average across tasks. For each KV Cache compression level per model, we highlight the best performing average result. 
+
+KV Cache
+
+Retained
+
+Narrative
+
+QA
+
+Qasper
+
+Multifield
+
+QA
+
+Hotpot
+
+QA
+
+Wikimqa
+Musique
+gov_report
+qmsum
+multi_news
+trec
+triviaqa
+samsum
+
+passage
+
+_count
+
+passage_
+
+retrieval_en
+
+lcc
+repobench
+Average
+
+Llama3.2 3B Instruct.
+
+Uncompressed
+100%
+21.25
+39.89
+50.06
+47.31
+36.75
+19.15
+33.91
+23.5
+26.64
+71
+88.41
+42.62
+8.5
+75
+52.01
+52.5
+43.03
+
+87.5%
+24.81
+33.42
+49.61
+47.52
+36.52
+17.9
+33.95
+23
+26.98
+73
+90.47
+42.91
+4
+63.5
+51.26
+53.9
+42.05
+
+75%
+22.2
+30.79
+45.3
+40.44
+35.29
+15.96
+32.88
+22.73
+25.77
+71
+87.78
+41.16
+3.5
+58.5
+44.34
+44.45
+38.88
+
+RACE
+50%
+11.45
+15.08
+25.46
+22.86
+20.01
+15.52
+21.44
+20.5
+20.97
+59.5
+78.45
+35.32
+1.18
+5.75
+34.83
+35.91
+26.51
+
+87.5%
+23.49
+32.55
+46.14
+41.67
+36.7
+14.63
+30.91
+22.6
+26.31
+68.5
+87.58
+40.96
+4.5
+45
+49.3
+52.24
+38.94
+
+75%
+19.49
+27.26
+41.91
+30.35
+31.14
+13.96
+25.55
+21.63
+25.39
+64
+84.46
+39.81
+4
+23
+47.55
+49.75
+34.33
+
+RAP
+50%
+7.79
+6.42
+19
+6.16
+6.81
+8.77
+9.2
+7.94
+5.48
+28
+40.2
+11.99
+4
+5
+34.8
+32.67
+14.64
+
+87.5%
+21.9
+31.34
+49.22
+45.26
+36.56
+17.96
+31.82
+23.32
+25.58
+67
+89.59
+30.3
+2.79
+74.5
+46.9
+50.69
+40.30
+
+75%
+21.91
+30.94
+46.85
+40.73
+32.06
+17.78
+30.95
+22.63
+24.6
+66
+88.7
+28.8
+2.21
+56.5
+43.62
+38.81
+37.07
+
+PALU
+50%
+20.47
+30.26
+37.77
+33.88
+29.15
+14.18
+24.79
+22.24
+21.8
+48
+79.63
+25.5
+1
+9
+25.74
+34.71
+28.63
+
+Qwen2.5 7B
+
+Uncompressed
+100%
+17.56
+14.86
+27.7
+29.5
+15.51
+11.51
+30.96
+23.07
+26.75
+72.5
+89.31
+45.83
+3.5
+24.5
+63.07
+51.58
+34.23
+
+87.5%
+17.98
+20.87
+41.23
+41.75
+31.3
+18.85
+28
+22.99
+26.7
+72.5
+90.25
+44.98
+2.5
+19
+53.35
+44.22
+36.03
+
+75%
+17.11
+18.33
+40.39
+41.08
+30.36
+18.76
+25.78
+22.27
+26.25
+70.5
+87.13
+44.07
+3
+8.5
+40.51
+46.8
+33.80
+
+RACE
+50%
+4.9
+14.27
+22.66
+19.21
+7.23
+3.84
+18.37
+21.1
+20.89
+69
+84.26
+39.01
+2.8
+8.5
+37.1
+38.07
+25.70
+
+87.5%
+13.1
+21.46
+27.31
+10.36
+18.43
+14.52
+26.22
+21.15
+25.7
+72.5
+89.56
+44.53
+4
+8
+44.44
+50.62
+30.74
+
+75%
+5.78
+21.38
+26.8
+13.88
+11.9
+5.26
+23.31
+23.32
+23.75
+68.5
+86.99
+44.21
+3
+4.5
+44.79
+42.49
+28.12
+
+RAP
+50%
+5.16
+9.4
+15.36
+7.57
+8.48
+4.09
+15.67
+21.49
+18.78
+52
+73.1
+33.92
+1.17
+2.8
+27.8
+42.13
+21.18
+
+87.5%
+7.94
+12.25
+29.8
+36.21
+26.83
+18.46
+29.05
+22.63
+26.35
+72.5
+89.49
+34.25
+2
+19
+49.72
+40.75
+32.33
+
+75%
+8.15
+16.48
+28.76
+36.94
+28.71
+18.8
+27.25
+22.58
+25.16
+70.5
+89.93
+34.45
+4
+10
+41.39
+33.24
+31.02
+
+PALU
+50%
+4.15
+8.95
+23.03
+10.8
+9.37
+5.83
+21.21
+21.25
+22.3
+69.5
+83.81
+33.82
+1.5
+8.5
+31.17
+31.17
+24.15
+
+Language Modeling and Zero-Shot Performance
+
+The main quality experiments evaluate Qwen2.5-7B, Llama-3.2-3B-Instruct, and
+Granite-4.1-3B. We compare against PALU-GLRD, EigenAttention, Thin Keys, and
+RAP at matched or reported KV-cache budgets. The full results are presented in Table 3 while only RAP, a reconstruction-free method like RACE, and PALU-GLRD, a reconstruction-based method, are included in Figure 3. Across all three model families, RACE consistently outperforms the
+reconstruction-free baselines RAP and Thin Keys, while remaining competitive
+with the reconstruction-based EigenAttention and PALU. The difference is most
+pronounced under aggressive compression: At 50% KV-cache retention, RACE achieves the lowest WikiText perplexity across all three model families while remaining competitive with PALU in average zero-shot accuracy. among the evaluated compression methods on each of Qwen2.5, Granite,
+and Llama. At more moderate compression, RACE remains close to the
+reconstruction-based methods; at 75% retention it preserves 98.5%, 96.5%,
+and 97.5% of the corresponding uncompressed average zero-shot accuracy on
+Qwen, Granite, and Llama, respectively. The per-task results also show that the effect of compression is
+not uniform across benchmarks: some tasks remain close to the uncompressed
+baseline even at lower retention, whereas others are more sensitive to reduced
+attention dimensionality. Table 4 presents the per-task results of Qwen2.5-7B and Llama-3.2-3B-Instruct on 16 English tasks in LongBench. RACE outperforms RAP at all evaluated retention levels and exceeds PALU at 87.5% and 75% retention on both model families. At 50% retention, RACE remains competitive with PALU, outperforming it on Qwen while trailing it modestly on Llama. Together, these results show that the
+quality-compression behavior is consistent across model families rather than
+being specific to a single architecture, while retaining the reconstruction-free
+execution of RACE.
+
+Additional Systems Results
+
+The systems results in Figure 11 show that RACE reduces both the fixed attention-parameter footprint and the context-dependent KV-cache footprint. As expected, the reduction in attention parameter memory aligns with the compression. However, since the folded projection weights are smaller in comparison to the result of the model parameters and memory consumption elements, the reduction in memory is less prominant in the total parameter memory. Additionally parameter memory is independent of context length. KV-cache memory scales with sequence length and therefore yields increasingly large absolute savings at longer contexts. At 256K tokens, the gap between the base model and the compressed variants becomes substantial, illustrating that the main systems benefit of RACE grows with context length while preserving native reduced-dimensional execution.
+
+Compatibility with Token compression and Quantization
+
+Table 5 reports the full per-task results when RACE is combined with token-compression and KV-quantization methods. Across H2O, SnapKV, and KIVI, applying RACE on top of an already compressed KV cache provides additional multiplicative memory reduction, but also introduces further accuracy and perplexity degradation. This effect is generally more pronounced for token-compression methods than for quantization.
+
+For H2O and SnapKV, reducing the head dimension with RACE consistently lowers the total KV-cache footprint from 50% to 37.5% and 25%, or from 25% to 18.75% and 12.5%, depending on the token-retention ratio. The corresponding degradation is gradual across most zero-shot tasks, while WikiText perplexity increases more noticeably at aggressive combined compression. For example, with H2O at 50% token retention, adding RACE at 75% and 50% head retention reduces total KV-cache usage to 37.5% and 25%, respectively, while average zero-shot accuracy decreases from 0.706 to 0.674 and 0.604. SnapKV follows a similar trend, with average accuracy decreasing from 0.710 to 0.676 and 0.612 under the same settings.
+
+RACE is comparatively more complementary with KIVI. With 4-bit quantization, adding RACE at 75% and 50% head retention reduces the total KV cache from 50% to 37.5% and 25%, while average accuracy decreases from 0.702 to 0.678 and 0.608. Similar behavior is observed with 2-bit quantization. Overall, the results suggest that RACE composes cleanly with both token and precision compression, but the cost of applying additional head-dimension compression is larger once information has already been removed along the token dimension. In contrast, quantization leaves more redundancy for RACE to exploit, resulting in a milder degradation at comparable total cache budgets.
+
+Table 5: Per-task results of Qwen2.5 7B on Wikitext (perplexity) and zero-shot accuracy on combining RACE with Token compression and quantization methods. 
+
+Tokens
+
+/Precision
+
+Retained
+
+RACE
+
+KV Cache
+
+Reatained
+
+Total
+
+KV Cache
+
+Retained
+
+wikitext
+hellaswag
+piqa
+arc_challenge
+boolq
+
+mmlu_
+
+college_cs
+
+Average
+
+H20 (Token Compression)
+
+100%
+50%
+12.66
+0.66
+0.85
+0.48
+0.82
+0.72
+0.706
+
+75%
+37.5%
+15.8
+0.65
+0.83
+0.45
+0.81
+0.63
+0.674
+
+512
+
+(50%)
+
+50%
+25%
+17.44
+0.62
+0.79
+0.44
+0.74
+0.43
+0.604
+
+100%
+25%
+13.62
+0.66
+0.85
+0.48
+0.79
+0.66
+0.688
+
+75%
+18.75%
+16.12
+0.65
+0.83
+0.45
+0.78
+0.63
+0.668
+
+256
+
+(25%)
+
+50%
+12.5%
+21.81
+0.62
+0.79
+0.42
+0.71
+0.4
+0.588
+
+SnapKV (Token Compression)
+
+100%
+50%
+12.55
+0.68
+0.86
+0.48
+0.82
+0.71
+0.71
+
+75%
+37.5%
+15.61
+0.65
+0.83
+0.46
+0.81
+0.63
+0.676
+
+512
+
+(50%)
+
+50%
+25%
+18.63
+0.62
+0.79
+0.45
+0.76
+0.44
+0.612
+
+100%
+25%
+12.76
+0.68
+0.85
+0.48
+0.81
+0.7
+0.704
+
+75%
+18.75%
+15.66
+0.65
+0.83
+0.45
+0.79
+0.63
+0.67
+
+256
+
+(25%)
+
+50%
+12.5%
+18.44
+0.62
+0.79
+0.46
+0.74
+0.44
+0.61
+
+KIVI (Quantization)
+
+100%
+25%
+17.04
+0.69
+0.86
+0.48
+0.78
+0.7
+0.702
+
+75%
+18.75%
+18.17
+0.66
+0.84
+0.48
+0.76
+0.6
+0.668
+
+2 bits
+
+(25%)
+
+50%
+12.5%
+21.81
+0.64
+0.8
+0.44
+0.71
+0.42
+0.602
+
+100%
+50%
+15.7
+0.69
+0.86
+0.48
+0.78
+0.7
+0.702
+
+75%
+37.5%
+16.58
+0.66
+0.84
+0.48
+0.78
+0.63
+0.678
+
+4 bits
+
+(50%)
+
+50%
+25%
+17.14
+0.64
+0.8
+0.44
+0.74
+0.42
+0.608
+
+Ablations
+
+Figure 12: Layer-wise normalised approximation error as in Eq.5 with respect to uncompressed model for joint and single-sided energy selectors. Joint Q/K selection yields the lowest average error compared to Q-only or K-only selection.
+
+Table 6: Ablation of selection criteria for RoPE-pair retention. We compare RACE’s joint Q/K activation-energy criterion against magnitude, random selection, gradient Fisher, attention-score selection, and Q-only or K-only energy. Results are reported on WikiText perplexity and zero-shot accuracy across nine tasks at 87.5%, 75%, and 50% KV-cache retention. Joint Q/K energy is consistently strongest overall, with the advantage becoming more pronounced at higher compression.
+
+KV Cache
+
+Retained
+
+Selection Criteria
+wikitext
+piqa
+wino
+acr_c
+sciq
+arc_easy
+boolq
+race
+mmlu_cs
+mmlu_phy
+Avg
+
+Joint QK Energy (RACE)
+13.88
+0.74
+0.67
+0.46
+0.93
+0.70
+0.77
+0.42
+0.48
+0.35
+0.61
+
+Magnitude
+14.58
+0.74
+0.64
+0.44
+0.89
+0.68
+0.71
+0.41
+0.37
+0.25
+0.57
+
+Random
+14.95
+0.71
+0.63
+0.45
+0.89
+0.67
+0.65
+0.39
+0.35
+0.25
+0.55
+
+Gradient Fisher
+14.58
+0.76
+0.66
+0.44
+0.87
+0.69
+0.74
+0.41
+0.38
+0.25
+0.58
+
+Attention Score
+14.13
+0.74
+0.66
+0.44
+0.92
+0.69
+0.75
+0.40
+0.40
+0.27
+0.59
+
+Energy Q only
+14.02
+0.75
+0.66
+0.45
+0.93
+0.69
+0.75
+0.42
+0.40
+0.32
+0.60
+
+87.5%
+Energy K only
+14.03
+0.76
+0.67
+0.45
+0.93
+0.67
+0.75
+0.43
+0.45
+0.30
+0.60
+
+Joint QK Energy (RACE)
+14.95
+0.76
+0.66
+0.43
+0.93
+0.70
+0.76
+0.42
+0.48
+0.33
+0.61
+
+Magnitude
+15.64
+0.73
+0.61
+0.43
+0.88
+0.65
+0.67
+0.39
+0.34
+0.24
+0.55
+
+Random
+17.74
+0.72
+0.56
+0.39
+0.84
+0.62
+0.60
+0.36
+0.25
+0.21
+0.50
+
+Gradient Fisher
+14.76
+0.75
+0.60
+0.42
+0.86
+0.67
+0.73
+0.39
+0.40
+0.27
+0.57
+
+Attention Score
+14.87
+0.74
+0.64
+0.42
+0.91
+0.67
+0.73
+0.40
+0.42
+0.32
+0.58
+
+Energy Q only
+16.78
+0.74
+0.66
+0.42
+0.91
+0.68
+0.75
+0.41
+0.43
+0.33
+0.59
+
+75%
+Energy K only
+16.17
+0.75
+0.65
+0.44
+0.92
+0.68
+0.74
+0.42
+0.43
+0.33
+0.60
+
+Joint QK Energy (RACE)
+16.02
+0.69
+0.59
+0.38
+0.89
+0.62
+0.69
+0.37
+0.34
+0.33
+0.54
+
+Magnitude
+18.73
+0.71
+0.54
+0.32
+0.77
+0.49
+0.50
+0.31
+0.23
+0.22
+0.45
+
+Random
+26.09
+0.62
+0.50
+0.30
+0.65
+0.44
+0.47
+0.27
+0.26
+0.22
+0.41
+
+Gradient Fisher
+17.80
+0.72
+0.55
+0.35
+0.80
+0.53
+0.44
+0.33
+0.30
+0.27
+0.48
+
+Attention Score
+17.86
+0.70
+0.59
+0.33
+0.73
+0.49
+0.50
+0.35
+0.33
+0.31
+0.48
+
+Energy Q only
+21.01
+0.72
+0.57
+0.35
+0.86
+0.55
+0.66
+0.37
+0.30
+0.33
+0.52
+
+50%
+Energy K only
+20.32
+0.71
+0.57
+0.35
+0.87
+0.54
+0.66
+0.38
+0.30
+0.32
+0.52
+
+We first examine whether the retained RoPE pairs should be selected using information from queries and keys jointly or from either projection alone. Across all retention ratios, the joint Q/K energy criterion gives the strongest overall results. At 87.5% retention, Q-only and K-only selection remain close to the joint criterion, but the gap becomes clearer as compression increases. At 75% retention, joint Q/K energy achieves 0.61 average accuracy with a WikiText perplexity of 14.95, compared with 0.59/16.78 for Q-only and 0.60/16.17 for K-only. At 50% retention, the joint criterion retains 0.54 average accuracy and 16.02 perplexity, while both Q-only and K-only fall to 0.52 average accuracy with substantially higher perplexity.
+
+This trend is also reflected directly in the approximation of the uncompressed attention interaction. Figure 12 shows the layer-wise error norm of the compressed $QK^{\top}$ product relative to the uncompressed model. Joint Q/K selection gives the lowest average error, 0.105, compared with 0.112 for K-only and 0.116 for Q-only, and the reduction is observed across most layers rather than being concentrated in a small subset. Together, the downstream results and the layer-wise approximation error support deriving the shared selector from both Q and K rather than from either side in isolation.
+
+We next compare different scoring criteria that all operate on joint Q/K information. Joint activation energy consistently outperforms magnitude, random selection, gradient-Fisher scoring, and attention-based scoring, with the differences becoming larger at stronger compression. At 50% retention, RACE achieves 0.54 average accuracy, compared with 0.48 for gradient Fisher and attention score, 0.45 for magnitude, and 0.41 for random selection. The same trend is reflected in WikiText perplexity, where joint Q/K energy also achieves the lowest value. Notably, the gradient- and attention-based alternatives do not recover the performance of the simple forward-pass energy criterion despite requiring more complex statistics. Overall, these ablations indicate that both components of the selector are important: the ranking should be derived jointly from Q and K, and joint activation energy provides an effective criterion for identifying the RoPE pairs that best preserve the original attention interaction.

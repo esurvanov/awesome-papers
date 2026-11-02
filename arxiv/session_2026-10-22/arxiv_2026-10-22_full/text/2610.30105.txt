@@ -1,0 +1,1837 @@
+## Asymmetric On-Policy Distillation Learns In-Context Exploration
+
+Sriyash Poddar
+
+Yanda Bao
+
+Jacob Krantz
+
+Matthew Chang
+
+Xavier Puig
+
+Roozbeh Mottaghi
+
+Natasha Jaques
+
+Abhishek GuptaProject website: https://weirdlabuw.github.io/asteroid/
+
+Abstract
+
+Sequential decision-making under partial observability is difficult because agents must explore to infer hidden, task-relevant information before acting effectively.
+Learning such information-gathering behaviors tabula rasa via online reinforcement learning is sample-inefficient, whereas offline imitation averages expert actions across hidden states and fails to learn exploration. In this work, we propose ASTEROID, a simple and effective student–teacher supervised learning framework that can learn test-time exploration. Although a privileged expert never needs to explore, we demonstrate that a history-conditioned student can learn to do so when trained with on-policy contexts: the student first collects on-policy context under partial observability, and the privileged expert provides action labels conditioned on that context. By distilling expert actions directly conditioned on the student’s on-policy history, the student learns to systematically resolve partial observability, i.e., search while uncertain and exploit once the hidden state is revealed. This enables efficient test-time exploration (similar to Bayesian posterior sampling) without incurring the impractical training-data costs of reinforcement learning. Across a diverse range of eleven different environments, including discrete exploration benchmarks, robotic manipulation, navigation, and Procgen environments, ASTEROID achieves $\sim$ 2 $\times$ higher returns under fixed exploration budgets, uses up to $\sim$ 100 $\times$ fewer interactions than RL baselines, and outperforms frontier models at exploration. Finally, our method transfers policies trained in simulation to vision-denied real-world robot manipulation, exhibiting efficient exploration and increasing success by $+40\%$ over standard distillation. Overall, it provides a simple yet surprisingly effective framework to learn efficient test-time exploration.
+
+††footnotetext: 
+
+1Paul G. Allen School of Computer Science and Engineering, University of Washington
+2Work partially done while at Meta
+∗Equal advising.
+
+Figure 1: ASTEROID provides a simple and reliable method for learning efficient exploration in partially observed domains via on-policy asymmetric student-teacher distillation.
+
+## 1 Introduction
+
+Sequential decision-making under partial observability is a central challenge in reinforcement learning (RL) [34, 53]. In the real world, from robotics to embodied AI, agents receive only partial, noisy observations of the environment. To act successfully, agents must first explore to uncover hidden, task-relevant information [31, 79, 42, 74, 46, 71]. For example, a household robot searching for an object must use onboard sensing to infer likely object locations, track locations it has already searched, and adapt future exploration based on prior attempts [12, 11, 30]. These problems are formalized as partially observable Markov decision processes (POMDPs) [34].
+
+Solving these tasks requires policies with memory [28, 50]. Learning them from scratch via recurrent RL is sample-inefficient, since the agent must learn to gather information and exploit it at the same time [5, 79, 21]. One way to improve sample efficiency is to assume training-time access to a privileged expert that observes the hidden state and acts accordingly. For example, in household navigation, an oracle planner could use the full map of the training environments, which is unavailable at deployment. In practice, these teachers can be trained in fully observed tasks using RL, imitation learning, or hybrid approaches [78, 75, 60, 27, 52]. This expert can teach the student how to act once the hidden state is known, but not how to find it [44]. As a result, naively copying the expert does not teach the student to explore [70]. Interactive imitation [65] offers a natural fix by relabeling student mistakes with expert actions. However, standard approaches [59] train the student to predict the average expert action across possible hidden states, so it dithers between hypotheses instead of resolving them [37, 70]. Other approaches propose to address the student-teacher mismatch using expensive online RL [74], differentiable experts [73], or offline coverage assumptions [42].
+
+In this work, we propose ASTEROID (Asymmetric Student Teacher Roll-Out In-context Distillation), a framework that shows that privileged experts can teach exploration through interactive imitation. The idea is simple: the student generates the history online, and the expert provides the labels. ASTEROID rolls out the current student under partial observability, producing a history of observations, actions, and rewards, then asks the expert what it would do from the state the student has reached. The expert does not explore; it only labels the student’s histories. As a result, failed searches and probes become useful context: they specify evidence accumulated so far, while the expert provides next actions given the hidden state. With on-policy history, the policy can identify inconsistent hypotheses and adapt its exploration and action distribution accordingly.
+
+Why does this teach exploration? A partial history represents uncertainty over the hidden state. Returning to household navigation: suppose the object could be in location $A$ , $B$ , or $C$ . If the student searches $A$ and finds nothing, its history rules out $A$ but is still consistent with $B$ and $C$ . A privileged expert would label this history with search(B) when the object is at $B$ , and search(C) when it is at $C$ . The student therefore learns to act and explore the remaining valid actions: if it fails at $A$ , it samples search(B) or search(C). If it then fails at $B$ , every label is search(C), since only $C$ remains. Unlike random sampling of locations, the policy conditions on its history and never retries hypotheses it has ruled out. Across many training tasks, ambiguous histories are labeled with a distribution of potential, consistent expert trajectories. The student samples from this distribution to explore, and each new observation and feedback eliminates additional hypotheses. The key insight: the set of histories that the student needs to learn to adapt from (e.g., failing at $A$ , failing at $B$ and then moving to $C$ ) is entirely covered by on-policy behavior. This is in-context exploration, i.e., searching while uncertain, and exploiting once the hidden state is revealed. Additionally, we show that a curriculum over the student rollout horizon improves sample efficiency and enables longer-context adaptation (Section 5). Overall, ASTEROID incorporates very simple changes into standard online student-teacher distillation to enable test-time exploration behavior.
+
+We show both empirically (Section 6) and theoretically (Appendix H) that ASTEROID approximates Bayesian posterior sampling, a provably efficient exploration strategy [53]. However, posterior sampling has been hard to scale: prior approaches maintain an explicit posterior [3] or assume infinite offline data [42], which are intractable in realistic settings. ASTEROID avoids both: it does not maintain an explicit posterior, and on-policy supervised learning avoids impractical data costs. Because it is a simple extension of student–teacher distillation, ASTEROID works with modern architectures and existing sim-to-real frameworks [75]. In summary, we make the following contributions:
+
+1. 
+
+We present ASTEROID, a simple student–teacher distillation framework that enables in-context exploration and test-time improvement learned solely from privileged experts.
+
+2. 
+
+We evaluate our method across 11 environments, including navigation in realistic household simulators and real-world robot manipulation, where it outperforms RL and supervised baselines under fixed exploration budgets while using two orders of magnitude fewer training interactions.
+
+3. 
+
+We show that learned policies exhibit efficient real-world exploration and, under appropriate assumptions, recover posterior sampling with error linear rather than quadratic in context length.
+
+## 2 Related Work
+
+Student–Teacher Distillation.
+Learning from privileged experts arises in settings from self-driving [13] to robotic exploration [17]. Interactive imitation addresses the covariate shift that drives the learner into unseen states [59], and prior work suggests that on-policy imitation is necessary under partial observability [65]. Our work targets this non-realizable regime, where the learner must take information-gathering actions that are not recoverable from a fully observed expert [63, 40]. Prior approaches handle this via additional assumptions, such as differentiable experts [73], predicting hidden information [38], or incorporating RL with bootstrapping to induce exploration [74, 70, 61, 37]. In contrast, we learn information-gathering behavior using iterative distillation of expert actions conditioned on on-policy histories, which is more sample-efficient than RL-based alternatives.
+
+Meta Learning.
+Meta-RL learns adaptive exploration across task distributions using recurrent policies [28, 21, 79, 44], but requires extensive online interaction [5], making it difficult to scale to high-dimensional, sparse-reward domains. Our approach replaces this expensive RL-based adaptation with supervised learning, making it efficient to learn long-horizon exploration. Further, unlike prior work limited to Bayes-Adaptive MDPs [40, 79, 42], our method scales to POMDPs, where the policy explores within a single episode to estimate the underlying state and achieve task success.
+
+Posterior Sampling.
+Posterior sampling methods [67, 53] drive exploration by maintaining a belief over hidden parameters, acting optimally under samples from this belief, and updating it based on feedback. Despite strong empirical and theoretical results [10, 53], such approaches require maintaining an explicit posterior and solving for policies under sampled parameters [53, 3], limiting scalability to high-dimensional settings. ASTEROID does not explicitly optimize a posterior-sampling objective. Instead, posterior-sampling-like behavior emerges through iterative on-policy distillation, even in high-dimensional continuous environments (Section 6), and we include theoretical insights to show convergence to posterior sampling on the covered history support (Appendix H). In Section 6, we show that current frontier models are inefficient at performing such exploration under partial observability, motivating the need to explicitly learn such behavior.
+
+In-Context Decision-Making.
+Transformers trained autoregressively on sequential data exhibit in-context learning [9, 25], which Decision Transformer [15] and Algorithm Distillation [39] leverage for decision-making. These works focus on using online rollouts as context to adapt behavior without external prompts. Closest to our work, Decision-Pretrained Transformer [42] learns an in-context policy that performs posterior sampling by pairing randomly generated contexts with privileged expert supervision. Such methods assume the offline dataset covers all possible interaction histories, which is intractable in high-dimensional domains. ASTEROID, instead, uses on-policy contexts, removing the coverage assumption and scaling to much harder, higher-dimensional problems (Section 6).
+
+We include an extended discussion of related work in Appendix A.
+
+## 3 Problem Statement
+
+We study decision-making under partial observability, modeled as a partially observable Markov decision process (POMDP) [34]. A POMDP is represented by the tuple $(\mathcal{S},\mathcal{A},\mathcal{O},E,T,R,\rho_{0},\gamma)$ , where $\mathcal{S}$ is the state space, $\mathcal{A}$ is the action space, $\mathcal{O}$ is the observation space and $E,T,R,\rho_{0},\gamma$ are the emission function, transition kernel, reward function, initial state distribution and discount factor, respectively. In a POMDP, the policy does not observe the state $s_{t}$ but receives partial observations $o_{t}\sim E(\cdot\mid s_{t})$ . For simplicity, we also define the Bayes-Adaptive Markov decision process (BAMDP), a special case of POMDPs in which the only hidden variable is a latent parameter, denoted by $z$ , i.e., $s_{t}=(o_{t},z)$ . For each interaction, $z\in\mathcal{Z}$ is sampled from a prior $p(z)$ and remains fixed for $K$ episodes (unlike a POMDP, where hidden states may vary at each step). Given $z$ , BAMDPs are fully observed and can be represented as a collection of MDPs $M_{z}$ (or tasks).
+
+As a running example, consider a three-door environment: a BAMDP with latent parameter $z$ denoting the target door. At the start of each interaction, $z$ is sampled uniformly from the three doors and remains fixed across multiple episodes, where the objective is to navigate to the correct door. The target is hidden, and the agent must use its interaction history to infer the hidden goal and then exploit that information. We can construct a POMDP by adding noise to agent observations at each time step.
+
+Since observations $o_{t}$ are partial, optimal policies depend on the current observation $o_{t}$ and the history $h_{t}=(o_{0},a_{0},r_{0},\ldots,o_{t-1},a_{t-1},r_{t-1})$ . Let $d_{\pi}(h)$ denote the distribution over histories for a policy $\pi$ . Learning information-gathering behavior directly from sparse rewards is highly sample-inefficient, often requiring impractical amounts of experience [5]. To mitigate this, we study an asymmetric training–testing setting in which a privileged teacher $\pi^{*}(a_{t}\mid s_{t})$ can access the true state $s_{t}$ during training, while the deployed student $\pi_{\theta}(a_{t}\mid o_{t},h_{t})$ acts under partial observability using $o_{t}$ and $h_{t}$ . During training, the learner interacts with the POMDP to collect transition tuples $(o_{t},a_{t},r_{t},o_{t+1})$ and queries the teacher for actions $a^{*}_{t}\sim\pi^{*}(\cdot\mid s_{t})$ . Our objective is to use these interactions and teacher supervision to learn a student $\pi_{\theta}(\cdot\mid o_{t},h_{t})$ that maximizes the expected return $J(\pi_{\theta})=\mathbb{E}_{\pi_{\theta}}\!\left[\sum_{t=0}^{\infty}\gamma^{t}r_{t}\right]$ . This asymmetric distillation setting arises naturally in navigation [33], sim-to-real robot manipulation [75], human-in-the-loop learning [36], and knowledge distillation [26].
+
+## 4 Background: Student–Teacher Distillation
+
+In the following sections, we focus on the key paradigms for teacher–student distillation under partial observability, discuss why they break down at learning how to explore in asymmetric settings, and motivate ASTEROID as an iterative on-policy distillation method for learning in-context exploration.
+
+## Naive asymmetric student–teacher distillation cannot learn adaptive exploration.
+
+A natural approach to train partially observed student policies is via behavior-cloning trajectories generated solely by a privileged policy [22, 54]. But there is a conflict: the privileged teacher policy $\pi^{*}(\cdot|s_{t})$ solves the task without exploration, whereas the unprivileged student policy $\pi_{\theta}$ must gather information through exploration before exploiting for task success [28]. Following the three-door example from Section 3, privileged experts observe $z$ , while the student only receives partial observations $o_{t}$ . At $t=0$ , $o_{0}$ is identical for all values of $z$ . Here, a student policy acting on partial observation $o_{0}$ cannot distinguish between actions provided for the three goals and learns the marginal expert behavior induced by the training data ${d}_{\pi^{*}}$ , i.e., choosing a door uniformly at random. Thus,
+
+Naive asymmetric distillation from expert trajectories learns i.i.d. exploration, but fails to adaptively exploit sequences of environment rewards and feedback.
+
+## In-context learning via Decision-Pretrained Transformer (DPT) [42] can learn exploration.
+
+Recent work [42] has shown that asymmetric student–teacher distillation can learn exploration when the training dataset is constructed with specific design choices.
+Lee et al. [42] introduce DPT, an in-context learning framework that constructs a dataset of contexts, observations and target actions: $\mathcal{D}^{\text{DPT}}=\{(h_{t},o_{t},a^{*}_{t})^{i}\}_{i=1}^{N}$ for supervised learning via random sampling. Here, $d_{\mathcal{D}}$ denotes the empirical distribution of histories and query observations in the dataset $\mathcal{D}$ . DPT generates its offline histories with an independent behavior policy.
+Further, it labels randomly sampled query observations $o_{t}\in\mathcal{O}$ with the privileged expert $a^{*}_{t}\sim\pi^{*}(\cdot|o_{t},z)$ . The history $h_{t}$ provides context about the underlying hidden parameter, which the policy learns to use at the query observation $o_{t}$ to predict actions. DPT trains a causal transformer policy maximizing action likelihood over this dataset:
+
+ $\mathcal{L}(\theta)\;=\;\mathop{\mathbb{E}}_{(h_{t},o_{t},a^{*}_{t})\sim{\mathcal{D}}}\left[-\log\pi_{\theta}\!\left(a_{t}^{*}\mid o_{t},h_{t}\right)\right].$ 
+
+(1)
+
+Under coverage assumptions, DPT provably converges to posterior sampling: it uses $h_{t}$ to form an implicit posterior over the latent state, and acts according to the expert policy averaged under this posterior, i.e., $\pi(a_{t}|o_{t},h_{t})=\int\pi^{*}(a_{t}|o_{t},z)\;\mathrm{p}(z|o_{t},h_{t})\;dz$ .
+
+Let $\mathcal{H}_{t}=(\mathcal{O}\times\mathcal{A}\times\mathcal{R})^{t}\times\mathcal{O}$ denote the space of length- $t$ history and observation tuples $(h_{t},o_{t})$ .
+
+The primary limitation of DPT is the reliance on a full-coverage assumption: the dataset must cover the combinatorial space of arbitrary contexts and query observations, i.e., we require
+
+ $\mathop{\bigcup}\limits_{t=0}^{H}{\mathcal{H}_{t}}\subseteq\operatorname{supp}(d_{\mathcal{D}}),$ 
+
+which scales exponentially with the interaction horizon $H$ .
+
+Figure 2: DPT needs intractable full-context coverage for training, while ASTEROID generates on-policy rollouts to learn scalable exploration. 
+
+The above assumption holds in the infinite-data limit, when randomly sampling histories and query observations provides complete coverage (see Figure 2). Under finite data, this quickly becomes impractical in high-dimensional observation and action spaces, where the number of possible histories grows exponentially, and informative feedback is sparse [6].
+Consequently, purely offline context datasets do not scale to learning exploration in realistic, large-scale decision-making problems. This has fundamentally limited the applicability of methods like DPT in robotics and other high-dimensional problems.
+
+## 5 Asymmetric Student Teacher Roll-Out In-context Distillation
+
+Figure 3: In each iteration, ASTEROID (1) collects on-policy context from the student $\pi_{\theta_{k}}$ and then (2) expert trajectories from $\pi^{*}$ , under the same hidden parameters $z$ . With this dataset, we can (3) train policies that perform in-context exploration.
+
+In Section 4, we identified a central bottleneck in supervised learning for in-context exploration: generating data that covers the histories a partially observed agent will experience at deployment.
+
+Our key insight is that the training dataset $\mathcal{D}$ should not necessarily cover the entire combinatorial history space $\mathcal{H}_{t}$ , but simply the distribution of trajectories generated by the student itself: the “on-policy” rollouts $h_{t}\sim d_{\pi_{\theta}}$ coupled with expert labels provide sufficient coverage in the dataset to learn an adaptive exploration strategy, i.e.
+
+ $\operatorname{supp}(d_{\pi_{\theta}})\subseteq\operatorname{supp}(d_{\mathcal{D}})$ 
+
+Consequently, this relaxes the strong assumption of infinite coverage over histories that renders DPT intractable. Our method ASTEROID is an iterative asymmetric distillation procedure that alternates between collecting on-policy histories from the student and training a history-conditioned student policy from privileged expert labels. Collecting supervision on student-induced histories reduces the distribution shift between training and deployment. Unlike standard interactive imitation [59], which aggregates per-step action labels, ASTEROID supervises with full expert trajectories and conditions on environment feedback (Appendix D).
+
+(Informal) Theorem.
+
+Under compliance (i.e., independence between the sources of on-policy contexts and supervision labels), on-policy coverage, and bounded episode cost, ASTEROID approximately
+recovers posterior sampling on the histories it visits. Given a supervised learner with
+average error $\epsilon$ on its own histories, its gap to posterior sampling over $K$ episodes
+is $O(\epsilon K)$ . The total regret is
+
+ $\mathrm{Reg}_{\mathrm{PS}}(K)+O(\epsilon K)$ 
+
+i.e., posterior sampling’s regret plus a linear approximation term.
+
+The formal statements and proofs are given in
+Appendix H. The key step is that privileged labels queried on
+the student’s own histories are exactly posterior-sampling labels
+(Lemma 1). In addition, we show that an offline
+in-context learner with the same training error can incur $O(\epsilon K^{2})$ 
+error (Lemma 2), because the test-time histories it
+encounters drift away from its fixed training distribution.
+
+Algorithm 1 ASTEROID
+
+ 0:
+
+  iterations $K$ , tasks per iteration $N$ , horizon $H$ , privileged teacher $\pi^{*}$ 
+
+ 1:
+
+  Initialize $\mathcal{D}_{0}\leftarrow\text{expert trajectories}$ , student $\pi_{\theta_{0}}\leftarrow\textit{i.i.d}\;\text{policy}$ 
+
+ 2:
+
+  for $k=1,\dots,K$ do
+
+ 3:
+
+    $\mathcal{D}_{k}\leftarrow\mathcal{D}_{k-1}$ 
+
+ 4:
+
+   // Collect on-policy contexts and privileged labels
+
+ 5:
+
+   for $i=1,\dots,N$ do
+
+ 6:
+
+    Sample $z\sim p(z)$ and instantiate $M_{z}$ 
+
+ 7:
+
+    Roll out $\pi_{\theta_{k-1}}$ in $M_{z}$ for $k$ episodes: $h_{k}^{(i)}=(\tau^{0},\dots,\tau^{k-1})$ 
+
+ 8:
+
+    Roll out $\pi^{*}$ in $M_{z}$ for one episode:
+ $\tau^{*,(i)}=(o^{*}_{0},a^{*}_{0},r^{*}_{0},\dots,o^{*}_{H-1},a^{*}_{H-1},r^{*}_{H-1})$ 
+
+ 9:
+
+    Add labels
+ $\mathcal{D}_{k}\leftarrow\mathcal{D}_{k}\cup\{(h_{k}^{(i)},o^{*}_{0:t},r^{*}_{0:t-1},a^{*}_{t})\}_{t=0}^{H-1}$ 
+
+ 10:
+
+   end for
+
+ 11:
+
+   Train $\pi_{\theta_{k}}$ on $\mathcal{D}_{k}$ using Eq. 1 // Update student by conditional imitation
+
+ 12:
+
+  end for
+
+ 13:
+
+  return $\pi_{\theta_{K}}$ 
+
+## 5.1 How does ASTEROID learn in-context exploration?
+
+Figure 3 and Algorithm 1 summarize ASTEROID. Let $\pi_{\theta_{k}}$ denote the student policy and $\mathcal{D}_{k}$ the dataset at iteration $k$ . We first instantiate the method in a BAMDP, where a latent $z\sim p(z)$ stays fixed while the policy interacts for $k$ episodes, and extend it to general POMDPs in Section 5.3. Each iteration has two phases. In the data generation phase, we roll out the student for $k$ episodes to produce the on-policy context $h=(\tau^{0},\dots,\tau^{k-1})$ , then roll out the privileged expert $\pi^{*}(\cdot\mid o,z)$ under the same $z$ to produce an expert trajectory $\tau^{*}$ . The expert observations $o^{*}_{0:t}$ and rewards $r^{*}_{0:t-1}$ from $\tau^{*}$ serve as the query, and the expert action $a^{*}_{t}$ as the label. Unlike DPT, which samples query observations randomly, our queries come from expert rollouts. In the supervised learning phase, we train $\pi_{\theta_{k}}$ to predict $a^{*}_{t}$ given $(h,o^{*}_{0:t},r^{*}_{0:t-1})$ with the DPT loss (Eq. 1). In practice, we use a causal transformer [42] and compute the loss only on expert actions. We repeat this process of collecting on-policy contexts and expert labels, followed by supervised learning iteratively. After iteration $k$ , $\pi_{\theta_{k}}$ adapts using up to $k$ test-time episodes. Revisiting the three-door problem from Section 3,
+
+Figure 4: We iteratively learn to adapt exploration using feedback over longer contexts.
+
+Iteration 0.
+ $\pi_{\theta_{0}}$ learns an i.i.d. policy with no in-context learning. It randomly chooses a door every episode, ignoring previous episodes.
+
+Iteration 1.
+ $\pi_{\theta_{0}}$ generates an on-policy trajectory, which visits a random door. The reward reveals whether that door is correct: $+1$ if correct, $0$ otherwise. The expert label then returns to the same door on success or points to a different door after failure. Thus, $\pi_{\theta_{1}}$ learns to use the first episode as context for choosing the second. However, $\pi_{\theta_{1}}$ has a context window of one episode, so it cannot reason over more than one attempt, motivating more iterations to expand the window.
+
+Iteration 2.
+ $\pi_{\theta_{1}}$ now generates two context trajectories: it repeats a successful door, or tests a new door after failure. If both tested doors fail, the expert label points to the remaining door. Thus, $\pi_{\theta_{2}}$ learns in-context exploration that identifies the true goal in this partially observed task.
+
+To further illustrate ASTEROID, Appendix E provides another dry run showing that the student behavior approaches posterior sampling. We discuss certain practical details of the method below.
+
+## 5.2 Practical Implementation
+
+Initialization.
+We initialize $\mathcal{D}_{0}$ with privileged expert trajectories. The initial policy $\pi_{\theta_{0}}$ is therefore trained without contextual information and resembles naive student–teacher distillation; see Section 4.
+
+Deployment.
+At deployment, the policy starts from a null context, $h_{0}=\emptyset$ (see Algorithm 2). We do not use any training context; at each step, the policy uses online interaction to build context and infer hidden information. For evaluations longer than the training context length, we use a sliding window.
+
+Algorithm 2 ASTEROID Deployment
+
+ 0:
+
+  trained student $\pi_{\theta_{K}}$ , horizon $T$ 
+
+ 1:
+
+  Initialize context $h\leftarrow\emptyset$ 
+
+ 2:
+
+  for $t=0,\dots,T-1$ do
+
+ 3:
+
+   Observe $o_{t}$ , sample $a_{t}\sim\pi_{\theta_{K}}(\cdot\mid h,o_{t})$ 
+
+ 4:
+
+   Execute $a_{t}$ , receive $r_{t}$ 
+
+ 5:
+
+   Update context $h\leftarrow(h,o_{t},a_{t},r_{t})$ // Build context from online interaction
+
+ 6:
+
+  end for
+
+Context-length curriculum.
+At each iteration $k$ , the policy is rolled out for $k$ episodes, inducing a curriculum on rollout horizons. As the horizon expands, the student can eliminate task instances that are inconsistent with its history over a longer horizon, making exploration efficient. This also makes our method more sample-efficient, and we discuss this further in Appendix B.3.
+
+## 5.3 How does ASTEROID work on arbitrary POMDPs?
+
+We described ASTEROID in a BAMDP, where a latent variable $z$ remains fixed across multiple episodes. In a general POMDP, the hidden state evolves within a single episode. For example, in a locally observed maze, the agent does not observe its global position, and this hidden position changes after every move. At test time, the policy interacts with the environment for a single episode over a fixed horizon $H$ . As the underlying state changes at each step, the agent faces a branching inference problem: each action and observation changes which hidden states remain plausible. Thus, instead of coverage over repeated episodes for a fixed $z$ , we need coverage over on-policy histories $h_{t}$ across timesteps $t\in[H]$ .
+
+In practice (see Algorithm 3), ASTEROID samples a timestep $t$ , rolls out the student to produce an on-policy history $h_{t}$ , and queries the expert from the reached state, producing a partial trajectory that generates the queries $o^{*}_{t:}$ and action labels $a^{*}_{t:}$ (similar to takeovers in [36]). The resulting tuples $(h_{t},o^{*}_{t:},a^{*}_{t:})$ train the policy to map its history to actions that
+are optimal for the hidden state under that history. At the takeover step, it
+approximates $\pi(a_{t}\mid o_{t},h_{t})=\int\pi^{*}(a_{t}\mid s_{t})\,p(s_{t}\mid o_{t},h_{t})\,ds_{t}$ , and over
+the future steps, the expert trajectory teaches it to follow one hypothesis
+rather than dithering.
+For example, in the maze, after each move, the local observations and rewards prune some possible positions while keeping others plausible. Further, we induce a curriculum in the context horizon by iteratively biasing the sampled timestep $t$ toward longer horizons. Thus, we adapt the method to a POMDP: collect on-policy histories, then use privileged labels to teach it how to guide future behavior.
+
+## 6 Experiments
+
+In our experiments, we aim to answer the following questions:
+
+1. 
+
+Does ASTEROID learn to solve partially observed problems efficiently on deployment?
+
+2. 
+
+Is ASTEROID sample-efficient compared to baselines?
+
+3. 
+
+What kind of exploratory behavior do policies trained with ASTEROID display at test time?
+
+4. 
+
+Does ASTEROID learn exploration policies that can be deployed on real-robot hardware?
+
+5. 
+
+Do frontier models perform in-context exploration?
+
+6. 
+
+Is learning from on-policy contexts necessary to learn exploration efficiently?
+
+## 6.1 Training and Evaluation Details
+
+We evaluate all methods across 11 environments and three seeds11
+ 1
+
+ We run Habitat on a single seed and the wrist-camera RL baseline on two seeds due to high wall-clock time.. We include error bars denoting the standard error across the seeds. For model architecture and tokenization, we use the causal transformer implementation from [42]. We include the hyperparameters, training, and environment details in Appendix F. We also include ablations over ASTEROID in Appendix B, and qualitative videos on the website22
+ 2
+
+ Project
+webpage: weirdlabuw.github.io/asteroid.
+We evaluate the policy’s performance and exploration efficiency across multiple test-time episodes on held-out goals. We compare policy performance across training iterations, with a fixed test-time budget.
+
+Figure 5: Tasks: (left to right) meta-learning gridworld benchmark, partially observed navigation, Procgen maze navigation, embodied object search, simulated robot and real robot manipulation.
+
+## 6.2 Tasks
+
+We evaluate our approach on a diverse suite of partially observable decision-making problems across robotic manipulation, discrete exploration, and continuous navigation (Figure 5), requiring strong elements of exploration, memory, and adaptation under limited sensing.
+
+• 
+
+Partially observed gridworlds [16] are a classic benchmark consisting of discrete search problems, where an agent acts over multiple episodes in a gridworld to reach one or more goals. The agent is in an $n\times n$ grid and must perform targeted exploration to solve the task, such as finding the hidden goal or sequentially finding the hidden key and the door across multiple episodes.
+
+• 
+
+Meta-Learning navigation [57] is a meta-learning task where an agent must navigate in an environment to a hidden goal. We instantiate (i) Ant Navigation, where the agent is an 8-DoF robot, and (ii) 2D Navigation, which reduces the dynamics to a simple point mass.
+
+• 
+
+Procgen Maze Navigation [18] involves finding the goal in procedurally generated mazes, where the agent receives only a local $3\times 3$ observation and has to infer the maze layout and goal location using the interaction history.
+
+• 
+
+Embodied Object Search [56] involves searching for a household object in a fixed environment in Habitat-Sim. This presents a visually complex domain for a realistic partially observed problem.
+
+• 
+
+Simulated Robotic Manipulation [75] tasks are high-dimensional, continuous-control manipulation tasks under partial observability: Wrist-Camera Peg-Insertion and Tactile-Pick. Here, the robot has to use limited sensing to manipulate objects, i.e., explore over the table using only the wrist view, or use touch sensing to locate the object and complete the given task.
+
+• 
+
+Real Robot Manipulation [78, 8]: We reconstruct one of the simulated tasks in the real world, where the robot has to pick up a cube using proprioception from the arm and gripper only. We train policies in simulation with domain randomization [68, 75] and then transfer them to the real world.
+
+## 6.3 Baselines
+
+We compare against ten strong baselines from several frameworks under partial observability:
+
+• 
+
+Asymmetric student–teacher: BC: imitates privileged expert trajectories, DAgger [59]: relabels the student’s per-step actions with the expert. DPT [42] trains a transformer on an in-context dataset of randomly collected interactions to predict oracle actions;
+SPOC [22] imitates shortest-path trajectories with data augmentation, yielding exploration-like behavior.
+AAWR [30] extends Advantage Weighted Regression [55] to POMDPs, using privileged state during training to learn a stronger critic.
+
+• 
+
+Meta-RL:
+RL2 [21] trains a recurrent policy to adapt to the hidden parameters purely through interaction, treating the policy’s hidden state as an implicit learning algorithm that updates from histories across episodes.
+Distilled Planner [56, 53]: For embodied navigation in Habitat, we train a policy that performs posterior-sampling RL (PSRL) [53] (i.e., upper bound performance).
+
+• 
+
+Imitation-informed RL:
+BC+PPO [60, 21] accelerates PPO [60] by adding a behavior-cloning loss over privileged actions; for meta-learning tasks, we use an adapted variant (BC+RL2) that leverages privileged supervision to bootstrap learning.
+ADVISOR [74] dynamically combines imitation learning (IL) and online RL objectives during training, resolving the imitation gap adaptively. RMA [38] learns to predict the privileged latent from history, and a frozen expert policy acts on that predicted latent.
+
+## 6.4 Does ASTEROID learn to solve partially observed problems efficiently on deployment?
+
+Figure 6: Performance on discrete exploration tasks requiring memory and goal inference. We observe that ASTEROID outperforms all baselines in terms of test-time efficiency. It performs efficient exploration and almost converges to the expert after inferring the hidden task variables.
+
+In Figure 6, we compare the test-time performance of in-context policies learned via ASTEROID against baselines. Given the same test-time budget, our method achieves substantially higher final performance. Unlike the baselines, ASTEROID’s on-policy data generation and expert supervision provide coverage over the context the policy sees and the subsequent actions it should take at deployment, i.e., it can effectively adapt its exploration using these contexts to infer task-relevant information. Figures 8, 11, and 16 show the same trend in partially observed navigation and manipulation. In Procgen Maze (Figure 6.5), ASTEROID solves procedurally generated mazes by using local observation history to maintain an implicit belief over the state, guiding exploration toward unexplored regions [35]. This avoids redundant search and enables ASTEROID to achieve higher success while being $2\times$ faster.
+In contrast, BC achieves non-trivial success through random exploration but does not use context to avoid redundant search, making it highly inefficient. DPT also underperforms because offline datasets provide incomplete coverage over test-time histories. For RMA, latent uncertainty generates out-of-distribution (OOD) inputs for the base policy, which is trained only under full observability. As a result, it never learns to explore. ASTEROID instead directly supervises the action distribution conditioned on the student’s own context to perform directed exploration. In ASTEROID, exploration is the learned behavior, not a byproduct. Finally, as we discuss in Appendix D, we see that DAgger under partial observability leads to performance degradation (below BC), while history conditioning and multi-step supervision in ASTEROID learn an effective search policy. We also show robustness to noisy experts in Appendix B.2. Videos of the learned behavior are on the website33
+ 3
+
+ Project
+webpage: weirdlabuw.github.io/asteroid.
+
+## 6.5 Is ASTEROID sample-efficient?
+
+Figure 7: ASTEROID improves success while reducing episode length on Procgen Maze; BC succeeds non-trivially via random exploration but is much less efficient.
+
+Figure 8: We observe extreme sample efficiency ( $\sim 100\times$ speedup) when using ASTEROID to train policies for robot manipulation under limited sensing.
+
+In this section, we compare the training-time sample efficiency of ASTEROID against baselines that combine RL with privileged supervision to learn policies under partial observability. Using GPU-parallelized simulation [48], we evaluate manipulation tasks in which the policy has access to limited sensory modalities. In Figure 8, ASTEROID is $\sim 100\times$ more efficient in environment steps than RL baselines, learning a policy that explores and successfully picks the cube or inserts the peg. In Figure 16(b), the student observes only the history of past actions and tactile sensing (no proprioception), and ASTEROID efficiently learns policies with $\sim 92\%$ success rate under this partial observability.
+The supervised updates in ASTEROID (compared to expensive RL) make it highly efficient during training, even for high-dimensional tasks. While RL baselines can learn in low-dimensional settings (Appendix B.4), they are significantly sample-inefficient in domains such as ant navigation and robotics (Figures 8 and 11).
+
+## 6.6 What kind of in-context exploratory behavior do policies learned via ASTEROID display?
+
+Figure 9: End-effector trajectories on the tactile cube-pick task, where the policy must locate and lift a cube using proprioception and touch sensing. The privileged state expert (gray) observes the cube pose and grasps it directly. Under partial observability, the baselines fail to adapt their actions, whereas ASTEROID performs in-context exploration, exploring the table until contact, then grasping and lifting the cube. 
+
+In Tactile-Pick (Figure 9), the policy probes multiple grasp points and uses tactile feedback from failed attempts to inform its next actions, unlike BC, which treats trials independently and relies on i.i.d. exploration. Additionally, other baselines fail to learn directed exploration either because of incompatible supervision or inefficient context generation during training. Similarly, in Figure 11, the robot policy scans the tabletop using its wrist camera to localize both the object and target. In contrast, naive distillation goes out of distribution and degenerates.
+
+Figure 10: Robot positions (bottom row) during exploration for Peg-Insertion from wrist images (top row). ASTEROID learns policies that sweep the table to locate the peg and successfully place it in the hole, whereas direct imitation policies collapse under limited observability.
+
+Figure 11: Ant Navigation. (Right) ASTEROID performs posterior sampling over goals while controlling the 8-DoF robot and achieves high success (Left), while RL2 and DPT (success rate $\sim 0$ ) fail to learn control and exploration for higher-dimensional action spaces. 
+
+We also see goal-directed, memory-based exploration (Appendix C.2) in Habitat and navigation tasks: the policy explores the environment, remembers failed locations, and avoids redundant search. See Appendix C and the website for videos. In Figure 11, we observe in the Ant Navigation task that the learned exploration resembles strategies found in prior meta-learning methods [79]. The ant efficiently explores different goals and eliminates regions where it does not receive a high reward (see trajectories in Figure 11). This enables the agent to adaptively find the right goal and exploit it. Although RL can learn exploration, its sample inefficiency makes it impractical. DPT performs poorly in continuous control, as it is nearly impossible to construct offline datasets via random exploration that cover test-time histories.
+
+## 6.7 Does ASTEROID learn exploration policies that can be deployed on real robot hardware?
+
+In Figure 12, we evaluate ASTEROID on a real robot manipulation task that requires exploration under partial observability. We first train clairvoyant experts in Isaac Lab using large-scale reinforcement learning with domain randomization [75, 78]. These experts
+use privileged state information to pick up a cube. At deployment, the real robot observes only proprioception (joint angles and gripper positions, no touch). The cameras are off, so it cannot see the cube, and vision-based transfer is not applicable. We train student policies to explore the world and infer this hidden information by trying different grasp locations and using gripper jaw position.
+
+Figure 12: (Left) Real robot setup, where it must rely solely on proprioception (arm joint and gripper positions) to infer the object’s location and pick it up. (Right) Comparing the performance of sim-to-real distillation via naive BC and our method on the real-robot task. ASTEROID learns an effective exploration policy that achieves a higher success rate across 10 trials with randomized cube positions.
+
+The standard transfer baseline is to distill the simulation expert into the student policy via behavior cloning. This student policy imitates expert trajectories, but does not learn how to recover from failed attempts. In contrast, ASTEROID trains the policy to perform in-context exploration, so the robot learns to adapt its next grasp attempt based on the history of previous attempts.
+As shown in Figure 12 (right), ASTEROID achieves a higher success rate than behavior cloning. The qualitative rollouts in Figure 15 show this behavior: after a failed attempt, the baseline goes out of distribution, while ASTEROID continues searching over potential cube locations using its in-context abilities, completes the grasp, and successfully picks up the cube without cameras. We further demonstrate qualitatively that as the policy does not use vision, it can successfully solve the task in situations where the partial observability is natural, e.g., rummaging inside a box or under visual distractors (see robot videos on our website44
+ 4
+
+ Project
+webpage: weirdlabuw.github.io/asteroid).
+
+## 6.8 Do frontier models perform in-context exploration?
+
+Figure 13: In the Peg-Insertion task, ASTEROID outperforms a frontier model (Claude Opus 5.5) at exploring the table to pick up the peg and insert it, while also being faster.
+
+Given recent progress in highly capable foundation models [2], a natural question is: if we use frontier models for exploration in partially observed environments, how well do they perform? To investigate this, we conduct an experiment on the Peg-Insertion task where the robot has to use its wrist camera to explore the table, locate and pick up the peg, and insert it into the peg hole.
+
+Following work on using foundation models to write code for controlling robots, e.g., “code-as-policies” [43, 14], we first let a Claude Opus 5.5 coding agent (inside Claude Code) build a harness around the environment. Like ASTEROID, it has access to the full Isaac Lab environment and the privileged expert policy, which it uses to collect 3 demonstrations, train a perception model, and tune the prompt. We then use Claude Opus 5.5 as the policy: during each episode, we show it the camera images and robot state, and it writes a small program that controls the robot until the current sub-task (e.g., grasping the peg) is done, then looks again and writes the next subtask policy. Notably, directly using the model to output actions for this led to almost zero successes, as the model failed to precisely insert the peg.
+Under full observability, the model achieves a $\sim 65\%$ success rate, below the expert policy ( $\sim 90\%$ ), while also being $\sim 2\times$ less efficient (see Figure 13). To adapt the policy to partial observability, we prompt the agent to tune the code policy to a wrist-camera-only setting (preserving the base controller it has generated). In the Wrist-Camera Peg-Insertion task, we see that our learned policy outperforms the frontier model ( $\sim 78\%$ vs. $\sim 50\%$ success rate). This implies that while frontier models are capable of completing tasks under full observability, the ability to explore via context is still missing from the repertoire of skills they have.
+
+## 6.9 Is learning from on-policy contexts necessary?
+
+Figure 14: ASTEROID generates data online, while AAWR is sensitive to the quality of offline datasets.
+
+Across multiple domains, DPT performs poorly because offline random contexts fail to capture the deployment histories. In Figure 14, we compare ASTEROID against AAWR [30] trained with offline datasets of varying diversity in the peg-insertion task, to highlight the importance of on-policy context collection. AAWR [30], which learns from an offline dataset, is highly sensitive to the dataset quality and diversity. ASTEROID avoids this offline dependence by generating on-policy contexts from the student. This focuses supervision on deployment-relevant contexts, and is robust to imperfect expert labels (see Appendix B.2).
+
+Figure 15: We evaluate sim-to-real transfer of policies learned via ASTEROID and naive behavior cloning on a real-robot task, where the robot cannot use the camera to localize the object and pick it up. Instead, it has to use the proprioception of the arm and the gripper and explore different locations by attempting grasps at different positions. We compare the behavior learned with BC vs ASTEROID. The baseline (first row) is trained to imitate expert data only and goes out of distribution. Meanwhile, ASTEROID (second row) learns a policy that uses its in-context exploration to explore multiple grasp locations and pick up the object.
+
+## 7 Discussion
+
+In this work, we propose ASTEROID, an iterative asymmetric distillation framework for learning in-context exploration. The key idea is to train a history-conditioned policy using supervised targets from a privileged expert, while collecting the histories on-policy from the student. This directly addresses two bottlenecks for exploration: (i) privileged teachers do not demonstrate information-gathering behavior, and (ii) offline or randomly collected histories may not match the distribution the student will encounter at deployment. While the need for history-conditioned exploration policies is well established, we show that on-policy distillation from privileged teachers, without RL or latent regression, is sufficient to learn exploration scalably across diverse simulated and real-world tasks. We believe that as robots and AI agents are deployed in the wild, acting as web assistants or robot butlers, in-context exploration learned via simple and scalable online training is key to enabling truly autonomous behavior.
+
+A limitation is that the approach relies on a strong privileged expert, though it is agnostic to how the expert is generated. An interesting direction is to remove this reliance and train experts from offline demonstrations. We note that posterior sampling exploration is not Bayes-optimal, i.e., it trades off some exploration efficiency for tractability and strong regret guarantees. This motivates future extensions that combine our approach with optimistic exploration. Another limitation is that this exploration relies on inferring hidden states from the overall expert support. When the hidden information can only be gathered outside this support, the student cannot reduce its uncertainty. A promising future direction is to learn a residual policy on top of this student to learn off-support information-gathering behavior. Additionally, the student policy is trained to imitate expert actions, but may produce unsafe exploration. Therefore, an important direction is to enforce safety via explicit constraints and safety filters.
+
+## Acknowledgments
+
+We thank the members of the WEIRD Lab for their helpful feedback and
+insightful discussions. We thank the authors of OmniReset for guiding us in setting up the simulation experts and sim-to-real transfer of robot policies. The authors acknowledge the UW Hyak Team for providing HPC resources that have contributed to the research results reported in this paper. This work was partially funded by NSF Award 2535892.
+
+## References
+
+[1]
+
+A. Agarwal, S. Kakade, A. Krishnamurthy, and W. Sun.
+
+Flambe: Structural complexity and representation learning of low rank
+mdps, 2020.
+
+URL https://arxiv.org/abs/2006.10814.
+
+[2]
+
+Anthropic.
+
+Claude opus 5.5.
+
+Technical report, Anthropic, September 2026.
+
+[3]
+
+J. Asmuth, L. Li, M. L. Littman, A. Nouri, and D. Wingate.
+
+A bayesian sampling approach to exploration in reinforcement
+learning.
+
+UAI ’09, page 19–26, Arlington, Virginia, USA, 2009. AUAI Press.
+
+ISBN 9780974903958.
+
+[4]
+
+M. Bansal, A. Krizhevsky, and A. Ogale.
+
+Chauffeurnet: Learning to drive by imitating the best and
+synthesizing the worst.
+
+arXiv preprint arXiv:1812.03079, 2018.
+
+[5]
+
+J. Bauer, K. Baumli, F. Behbahani, A. Bhoopchand, N. Bradley-Schmieg, M. Chang,
+N. Clay, A. Collister, V. Dasagi, L. Gonzalez, K. Gregor, E. Hughes,
+S. Kashem, M. Loks-Thompson, H. Openshaw, J. Parker-Holder, S. Pathak,
+N. Perez-Nieves, N. Rakicevic, T. Rocktäschel, Y. Schroecker, S. Singh,
+J. Sygnowski, K. Tuyls, S. York, A. Zacherl, and L. Zhang.
+
+Human-timescale adaptation in an open-ended task space.
+
+In Proceedings of the 40th International Conference on Machine
+Learning, ICML’23. JMLR.org, 2023.
+
+[6]
+
+R. Bellman.
+
+Dynamic programming.
+
+Science, 153(3731):34–37, 1966.
+
+doi: 10.1126/science.153.3731.34.
+
+[7]
+
+M. Bhardwaj, S. Choudhury, and S. Scherer.
+
+Learning heuristic search via imitation.
+
+In Conference on Robot Learning, pages 271–280. PMLR, 2017.
+
+[8]
+
+A. Bronars, Y. Park, K. Kedia, and P. Agrawal.
+
+Blind precise assembly: Proprioceptive sim-to-real peg-in-hole for
+diverse parts, 2026.
+
+URL https://arxiv.org/abs/2610.23849.
+
+[9]
+
+T. Brown, B. Mann, N. Ryder, M. Subbiah, J. D. Kaplan, P. Dhariwal,
+A. Neelakantan, P. Shyam, G. Sastry, A. Askell, et al.
+
+Language models are few-shot learners.
+
+Advances in neural information processing systems,
+33:1877–1901, 2020.
+
+[10]
+
+O. Chapelle and L. Li.
+
+An empirical evaluation of thompson sampling.
+
+In J. Shawe-Taylor, R. Zemel, P. Bartlett, F. Pereira, and
+K. Weinberger, editors, Advances in Neural Information Processing
+Systems, volume 24. Curran Associates, Inc., 2011.
+
+URL
+https://proceedings.neurips.cc/paper_files/paper/2011/file/e53a0a2978c28872a4505bdb51db06dc-Paper.pdf.
+
+[11]
+
+D. S. Chaplot, D. Gandhi, A. Gupta, and R. Salakhutdinov.
+
+Object goal navigation using goal-oriented semantic exploration.
+
+In In Neural Information Processing Systems (NeurIPS),
+2020a.
+
+[12]
+
+D. S. Chaplot, R. Salakhutdinov, A. K. Gupta, and S. Gupta.
+
+Neural topological slam for visual navigation.
+
+2020 IEEE/CVF Conference on Computer Vision and Pattern
+Recognition (CVPR), pages 12872–12881, 2020b.
+
+URL https://api.semanticscholar.org/CorpusID:214754592.
+
+[13]
+
+D. Chen, B. Zhou, V. Koltun, and P. Krähenbühl.
+
+Learning by cheating.
+
+In Conference on robot learning, pages 66–75. PMLR, 2020.
+
+[14]
+
+D. Chen, A. R. Jain, E. Goossen, E. Romig, M. Murray, N. Walker, and M. Cakmak.
+
+A few words go a long way: Language guided robot policy synthesis,
+2026.
+
+URL https://arxiv.org/abs/2607.23784.
+
+[15]
+
+L. Chen, K. Lu, A. Rajeswaran, K. Lee, A. Grover, M. Laskin, P. Abbeel,
+A. Srinivas, and I. Mordatch.
+
+Decision transformer: Reinforcement learning via sequence modeling.
+
+arXiv preprint arXiv:2106.01345, 2021.
+
+[16]
+
+M. Chevalier-Boisvert, B. Dai, M. Towers, R. Perez-Vicente, L. Willems,
+S. Lahlou, S. Pal, P. S. Castro, and J. Terry.
+
+Minigrid & miniworld: Modular & customizable reinforcement
+learning environments for goal-oriented tasks.
+
+In Advances in Neural Information Processing Systems 36, New
+Orleans, LA, USA, December 2023.
+
+[17]
+
+S. Choudhury, A. Kapoor, G. Ranade, S. Scherer, and D. Dey.
+
+Adaptive information gathering via imitation learning.
+
+arXiv preprint arXiv:1705.07834, 2017.
+
+[18]
+
+K. Cobbe, C. Hesse, J. Hilton, and J. Schulman.
+
+Leveraging procedural generation to benchmark reinforcement learning.
+
+arXiv preprint arXiv:1912.01588, 2019.
+
+[19]
+
+H. Daumé Iii, J. Langford, and D. Marcu.
+
+Search-based structured prediction.
+
+Machine learning, 75(3):297–325, 2009.
+
+[20]
+
+P. De Haan, D. Jayaraman, and S. Levine.
+
+Causal confusion in imitation learning.
+
+Advances in neural information processing systems, 32, 2019.
+
+[21]
+
+Y. Duan, J. Schulman, X. Chen, P. L. Bartlett, I. Sutskever, and P. Abbeel.
+
+Rl2: Fast reinforcement learning via slow reinforcement learning.
+
+arXiv preprint arXiv:1611.02779, 2016.
+
+[22]
+
+K. Ehsani, T. Gupta, R. Hendrix, J. Salvador, L. Weihs, K.-H. Zeng, K. P.
+Singh, Y. Kim, W. Han, A. Herrasti, R. Krishna, D. Schwenk, E. VanderBilt,
+and A. Kembhavi.
+
+Imitating shortest paths in simulation enables effective navigation
+and manipulation in the real world.
+
+arXiv, 2023.
+
+[23]
+
+C. Finn, P. Abbeel, and S. Levine.
+
+Model-agnostic meta-learning for fast adaptation of deep networks.
+
+In Proceedings of the 34th International Conference on Machine
+Learning - Volume 70, ICML’17, page 1126–1135. JMLR.org, 2017.
+
+[24]
+
+L. Fu, H. Huang, G. Datta, L. Y. Chen, W. C.-H. Panitch, F. Liu, H. Li, and
+K. Goldberg.
+
+In-context imitation learning via next-token prediction.
+
+arXiv preprint arXiv:2408.15980, 2024.
+
+[25]
+
+S. Garg, D. Tsipras, P. S. Liang, and G. Valiant.
+
+What can transformers learn in-context? a case study of simple
+function classes.
+
+Advances in neural information processing systems,
+35:30583–30598, 2022.
+
+[26]
+
+Y. Gu, L. Dong, F. Wei, and M. Huang.
+
+Minillm: Knowledge distillation of large language models.
+
+In The twelfth international conference on learning
+representations, 2024.
+
+[27]
+
+T. Haarnoja, A. Zhou, K. Hartikainen, G. Tucker, S. Ha, J. Tan, V. Kumar,
+H. Zhu, A. Gupta, P. Abbeel, and S. Levine.
+
+Soft actor-critic algorithms and applications.
+
+Technical report, 2018.
+
+[28]
+
+M. J. Hausknecht and P. Stone.
+
+Deep recurrent q-learning for partially observable mdps.
+
+In AAAI fall symposia, volume 45, page 141, 2015.
+
+[29]
+
+C. Higuera, J. Ortiz, H. Qi, L. Pineda, B. Boots, and M. Mukadam.
+
+Perceiving extrinsic contacts from touch improves learning insertion
+policies, 2023.
+
+[30]
+
+E. S. Hu, J. Wang, X. Yuan, F. Luo, M. Li, G. Lambrechts, O. Rybkin, and
+D. Jayaraman.
+
+Real-world reinforcement learning of active perception behaviors.
+
+In The Thirty-ninth Annual Conference on Neural Information
+Processing Systems, 2025.
+
+URL https://openreview.net/forum?id=RkdTtznSAL.
+
+[31]
+
+M. Igl, L. M. Zintgraf, T. A. Le, F. Wood, and S. Whiteson.
+
+Deep variational reinforcement learning for pomdps.
+
+In International Conference on Machine Learning, 2018.
+
+URL https://api.semanticscholar.org/CorpusID:46955236.
+
+[32]
+
+P. Intelligence, K. Black, N. Brown, J. Darpinian, K. Dhabalia, D. Driess,
+A. Esmail, M. Equi, C. Finn, N. Fusai, et al.
+
+ $\pi_{0.5}$ : a vision-language-action model with open-world
+generalization.
+
+arXiv preprint arXiv:2504.16054, 2025.
+
+[33]
+
+U. Jain, I.-J. Liu, S. Lazebnik, A. Kembhavi, L. Weihs, and A. G. Schwing.
+
+Gridtopix: Training embodied agents with minimal supervision.
+
+In Proceedings of the IEEE/CVF International Conference on
+Computer Vision, pages 15141–15151, 2021.
+
+[34]
+
+L. P. Kaelbling, M. L. Littman, and A. R. Cassandra.
+
+Planning and acting in partially observable stochastic domains.
+
+Artificial Intelligence, 101(1):99–134,
+1998.
+
+ISSN 0004-3702.
+
+doi: https://doi.org/10.1016/S0004-3702(98)00023-X.
+
+URL
+https://www.sciencedirect.com/science/article/pii/S000437029800023X.
+
+[35]
+
+P. Karkus, D. Hsu, and W. S. Lee.
+
+Qmdp-net: Deep learning for planning under partial observability.
+
+Advances in neural information processing systems, 30, 2017.
+
+[36]
+
+M. Kelly, C. Sidrane, K. Driggs-Campbell, and M. J. Kochenderfer.
+
+Hg-dagger: Interactive imitation learning with human experts.
+
+In 2019 International Conference on Robotics and Automation
+(ICRA), pages 8077–8083. IEEE, 2019.
+
+[37]
+
+Y. Kim, N. Chin, A. Vasudev, and S. Choudhury.
+
+Distilling realizable students from unrealizable teachers.
+
+arXiv preprint arXiv:2505.09546, 2025.
+
+[38]
+
+A. Kumar, Z. Fu, D. Pathak, and J. Malik.
+
+Rma: Rapid motor adaptation for legged robots.
+
+arXiv preprint arXiv:2107.04034, 2021.
+
+[39]
+
+M. Laskin, L. Wang, J. Oh, E. Parisotto, S. Spencer, R. Steigerwald,
+D. Strouse, S. Hansen, A. Filos, E. Brooks, M. Gazeau, H. Sahni, S. Singh,
+and V. Mnih.
+
+In-context reinforcement learning with algorithm distillation, 2022.
+
+URL https://arxiv.org/abs/2210.14215.
+
+[40]
+
+G. Lee, B. Hou, S. Choudhury, and S. S. Srinivasa.
+
+Bayesian residual policy optimization:: Scalable bayesian
+reinforcement learning with clairvoyant experts.
+
+In 2021 IEEE/RSJ International Conference on Intelligent Robots
+and Systems (IROS), pages 5611–5618. IEEE, 2021.
+
+[41]
+
+J. Lee, J. Hwangbo, L. Wellhausen, V. Koltun, and M. Hutter.
+
+Learning quadrupedal locomotion over challenging terrain.
+
+Science robotics, 5(47):eabc5986, 2020.
+
+[42]
+
+J. N. Lee, A. Xie, A. Pacchiano, Y. Chandak, C. Finn, O. Nachum, and
+E. Brunskill.
+
+Supervised pretraining can learn in-context reinforcement learning.
+
+arXiv preprint arXiv:2306.14892, 2023.
+
+[43]
+
+J. Liang, W. Huang, F. Xia, P. Xu, K. Hausman, B. Ichter, P. Florence, and
+A. Zeng.
+
+Code as policies: Language model programs for embodied control.
+
+In arXiv preprint arXiv:2209.07753, 2022.
+
+[44]
+
+E. Z. Liu, A. Raghunathan, P. Liang, and C. Finn.
+
+Decoupling exploration and exploitation for meta-reinforcement
+learning without sacrifices.
+
+In M. Meila and T. Zhang, editors, Proceedings of the 38th
+International Conference on Machine Learning, volume 139 of
+Proceedings of Machine Learning Research, pages 6925–6935. PMLR,
+18–24 Jul 2021.
+
+URL https://proceedings.mlr.press/v139/liu21s.html.
+
+[45]
+
+H. Liu and P. Abbeel.
+
+Emergent agentic transformer from chain of hindsight experience.
+
+In International Conference on Machine Learning, pages
+21362–21374. PMLR, 2023.
+
+[46]
+
+M. Memmel, A. Wagenmaker, C. Zhu, P. Yin, D. Fox, and A. Gupta.
+
+Asid: Active exploration for system identification in robotic
+manipulation.
+
+arXiv preprint arXiv:2404.12308, 2024.
+
+[47]
+
+S. Min, X. Lyu, A. Holtzman, M. Artetxe, M. Lewis, H. Hajishirzi, and
+L. Zettlemoyer.
+
+Rethinking the role of demonstrations: What makes in-context learning
+work?
+
+In Proceedings of the 2022 conference on empirical methods in
+natural language processing, pages 11048–11064, 2022.
+
+[48]
+
+M. Mittal, C. Yu, Q. Yu, J. Liu, N. Rudin, D. Hoeller, J. L. Yuan, R. Singh,
+Y. Guo, H. Mazhar, et al.
+
+Orbit: A unified simulation framework for interactive robot learning
+environments.
+
+IEEE Robotics and Automation Letters, 8(6):3740–3747, 2023.
+
+[49]
+
+H. Nguyen, A. Baisero, D. Wang, C. Amato, and R. Platt.
+
+Leveraging fully observable policies for learning under partial
+observability.
+
+arXiv preprint arXiv:2211.01991, 2022.
+
+[50]
+
+T. Ni, B. Eysenbach, and R. Salakhutdinov.
+
+Recurrent model-free rl can be a strong baseline for many pomdps.
+
+arXiv preprint arXiv:2110.05038, 2021.
+
+[51]
+
+A. Nikulin, I. Zisman, A. Zemtsov, and V. Kurenkov.
+
+Xland-100b: A large-scale multi-task dataset for in-context
+reinforcement learning, 2025.
+
+URL https://arxiv.org/abs/2406.08973.
+
+[52]
+
+T. Osa, J. Pajarinen, G. Neumann, J. A. Bagnell, P. Abbeel, and J. Peters.
+
+An algorithmic perspective on imitation learning.
+
+Foundations and Trends® in Robotics,
+7(1-2):1–179, 2018.
+
+[53]
+
+I. Osband, D. Russo, and B. Van Roy.
+
+(More) efficient reinforcement learning via posterior sampling.
+
+In Proceedings of the 27th International Conference on Neural
+Information Processing Systems - Volume 2, NIPS’13, page 3003–3011, Red
+Hook, NY, USA, 2013. Curran Associates Inc.
+
+[54]
+
+X. B. Peng, M. Andrychowicz, W. Zaremba, and P. Abbeel.
+
+Sim-to-real transfer of robotic control with dynamics randomization.
+
+In 2018 IEEE international conference on robotics and
+automation (ICRA), pages 3803–3810. IEEE, 2018.
+
+[55]
+
+X. B. Peng, A. Kumar, G. Zhang, and S. Levine.
+
+Advantage-weighted regression: Simple and scalable off-policy
+reinforcement learning.
+
+CoRR, abs/1910.00177, 2019.
+
+URL https://arxiv.org/abs/1910.00177.
+
+[56]
+
+X. Puig, E. Undersander, A. Szot, M. D. Cote, T.-Y. Yang, R. Partsey, R. Desai,
+A. Clegg, M. Hlavac, S. Y. Min, V. Vondrus, T. Gervet, V.-P. Berges, J. M.
+Turner, O. Maksymets, Z. Kira, M. Kalakrishnan, J. Malik, D. S. Chaplot,
+U. Jain, D. Batra, A. Rai, and R. Mottaghi.
+
+Habitat 3.0: A co-habitat for humans, avatars, and robots.
+
+In ICLR. OpenReview.net, 2024.
+
+URL
+http://dblp.uni-trier.de/db/conf/iclr/iclr2024.html#PuigUSCYPDCHMVG24.
+
+[57]
+
+K. Rakelly, A. Zhou, D. Quillen, C. Finn, and S. Levine.
+
+Efficient off-policy meta-reinforcement learning via probabilistic
+context variables.
+
+In International Conference on Machine Learning, 2019.
+
+URL https://api.semanticscholar.org/CorpusID:84187276.
+
+[58]
+
+S. Ross and J. A. Bagnell.
+
+Reinforcement and imitation learning via interactive no-regret
+learning.
+
+arXiv preprint arXiv:1406.5979, 2014.
+
+[59]
+
+S. Ross, G. Gordon, and D. Bagnell.
+
+A reduction of imitation learning and structured prediction to
+no-regret online learning.
+
+In Proceedings of the fourteenth international conference on
+artificial intelligence and statistics, pages 627–635. JMLR Workshop and
+Conference Proceedings, 2011.
+
+[60]
+
+J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov.
+
+Proximal policy optimization algorithms.
+
+CoRR, abs/1707.06347, 2017.
+
+URL
+http://dblp.uni-trier.de/db/journals/corr/corr1707.html#SchulmanWDRK17.
+
+[61]
+
+I. Shenfeld, Z.-W. Hong, A. Tamar, and P. Agrawal.
+
+Tgrl: An algorithm for teacher guided reinforcement learning.
+
+In International Conference on Machine Learning, pages
+31077–31093. PMLR, 2023.
+
+[62]
+
+A. Somani, N. Ye, D. Hsu, and W. S. Lee.
+
+Despot: Online pomdp planning with regularization.
+
+In C. Burges, L. Bottou, M. Welling, Z. Ghahramani, and
+K. Weinberger, editors, Advances in Neural Information Processing
+Systems, volume 26. Curran Associates, Inc., 2013.
+
+URL
+https://proceedings.neurips.cc/paper_files/paper/2013/file/c2aee86157b4a40b78132f1e71a9e6f1-Paper.pdf.
+
+[63]
+
+J. Spencer, S. Choudhury, A. Venkatraman, B. Ziebart, and J. A. Bagnell.
+
+Feedback in imitation learning: The three regimes of covariate shift.
+
+arXiv preprint arXiv:2102.02872, 2021.
+
+[64]
+
+W. Sun, A. Venkatraman, G. J. Gordon, B. Boots, and J. A. Bagnell.
+
+Deeply aggrevated: Differentiable imitation learning for sequential
+prediction.
+
+In International conference on machine learning, pages
+3309–3318. PMLR, 2017.
+
+[65]
+
+G. Swamy, S. Choudhury, J. Bagnell, and S. Z. Wu.
+
+Sequence model imitation learning with unobserved contexts.
+
+Advances in Neural Information Processing Systems,
+35:17665–17676, 2022.
+
+[66]
+
+G. Tennenholtz, A. Hallak, G. Dalal, S. Mannor, G. Chechik, and U. Shalit.
+
+On covariate shift of latent confounders in imitation and
+reinforcement learning.
+
+arXiv preprint arXiv:2110.06539, 2021.
+
+[67]
+
+W. R. Thompson.
+
+On the likelihood that one unknown probability exceeds another in
+view of the evidence of two samples.
+
+Biometrika, 25:285–294, 1933.
+
+doi: 10.1093/biomet/25.3-4.285.
+
+URL https://doi.org/10.1093/biomet/25.3-4.285.
+
+[68]
+
+J. Tobin, R. Fong, A. Ray, J. Schneider, W. Zaremba, and P. Abbeel.
+
+Domain randomization for transferring deep neural networks from
+simulation to the real world.
+
+In 2017 IEEE/RSJ international conference on intelligent robots
+and systems (IROS), pages 23–30. IEEE, 2017.
+
+[69]
+
+L. von Werra, Y. Belkada, L. Tunstall, E. Beeching, T. Thrush, N. Lambert,
+S. Huang, K. Rasul, and Q. Gallouédec.
+
+TRL: Transformers Reinforcement Learning, 2020.
+
+URL https://github.com/huggingface/trl.
+
+[70]
+
+A. Walsman, M. Zhang, S. Choudhury, D. Fox, and A. Farhadi.
+
+Impossibly good experts and how to follow them.
+
+In The Eleventh International Conference on Learning
+Representations, 2023.
+
+URL https://openreview.net/forum?id=sciA_xgYofB.
+
+[71]
+
+Y. Wan, J. Wu, M. Abdulhai, L. Shani, and N. Jaques.
+
+Enhancing personalized multi-turn dialogue with curiosity reward.
+
+arXiv preprint arXiv:2504.03206, 2025.
+
+[72]
+
+J. X. Wang, Z. Kurth-Nelson, H. Soyer, J. Z. Leibo, D. Tirumala, R. Munos,
+C. Blundell, D. Kumaran, and M. M. Botvinick.
+
+Learning to reinforcement learn.
+
+ArXiv, abs/1611.05763, 2016.
+
+URL https://api.semanticscholar.org/CorpusID:13623631.
+
+[73]
+
+A. Warrington, J. W. Lavington, A. Scibior, M. Schmidt, and F. Wood.
+
+Robust asymmetric learning in pomdps.
+
+In International Conference on Machine Learning, pages
+11013–11023. PMLR, 2021.
+
+[74]
+
+L. Weihs, U. Jain, I.-J. Liu, J. Salvador, S. Lazebnik, A. Kembhavi, and
+A. Schwing.
+
+Bridging the imitation gap by adaptive insubordination.
+
+In NeurIPS, 2021.
+
+[75]
+
+P. Yin, T. Westenbroek, Z. Zhang, J. Tran, I. Dagnino, E. Shilamkar,
+N. Mbiziwo-Tiapo, S. Bagaria, X. Liu, G. Mullins, A. Kolobov, and A. Gupta.
+
+Emergent dexterity via diverse resets and large-scale reinforcement
+learning.
+
+In Proceedings of the International Conference on Learning
+Representations (ICLR), 2026.
+
+[76]
+
+Y. You, V. Thomas, A. Schutz, R. Skilton, N. Hawes, and O. Buffet.
+
+Partially observable monte-carlo graph search.
+
+Proceedings of the International Conference on Automated
+Planning and Scheduling, 35(1):279–287, Sep. 2025.
+
+doi: 10.1609/icaps.v35i1.36129.
+
+URL https://ojs.aaai.org/index.php/ICAPS/article/view/36129.
+
+[77]
+
+T. Yu, D. Quillen, Z. He, R. Julian, K. Hausman, C. Finn, and S. Levine.
+
+Meta-world: A benchmark and evaluation for multi-task and meta
+reinforcement learning.
+
+In Conference on robot learning, pages 1094–1100. PMLR, 2020.
+
+[78]
+
+O. Zhang, M. Guaman Castro, P. Yin, I. Dagnino, A. Gupta, R. Scalise, and
+B. Boots.
+
+A balanced data diet: Addressing the exploration bottleneck in
+mega-scale rl for robot control.
+
+In Conference on Robot Learning (CoRL), 2026.
+
+[79]
+
+L. Zintgraf, S. Schulze, C. Lu, L. Feng, M. Igl, K. Shiarlis, Y. Gal,
+K. Hofmann, and S. Whiteson.
+
+Varibad: variational bayes-adaptive deep rl via meta-learning.
+
+J. Mach. Learn. Res., 22(1), Jan. 2021.
+
+ISSN 1532-4435.
+
+## Appendix Contents
+
+## Appendix A Related Work
+
+Student–Teacher Distillation.
+Learning from privileged experts arises in settings from self-driving [13, 20, 4] to robotic exploration [17, 33, 7]. In partially observed domains, interactive imitation learning addresses covariate shift and the resulting, compounding errors that drive the learner into unseen states [13, 41] with classic iterative schemes including [19, 59, 58, 64]. Recent results suggest that on-policy imitation is necessary under partial observability [65], and that off-policy cloning [45] can fail in non-realizable settings where information-gathering behavior is required [63, 74]. Our work targets this non-realizable regime: the learner must take information-gathering actions that are not directly recoverable from a fully observed expert [40]. Prior approaches handle this via additional assumptions (e.g., access to confounders at test time [66] or differentiable experts [73]) or by incorporating reinforcement learning with bootstrapping via demonstrations or resets to induce exploration [49, 70, 30, 74, 37]. In contrast, we learn information-gathering behavior using iterative distillation conditioned on on-policy histories, which is substantially more stable and sample-efficient than RL-based alternatives.
+
+Meta Learning.
+A common approach to learning in POMDPs is to use recurrent policies that compress the interaction history into a latent belief representation [28, 31]. Meta-RL provides a general framework for learning adaptive exploration across task distributions [21, 79, 57, 44], but often requires extensive online training interaction [72, 5], making it difficult to scale to high-dimensional, sparse-reward domains with long-horizon credit assignment. Our approach replaces this expensive RL-based adaptation with iterative supervised learning, still enabling long-horizon, history-dependent exploration through on-policy context collection. Additionally, unlike prior work [42, 79, 21, 40], our method is not limited to Bayes-Adaptive MDPs [40], where the agent interacts with an environment with a fixed underlying parameter across multiple episodes. We demonstrate that our method scales to POMDPs, in which the policy explores actions within a single episode to estimate the underlying state distribution and achieve task success.
+
+Posterior Sampling.
+Posterior sampling methods [67, 53] drive exploration by implicitly or explicitly maintaining a belief over the environment’s underlying hidden parameters, acting optimally under samples from this distribution, and updating the belief based on feedback. Despite strong empirical and theoretical results [10, 53], such approaches typically require maintaining and sampling from an explicit posterior, and solving for policies under the sampled parameters (e.g., PSRL, BOSS) [53, 3], limiting practicality in rich-observation settings. Recent approaches [62, 76] learn Bayes-optimal policies for POMDPs but are applied in discrete settings, whereas posterior sampling yields a simple, scalable solution with provable regret guarantees. ASTEROID does not explicitly optimize a posterior-sampling objective, but in Section 6 we show that posterior-sampling-like behavior emerges naturally from our method through iterative on-policy distillation, even in high-dimensional continuous environments. Further, in Appendix H, we show that theoretically, ASTEROID converges to posterior sampling with linear regret akin to standard online learning methods [59]. We show that under stated assumptions, ASTEROID converges to posterior sampling on the covered history support. We also observe this behavior empirically in high-dimensional manipulation, and it transfers to a real robot (see Section 6).
+
+In-Context Decision-Making.
+Recent works [32, 9, 69] extensively use transformers as decision-making policies. When trained on a large corpus of sequential data using autoregressive supervised prediction, transformers can exhibit in-context learning [24, 47, 25], i.e., adapting their behavior to new inputs based on interaction histories or input-output examples provided in context. In online decision-making, prior works have used these emergent capabilities to steer policies conditioned on rewards or prior context. For example, Decision Transformer (DT) [15] learns a transformer to autoregressively predict actions conditioned on past interactions and the desired return. Similarly, Algorithm Distillation [39] uses experience traces from a learning method (such as PPO [60]) to adapt and improve policy behavior based on past contexts. More recently, Decision-Pretrained Transformer [42] shows that we can learn an in-context policy that performs posterior sampling in certain POMDPs. DPT generates the context using random interactions in the environment and action supervision from oracle experts with privileged information. Such methods assume that these offline datasets provide coverage over all possible histories of interaction, which is intractable and unrealistic in high-dimensional domains. ASTEROID, instead, uses a dataset of on-policy contexts, removing the coverage assumption and scaling to much harder and higher-dimensional problems (see Section 6).
+
+## Appendix B Ablation Experiments
+
+## B.1 Performance of ASTEROID on additional environments
+
+In Figure 16, we show the performance of our proposed method across additional partially observed environments. ASTEROID leverages on-policy context accumulation and expert supervision to solve these tasks efficiently. In the Tactile-Pick w/o Proprioception task, the objective is to pick a randomly placed cube on the table. The arm is randomly initialized, and the only observation available to the student is tactile forces and the last action. We observe that ASTEROID effectively solves the high-dimensional POMDP task with $\sim 92\%$ success by implicitly maintaining a belief over the underlying state. We plot the performance over iterations and the resulting behavior in Figure 16(b). Note that in the tactile-pick (and some other) tasks, BC while history-conditioned is not efficient and achieves non-trivial performance (here, $\sim 48\%$ ) because certain evaluation reset conditions do not require significant or directed exploration to locate the object.
+
+(a) Fixed Maze Navigation
+
+(b) Tactile-Pick w/o Proprioception
+
+(c) Habitat Object Search
+
+Figure 16: ASTEROID learns to solve POMDPs such as maze navigation, robot manipulation, and Habitat object search, where agents must act under limited fields of view, random resets, and partial sensing.
+
+Figure 17: We run ablations on different parts of ASTEROID in the Tactile-Pick task. Left: we run ASTEROID with a noisy expert and observe no performance drop. Middle: we sweep over different curricula with increasing exploration horizons and find minimal sensitivity. Right: we show that adding curriculum improves the efficiency of ASTEROID by ensuring that as the horizon increases over iterations, the learned policy does not suffer from OOD histories or generating random actions.
+
+## B.2 Robustness of ASTEROID to noise in privileged expert supervision
+
+In Figure 17 (left), we evaluate the robustness of ASTEROID through an ablation study in which a noisy expert supervises the student. We inject Gaussian noise into the expert actions during training ( $\sigma=0.2$ ) and find that ASTEROID remains performant under noisy supervision. The slight performance improvement may stem from the regularizing effect of learning from noisy targets.
+
+## B.3 How does the curriculum of exploration affect ASTEROID during training?
+
+At each iteration $k<K$ , the policy interacts with the environment for $k$ episodes, thereby inducing an increasing curriculum on on-policy rollout horizons. As the context window gradually expands, it allows the student to use longer histories to rule out hidden states or task instances inconsistent with its observations and feedback (Appendix B.5).
+The curriculum also avoids a subtle distribution-shift issue. Suppose the maximum context length is $K$ , and we roll out an intermediate policy $\pi_{\theta_{k}}$ for more than $k$ episodes. Since $\pi_{\theta_{k}}$ was only trained on contexts of length at most $k$ , maintaining an in-distribution context would require a sliding window over the most recent $k$ episodes. However, this window can discard early exploration outcomes. If a failed goal is no longer in context, the policy may re-explore it, producing redundant exploration histories that a fully converged policy would not generate. Informally, this reduces the effective number of length- $H$ exploration contexts from $|\mathcal{Z}|^{H}$ arbitrary failure sequences to at most $\frac{|\mathcal{Z}|!}{(|\mathcal{Z}|-H)!}$ ordered non-redundant histories. This further reduces the effective context space, thereby making ASTEROID sample-efficient.
+
+In Figure 17 (right), we compare the performance of ASTEROID across two different schedules: (i) No-Curriculum: the exploration horizon is sampled from a fixed range across all iterations, and (ii) Curriculum: the exploration horizon is sampled from a range that increases every iteration. We observe that curriculum-based exploration is more efficient than the non-curriculum variant, as it keeps student policy rollouts in distribution and makes on-policy data generation more sample-efficient. Furthermore, in Figure 17 (middle), we compare the robustness of the method across different values of increasing curriculum and observe that it is relatively insensitive to this parameter.
+
+## B.4 ASTEROID is significantly more scalable than RL in complex domains
+
+Figure 18: RL is effective over short horizons, but ASTEROID uses supervised updates to be effective across long-horizon tasks as well.
+
+In Figures 6 and 8, we observe that RL-based baselines (RL2, BC+RL2, and ADVISOR) severely underperform in some long-horizon sparse reward tasks. To further ablate this, we run the RL baselines and our method in a smaller version of the Darkroom environment, where the grid size is $5\times 5$ . We observe that RL baselines learn competitive search policies in these small-scale environments. ASTEROID uses supervised learning to model expert actions while building exploration context via student rollouts, rather than relying on expert supervision and dynamic programming over random contexts to learn how to explore and exploit information. As a result, ASTEROID performs better than RL baselines in high-dimensional, long-horizon settings.
+
+## B.5 Does iterative context accumulation actually help ASTEROID?
+
+Figure 19: The test-time efficiency of ASTEROID increases significantly with more iterations of asymmetric on-policy distillation, demonstrating that as the context dataset grows, the policy can adapt over longer horizons, making exploration more efficient.
+
+Figure 16(c) shows exploration performance as a function of the number of in-context exploration iterations on a high-dimensional navigation task. In Habitat Object Search, performance improves steadily as additional exploration steps allow the policy to gather informative observations and refine its behavior, despite the complexity of the observations, almost converging to the posterior-sampling upper bound. Further, in Figure 19, we observe that the test-time efficiency of ASTEROID improves significantly with more iterations. These results indicate that ASTEROID effectively uses in-context interaction to accumulate task-relevant information, translating additional exploration into improved downstream task performance in realistic, partially observable environments, such as higher success rates in embodied object search in Habitat and in robot manipulation tasks. In Appendix B.3, we further include ablations showing the benefits and robustness of ASTEROID to the curriculum over exploration horizon across multiple iterations.
+
+## B.6 How well does ASTEROID generalize under shifted latent priors?
+
+Figure 20: Generalization under shifted latent priors in 2D Navigation. Training goals lie at radius 0.7; evaluation goals are sampled at increasing radii up to 1.0. Performance degrades gradually with shift magnitude.
+
+In Figure 20, we additionally measure how far generalization extends. In the 2D Navigation task, training goals are sampled on a semicircle of radius 0.7 from the origin, and at evaluation we sample goals at increasing radii from 0.7 (in-distribution) to 1.0 (far out-of-distribution), keeping the dynamics and observations unchanged. This isolates the shift to the latent (goal) distribution alone. As shown in Figure 20, ASTEROID retains near-optimal performance near the training distribution (normalized return of 0.99 at radius 0.7 and 0.98 at 0.75) and degrades gradually as the goals move farther away (0.41 at radius 1.0). Generally, amortized POMDP solvers [42, 53, 23] that are learned via interaction or offline datasets suffer from a decline in performance as the train and test distributions diverge, and this observation is consistent with past results [51, 77].
+
+## Appendix C Qualitative Results
+
+## C.1 ASTEROID learns efficient exploration in robot manipulation under limited sensing and navigation
+
+Figure 21: In 2D navigation, ASTEROID adapts its exploration based on context, converging to the true goal.
+
+In Figures 11 and 21, we further compare the qualitative exploration behavior across the Peg-Insertion and 2D Navigation tasks. We observe that ASTEROID enables active exploration-like behavior during manipulation, in which the robot arm moves efficiently across the table to locate the peg and the target. Similarly, in the 2D navigation maze task, ASTEROID learns a policy that adaptively searches for the goal in unexplored regions and converges to high reward in subsequent episodes once it can identify the goal region from past trials.
+We include full videos of the policies on our website55
+ 5
+
+ Project webpage: weirdlabuw.github.io/asteroid, which also includes goal-directed exploration across different rooms in Habitat.
+
+## C.2 ASTEROID presents emergent in-context properties such as memory as a result of on-policy in-context learning
+
+(a) The agent finds the key in earlier episodes, can reference it back in its context, and always picks up the key before searching for the door.
+
+(b) The agent finds the door in the first episode but gets no reward. So, in the next episodes, it looks for the key and memorizes the door location. As a result, in episode 3, it finds the key and goes directly to the door (without having to search for it, since it has memory).
+
+Figure 22: In the Key-Door task, the agent explores to find both the key and the door to get +1 reward for each task. ASTEROID learns an effective strategy: if it reaches the key or door first, it uses its context to remember the location, and upon finding the other goal, it can immediately complete the task without additional exploration.
+
+To investigate whether the policy learned with ASTEROID actually attends to context, we construct a variant of the Key-Door environment in which the agent observes two boolean flags in its state whenever it lands on the key or the door during exploration. Policies trained with ASTEROID exhibit emergent in-context memory. If the agent discovered the key or door in earlier attempts, it can later retrieve that information from context and use it efficiently.
+
+## Appendix D Per-step interactive imitation learning fails in history-conditioned asymmetric distillation
+
+Figure 23: Under DAgger, the same student rollout receives per-step expert labels toward different goals depending on the hidden goal (left, middle). Aggregating these labels yields a policy that chooses a goal uniformly at each step (right) instead of committing to one hypothesis.
+
+An extension to improve naive teacher–student distillation is to apply standard interactive learning methods, such as DAgger [59], on a history-conditioned student policy $\pi_{\theta}(\cdot|o_{t},h_{t})$ . However, these interactive methods are not feedback-driven and rely on per-step supervision, i.e., they aggregate privileged action labels at each step. Further, in POMDPs, DAgger surprisingly converges to an exploration strategy that is generally worse than naive distillation. Consider that a policy has to take $H$ steps towards a potential goal to receive a reward and disambiguate between them. Here, $\pi_{\theta}(\cdot|o_{t},h_{t})$ cloned on expert behavior would randomly pick a door and generate an $H$ step trajectory. Applying DAgger, an expert provides supervision at each step of the trajectory. In Figure 23, we see that under different latent settings, the same student trajectory receives multi-modal action targets at each step. Supervised learning on this aggregated dataset would instead learn a policy that chooses a random goal at each step, which does not correspond to meaningful, effective exploration. Over repeated interactions, the updated policy uniformly explores the environment to find the goal, leading to extremely high exploration budgets. Overall, DAgger underperforms as a baseline in partially observed domains, even below naive behavior cloning (see Figure 8). Instead, ASTEROID employs trajectory/context-level supervision, i.e., given the history $h_{t}$ , we supervise either the full interaction trajectory (in BAMDPs) or the partial trajectory from the takeover state (in POMDPs). This encourages the policy to execute goal-directed actions over a longer horizon (rather than uniform dithering), resulting in much more efficient exploration, even in high-dimensional continuous action spaces (see Figure 11).
+
+## Appendix E Didactic Example: ASTEROID learns efficient posterior sampling
+
+Figure 24: Toy example demonstrating that ASTEROID learns adaptive in-context behavior, where it effectively explores based on history.
+
+Consider a POMDP with one hidden variable. For each task, a fixed goal $g\in\{A,B,C\}$ is sampled uniformly. The agent takes actions to move to one of the locations in $\{A,B,C\}$ and receives a reward of $1$ if it matches $g$ and $0$ otherwise.
+A privileged teacher observes $g$ and always chooses the correct door, producing expert trajectories: $(A,1)$ , $(B,1)$ , or $(C,1)$ depending on the goal. If the student is trained only on these expert rollouts with no context (i.e., $\tau^{c}=\emptyset$ ), then at deployment it cannot infer $g$ and must choose uniformly, yielding expected reward $1/3$ .
+
+Dry run.
+At iteration $k=0$ , we train on expert-only trajectories with $\tau^{c}=\emptyset$ , so the student has no information about $g$ at decision time.
+The resulting policy chooses $A,B,C$ uniformly, giving an expected reward of $1/3$ .
+
+Now deploy this student and collect on-policy contexts.
+If the true goal is $g=C$ , then across episodes the observed contexts are of the form $(A,0)$ , $(B,0)$ , or $(C,1)$ , depending on which door was tried.
+At iteration $k=1$ , ASTEROID pairs each such context with a privileged teacher trajectory generated under the same goal.
+For example, conditioning on $\tau^{c}=(A,0)$ rules out $g=A$ , so the teacher data for this context consists only of successful choices at the remaining doors, i.e., $(B,1)$ or $(C,1)$ .
+After distillation, the updated student still chooses uniformly when $\tau^{c}=\emptyset$ , but it adapts after one failed attempt: given $\tau^{c}=(A,0)$ it chooses between $\{B,C\}$ uniformly, yielding expected reward $1/2$ on the next episode.
+
+At iteration $k=2$ , the student generates longer contexts such as $(A,0;B,0)$ , $(A,0;C,1)$ , etc.
+A context like $(A,0;B,0)$ uniquely identifies $g=C$ , so the teacher data for this context concentrates on choosing $C$ .
+After distillation, the student learns the corresponding rule: once it has observed two failures, it deterministically selects the remaining door and receives a reward of $1$ .
+Figure 24 depicts this progression: as $\tau^{c}$ grows with on-policy interaction, the student eliminates inconsistent goals based on context and its behavior approaches posterior sampling over $\{A,B,C\}$ .
+
+## On-policy context enables more efficient learning than random exploration rollouts.
+
+Figure 25: On-policy contexts ensure efficient coverage over relevant histories, while random exploration [42] can generate uninformative contextual information that harms training.
+
+In this example, a context $\tau^{c}$ is useful only if it induces a non-trivial posterior over the goal, i.e., it eliminates some candidates in $\{A,B,C\}$ based on observed rewards.
+Suppose instead that reaching each location requires multiple actions before any reward is revealed.
+Then a large fraction of randomly generated rollouts will fail to reach any door within the context horizon (row 1 in Figure 25), producing trajectories whose rewards are uninformative and whose posterior over $g$ remains essentially unchanged.
+By contrast, on-policy contexts produced by the student concentrate on trajectories that actually reach candidate doors, since the student is trained on teacher trajectories that are goal-directed and therefore yield plausible search behavior (row 2 in Figure 25). As a result, the contexts in $\mathcal{D}_{k}$ more often contain the key feedback events that reduce uncertainty about $g$ , providing a higher-signal training distribution for learning a context-conditioned policy.
+
+## Appendix F Training and Implementation Details
+
+## F.1 Training Details
+
+## Model Architecture.
+
+ASTEROID uses a causal transformer similar to Lee et al. [42], Chen et al. [15]. Each token encodes the $\langle$ observation, previous action, reward, terminal signal $\rangle$ tuple via an MLP encoder. For images, we encode observations with an ImageNet-pretrained ResNet18. For discrete actions, we predict logits over the action space, and for continuous actions, we predict the mean and standard deviation of a Gaussian.
+
+## Asymmetric Sampling of datasets.
+
+For the robot manipulation tasks, to avoid overfitting, we skew the sampling ratio of the data collected across iterations to upweight the new data more. This significantly reduced overfitting to past data and enabled better policy learning.
+
+## Filtering for successful trajectories.
+
+As ASTEROID imitates privileged actions conditioned on context, we keep only the successful expert trajectories while collecting the datasets during each iteration. This ensures that the learned in-context policy samples from a distribution of expert actions that are optimal under the true parameters that could generate the given context.
+
+## Task Experts
+
+ASTEROID depends on a strong privileged expert but is agnostic to how it is generated: it may leverage simple planners, use RL, imitation learning, or hybrid methods [60, 75, 78]. Concretely: for all navigation and gridworld tasks, the experts are shortest-path planners. For manipulation, we train state-based policies via large-scale simulation RL [75] with hyperparameters from the original implementations. Privileged state makes these experts cheap to train. E.g., in peg insertion, a state-based teacher (object and goal 6-D pose) reaches 90+% success in $\sim$ 8 h, while a wrist-camera policy takes 4+ days to reach only $\sim$ 10%. This state information is not available at deployment, and thus, we learn exploration via ASTEROID. Most of our baselines also use privileged experts, so teacher cost is not exclusive to our method.
+
+## Compute.
+
+DPT, ASTEROID, BC, and AAWR learn context-conditioned policies, and we use the same architecture and evaluation setup. Thus, these methods use the same tokens and computation during rollouts. During training, ASTEROID additionally conditions on the expert observations, adding at most |T| tokens more than DPT, where |T| is the length of an episode. Unless noted otherwise, all models were trained on a single L40 GPU; training takes 1–6 h, and the main bottleneck is environment rollouts, not training. For Isaac Lab tasks, we used 2× RTX-4090s for our method and all baselines. We carefully match the compute in terms of environment interactions across all baselines (except when comparing efficiency). In all experiments, each baseline is trained on as much as or more data than ASTEROID. ASTEROID runs $K$ iterations with $M$ environment steps each; all offline baselines (BC, DPT, SPOC, AAWR) train on a dataset of size $K\times M$ . Figure 8 plots training steps vs. performance for the manipulation baselines. RL baselines are trained to convergence. In Table 1, we outline the parameters:
+
+Table 1: Per-environment data and compute budget for ASTEROID and baselines.
+
+Environment
+ $K$ (iters)
+ASTEROID data (trajs)
+Offline baselines data
+RL baselines env steps
+Expert labels (rollouts)
+Teacher cost
+
+Gridworld (Darkroom, 2D-Nav)
+10
+ $10\times 1000=10$ k (env horizon $H$ )
+10k expert trajs
+to convergence
+10k
+negligible (planner)
+
+Tactile-Pick
+3
+ $3\times 8192\approx 24$ k
+ $\approx$ 24k expert trajs
+ $\sim 10^{8}$ 
+ $\approx$ 24k
+ $\sim$ 8 h (state-based RL)
+
+Peg-Insertion
+4
+ $4\times 4096\approx 16$ k
+ $\approx$ 16k expert trajs
+ $\sim 10^{8}$ 
+ $\approx$ 16k
+ $\sim$ 8 h (state-based RL)
+
+Habitat
+5
+ $5\times 1024=5120$ 
+5120 (Distilled Planner)
+n/a
+5120
+negligible (planner)
+
+## F.2 Tasks
+
+## Wrist-Camera Peg-Insertion.
+
+[75]
+A 7-DoF robot must locate a peg on a tabletop and insert it into the corresponding hole using only a wrist-mounted RGB camera and proprioception. This is a single-episode POMDP: the peg and arm are randomly reset at the start of each episode, and the robot must search under a limited camera field of view. We denote the privileged state as $s_{t}=(q_{t},p_{\text{peg}},p_{\text{hole}})$ , where $q_{t}$ is the robot proprioceptive state and $p_{\text{peg}},p_{\text{hole}}$ are the peg and hole positions. The student observes $o_{t}=(I_{t}^{\text{wrist}},q_{t},a_{t-1})$ , where $I_{t}^{\text{wrist}}$ is the wrist-camera RGB image and $a_{t-1}$ is the previous action. The reward indicates successful insertion, and expert trajectories are generated using large-scale RL as described in Yin et al. [75]. An effective exploration strategy must scan the workspace, localize the peg and hole from partial views, and then execute the contact-rich insertion behavior.
+
+## Tactile-Pick.
+
+[75, 29]
+The robot must locate and pick up a cube using proprioceptive and tactile feedback, without visual observations. This is a single-episode POMDP: the cube pose is randomly reset and hidden, so the agent can only infer it through contact during the episode. We denote the privileged state as $s_{t}=(q_{t},p_{\text{cube}})$ , where $q_{t}$ is the robot proprioceptive state and $p_{\text{cube}}$ is the cube position. The student observes $o_{t}=(q_{t},\tau_{t},a_{t-1})$ , where $\tau_{t}$ is the $2\times 3$ -dimensional force feedback from the two fingers of the parallel-jaw gripper. The reward indicates successful pickup, and expert trajectories are generated using large-scale RL as described in Yin et al. [75]. An effective exploration strategy must probe the workspace, use contact events to infer the cube location, and then transition from search to grasping. We also evaluate a harder variant with observations $o_{t}=(\tau_{t},a_{t-1})$ , where the robot observes the world only through contact forces and past actions. In this setting, the robot starts from a random configuration and must use its interaction history to maintain a belief over both its own joint configuration and the cube position.
+
+## Darkroom.
+
+[16, 42]
+The agent must find a hidden goal in a partially observable gridworld. We use three versions with different grid sizes: Mini ( $5\times 5$ ), Easy ( $10\times 10$ ), and Hard ( $25\times 25$ ). This is a BAMDP: the agent interacts with the environment over multiple test-time episodes, the goal remains fixed across episodes, and the agent is reset to $(0,0)$ at the start of each episode. We denote the privileged state as $s_{t}=(p_{x},p_{y},g_{x},g_{y})$ , where $(p_{x},p_{y})$ is the agent position and $(g_{x},g_{y})$ is the hidden goal. The student observes $o_{t}=(p_{x},p_{y},r_{t})$ , where $r_{t}=\mathbbm{1}\{(p_{x},p_{y})=(g_{x},g_{y})\}$ . The expert is obtained by planning the shortest path to the hidden goal using privileged goal information. An effective exploration strategy must use the interaction history to avoid revisiting locations that already produced zero reward, search new candidate goals, and exploit the goal once it is found. This is exactly the structure induced by ASTEROID: given a student history, if a rewarding position has been observed, the expert labels return to it; otherwise, the expert labels target positions not yet ruled out by the history. We train and evaluate on an 80–20 random split of goal locations.
+
+## Key-Door.
+
+[16, 42]
+The agent must first locate a hidden key and then navigate to a door; the key is picked up and the door is opened by moving to their respective positions. This is a BAMDP with non-Markovian observations: the agent interacts across multiple test-time episodes, and optimal behavior depends on remembering which locations have been searched and whether the key has already been acquired. We denote the privileged state as
+ $s_{t}=(p_{x},p_{y},k_{x},k_{y},d_{x},d_{y},\mathbbm{1}\{\text{has key}\})$ ,
+where $(p_{x},p_{y})$ is the agent position, $(k_{x},k_{y})$ is the key position, $(d_{x},d_{y})$ is the door position, and the final bit indicates whether the agent has the key. The student observes $o_{t}=(p_{x},p_{y},r_{t})$ . In the Markovian version, the agent receives a reward of $+1$ at every timestep after acquiring the key, effectively revealing the task stage. This dense reward also leads the RL baselines to get stuck in a local minimum and perform poorly. In the non-Markovian version, the agent receives a reward of $+1$ only at the timestep when it picks up the key, so it must use its history to decide whether to continue searching for the key or switch to searching for the door. In both versions, the agent receives an additional reward of $+1$ upon reaching the door with the key, and the episode ends. An effective exploration strategy must search for the key, remember how to acquire it, and then search for or navigate to the door.
+
+## Ant and 2D Navigation.
+
+[57, 79]
+The agent must discover and reach a hidden goal, either in a continuous 2D navigation domain or with a high-dimensional quadruped. These are BAMDPs: the goal remains fixed across multiple episodes within a trajectory, while the agent resets between episodes and must use in-context exploration to identify unvisited candidate goals. We denote the privileged state as $s_{t}=(x_{t},g)$ , where $x_{t}$ is the agent state and $g$ is the hidden goal. The student observes $o_{t}=(x_{t},r_{t})$ , but not $g$ . The reward is sparse, with $r_{t}=\mathbbm{1}\{\|x_{t}-g\|_{2}\leq\epsilon\}$ for a success threshold $\epsilon$ . The expert uses privileged access to $g$ to produce goal-directed behavior. We train and evaluate on an 80–20 split of goal locations. An effective exploration strategy must use history to avoid revisiting unlikely goals, sample unexplored regions, and exploit the goal once discovered.
+
+## Habitat Object Search.
+
+[56]
+The agent must find a target object in a realistic indoor environment, where the object is placed at one of $k$ possible locations. This is a partially observed task: the agent interacts for a single episode, while the hidden object location remains fixed throughout the episode and must be inferred from experience. We denote the privileged state as $s_{t}=(\mathcal{M},x_{t},g)$ , where $\mathcal{M}$ is the map of the house, $x_{t}$ is the robot pose, and $g\in\{1,\ldots,k\}$ is the hidden object location. The student observes $o_{t}=(x_{t},I_{t},b_{t})$ , where $I_{t}$ is the onboard camera observation and $b_{t}\in\{0,1\}$ is the output of an object detector applied to the current image. The reward is sparse and indicates whether the target object has been found. The expert is an oracle planner that uses the map and object location to navigate to the target. The student policy must use history to eliminate previously checked locations, search among the remaining candidates, and stop once the detector identifies the object.
+
+## Procgen Maze Navigation.
+
+The agent must navigate a procedurally generated maze to find a hidden goal. This is a single-episode POMDP: the maze layout, initial position, and goal location are unknown, and the agent observes only a local $3\times 3$ window centered at its current position. We denote the privileged state as $s_{t}=(\mathcal{M},p_{t},g)$ , where $\mathcal{M}$ is the maze layout, $p_{t}$ is the agent position, and $g$ is the goal location. The student observes $o_{t}=\mathcal{M}_{3\times 3}(p_{t})$ , the local egocentric crop centered on the agent, but not the global map or the goal. The reward is sparse and indicates whether the agent reaches the goal. The expert plans the shortest path using Q-learning and privileged access to the full maze layout and goal location. An effective exploration strategy must use temporal context to build an implicit belief over the maze, avoid repeatedly visiting uninformative regions, and search until the goal is found. In Fixed Maze Navigation, we evaluate a simplified variant with a fixed maze layout but random initial and goal positions, isolating the challenge of goal-directed exploration under local $3\times 3$ observations from the additional generalization required by procedurally generated layouts.
+
+Real Robot Manipulation. We deploy on a UR5e arm with a parallel-jaw gripper.
+The cube is placed at a random position within a 10 cm $\times$ 2 cm region on the table,
+and the arm starts from a fixed initial configuration. The student observes only proprioception,
+i.e., joint angles and gripper jaw position, with no cameras or touch sensing, so the cube
+location can only be inferred from whether a grasp attempt closes on the object. Here, if the robot attempts a grasp at a false location, the gripper closes all the way, eliminating that location. Prior work [8] also explores learning such proprioception-only behavior via RL for insertion tasks. We train the privileged expert in Isaac Lab with large-scale RL and domain randomization over physics parameters following [48, 75]. We train both ASTEROID and the BC baseline in simulation with the same partial observations, then transfer them to hardware. We evaluate each method on 10 trials with the same set of cube positions, and count a trial as successful if the cube is lifted within 20 seconds.
+
+## Appendix G Baseline Implementation Details
+
+## DPT [42].
+
+We use the official implementation of DPT with the default hyperparameters from Lee et al. [42]. For a fair comparison, we set the dataset size to match the total data collected over all iterations of ASTEROID.
+
+## SPOC [22].
+
+SPOC augments naive distillation with sampled positional embeddings. We implement SPOC within our codebase and train it on the same total amount of data used across all iterations of ASTEROID.
+
+## RL baselines.
+
+For continuous-control RL baselines, we use high-quality implementations from RSL-RL [48] and OmniReset [75], which support large-scale GPU-parallel training. We implement ADVISOR in RSL-RL and tune its $\alpha$ and $\beta$ parameters over the ranges reported in the original paper. For the meta-RL baselines, we use RL2/PPO baselines [21] and adapted versions that incorporate privileged expert supervision, thereby reducing the computational burden of learning exploration and task execution from sparse rewards alone. For gridworld tasks, we use Stable-Baselines3 PPO implementations with task-specific modifications. On the wrist-camera task, we run the vision-based RL baseline for two seeds due to computational cost: $10^{8}$ environment steps take roughly four days on an RTX-enabled GPU. Despite this scale, the learned exploration policy achieves only $10\%$ success.
+
+## AAWR [30].
+
+We use an extended version of the original AAWR implementation. To construct the initial offline dataset, we add Gaussian noise to generate broad coverage over possible histories. As shown in Figure 14, AAWR is sensitive to this initial dataset coverage, whereas ASTEROID avoids this dependence by collecting context on-policy. AAWR and SPOC were not originally designed for BAMDPs, but we include them in both settings for completeness.
+
+## Distilled Planner.
+
+For Habitat object search, we construct an upper-bound baseline by distilling a posterior-sampling planner under a uniform prior. The dataset consists of expert trajectories that visit the possible object locations in a fixed order and terminate upon finding the target. This produces goal-directed exploration behavior, which we distill into a transformer policy. Unlike ASTEROID, however, this baseline assumes access to the full set of possible object locations and the underlying task structure during training, which is unrealistic.
+
+## G.1 Pseudocode
+
+Algorithm 3 ASTEROID for general POMDPs
+
+ 0:
+
+  iterations $K$ , samples per iteration $N$ , horizon $H$ , privileged teacher $\pi^{*}$ , curriculum $\{[\alpha_{k},\beta_{k}]\}_{k=1}^{K}$ 
+
+ 1:
+
+  Initialize $\mathcal{D}_{0}\leftarrow\text{expert trajectories}$ , student $\pi_{\theta_{0}}\leftarrow\textit{i.i.d.}\;\text{policy}$ 
+
+ 2:
+
+  for $k=1,\dots,K$ do
+
+ 3:
+
+    $\mathcal{D}_{k}\leftarrow\mathcal{D}_{k-1}$ 
+
+ 4:
+
+   // Collect on-policy contexts and privileged labels
+
+ 5:
+
+   for $i=1,\dots,N$ do
+
+ 6:
+
+    Sample $T$ uniformly in $[\alpha_{k}H,\beta_{k}H]$ // Curriculum (Table 3)
+
+ 7:
+
+    Roll out $\pi_{\theta_{k-1}}$ in the POMDP for $T$ steps: $h_{k}^{(i)}=(o_{0},a_{0},r_{0}\cdots o_{T-1},a_{T-1},r_{T-1})$ 
+
+ 8:
+
+    Roll out $\pi^{*}$ in the same episode from $o_{T}$ :
+ $\tau^{*,(i)}=(o^{*}_{T},a^{*}_{T},r^{*}_{T},\dots,o^{*}_{H-1},a^{*}_{H-1},r^{*}_{H-1})$ 
+
+ 9:
+
+    Add labels
+ $\mathcal{D}_{k}\leftarrow\mathcal{D}_{k}\cup\{(h_{k}^{(i)},o^{*}_{T:t},r^{*}_{T:t-1},a^{*}_{t})\}_{t=T}^{H-1}$ 
+
+ 10:
+
+   end for
+
+ 11:
+
+   // Update student by conditional imitation
+
+ 12:
+
+   Train $\pi_{\theta_{k}}$ on $\mathcal{D}_{k}$ using Eq. 1
+
+ 13:
+
+  end for
+
+ 14:
+
+  return $\pi_{\theta_{K}}$ 
+
+## G.2 Hyperparameters
+
+Table 2: Hyperparameters for ASTEROID on Gridworld tasks.
+
+Hyperparameter
+Value
+
+Training
+
+Dataset size (per iteration)
+1000
+
+ASTEROID iterations
+10
+
+Batch size
+64
+
+Learning rate
+ $1\times 10^{-4}$ 
+
+Weight decay
+ $1\times 10^{-4}$ 
+
+Number of training epochs (per iteration)
+100
+
+Warmup ratio
+0.03
+
+Gradient clipping
+1.0
+
+Optimizer
+AdamW
+
+LR scheduler
+Warmup + Cosine Decay
+
+Model Architecture (Decision Transformer [15])
+
+Architecture
+GPT-2
+
+Tokenizer
+Project $(o_{t},a_{t-1},r_{t-1})$ linearly
+
+Parameters
+ $\sim$ 3M
+
+Number of layers
+4
+
+Number of attention heads
+4
+
+Embedding dimension
+256
+
+Dropout
+0.1
+
+Max context length
+ $H\times K$ 
+
+Evaluation
+
+Test-time episodes
+40
+
+Episode length
+100
+
+Table 3: Hyperparameters for ASTEROID on Isaac Lab tasks. The exploration horizon denotes the $[\min,\max]$ fraction of the episode during which the exploration policy acts before handing off to the expert.
+
+Hyperparameter
+Value
+
+Training
+
+Demonstrations per iteration
+8192 for Tactile-Pick / 4096 for Peg-Insertion
+
+Training steps per iteration
+50,000 gradient steps
+
+Learning rate
+ $1\times 10^{-4}$ 
+
+Optimizer
+AdamW
+
+Curriculum Schedule (Ratio of episode length)
+
+Exploration horizon (iteration 1)
+ $[0.2,0.5]$ 
+
+Exploration horizon (iteration 2)
+ $[0.3,0.8]$ 
+
+Exploration horizon (iteration 3)
+ $[0.4,0.9]$ 
+
+Evaluation
+
+Evaluation episodes
+64
+
+Episode length
+240
+
+## Appendix H Additional Theory
+
+We present a theoretical analysis of properties of learning in-context exploration using ASTEROID. We discuss why on-policy contexts help: since ASTEROID labels the student’s own histories, it behaves like DAgger [59] in history space, while an offline in-context learner behaves like behaviour cloning. We analyse the BAMDP setting of Algorithm 1. Reusing notation from Section 4, $h$ denotes the student’s history, $d_{\pi}$ denotes the history distribution induced by a policy $\pi$ , $d_{\mathcal{D}}$ denotes the empirical history distribution in a dataset, $\pi^{*}(a\mid o,z)$ denotes the privileged teacher, and $\pi_{\theta}(a\mid h)$ denotes the history-conditioned student. We write $\pi_{k}\equiv\pi_{\theta_{k}}$ for the student iterate at ASTEROID iteration $k$ .
+
+## H.1 Preliminaries
+
+Following PSRL [53], we analyse ASTEROID at the episode level: at the
+start of each episode, the policy selects a hypothesis $\tilde{z}$ and executes the teacher
+ $\pi^{*}(\cdot\mid\cdot,\tilde{z})$ for the full episode. Here, the student induces an
+episode-level policy $\pi(\tilde{z}\mid h)$ . We define the posterior-sampling policy
+
+ $\pi^{\mathrm{PS}}(\tilde{z}\mid h):=p(\tilde{z}\mid h),$ 
+
+which samples a hypothesis from the posterior and commits to it for the episode. This produces a policy $\pi^{\text{PS}}(a|o,h)=\int\pi^{*}(a|o,z)\;\mathrm{p}(z|h)\;dz$ . Here, we evaluate the policy over $K$ online
+episodes of fixed episode horizon $H$ . Per-episode returns are normalised to $[0,1]$ .
+
+Let $d^{\pi}_{k}$ denote the distribution of context at the start of episode $k$ when rolling out $\pi$ : the history $h$ contains the first $k-1$ episodes. We measure the student’s error in episode $k$ by its deviation from posterior sampling on its own contexts,
+
+ $e_{k}(\pi):=\mathbb{E}_{h\sim d^{\pi}_{k}}\left[\mathrm{TV}\!\left(\pi(\cdot\mid h),\,\pi^{\mathrm{PS}}(\cdot\mid h)\right)\right].$ 
+
+(2)
+
+Minimising (1) controls this via Pinsker’s inequality.
+
+Assumption 1 (Compliance).
+
+The policy used to generate context is unprivileged: at time $t$ , its action
+depends only on the observed history, not directly on the latent variable
+ $z$ .
+
+This mirrors Assumption 1 of DPT [42].
+
+Assumption 2 (On-policy support coverage).
+
+At ASTEROID iteration $k$ , the aggregated dataset covers the support of the
+histories visited by the current rollout policy up to context of $k$ episodes.
+
+Assumption 3 (Realizability and exact optimization).
+
+The policy class $\Pi$ contains $\pi^{\mathrm{PS}}$ , and at every iteration
+the conditional maximum-likelihood objective in (1) is
+minimised exactly in the population limit.
+
+Assumption 4 (Bounded episode cost).
+
+A wrong hypothesis in episode $k$ affects the return only through that episode, i.e.,
+the episode- $k$ return gap between $\pi$ and $\pi^{\mathrm{PS}}$ is at most $e_{k}(\pi)$ . Summing over episodes gives $J(\pi^{\mathrm{PS}})-J(\pi)\leq\textstyle\sum_{k=1}^{K}e_{k}(\pi).$ 
+
+Remark 1.
+
+The student $\pi_{\theta}$ acts only on its observed history and never on $z$ ,
+so every context generated by ASTEROID rollouts satisfies
+Assumption 1 by construction.
+
+## H.2 Privileged Labels Provide Posterior-Sampling Supervision
+
+The key observation is that privileged labels are posterior-sampling labels
+when conditioned on compliant histories. A history is compliant if it is
+generated by a policy that does not directly observe the latent variable
+ $z$ , as in prior work on learning a posterior from in-context
+supervision [42]. Intuitively, compliance ensures that
+the history reveals information about $z$ only through observations,
+actions, and rewards available to the student, not through hidden privileged
+information.
+
+Lemma 1 (Privileged labels equal posterior-sampling labels).
+
+Let $h$ be a compliant history and $o$ a query observation. If the privileged
+teacher label is sampled as $a^{*}\sim\pi^{*}(\cdot\mid o,z)$ , then
+
+ $\mathbb{P}(a^{*}=a\mid h,o)=\pi^{\mathrm{PS}}(a\mid h,o).$ 
+
+This lemma says that we do not need to explicitly infer $z$ : if we train on privileged labels conditioned on compliant histories, maximum likelihood directly trains the posterior-predictive policy. The proof follows Lee et al. [42].
+
+Theorem 1 (ASTEROID approximates posterior sampling on covered histories).
+
+Under Assumptions 1–3, at every
+iteration $k$ , for every context $h$ in the support of the aggregated
+on-policy dataset $\mathcal{D}_{k}$ ,
+
+ $\pi_{k}(\cdot\mid h)=\pi^{\mathrm{PS}}(\cdot\mid h).$ 
+
+Consequently, as the context horizon reaches the full online interaction
+horizon, ASTEROID matches posterior sampling on the covered trajectory
+support.
+
+Proof sketch.
+
+The proof is by induction over iterations.
+
+## Base case.
+
+At iteration $0$ , ASTEROID trains on null-context expert data. For the empty context $h=\emptyset$ (and along the expert query prefixes, per Remark 1), Lemma 1 implies that the conditional label distribution is exactly $\pi^{\mathrm{PS}}(\cdot\mid h)$ . Minimizing cross-entropy over $\mathcal{D}_{0}$ under Assumption 3 recovers this conditional distribution, so $\pi_{0}(\cdot\mid h)=\pi^{\mathrm{PS}}(\cdot\mid h)$ on the support of the dataset.
+
+## Inductive step.
+
+Assume that at iteration $k$ , $\pi_{k-1}(\cdot\mid h)=\pi^{\mathrm{PS}}(\cdot\mid h)$ for every context $h$ of depth at most $k-1$ episodes in the covered support. ASTEROID now rolls out $\pi_{k-1}$ for $k$ episodes to collect contexts. By Remark 1 these contexts are compliant, and since the two policies agree up to that depth, the collected histories follow the same distribution as those posterior sampling would generate up to that horizon. At each such history $h$ , ASTEROID queries the privileged teacher.
+By Lemma 1, the conditional label distribution given $h$ is $\pi^{\mathrm{PS}}(\cdot\mid h)$ , so exact minimization of (1) yields $\pi_{k}(\cdot\mid h)=\pi^{\mathrm{PS}}(\cdot\mid h)$ . Because the context schedule expands from $k-1$ to $k$ episodes, the agreement extends to the larger support, proving the inductive claim.
+∎
+
+Theorem 1 is an on-support statement: ASTEROID does not need offline coverage of all possible histories. It constructs the relevant support by rolling out the student and querying the teacher on the histories the student actually visits.
+
+## H.3 Offline versus On-Policy Training
+
+DPT [42] recovers posterior sampling in the population limit, and Theorem 1 shows that this holds under on-policy support. We now relax Assumption 3. The argument follows the classic comparison of behavior cloning and DAgger [59], with states replaced by histories and actions by $\tilde{z}$ .
+
+## Offline error compounds across episodes.
+
+Suppose an offline learner is trained on contexts from a fixed distribution
+ $d_{k}^{\mathrm{off}}$ , and has small error there, $e_{k}^{\mathrm{off}}(\pi)\leq\epsilon$ .
+At deployment, however, it is evaluated on its own contexts $d_{k}^{\pi}$ . Since
+ $\mathrm{TV}$ is bounded,
+
+ $e_{k}(\pi)\leq\epsilon+\mathrm{TV}(d_{k}^{\pi},d_{k}^{\mathrm{off}}).$ 
+
+Lemma 2 (Offline history mismatch compounds).
+
+If the offline contexts are generated by posterior sampling, $d_{k}^{\mathrm{off}}=d_{k}^{\mathrm{PS}}$ ,
+then $\mathrm{TV}(d_{k}^{\pi},d_{k}^{\mathrm{off}})\leq(k-1)\epsilon$ , and hence $e_{k}(\pi)\leq k\epsilon$ .
+
+Proof sketch.
+
+Couple a rollout from the offline context distribution with a rollout from the learner.
+In each earlier episode, the learner makes an error with probability at most $\epsilon$ .
+Once such an error occurs, the subsequent history may differ from the offline history,
+since future observations, rewards, and actions are conditioned on the previous trajectory.
+A union bound over the first $k-1$ episodes bounds the probability that the two histories
+have diverged by $(k-1)\epsilon$ , which upper-bounds the total variation distance.
+Substituting into the previous inequality gives $e_{k}(\pi)\leq k\epsilon$ .
+∎
+
+For other offline distributions, such as random contexts, the mismatch is only larger.
+Summing over $K$ online episodes,
+
+ $\sum_{k=1}^{K}e_{k}(\pi)\leq\epsilon\sum_{k=1}^{K}k=O(\epsilon K^{2}).$ 
+
+Thus, even if the offline learner has small error on its dataset, its error can compound
+quadratically because the histories it sees at deployment drift away from the histories
+used for training.
+
+## On-policy error is linear in the number of episodes.
+
+ASTEROID avoids this mismatch by training on the student’s own histories. Here, we assume the number of training iterations equals the number of online episodes, so we index both by $K$ . Let $\pi_{1},\ldots,\pi_{K}$ be the policies produced during iterative training, and define the on-policy loss
+
+ $\ell_{i}(\pi):=\frac{1}{K}\sum_{k=1}^{K}e_{k}^{(i)}(\pi),$ 
+
+where $e_{k}^{(i)}(\pi)$ denotes the per-episode deviation of (2) evaluated on the histories induced by the iterate $\pi_{i}$ .
+Let $\epsilon_{K}:=\min_{\pi\in\Pi}\frac{1}{K}\sum_{i=1}^{K}\ell_{i}(\pi)$ be the best average error achievable within the policy class, and suppose the supervised learner is no-regret with online regret
+ $\gamma_{K}$ :
+
+ $\frac{1}{K}\sum_{i=1}^{K}\ell_{i}(\pi_{i})\leq\epsilon_{K}+\gamma_{K}.$ 
+
+Lemma 3 (On-policy error).
+
+There exists an iterate $\hat{\pi}=\pi_{\hat{\imath}}\in\{\pi_{1},\ldots,\pi_{K}\}$ such that
+
+ $\ell_{\hat{\imath}}(\hat{\pi})\leq\epsilon_{K}+\gamma_{K},$ 
+
+i.e., its average error on its own induced history distribution is at most $\epsilon_{K}+\gamma_{K}$ .
+
+Proof.
+
+The average on-policy loss of the iterates is at most $\epsilon_{K}+\gamma_{K}$ . Therefore, at least one iterate has loss no larger than this average.
+∎
+
+Theorem 2 (On-policy error is linear in the number of episodes).
+
+Let $\hat{\pi}$ be the iterate from Lemma 3, and $\epsilon:=\epsilon_{K}+\gamma_{K}$ . Then the cumulative error over $K$ online episodes satisfies
+
+ $\sum_{k=1}^{K}e_{k}(\hat{\pi})=K\,\ell_{\hat{\imath}}(\hat{\pi})\leq K(\epsilon_{K}+\gamma_{K})=O(\epsilon K).$ 
+
+Proof sketch.
+
+Unlike the offline learner, ASTEROID does not train on histories from a fixed behavior distribution: at each iteration, the histories in the dataset are generated by the current student policy itself. On-policy histories are collected and relabeled at the next iteration, so the student learns to continue from its own histories. When the learned policy is evaluated on its own histories, there is therefore no additional mismatch term of the form $\mathrm{TV}(d_{k}^{\hat{\pi}},d_{k}^{\mathrm{off}})$ . The only remaining error is the supervised error on the student’s own induced history distribution, which Lemma 3 bounds by $\epsilon_{K}+\gamma_{K}$ on average over context depths. Multiplying by $K$ gives the claim. Thus, on-policy context aggregation removes the history-mismatch term that makes the offline error grow like $O(k\epsilon)$ per episode: the cumulative error is linear rather than quadratic in the number of online episodes.
+∎
+
+Corollary 1 (Total regret).
+
+ $\mathrm{Reg}_{\mathrm{PS}}(K)$ is the Bayesian regret of posterior sampling over
+ $K$ episodes. By Assumption 4 and Theorem 2,
+ $J(\pi^{\mathrm{PS}})-J(\hat{\pi})\leq\epsilon K$ , so the Bayesian regret of ASTEROID is
+
+ $\mathrm{Reg}_{\mathrm{PS}}(K)+O(\epsilon K),$ 
+
+posterior sampling’s regret plus a linear approximation term.
+
+Corollary 2 (Finite samples).
+
+By Lemma 1, each iteration is a standard conditional maximum-likelihood problem. Applying the finite-class MLE guarantee of FLAMBE [1, Theorem 21] with $N$ on-policy contexts per iteration (and a union bound over the $K$ iterations), with probability at least
+ $1-\delta$ ,
+
+ $\sum_{k\leq K}e_{k}(\hat{\pi})=\widetilde{O}\!\Big(K\big(\epsilon+\sqrt{\log(K|\Pi|/\delta)/N}\big)\Big),$ 
+
+so finite data adds a $\widetilde{O}(K/\sqrt{N})$ term without changing the linear dependence on
+the number of episodes.

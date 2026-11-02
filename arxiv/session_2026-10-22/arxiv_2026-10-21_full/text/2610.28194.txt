@@ -1,0 +1,2058 @@
+## Adaptive Pullback: Reweighting Supervision at Penalty Jumps
+
+in On-Policy Distillation
+
+Guangyu Liu
+
+Email: liuguangyu@smail.nju.edu.cn
+
+Siyuan Gan
+
+Email: gansiyuan@smail.nju.edu.cn
+
+Shilong Zhou
+
+Email: zsdragon@smail.nju.edu.cn
+
+Linjian Meng
+
+Email: boyanwang@nju.edu.cn
+
+Boyan Wang
+
+Email: huojing@nju.edu.cn
+
+Jing Huo
+
+Affiliation: State Key Laboratory of Novel Software Technology, Nanjing University, Nanjing, China
+
+Affiliation: Shanghai Artificial Intelligence Laboratory, Shanghai, China
+
+Abstract
+
+On-policy distillation (OPD) supervises student-generated responses using sampled-token student–teacher log-ratios.
+A positive log-ratio penalizes a token that the student assigns higher probability to than the teacher, but its current value does not distinguish sustained high penalties from abrupt increases along a response.
+We examine these local changes by comparing consecutive blocks of tokens within the same response.
+Our diagnostic identifies penalty jumps, abrupt increases in average penalty that persist on held-out tokens.
+Across these jumps, penalties rise while teacher confidence decreases.
+We call this pattern penalty–confidence tension.
+Boundaries into high-penalty blocks do not exhibit comparable confidence changes, showing that local changes provide information beyond the current penalty value.
+Motivated by this observation, we propose Adaptive Pullback OPD (AP-OPD).
+At each detected jump, AP-OPD uses the preceding block as a local reference and uniformly scales all supervision coefficients in the following block so that its weighted average penalty matches the preceding block’s original mean.
+This reference determines the scaling factor without an additional strength constant.
+AP-OPD improves performance on both mathematical reasoning and code generation.
+
+11footnotetext: Equal contribution.22footnotetext: Corresponding authors.
+
+Figure 1: Penalty–confidence tension at penalty jumps: penalties rise while teacher confidence decreases.
+Adaptive Pullback uniformly scales post-jump supervision to match the preceding block’s original mean penalty. Numbers are illustrative.
+ $D_{i}$ : block mean penalty; $H$ : teacher entropy; $P_{\max}$ : teacher top-1 probability; $w$ : supervision weight.
+
+## 1 Introduction
+
+On-policy distillation (OPD) transfers reasoning capabilities from a teacher model to a student through feedback on the student’s own rollouts.
+Training on student-generated prefixes brings the training distribution closer to the one visited at inference time and mitigates exposure bias
+(Bengio et al., 2015; Ranzato et al., 2016; Gu et al., 2024; Agarwal et al., 2024; Song and Zheng, 2026).
+OPD also provides token-level teacher feedback throughout each response (Gu et al., 2024; Agarwal et al., 2024).
+How to weight this supervision along a response is therefore an important question for OPD post-training.
+
+In practical token-level OPD, supervision is determined by the sampled-token student–teacher log-ratio $r_{t}$ (Fu et al., 2026).
+A positive log-ratio penalizes a token that the student assigns higher probability to than the teacher.
+The current penalty value describes how strongly a sampled token is penalized, but does not describe how that penalty changes along the response.
+A high penalty can persist across neighboring segments or emerge as an abrupt increase.
+Comparing consecutive blocks of tokens provides a local reference within the same response, allowing us to examine these increases separately from sustained high penalties.
+We investigate whether local penalty changes carry information relevant to supervision allocation and whether using this information to reweight supervision improves training.
+
+Our diagnostic analysis shows that local penalty changes reveal differences in teacher predictions that the current penalty value alone does not express.
+We summarize each block by its block-averaged penalty, the mean positive log-ratio within a block.
+We call an abrupt increase in the block-averaged penalty between consecutive blocks a penalty jump.
+The analysis in Section 3 shows that the increase persists on held-out tokens not used to detect the jump and is concentrated in the first block after it.
+Across penalty jumps, the block-averaged penalty increases while teacher confidence decreases, as reflected in rising entropy and falling top-1 probability.
+We call this observed pattern penalty–confidence tension.
+Control boundaries entering blocks with high penalties do not exhibit comparable changes in teacher confidence.
+This tension motivates examining whether supervision in the block after a jump should be reduced.
+
+Motivated by penalty–confidence tension, we propose Adaptive Pullback OPD (AP-OPD), illustrated in Figure 1.
+The method uses the preceding block as a local reference and, at each detected jump, uniformly scales down all signed supervision coefficients in the following block so that its weighted block-averaged penalty matches the preceding block’s original mean.
+This rule uses an adjacent segment of the same response to set the reference.
+A positive scaling factor preserves the signs and relative proportions of the token coefficients.
+The reference determines the scaling factor without an additional strength constant.
+AP-OPD detects jumps using log-probabilities already computed by OPD and requires no additional forward passes.
+
+Training experiments support the value of this intervention.
+AP-OPD improves performance, whereas a magnitude-cap rule that selects blocks by their penalty values and removes a similar amount of penalty brings no gain over vanilla OPD.
+The removal amount alone therefore does not explain the improvement.
+We also compare AP-OPD with FiRe-OPD, which weights supervision using teacher and student confidence (Li et al., 2026b), and IW-OPD, which uses accumulated prefix discrepancy (Xie et al., 2026b).
+On mathematical reasoning, AP-OPD consistently improves macro-averaged Avg@ $k$ over vanilla OPD under both jump detectors and obtains a higher macro average than the compared reweighting methods.
+On code generation, with a different teacher and student, AP-OPD also achieves the highest macro average among the evaluated methods.
+
+Our contributions are:
+(1) We identify and diagnose penalty–confidence tension at penalty jumps in OPD, showing that local penalty changes provide information about changes in teacher predictions beyond the current penalty value.
+(2) We propose Adaptive Pullback OPD, which uniformly scales supervision in the block after a jump using the preceding block as a local reference.
+(3) We demonstrate gains on mathematical reasoning and code generation, and show that removing a comparable amount of penalty with a magnitude-cap rule does not yield the same benefit.
+
+## 2 Preliminaries
+
+## 2.1 Token-Level OPD
+
+Let $x$ be a prompt, $\pi_{\theta}$ the student, and $\pi_{T}$ a frozen teacher.
+The student samples $\hat{y}_{1:T}\sim\pi_{\theta}(\cdot\mid x)$ , and $c_{t}=(x,\hat{y}_{<t})$ denotes the context at position $t$ .
+With $\ell_{t}^{S}=\log\pi_{\theta}(\hat{y}_{t}\mid c_{t})$ and $\ell_{t}^{T}=\log\pi_{T}(\hat{y}_{t}\mid c_{t})$ , the sampled log-ratio is
+
+ $r_{t}=\ell_{t}^{S}-\ell_{t}^{T}.$ 
+
+(1)
+
+The sequence-level reverse KL is $\mathbb{E}[\sum_{t}r_{t}]$ (Gu et al., 2024); its policy gradient uses suffix returns (Williams, 1992; Sutton et al., 1999).
+Token-level OPD uses only the local term, with stop-gradient advantage $A_{t}=-\operatorname{sg}(r_{t})$ (Fu et al., 2026).
+Averaging over the $N_{\mathrm{tok}}$ valid tokens in a mini-batch (Yu et al., 2025) gives
+
+ $\mathcal{L}=-\frac{1}{N_{\mathrm{tok}}}\sum_{n}\sum_{t=1}^{T_{n}}w_{n,t}\,A_{n,t}\,\ell_{n,t}^{S}.$ 
+
+(2)
+
+Vanilla OPD sets $w_{n,t}=1$ .
+AP-OPD and the compared baselines all change the stop-gradient weights $w_{n,t}$ .
+
+## Penalizing supervision.
+
+A single realization of $r_{t}$ can take either sign.
+When $r_{t}>0$ , the student assigns the sampled token a higher probability than the teacher, so $A_{t}<0$ and the update pushes that token down.
+This case dominates in practice: in the vanilla OPD rollouts analyzed below, tokens with $r_{t}>0$ carry 83.5% of $\sum_{t}|A_{t}|$ .
+We define the token penalty as
+
+ $d_{t}=\operatorname{sg}\bigl([r_{t}]_{+}\bigr),\quad[u]_{+}=\max(u,0).$ 
+
+(3)
+
+## 2.2 Block Profile and Jumps
+
+Single log-ratios fluctuate sharply between neighboring tokens, so we summarize a response at the level of contiguous blocks.
+We partition its valid tokens into blocks $\mathcal{B}_{1},\ldots,\mathcal{B}_{M}$ of $B$ tokens; only the last block may be shorter, and $n_{i}=|\mathcal{B}_{i}|$ .
+The block-averaged penalty $D_{i}$ is the mean positive log-ratio within a block, including zeros for nonpositive values; $s_{i}^{2}$ is the within-block sample variance of $d_{t}$ for $n_{i}\geq 2$ :
+
+ $\displaystyle D_{i}=\frac{1}{n_{i}}\sum_{t\in\mathcal{B}_{i}}d_{t},\;s_{i}^{2}=\frac{1}{n_{i}-1}\sum_{t\in\mathcal{B}_{i}}(d_{t}-D_{i})^{2}.$ 
+
+(4)
+
+At boundary $i$ , let $\Delta_{i}=D_{i+1}-D_{i}$ .
+A jump is a positive change judged sufficiently large by a chosen detector.
+Let $\mathcal{P}$ denote the response’s block penalty profile and required statistics, and $\operatorname{Det}(i;\mathcal{P})\in\{0,1\}$ the detector’s decision.
+Over boundaries $i=1,\ldots,M-1$ , the jump set is
+
+ $\mathcal{E}_{\operatorname{Det}}=\bigl\{i:\Delta_{i}>0,\;\operatorname{Det}(i;\mathcal{P})=1\bigr\}.$ 
+
+(5)
+
+The default $z$ -gate accepts $i$ when $n_{i},n_{i+1}\geq 2$ and $\Delta_{i}>z\hat{\sigma}_{i}$ , where
+
+ $\hat{\sigma}_{i}=\sqrt{\frac{s_{i}^{2}}{n_{i}}+\frac{s_{i+1}^{2}}{n_{i+1}}}.$ 
+
+(6)
+
+We fix $z=2$ ; because adjacent tokens are correlated, this is a standardized threshold, not a calibrated significance level.
+For $i\in\mathcal{E}$ , $\mathcal{B}_{i}$ and $\mathcal{B}_{i+1}$ are the pre- and post-jump blocks, and $\Delta_{i}$ is the rise.
+Blocks only localize where to intervene; the loss in Eq. (2) remains token-level.
+
+## 3 Diagnostic Analysis
+
+Figure 2: Held-out rise in token penalty $d_{t}$ around penalty jumps, abrupt increases in block-averaged penalty detected with the $z=2$ gate, and three control boundaries.
+The rise is relative to the mean penalty of the block before each boundary.
+Boundaries are selected on one half of each block’s tokens and the curves are measured on the other half.
+The curves use 8-token bins and average both detection directions; bands for Jump and High-magnitude boundary are 95% bootstrap intervals clustered by prompt.
+The boundary lies at offset 0, and $B=64$ .
+
+We examine whether local changes in block-averaged penalty reveal changes in teacher predictions beyond the current penalty value.
+We analyze 512 rollouts saved during vanilla OPD training at steps 70, 80, 90, and 100, one per distinct prompt, with the mathematical-reasoning student, teacher, and data of §5.1.
+Jumps are detected with the default $z$ -gate at $B=64$ and $z=2$ , about twice per response.
+We compare each jump with control boundaries from the same response at a similar relative position: the high-magnitude boundary, which enters the block with the highest block-averaged penalty among the candidates; a random positive-change boundary with $\Delta_{i}>0$ ; and a random boundary.
+The random boundary measures background variation.
+The random positive-change boundary asks whether selecting a rise alone explains the effect.
+The high-magnitude boundary asks whether entering a block with a high penalty is sufficient to account for the observations.
+Appendix B gives the full protocol.
+
+Figure 3: Teacher prediction changes across penalty jumps, abrupt increases in block-averaged penalty detected with the $z=2$ gate, and control boundaries ( $B=64$ ).
+(a) Teacher entropy and (b) teacher top-1 probability, averaged over all tokens in the block before and the block after each boundary, on 153 independent matched groups.
+Their changes indicate decreasing teacher confidence at jumps, accompanying the penalty increase in the observed penalty–confidence tension.
+Appendix B.4 also reports all 353 groups.
+ $\Delta$ is after minus before, and the vertical axis in (b) is truncated.
+(c) Drop in the student’s and the teacher’s log-probability of the sampled tokens (before minus after), measured on held-out tokens from 324 prompts; (a,b) use all block tokens.
+Error bars are 95% bootstrap intervals.
+
+## 3.1 The Penalty Jumps
+
+Jumps are selected for a large $\Delta_{i}$ , so measuring the rise on the same tokens would also count the noise that made the boundary pass the gate.
+We therefore use a held-out measurement: jumps are detected on the odd-position tokens of each block and the profile is measured on the even-position tokens, and vice versa.
+The held-out profiles in Figure 2 show an abrupt penalty increase at jumps, larger than at any of the three controls.
+The rise is concentrated in the first block after a jump.
+By the second block, the held-out block-averaged penalty is back at the level of a position-matched random boundary.
+The analysis in Section 5.4 shows that the rise persists after token-level clipping.
+Appendix B reports the same pattern in two further training runs.
+
+The post-jump block carries about twice its token share of the penalty: 6.5% of tokens hold 13.5% of the penalty mass.
+The blocks selected by magnitude-cap are even more concentrated, so concentration alone does not single out jumps.
+
+## 3.2 Penalty–Confidence Tension
+
+We measure teacher prediction changes using entropy and top-1 probability separately.
+For the teacher distribution $p_{t}(v)=\pi_{T}(v\mid c_{t})$ over vocabulary $\mathcal{V}$ , these are $H_{t}=-\sum_{v\in\mathcal{V}}p_{t}(v)\log p_{t}(v)$ and $P_{\max,t}=\max_{v\in\mathcal{V}}p_{t}(v)$ .
+We run full-vocabulary teacher forward passes over the analysis rollouts and report their block means as $H$ and $P_{\max}$ .
+Panels a and b of Figure 3 show that across the detected jumps, $H$ rises and $P_{\max}$ falls, indicating a decrease in teacher confidence.
+Together with the increase in block-averaged penalty, this observed pattern constitutes penalty–confidence tension.
+Compared with high-magnitude boundaries, jumps show an additional entropy increase of 0.261 nats and an additional top-1 probability decrease of 0.083.
+These paired contrasts compare the post-minus-pre changes within matched groups.
+They quantify how teacher predictions change across the boundary, rather than how confident the teacher is in the following block alone.
+Local penalty changes therefore reveal differences in teacher predictions beyond entering a block with a high penalty.
+
+Figure 3c shows that, on the held-out tokens, the log-probabilities that both the student and the teacher assign to the sampled tokens fall across a jump.
+For both models, the drop is larger than across either control.
+This pattern cannot be explained by an increase in the student’s sampled-token probability alone.
+
+## Implications for the method.
+
+Penalty–confidence tension motivates testing whether supervision in the post-jump block should be reduced.
+We use the preceding block in the same response as a local reference, without assuming that its penalty is correct or optimal.
+The rule in Section 4 detects penalty jumps rather than teacher uncertainty and does not use teacher confidence as an input.
+Training experiments in Section 5.3 evaluate the intervention: AP-OPD improves performance, whereas magnitude-cap removes a similar amount of penalty without a gain.
+This comparison does not establish a causal role for the confidence decrease.
+
+## 4 Methodology
+
+Adaptive Pullback OPD keeps the vanilla advantage $A_{t}$ and the objective in Eq. (2), and changes only the token weights $w_{t}$ .
+For each response, it computes the block profile in Eq. (4) and detects the jumps $\mathcal{E}$ using Eq. (5).
+It then uniformly scales supervision in each post-jump block using the preceding block as a local reference.
+Algorithm 1 gives the complete procedure.
+
+## 4.1 Pullback Rule
+
+At a jump $i\in\mathcal{E}$ , AP-OPD uses the preceding block’s original block-averaged penalty $D_{i}$ as a local reference.
+It uniformly scales all signed supervision coefficients in the post-jump block by one factor:
+
+ $w_{t}=\left\{\begin{array}[]{@{}l@{\;}l@{}}D_{i}/D_{i+1},&t\in\mathcal{B}_{i+1}\ \text{for some}\ i\in\mathcal{E},\\
+1,&\text{otherwise}.\end{array}\right.$ 
+
+(7)
+
+The weighted block-averaged penalty therefore matches the reference:
+
+ $\frac{1}{n_{i+1}}\sum_{t\in\mathcal{B}_{i+1}}w_{t}d_{t}=\frac{D_{i}}{D_{i+1}}D_{i+1}=D_{i}.$ 
+
+(8)
+
+A positive weight preserves the signs and relative proportions of the coefficients; a zero weight sets them all to zero.
+The scaling also reduces rewarding coefficients when $r_{t}<0$ .
+In contrast, setting every $r_{t}$ to $D_{i}$ erases token differences and turns negative coefficients into penalties when $D_{i}>0$ ; subtracting $\Delta_{i}$ turns tokens with $0<r_{t}<\Delta_{i}$ from penalized to rewarded.
+
+The rule triggers on detected local increases in block-averaged penalty.
+Detection and weights both use the observed, unweighted profile.
+A block that stays high after a jump therefore keeps weight one.
+If the next boundary is also a jump, the post-jump block serves as its pre-jump block, again with its original, unweighted block-averaged penalty.
+Each block is weighted at most once.
+
+## 4.2 Properties
+
+## Bounded weights.
+
+Since $0\leq D_{i}<D_{i+1}$ for every jump, post-jump weights lie in $[0,1)$ and all other weights are one: AP-OPD never upweights a token or flips the sign of a coefficient.
+
+## Strength set by the data.
+
+The penalty mass removed from a post-jump block is $\sum_{t\in\mathcal{B}_{i+1}}(1-w_{t})d_{t}=n_{i+1}\Delta_{i}$ .
+Given the detector and its parameters, the local reference sets the scaling factor without an additional strength constant.
+For the default detector, $B=64$ and $z=2$ are fixed before training.
+The weights have no additional normalization, clipping, or floor.
+Removed penalty mass is a coefficient statistic, not a gradient or parameter-update magnitude.
+
+## Selective intervention.
+
+As reported in Section 5.4, about a quarter of training responses contain no jump and are trained exactly as in vanilla OPD.
+As quantified in Appendix B, applying the same ratio at every boundary with $\Delta_{i}>0$ would remove 36.1% of the penalty mass instead of 11.6% under the default detector on the analysis rollouts.
+
+## Ranking detector.
+
+As an alternative to the $z$ -gate, the top- $\alpha$ detector ranks the boundaries of each response by $\Delta_{i}$ .
+It selects the
+
+ $K=\min\bigl(\lceil\alpha C\rceil,\ |\{i:\Delta_{i}>0\}|\bigr)$ 
+
+(9)
+
+largest positive changes, where $C$ is the number of block boundaries and $\alpha=5\%$ , and applies the same pullback in Eq. (7).
+
+## 4.3 Training Objective and Complexity
+
+Substituting Eq. (7) into Eq. (2) gives the AP-OPD objective.
+The weights are stop-gradient quantities computed in one $O(T)$ pass over log-probabilities that OPD already produces; they need no additional rollout, model forward pass, or full-vocabulary statistic, and inference is unchanged.
+The weights are not renormalized.
+
+Algorithm 1 AP-OPD token weights with the default $z$ -gate
+
+ 0:
+
+   $r_{1:T}$ , block size $B$ , threshold $z$ 
+
+ 0:
+
+  token weights $w_{1:T}$ 
+
+ 1:
+
+   $d_{t}\leftarrow\operatorname{sg}([r_{t}]_{+})$ , $w_{t}\leftarrow 1$ for all $t$ $\triangleright$ Eq. (3)
+
+ 2:
+
+  Split the tokens into blocks $\mathcal{B}_{1:M}$ 
+
+ 3:
+
+  Compute $D_{i}$ for each block and $s_{i}^{2}$ for each block with $n_{i}\geq 2$ $\triangleright$ Eq. (4)
+
+ 4:
+
+  for $i=1$ to $M-1$ with $n_{i},n_{i+1}\geq 2$ do
+
+ 5:
+
+   Compute $\Delta_{i}=D_{i+1}-D_{i}$ and $\hat{\sigma}_{i}$ $\triangleright$ Eq. (6)
+
+ 6:
+
+   if $\Delta_{i}>z\,\hat{\sigma}_{i}$ then
+
+ 7:
+
+     $w_{t}\leftarrow D_{i}/D_{i+1}$ for $t\in\mathcal{B}_{i+1}$ $\triangleright$ Eq. (7)
+
+ 8:
+
+   end if
+
+ 9:
+
+  end for
+
+ 10:
+
+  return $w_{1:T}$ 
+
+## 5 Experiments
+
+Method
+MATH500
+AMC23
+Minerva
+Olympiad
+AIME24
+AIME25
+Macro
+
+Teacher (Qwen3-8B-RL-Math)
+86.80
+74.22
+35.75
+50.19
+32.08
+21.67
+50.12
+
+Student (Qwen3-1.7B-Base)
+42.15
+24.06
+11.67
+16.63
+3.54
+1.67
+16.62
+
+Vanilla OPD
+72.90
+43.75
+20.96
+33.63
+12.40
+7.29
+31.82
+
+IW-OPD
+71.60
+43.28
+22.15
+32.31
+11.35
+7.19
+31.31
+
+FiRe-OPD
+72.80
+45.39
+21.74
+32.83
+11.88
+8.44
+32.18
+
+AP-OPD (top- $\alpha$ )
+72.97
+44.77
+22.06
+34.26
+13.02
+8.65
+32.62
+
+AP-OPD ( $z$ -gate)
+73.08
+46.72
+21.42
+32.94
+12.19
+8.02
+32.39
+
+Table 1: Main results at step 200, reported as Avg@ $k$ in percent under a shared evaluation protocol, averaged over two training runs.
+The teacher and the student before distillation are reference evaluations and are not ranked.
+Best in bold, second underlined; Macro weights the six benchmarks equally.
+
+## 5.1 Experimental Setup
+
+## Training.
+
+For mathematical reasoning, the student is Qwen3-1.7B-Base (Yang et al., 2025).
+The frozen teacher is Qwen3-8B-RL-Math, which is Qwen3-8B-Base trained on mathematics with GSPO (Zheng et al., 2025).
+Training prompts come from DAPO-Math-17K (Yu et al., 2025), and each method trains for 200 steps.
+For code generation, Qwen3-4B-Instruct-2507 is distilled into Qwen3-1.7B on the code subset of Eurus-2-RL-Data (Cui et al., 2026), and each method trains for 100 steps.
+Within each domain, every method starts from the same student checkpoint.
+In both domains, our runs use 128 prompts per step, one rollout per prompt of at most 8,192 tokens, and AdamW with a constant learning rate of $10^{-6}$ .
+AP-OPD uses $B=64$ and $z=2$ in both domains, fixed before training.
+Details are shown in Appendix A.
+
+## Baselines.
+
+We compare with vanilla token-level OPD (Fu et al., 2026) and two supervision reweighting methods.
+IW-OPD uses accumulated absolute log-ratios, normalized within each response, to assign decreasing prefix weights (Xie et al., 2026b).
+FiRe-OPD filters trajectories and reweights tokens by teacher and student confidence (Li et al., 2026b).
+Both use their authors’ code and default optimization settings, and share the student, teacher, training prompts, number of steps, and evaluation with our runs.
+On code generation, we compare with vanilla OPD and IW-OPD.
+
+## Evaluation.
+
+For mathematical reasoning, we report Avg@ $k$ , the accuracy averaged over $k$ sampled responses per problem, on MATH500 (Hendrycks et al., 2021; Lightman et al., 2024), AMC23, Minerva (Lewkowycz et al., 2022), OlympiadBench (He et al., 2024), AIME24, and AIME25.
+Answers are graded with the rule-based math checker of verl (Sheng et al., 2025).
+For code generation, we report Avg@4 on HumanEval+, MBPP+ (Liu et al., 2023), and LiveCodeBench v6 (Jain et al., 2025), running each program against the benchmark’s tests.
+All models share one decoding setup.
+Mathematical results average two training runs that differ in data order.
+Appendix A gives the full protocol, and Appendix C reports each run.
+
+## 5.2 Main Results
+
+## Mathematical reasoning.
+
+Table 1 reports AP-OPD with each of its two jump detectors, the $z$ -gate of Section 2.2 and the top- $\alpha$ ranking of Eq. (9).
+Both detectors improve the macro average over vanilla OPD, by 0.80 points for top- $\alpha$ and 0.57 for the $z$ -gate.
+The improvement holds in each training run (Appendix C).
+In the two-run mean, top- $\alpha$ improves on every benchmark.
+Both detectors also obtain higher macro averages than IW-OPD and FiRe-OPD in this mean.
+FiRe-OPD, the stronger baseline, improves on vanilla OPD by less than either detector.
+Computing its token weights requires the full-vocabulary entropies of the teacher and the student.
+AP-OPD uses only the sampled-token log-ratios that OPD already computes.
+
+## Choice of detector.
+
+The selected boundary sets of the two detectors have a Jaccard overlap of about one third on the analysis rollouts.
+Since both improve over vanilla OPD, the gain is not tied to one detector.
+We keep the $z$ -gate as the default as it needs no selection ratio and leaves responses without a clear rise untouched.
+
+Method
+HE+
+MBPP+
+LCB
+Macro
+
+Teacher
+83.69
+72.95
+32.29
+62.97
+
+Student
+61.59
+56.81
+14.57
+44.32
+
+Vanilla OPD
+70.43
+63.89
+23.57
+52.63
+
+IW-OPD
+70.88
+65.28
+25.00
+53.72
+
+AP-OPD
+73.17
+65.15
+25.71
+54.68
+
+Table 2: Code generation uses Avg@4 (%).
+Qwen3-4B-Instruct-2507 (Teacher) and undistilled Qwen3-1.7B (Student) are unranked references.
+HE+ is HumanEval+; LCB is LiveCodeBench v6.
+Macro is the unweighted mean; best trained scores are bold.
+
+## Code generation.
+
+Code generation tests AP-OPD with a different student, teacher, and training data.
+The student is already post-trained.
+The teacher is a general instruction model.
+With the default $z$ -gate, AP-OPD obtains the highest macro average, 2.05 points above vanilla OPD and 0.96 above IW-OPD (Table 2).
+It improves over vanilla OPD on all three benchmarks.
+It leads on HumanEval+ and on LiveCodeBench, the hardest benchmark, and is close to IW-OPD on MBPP+.
+The gain over vanilla OPD is larger than on mathematical reasoning.
+Across both domains, down-weighting supervision after detected jumps improves over vanilla OPD.
+Section 5.3 compares AP-OPD with magnitude-cap to test whether removing a similar amount of penalty is sufficient to obtain the observed gains.
+
+Variant
+Offline
+Trained
+
+Cov.
+Unsel.
+ $q$ 
+Macro
+ $\Delta$ 
+
+(a) Comparison with magnitude-cap
+
+Vanilla OPD
+–
+–
+–
+31.55
+–
+
+Magnitude-cap
+7.17
+0.00
+13.75
+31.40
+ $-0.15$ 
+
+AP-OPD (top- $\alpha$ )
+7.19
+0.00
+14.63
+32.50
+ $+0.95$ 
+
+AP-OPD ( $z$ -gate)
+6.49
+28.71
+11.60
+32.50
+ $+0.95$ 
+
+(b) Block size, $z$ -gate
+
+ $B=32$ 
+4.23
+24.22
+9.51
+32.06
+ $+0.50$ 
+
+ $B=64$ 
+6.49
+28.71
+11.60
+32.50
+ $+0.95$ 
+
+ $B=128$ 
+8.60
+36.72
+11.78
+31.96
+ $+0.40$ 
+
+Table 3: Ablations, same number of training steps and evaluation protocol as Table 1, first run only.
+Macro: macro Avg@ $k$ ; $\Delta$ : difference from vanilla OPD.
+Offline statistics on the analysis rollouts are reported in percent: Cov., response-mean share of tokens in selected blocks; Unsel., share of responses with no selected boundary; $q$ , response-mean fraction of penalty mass removed.
+
+## 5.3 Ablation Studies
+
+## Comparison with magnitude-cap.
+
+Magnitude-cap selects the $\lceil\alpha C\rceil$ post-boundary blocks with the largest $D_{i+1}$ and assigns weight $\min(1,\bar{D}/D_{i+1})$ , where $\bar{D}$ is the response’s mean penalty.
+We measure the removed fraction as $q=\sum_{t}(1-w_{t})d_{t}/\sum_{t}d_{t}$ , averaged equally over responses with nonzero penalty mass.
+Magnitude-cap removes 13.75%, between the two AP-OPD detectors, but brings no gain and trails both by about one point (Table 3a; paired intervals in Appendix C).
+An earlier experiment also gains from a fixed post-jump weight of 0.3, whereas pre-jump upweighting brings no gain (Appendix D).
+The tested gains thus occur with two detectors and two post-jump weights; a similar removal amount alone is insufficient.
+These rule comparisons do not isolate selection, reference, and scaling depth.
+
+## Block size.
+
+The block-size ablation in Table 3b shows improvements over vanilla OPD and magnitude-cap for all three block sizes.
+Larger blocks select fewer jumps but weight longer spans, so the removed mass $q$ stays within 9.5–11.8%.
+The default $B=64$ gives the largest gain.
+Shorter blocks may make block means noisier, while longer blocks may average over local increases.
+
+## 5.4 Analysis
+
+## Relation to token-level clipping.
+
+The rise is not carried by a few extreme tokens, so clipping each token’s log-ratio, as REOPOLD does (Ko et al., 2026), leaves it largely in place.
+At a clipping bound that removes as much penalty mass as AP-OPD on the analysis set, jumps are still detected and about 90% of the held-out rise remains; REOPOLD’s default bound removes more than twice as much and still keeps about 70%.
+The two rules also remove different supervision.
+Appendix E reports that only 14.5% of AP-OPD’s removal lies above the bound, close to the 12.5% expected if its removal were unrelated to token size.
+
+## Training statistics.
+
+During training, AP-OPD marks 6.8% of boundaries as jumps and leaves 24.2% of responses unweighted.
+Gradient clipping fires less often than in vanilla OPD.
+The training statistics in Appendix C show that response length and student entropy stay close to vanilla OPD.
+The mean token weight is 0.945.
+Magnitude-cap has a similar mean weight, 0.961, but brings no gain.
+The removal amount alone therefore does not explain the performance difference.
+
+## 6 Related Work
+
+## On-policy distillation.
+
+Unlike distillation from fixed or teacher-generated data (Hinton et al., 2015; Kim and Rush, 2016; Hsieh et al., 2023; Wang et al., 2021; Xie et al., 2026a), OPD scores the student’s own rollouts with the teacher (Agarwal et al., 2024).
+GKD supports on-policy learning with alternative loss functions (Agarwal et al., 2024).
+MiniLLM minimizes reverse KL with policy gradients to prevent overestimating low-probability regions of the teacher distribution (Gu et al., 2024).
+DistiLLM uses an adaptive off-policy approach to reuse student-generated outputs (Ko et al., 2024).
+Recent work extends OPD to reasoning post-training (Zhu et al., 2026; Zhang et al., 2026a; Ko et al., 2026; Li et al., 2026a) and studies its supervision and optimization (Song and Zheng, 2026; Jang et al., 2026; Jin et al., 2026; Yang et al., 2026a; Zhang et al., 2026b; Wang et al., 2026).
+RevisitingOPD documents failure modes of sampled-token comparison, including unreliable guidance on student-drifted prefixes (Fu et al., 2026).
+
+## Reweighting, pruning, and down-weighting in OPD.
+
+TIP selects tokens by student uncertainty and teacher–student divergence (Xu et al., 2026).
+FiRe-OPD filters trajectories and softly reweights tokens by teacher and student confidence (Li et al., 2026b).
+IW-OPD uses accumulated absolute log-ratios, normalized within each response, to assign decreasing prefix weights (Xie et al., 2026b).
+Prune-OPD decays the supervision of a suffix once teacher–student support mismatch accumulates (Yang et al., 2026b).
+REOPOLD clips token rewards at a fixed bound (Ko et al., 2026).
+Rock Tokens studies tokens whose distillation loss persists over training (Jiang et al., 2026), Blockwise Gating weights 64-token blocks by student policy drift (Zheng and Jiang, 2026), and entropy-aware OPD adds a forward-KL term where teacher entropy is high (Jin et al., 2026).
+TrOPD gates the penalty by the teacher–student probability ratio (Xing et al., 2026).
+AP-OPD instead uses changes between consecutive blocks in the same response and scales post-jump supervision using the preceding block as a local reference.
+Unlike confidence-based weighting, its rule uses penalty changes without measuring teacher confidence.
+
+## Temporal information.
+
+Return-to-go OPD propagates later log-ratios to earlier positions, at the cost of higher gradient variance (Gu et al., 2024; Fu et al., 2026).
+TOPD and AC-OPD obtain near-future evidence by generating continuations from selected prefixes (Jiang and Ferraro, 2026; Zhou et al., 2026).
+LGR evaluates the student’s top-K candidate tokens by the one-step-ahead teacher confidence they induce and adds a group-normalized reward (Liu et al., 2026).
+AP-OPD uses only changes realized along the completed rollout and needs no additional generation or forward pass.
+
+## Choice of baselines.
+
+We compare with IW-OPD and FiRe-OPD as supervision reweighting baselines on student-generated rollouts; FiRe-OPD also filters trajectories.
+Other methods introduce changes to objectives, rollout generation, or token selection.
+TrOPD and entropy-aware OPD add a forward-KL term, and TrOPD also uses teacher-generated prefixes.
+LGR, TOPD, and AC-OPD add teacher passes or continuations.
+Prune-OPD truncates rollouts, and TIP keeps a subset of tokens to reduce training memory.
+Rock Tokens selects token types by their loss over training.
+Blockwise Gating gates on the drift between the rollout and the current student, which is zero when each batch is used for one update, as in our setting.
+REOPOLD also adds stage-dependent token masks, so we compare only its token-level clipping, directly on our rollouts (§5.4).
+Magnitude-cap selects blocks by their block-averaged penalties and removes a similar amount of penalty mass, trained with the same configuration as AP-OPD (§5.3).
+
+## 7 Conclusion
+
+We studied local penalty changes in on-policy distillation, where the current penalty value does not distinguish sustained high penalties from abrupt increases along a response.
+Comparing consecutive token blocks reveals penalty jumps that persist on held-out tokens.
+Across these jumps, penalties rise while teacher confidence decreases, whereas boundaries into high-penalty blocks do not exhibit comparable confidence changes.
+This penalty–confidence tension shows that local changes provide information beyond the current penalty value.
+Motivated by this observation, we proposed AP-OPD, which uniformly scales supervision coefficients in each post-jump block using the preceding block as a local reference.
+The weighted average penalty matches the preceding block’s original mean, setting the scaling factor without an additional strength constant.
+AP-OPD improves performance on mathematical reasoning and code generation.
+
+## Limitations
+
+We evaluate AP-OPD on mathematical reasoning and code generation, and have not yet applied it to other settings such as agentic or multi-turn tasks.
+Our diagnostic evidence for penalty–confidence tension is observational and does not establish that decreased teacher confidence causes the gains from pullback.
+AP-OPD also leaves room for improvement in how it forms blocks.
+It uses a fixed block length, and adapting the block size to each response or aligning blocks with reasoning steps is a natural extension.
+Finally, AP-OPD responds only to abrupt rises, so it does not address reward-hacking-like behavior in OPD such as repetitive looping, where the penalty fades rather than jumps.
+
+## References
+
+Agarwal et al. (2024)
+
+Rishabh Agarwal, Nino Vieillard, Yongchao Zhou, Piotr Stanczyk, Sabela Ramos
+Garea, Matthieu Geist, and Olivier Bachem. 2024.
+
+On-policy distillation of language models: Learning from self-generated
+mistakes.
+
+In International Conference on Learning Representations,
+volume 2024, pages 21246–21263.
+
+Bengio et al. (2015)
+
+Samy Bengio, Oriol Vinyals, Navdeep Jaitly, and Noam Shazeer. 2015.
+
+Scheduled sampling for sequence prediction with recurrent neural networks.
+
+In Advances in Neural Information Processing Systems,
+volume 28, pages 1171–1179. Curran Associates, Inc.
+
+Cui et al. (2026)
+
+Ganqu Cui, Lifan Yuan, Zefan Wang, Hanbin Wang, Yuchen Zhang, Jiacheng Chen,
+Wendi Li, Bingxiang He, Yuchen Fan, Tianyu Yu, Qixin Xu, Weize Chen, Jiarui
+Yuan, Huayu Chen, Kaiyan Zhang, Xingtai Lv, Shuo Wang, Yuan Yao, Xu Han, and
+6 others. 2026.
+
+Process
+reinforcement through implicit rewards.
+
+Transactions on Machine Learning Research.
+
+Fu et al. (2026)
+
+Yuqian Fu, Haohuan Huang, Kaiwen Jiang, Jiacai Liu, Zhuo Jiang, Yuanheng Zhu,
+and Dongbin Zhao. 2026.
+
+Revisiting
+on-policy distillation: Empirical failure modes and simple fixes.
+
+In Third Conference on Language Modeling.
+
+Gu et al. (2024)
+
+Yuxian Gu, Li Dong, Furu Wei, and Minlie Huang. 2024.
+
+MiniLLM: Knowledge distillation of large language models.
+
+In International Conference on Learning Representations,
+volume 2024, pages 32694–32717.
+
+He et al. (2024)
+
+Chaoqun He, Renjie Luo, Yuzhuo Bai, Shengding Hu, Zhen Thai, Junhao Shen, Jinyi
+Hu, Xu Han, Yujie Huang, Yuxiang Zhang, Jie Liu, Lei Qi, Zhiyuan Liu, and
+Maosong Sun. 2024.
+
+OlympiadBench: A challenging benchmark for promoting AGI with
+olympiad-level bilingual multimodal scientific problems.
+
+In Proceedings of the 62nd Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Papers), pages 3828–3850,
+Bangkok, Thailand. Association for Computational Linguistics.
+
+Hendrycks et al. (2021)
+
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric
+Tang, Dawn Song, and Jacob Steinhardt. 2021.
+
+Measuring mathematical problem solving with the MATH dataset.
+
+In Proceedings of the Neural Information Processing Systems
+Track on Datasets and Benchmarks, volume 1. Curran Associates, Inc.
+
+Hinton et al. (2015)
+
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean. 2015.
+
+Distilling the
+knowledge in a neural network.
+
+Preprint, arXiv:1503.02531.
+
+Hsieh et al. (2023)
+
+Cheng-Yu Hsieh, Chun-Liang Li, Chih-Kuan Yeh, Hootan Nakhost, Yasuhisa Fujii,
+Alex Ratner, Ranjay Krishna, Chen-Yu Lee, and Tomas Pfister. 2023.
+
+Distilling
+step-by-step! outperforming larger language models with less training data
+and smaller model sizes.
+
+In Findings of the Association for Computational Linguistics:
+ACL 2023, pages 8003–8017, Toronto, Canada. Association for Computational
+Linguistics.
+
+Jain et al. (2025)
+
+Naman Jain, King Han, Alex Gu, Wen-Ding Li, Fanjia Yan, Tianjun Zhang, Sida
+Wang, Armando Solar-Lezama, Koushik Sen, and Ion Stoica. 2025.
+
+LiveCodeBench: Holistic and contamination free evaluation of large
+language models for code.
+
+In International Conference on Learning Representations,
+volume 2025, pages 58791–58831.
+
+Jang et al. (2026)
+
+Ijun Jang, Jewon Yeom, Juan Yeo, Hyunggyu Lim, and Taesup Kim. 2026.
+
+Stable
+on-policy distillation through adaptive target reformulation.
+
+In Findings of the Association for Computational Linguistics:
+ACL 2026, pages 42217–42227, San Diego, California, United States.
+Association for Computational Linguistics.
+
+Jiang and Ferraro (2026)
+
+Yuxuan Jiang and Francis Ferraro. 2026.
+
+Bridging reasoning
+trajectories in on-policy distillation via near-future guidance.
+
+Preprint, arXiv:2606.00305.
+
+Jiang et al. (2026)
+
+Yuxuan Jiang, Runchao Li, Shubhashis Roy Dipta, Dawei Li, and Zhao Yang. 2026.
+
+Cornerstones or stumbling
+blocks? deciphering the rock tokens in on-policy distillation.
+
+Preprint, arXiv:2605.09253.
+
+Jin et al. (2026)
+
+Woogyeol Jin, Taywon Min, Yongjin Yang, Dennis Wei, Yi Zhou, Swanand Ravindra
+Kadhe, Nathalie Baracaldo, and Kimin Lee. 2026.
+
+Entropy-aware
+on-policy distillation of language models.
+
+In Proceedings of the 43rd International Conference on Machine
+Learning, volume 306 of Proceedings of Machine Learning Research,
+pages 53926–53943. PMLR.
+
+Kim and Rush (2016)
+
+Yoon Kim and Alexander M. Rush. 2016.
+
+Sequence-level
+knowledge distillation.
+
+In Proceedings of the 2016 Conference on Empirical Methods in
+Natural Language Processing, pages 1317–1327, Austin, Texas. Association
+for Computational Linguistics.
+
+Ko et al. (2026)
+
+Jongwoo Ko, Sara Abdali, Young Jin Kim, Tianyi Chen, and Pashmina Cameron.
+2026.
+
+Scaling reasoning
+efficiently via relaxed on-policy distillation.
+
+Preprint, arXiv:2603.11137.
+
+Ko et al. (2024)
+
+Jongwoo Ko, Sungnyun Kim, Tianyi Chen, and Se-Young Yun. 2024.
+
+DistiLLM:
+Towards streamlined distillation for large language models.
+
+In Proceedings of the 41st International Conference on Machine
+Learning, volume 235 of Proceedings of Machine Learning Research,
+pages 24872–24895. PMLR.
+
+Lewkowycz et al. (2022)
+
+Aitor Lewkowycz, Anders Andreassen, David Dohan, Ethan Dyer, Henryk
+Michalewski, Vinay Ramasesh, Ambrose Slone, Cem Anil, Imanol Schlag, Theo
+Gutman-Solo, Yuhuai Wu, Behnam Neyshabur, Guy Gur-Ari, and Vedant Misra.
+2022.
+
+Solving quantitative
+reasoning problems with language models.
+
+In Advances in Neural Information Processing Systems,
+volume 35, pages 3843–3857. Curran Associates, Inc.
+
+Li et al. (2026a)
+
+Yaxuan Li, Yuxin Zuo, Bingxiang He, Jinqian Zhang, Chaojun Xiao, Cheng Qian,
+Tianyu Yu, Huan-ang Gao, Wenkai Yang, Zhiyuan Liu, and Ning Ding.
+2026a.
+
+Rethinking
+on-policy distillation of large language models: Phenomenology, mechanism,
+and recipe.
+
+Preprint, arXiv:2604.13016.
+
+Li et al. (2026b)
+
+Yuying Li, Leqi Zheng, Yongzi Yu, Wenrui Zhou, Xuchang Zhong, Xing Hu, Jing
+Jin, Hangjie Yuan, and Tao Feng. 2026b.
+
+Filter, then
+reweight: Rethinking optimization granularity in on-policy distillation.
+
+Preprint, arXiv:2606.02684.
+
+Lightman et al. (2024)
+
+Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri Edwards, Bowen Baker, Teddy
+Lee, Jan Leike, John Schulman, Ilya Sutskever, and Karl Cobbe. 2024.
+
+Let’s verify step by step.
+
+In International Conference on Learning Representations,
+volume 2024, pages 39578–39601.
+
+Liu et al. (2023)
+
+Jiawei Liu, Chunqiu Steven Xia, Yuyao Wang, and Lingming Zhang. 2023.
+
+Is your code generated
+by ChatGPT really correct? rigorous evaluation of large language models for
+code generation.
+
+In Advances in Neural Information Processing Systems,
+volume 36, pages 21558–21572.
+
+Liu et al. (2026)
+
+Yanjiang Liu, Jie Lou, Xinyan Guan, Yuqiu Ji, Hongyu Lin, Ben He, Xianpei Han,
+Le Sun, Xing Yu, and Yaojie Lu. 2026.
+
+Your teacher can’t
+help you here: Combating supervision fidelity decay in on-policy
+distillation.
+
+Preprint, arXiv:2605.30833.
+
+Ranzato et al. (2016)
+
+Marc’Aurelio Ranzato, Sumit Chopra, Michael Auli, and Wojciech Zaremba. 2016.
+
+Sequence level training
+with recurrent neural networks.
+
+In The Fourth International Conference on Learning
+Representations.
+
+Sheng et al. (2025)
+
+Guangming Sheng, Chi Zhang, Zilingfeng Ye, Xibin Wu, Wang Zhang, Ru Zhang,
+Yanghua Peng, Haibin Lin, and Chuan Wu. 2025.
+
+HybridFlow: A
+flexible and efficient RLHF framework.
+
+In Proceedings of the Twentieth European Conference on Computer
+Systems, EuroSys ’25, pages 1279–1297, Rotterdam, Netherlands. Association
+for Computing Machinery.
+
+Song and Zheng (2026)
+
+Mingyang Song and Mao Zheng. 2026.
+
+A survey of
+on-policy distillation for large language models.
+
+Preprint, arXiv:2604.00626.
+
+Sutton et al. (1999)
+
+Richard S. Sutton, David A. McAllester, Satinder P. Singh, and Yishay Mansour.
+1999.
+
+Policy gradient methods for reinforcement learning with function
+approximation.
+
+In Advances in Neural Information Processing Systems,
+volume 12, pages 1057–1063. MIT Press.
+
+Wang et al. (2021)
+
+Fusheng Wang, Jianhao Yan, Fandong Meng, and Jie Zhou. 2021.
+
+Selective
+knowledge distillation for neural machine translation.
+
+In Proceedings of the 59th Annual Meeting of the Association
+for Computational Linguistics and the 11th International Joint Conference on
+Natural Language Processing (Volume 1: Long Papers), pages 6456–6466,
+Online. Association for Computational Linguistics.
+
+Wang et al. (2026)
+
+Jiaqi Wang, Wenhao Zhang, Weijie Shi, Yaliang Li, and James Cheng. 2026.
+
+Exploring temporal
+curriculum in on-policy distillation for multi-turn autonomous agents.
+
+In Third Conference on Language Modeling.
+
+Williams (1992)
+
+Ronald J. Williams. 1992.
+
+Simple statistical
+gradient-following algorithms for connectionist reinforcement learning.
+
+Machine Learning, 8(3–4):229–256.
+
+Xie et al. (2026a)
+
+Xurong Xie, Zhucun Xue, Jiafu Wu, Jian Li, Yabiao Wang, Xiaobin Hu, Yong Liu,
+and Jiangning Zhang. 2026a.
+
+LLM-oriented
+token-adaptive knowledge distillation.
+
+Proceedings of the AAAI Conference on Artificial Intelligence,
+40(40):34070–34078.
+
+Xie et al. (2026b)
+
+Yan Xie, Sijie Zhu, Tiansheng Wen, Bo Chen, and Yifei Wang. 2026b.
+
+On the position bias of
+on-policy distillation.
+
+Preprint, arXiv:2606.22600.
+
+Xing et al. (2026)
+
+Xingrun Xing, Haoqing Wang, Boyan Gao, Ziheng Li, and Yehui Tang. 2026.
+
+Trust region on-policy
+distillation.
+
+Preprint, arXiv:2606.01249.
+
+Xu et al. (2026)
+
+Yuanda Xu, Hejian Sang, Zhengze Zhou, Ran He, Zhipeng Wang, and Alborz
+Geramifard. 2026.
+
+TIP: Token
+importance in on-policy distillation.
+
+Preprint, arXiv:2604.14084.
+
+Yang et al. (2025)
+
+An Yang, Anfeng Li, Baosong Yang, Beichen Zhang, Binyuan Hui, Bo Zheng, Bowen
+Yu, Chang Gao, Chengen Huang, Chenxu Lv, et al. 2025.
+
+Qwen3 technical
+report.
+
+Preprint, arXiv:2505.09388.
+
+Yang et al. (2026a)
+
+Wenkai Yang, Weijie Liu, Ruobing Xie, Kai Yang, Saiyong Yang, and Yankai Lin.
+2026a.
+
+Learning beyond
+teacher: Generalized on-policy distillation with reward extrapolation.
+
+Preprint, arXiv:2602.12125.
+
+Yang et al. (2026b)
+
+Zhicheng Yang, Zhijiang Guo, Yifan Song, Minrui Xu, Yongxin Wang, Yiwei Wang,
+Xiaodan Liang, and Jing Tang. 2026b.
+
+Prune-OPD: Efficient and
+reliable on-policy distillation for long-horizon reasoning.
+
+Preprint, arXiv:2605.07804.
+
+Yu et al. (2025)
+
+Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu Yue, Weinan
+Dai, Tiantian Fan, Gaohong Liu, Juncai Liu, et al. 2025.
+
+DAPO: An open-source LLM reinforcement learning system at scale.
+
+In Advances in Neural Information Processing Systems,
+volume 38, pages 113222–113244. Curran Associates, Inc.
+
+Zhang et al. (2026a)
+
+Dongxu Zhang, Zhichao Yang, Sepehr Janghorbani, Jun Han, Andrew Ressler, II,
+Qian Qian, Gregory D. Lyng, Sanjit Singh Batra, and Robert E. Tillman.
+2026a.
+
+Fast and
+effective on-policy distillation from reasoning prefixes.
+
+In Findings of the Association for Computational Linguistics:
+ACL 2026, pages 25553–25569, San Diego, California, United States.
+Association for Computational Linguistics.
+
+Zhang et al. (2026b)
+
+Yaocheng Zhang, Jiajun Chai, Yuqian Fu, Songjun Tu, Xiaohan Wang, Wei Lin,
+Guojun Yin, Qichao Zhang, Yuanheng Zhu, and Dongbin Zhao. 2026b.
+
+Are full rollouts
+necessary for on-policy distillation?
+
+Preprint, arXiv:2605.31490.
+
+Zheng et al. (2025)
+
+Chujie Zheng, Shixuan Liu, Mingze Li, Xiong-Hui Chen, Bowen Yu, Chang Gao, Kai
+Dang, Yuqiong Liu, Rui Men, An Yang, Jingren Zhou, and Junyang Lin. 2025.
+
+Group sequence policy
+optimization.
+
+Preprint, arXiv:2507.18071.
+
+Zheng and Jiang (2026)
+
+Liwen Zheng and Haiyun Jiang. 2026.
+
+Blockwise policy-drift
+gating for on-policy distillation.
+
+Preprint, arXiv:2606.24084.
+
+Zhou et al. (2026)
+
+Jingang Zhou, Yuyi Zhou, Haiyang Guo, Xukai Wang, Shuai Feng, Sirui Gao, Jian
+Xu, Qingpei Guo, and Xu-Yao Zhang. 2026.
+
+Teacher should think ahead:
+Adaptive continuations for reliable on-policy distillation.
+
+Preprint, arXiv:2609.22254.
+
+Zhu et al. (2026)
+
+Wenhong Zhu, Ruobing Xie, Rui Wang, and Pengfei Liu. 2026.
+
+Hybrid
+policy distillation for LLMs.
+
+In Proceedings of the 43rd International Conference on Machine
+Learning, volume 306 of Proceedings of Machine Learning Research,
+pages 167818–167837. PMLR.
+
+## Appendix A Experimental Details
+
+## A.1 Student Training
+
+Table 4 lists the mathematical-reasoning configuration shared by vanilla OPD, both AP-OPD detectors, magnitude-cap, and the block-size runs; the code experiment is described in Appendix A.4.
+
+Setting
+
+Value
+
+Student initialization
+
+Qwen3-1.7B-Base
+
+Frozen teacher
+
+Qwen3-8B-RL-Math; see Table 5
+
+Training prompts
+
+DAPO-Math-17K; 17,398 prompts
+
+Prompt / response limit
+
+2,048 / 8,192 tokens
+
+Steps
+
+200, from the base checkpoint
+
+Batch
+
+128 prompts, one rollout each; one update per step
+
+Rollout sampling
+
+temperature 1.0, top- $p$ 1.0, no top- $k$ ; thinking disabled
+
+Optimizer
+
+AdamW, $\beta=(0.9,0.999)$ , weight decay 0.01
+
+Learning rate
+
+ $10^{-6}$ , constant, no warmup
+
+Gradient clipping
+
+global norm 1.0
+
+Loss
+
+token mean; no task reward, KL loss, or entropy bonus
+
+Data order
+
+not shuffled; run 1: data seed 42; run 2: data seed 43
+
+AP-OPD
+
+ $B=64$ , $z=2$ ; top- $\alpha$ uses $\alpha=5\%$ 
+
+Table 4: Training configuration shared by our mathematical-reasoning runs.
+
+## A.2 Teacher
+
+The mathematical-reasoning teacher, Qwen3-8B-RL-Math, is Qwen3-8B-Base trained with GSPO (Zheng et al., 2025) on DAPO-Math-17K.
+Table 5 lists its configuration.
+The teacher is frozen during distillation.
+
+Setting
+
+Value
+
+Initialization
+
+Qwen3-8B-Base
+
+Training prompts
+
+DAPO-Math-17K
+
+Policy optimization
+
+GSPO
+
+Steps
+
+200
+
+Prompt / response limit
+
+2,048 / 4,096 tokens
+
+Batch
+
+512 prompts, 16 responses each; mini-batch of 32 prompts
+
+Clipping range
+
+ $3\times 10^{-4}$ lower, $4\times 10^{-4}$ upper
+
+Learning rate
+
+ $10^{-6}$ , 10 warmup steps
+
+Weight decay
+
+0.1
+
+Reward
+
+ $+1$ for a correct answer, $-1$ otherwise; no overlong shaping
+
+Table 5: Training configuration of the frozen mathematical-reasoning teacher.
+
+## A.3 Evaluation
+
+All models use the evaluation configuration in Table 6, with 7,388 responses per model.
+Prompts are capped at 2,048 tokens and responses at 16,384; sampling uses temperature 0.7, top- $p$ 0.8, top- $k$ 20, and seed 42, with thinking mode disabled.
+For a benchmark with $N$ problems and correctness $c_{q,j}\in\{0,1\}$ of sample $j$ on problem $q$ ,
+
+ $\operatorname{Avg@}k=\frac{1}{Nk}\sum_{q=1}^{N}\sum_{j=1}^{k}c_{q,j}.$ 
+
+(10)
+
+Answers are graded with the rule-based math checker of verl.
+
+## Paired bootstrap.
+
+For a contrast between two models, we resample the problems of each benchmark with replacement 10,000 times using seed 42, keep the existing $k$ scores of each resampled problem for both models, and recompute the per-benchmark and macro differences.
+We report percentile intervals.
+The intervals use the run-1 checkpoints and cover evaluation randomness, not training variance.
+
+Benchmark
+Problems
+ $k$ 
+Metric
+
+MATH500
+500
+4
+Avg@4
+
+AMC23
+40
+16
+Avg@16
+
+Minerva
+272
+4
+Avg@4
+
+OlympiadBench
+675
+4
+Avg@4
+
+AIME24
+30
+16
+Avg@16
+
+AIME25
+30
+16
+Avg@16
+
+Table 6: Evaluation benchmarks and samples per problem.
+
+## A.4 Code Generation
+
+The code experiment distills Qwen3-4B-Instruct-2507 into Qwen3-1.7B, with the configuration in Table 7.
+Training prompts are drawn from the 25,276 training problems in the code subset of Eurus-2-RL-Data (Cui et al., 2026), competitive-programming problems with test cases.
+All methods train for 100 steps from the same student checkpoint, and we evaluate the step-100 checkpoints.
+We evaluate on 164 HumanEval+ problems, 378 MBPP+ problems, and 175 LiveCodeBench v6 problems, with four samples per problem, responses capped at 16,384 tokens, temperature 0.7, top- $p$ 0.8, top- $k$ 20, and thinking disabled.
+Each program is executed in a sandbox against the benchmark’s tests, and Avg@4 is the share of passing samples.
+
+Setting
+
+Value
+
+Student initialization
+
+Qwen3-1.7B
+
+Frozen teacher
+
+Qwen3-4B-Instruct-2507
+
+Training prompts
+
+Eurus-2-RL-Data code subset; 12,800 prompts
+
+Prompt / response limit
+
+2,048 / 8,192 tokens
+
+Steps
+
+100, one epoch
+
+Batch
+
+128 prompts, one rollout each; one update per step
+
+Rollout sampling
+
+temperature 1.0, top- $p$ 1.0, no top- $k$ ; thinking disabled
+
+Optimizer
+
+AdamW, $\beta=(0.9,0.999)$ , weight decay 0.01
+
+Learning rate
+
+ $10^{-6}$ , constant, no warmup
+
+Gradient clipping
+
+global norm 1.0
+
+Task reward
+
+none
+
+AP-OPD
+
+ $z$ -gate, $B=64$ , $z=2$ 
+
+Table 7: Training configuration of our code-generation runs.
+
+## Appendix B Diagnostic Analysis Details
+
+## B.1 Rollouts
+
+The analysis set contains 512 rollouts, one per distinct prompt, saved by the vanilla OPD run at steps 70, 80, 90, and 100, with 128 rollouts per step.
+For replication we use two further training runs with rollouts saved every 10 steps over 300 steps, with 3,840 rollouts per run: a vanilla OPD run and a run trained with the paired rule of Appendix D.
+All statistics are computed offline and do not affect training.
+
+## B.2 Detector Statistics
+
+Table 8 compares jump detectors and other selection rules on the analysis set.
+The two detectors select overlapping but different boundaries, with a Jaccard index of 0.33.
+
+Rule
+Selected/resp.
+Unselected (%)
+Token cov. (%)
+ $q$ (%)
+
+Top- $\alpha$ ( $5\%$ )
+1.85
+0.00
+7.19
+14.63
+
+ $z=1.5$ 
+3.93
+8.98
+13.37
+20.04
+
+ $z=2$ (AP-OPD)
+1.91
+28.71
+6.49
+11.60
+
+ $z=3$ 
+0.36
+75.78
+1.10
+2.56
+
+All $\Delta_{i}>0$ 
+–
+–
+–
+36.11
+
+Magnitude-cap
+1.85
+0.00
+7.17
+13.75
+
+Table 8: Selection rules on the analysis rollouts at $B=64$ : selected boundaries per response, share of responses without a selection, share of tokens in selected blocks, and removed penalty fraction $q$ .
+Token coverage and $q$ are averaged equally over responses; $q$ uses responses with nonzero penalty mass.
+Among the $z$ -gate thresholds, only $z=2$ is used for training; the other $z$ values are reported for reference.
+Magnitude-cap selections are not penalty jumps.
+
+## B.3 Split-Half Protocol
+
+Profiles use the window $[-2B,2B)$ around each boundary, with offset 0 at the first token of the following block, and never cross a mask break or the response boundary.
+Controls come from the same response and the same decile of relative position, defined as the boundary offset divided by valid length.
+Within each control type, boundaries are drawn without replacement; the high-magnitude boundary is the candidate with the highest $D_{i+1}$ .
+For split-half measurement, detection uses only the odd-indexed tokens of each 64-token block, including the token counts in the gate, and controls are also selected on odd tokens; all quantities are then measured on even tokens.
+The reverse direction swaps the roles, and the two directions are averaged with shared bootstrap weights.
+Estimates are averaged within each response, then over prompts; intervals come from 10,000 prompt-clustered resamples using seed 42.
+The held-out rise $U_{a:b}$ is the measured mean of $d_{t}$ over offsets $[a,b)$ minus the measured mean of the block preceding the selected boundary.
+For a jump, this reference is the pre-jump block; each control uses its own preceding block.
+On the analysis set, 910 of the 978 $z=2$ jumps have a complete window, covering 346 responses; with odd and even detection there are 478 and 453 complete jumps from 247 and 230 responses, and 324 prompts in the union.
+Each detection half of a block has only 32 tokens, and adjacent tokens remain correlated, so split-half measurement reduces but does not remove selection effects.
+
+Detect
+ $-$ High-mag. bound.
+ $-$ Rand. pos.
+ $-$ Rand. bound.
+
+odd
+0.019 [0.006, 0.031]
+0.041 [0.025, 0.058]
+0.135 [0.105, 0.168]
+
+even
+0.036 [0.016, 0.057]
+0.050 [0.034, 0.066]
+0.145 [0.116, 0.177]
+
+Table 9: Held-out rise $U_{0:64}$ of $z=2$ jumps minus that of each matched control, for each detection direction on the analysis set at $B=64$ , with 95% intervals.
+
+Rollouts
+ $U_{0:64}$ 
+ $U_{64:128}$ 
+Ratio
+
+Analysis set
+0.190 [0.172, 0.209]
+0.096 [0.081, 0.111]
+50.3%
+
+Vanilla, 300 steps
+0.188 [0.183, 0.194]
+0.101 [0.096, 0.106]
+53.6%
+
+Paired rule, 300 steps
+0.190 [0.184, 0.196]
+0.103 [0.098, 0.108]
+54.5%
+
+Table 10: Held-out rise of the first and second blocks after $z=2$ jumps and their ratio, on the analysis set and on two further training runs.
+Both rises use the pre-jump block as the reference and are measured with the split-half protocol, averaging both detection directions.
+A positive second-block rise relative to this reference is compatible with returning to the level of position-matched random boundaries in Figure 2.
+
+## B.4 Teacher Confidence
+
+Of the 512 analysis prompts, 362 contain an eligible $z=2$ jump, and 353 of these yield a complete group with a position-matched high-magnitude boundary and a random boundary.
+153 groups share no prompt or control prefix with one another within the subset; the full set comprises 80 connected components.
+The teacher is run causally over the original student history, without re-encoding prefixes or truncating early context, and $H$ and $P_{\max}$ are averaged over the 64 tokens of each block.
+Intervals resample the 80 components for all groups and resample groups within training steps for the independent subset, using 10,000 resamples with seed 42.
+Table 11 reports both sets.
+These distributional changes support the observed penalty–confidence tension for the default $z=2$ jump set; they are not held-out measurements or a combined confidence score.
+
+Metric
+Control
+All 353 groups
+Independent 153
+
+ $H$ (nats)
+random
+0.300 [0.275, 0.342]
+0.311 [0.263, 0.365]
+
+ $H$ (nats)
+high-magnitude
+0.172 [0.122, 0.265]
+0.261 [0.212, 0.317]
+
+ $P_{\max}$ 
+random
+ $-$ 0.099 [ $-$ 0.112, $-$ 0.091]
+ $-$ 0.102 [ $-$ 0.116, $-$ 0.088]
+
+ $P_{\max}$ 
+high-magnitude
+ $-$ 0.061 [ $-$ 0.085, $-$ 0.050]
+ $-$ 0.083 [ $-$ 0.098, $-$ 0.069]
+
+Table 11: DID of the teacher’s entropy and top-1 probability, computed as the post-minus-pre change at jumps minus that at control boundaries, with 95% intervals.
+
+## Log-probability decomposition.
+
+Writing $\Delta S$ and $\Delta T$ for the post-minus-pre changes in the block means of $\ell_{t}^{S}$ and $\ell_{t}^{T}$ , the change in the mean signed log-ratio is $\Delta S-\Delta T$ .
+This identity does not directly give the change in block-averaged penalty, which averages $[r_{t}]_{+}$ .
+In the held-out setting of Figure 3c, the teacher’s drop exceeds that at high-magnitude boundaries by 0.052 $[0.028,0.077]$ with odd detection and 0.077 $[0.043,0.112]$ with even detection; the student’s drop also exceeds that of both controls.
+
+## Appendix C Supplementary Results
+
+Table 12 lists the per-benchmark scores of all trained models, and Table 13 gives per-benchmark paired intervals for the contrasts among our own runs.
+The five methods in the main comparison are reported for each run and for their mean.
+Magnitude-cap and the additional block sizes were trained in run 1 only.
+The paired intervals and training dynamics also refer to run 1.
+
+Model
+MATH500
+AMC23
+Minerva
+Olympiad
+AIME24
+AIME25
+Macro
+
+Mean of the two runs
+
+Vanilla OPD
+72.90
+43.75
+20.96
+33.63
+12.40
+7.29
+31.82
+
+IW-OPD
+71.60
+43.28
+22.15
+32.31
+11.35
+7.19
+31.31
+
+FiRe-OPD
+72.80
+45.39
+21.74
+32.83
+11.88
+8.44
+32.18
+
+AP-OPD (top- $\alpha$ )
+72.97
+44.77
+22.06
+34.26
+13.02
+8.65
+32.62
+
+AP-OPD ( $z$ -gate, $B=64$ )
+73.08
+46.72
+21.42
+32.94
+12.19
+8.02
+32.39
+
+Run 1
+
+Vanilla OPD
+73.50
+43.75
+20.22
+33.30
+12.08
+6.46
+31.55
+
+IW-OPD
+73.05
+43.91
+21.60
+31.78
+11.46
+8.75
+31.76
+
+FiRe-OPD
+73.00
+44.22
+21.42
+33.00
+11.46
+8.12
+31.87
+
+AP-OPD (top- $\alpha$ )
+73.05
+45.94
+21.42
+34.41
+13.12
+7.08
+32.50
+
+AP-OPD ( $z$ -gate, $B=64$ )
+72.75
+46.56
+21.32
+33.33
+12.71
+8.33
+32.50
+
+Run 2
+
+Vanilla OPD
+72.30
+43.75
+21.69
+33.96
+12.71
+8.12
+32.09
+
+IW-OPD
+70.15
+42.66
+22.70
+32.85
+11.25
+5.62
+30.87
+
+FiRe-OPD
+72.60
+46.56
+22.06
+32.67
+12.29
+8.75
+32.49
+
+AP-OPD (top- $\alpha$ )
+72.90
+43.59
+22.70
+34.11
+12.92
+10.21
+32.74
+
+AP-OPD ( $z$ -gate, $B=64$ )
+73.40
+46.88
+21.51
+32.56
+11.67
+7.71
+32.29
+
+Additional ablations
+
+Magnitude-cap
+72.55
+44.53
+21.88
+32.56
+9.58
+7.29
+31.40
+
+AP-OPD ( $z$ -gate, $B=32$ )
+71.30
+45.16
+22.61
+32.85
+12.29
+8.13
+32.06
+
+AP-OPD ( $z$ -gate, $B=128$ )
+73.15
+42.81
+22.79
+33.81
+11.25
+7.92
+31.96
+
+Table 12: Per-benchmark Avg@ $k$ in percent at step 200 under the same evaluation protocol.
+Mean: arithmetic mean of the two runs, calculated from unrounded scores.
+Macro: equal-weight mean over the six benchmarks; the additional ablations use run 1 only.
+Best in bold, second underlined within each block; ties at the reported precision share the same marking.
+
+Contrast
+MATH500
+AMC23
+Minerva
+Olympiad
+AIME24
+AIME25
+Macro
+
+ $z$ -gate $-$ Vanilla
+ $-0.75$ 
+ $+2.81$ 
+ $+1.10$ 
+ $+0.04$ 
+ $+0.63$ 
+ $+1.88$ 
+ $+0.95$ 
+
+[ $-$ 2.40, 0.80]
+[ $-$ 0.47, 6.25]
+[ $-$ 1.19, 3.31]
+[ $-$ 1.44, 1.48]
+[ $-$ 1.04, 2.29]
+[ $-$ 0.42, 5.00]
+[0.02, 1.90]
+
+Top- $\alpha$ $-$ Vanilla
+ $-0.45$ 
+ $+2.19$ 
+ $+1.19$ 
+ $+1.11$ 
+ $+1.04$ 
+ $+0.63$ 
+ $+0.95$ 
+
+[ $-$ 2.05, 1.10]
+[ $-$ 0.94, 5.47]
+[ $-$ 0.92, 3.31]
+[ $-$ 0.33, 2.52]
+[ $-$ 1.67, 4.17]
+[ $-$ 1.25, 2.71]
+[0.01, 1.90]
+
+Magnitude-cap $-$ Vanilla
+ $-0.95$ 
+ $+0.78$ 
+ $+1.65$ 
+ $-0.74$ 
+ $-2.50$ 
+ $+0.83$ 
+ $-0.15$ 
+
+[ $-$ 2.60, 0.65]
+[ $-$ 1.56, 3.28]
+[ $-$ 0.46, 3.86]
+[ $-$ 2.22, 0.70]
+[ $-$ 5.00, $-$ 0.21]
+[ $-$ 1.46, 3.33]
+[ $-$ 0.99, 0.70]
+
+ $z$ -gate $-$ Magnitude-cap
+ $+0.20$ 
+ $+2.03$ 
+ $-0.55$ 
+ $+0.78$ 
+ $+3.13$ 
+ $+1.04$ 
+ $+1.10$ 
+
+[ $-$ 1.55, 1.95]
+[ $-$ 0.31, 4.69]
+[ $-$ 2.57, 1.38]
+[ $-$ 0.81, 2.41]
+[0.42, 6.46]
+[ $-$ 1.04, 4.17]
+[0.20, 2.07]
+
+Top- $\alpha$ $-$ Magnitude-cap
+ $+0.50$ 
+ $+1.41$ 
+ $-0.46$ 
+ $+1.85$ 
+ $+3.54$ 
+ $-0.21$ 
+ $+1.11$ 
+
+[ $-$ 1.15, 2.20]
+[ $-$ 1.72, 4.22]
+[ $-$ 2.67, 1.75]
+[0.30, 3.44]
+[0.21, 7.50]
+[ $-$ 1.67, 1.04]
+[0.13, 2.12]
+
+ $z$ -gate $-$ Top- $\alpha$ 
+ $-0.30$ 
+ $+0.63$ 
+ $-0.09$ 
+ $-1.07$ 
+ $-0.42$ 
+ $+1.25$ 
+ $-0.00$ 
+
+[ $-$ 2.00, 1.35]
+[ $-$ 2.19, 3.59]
+[ $-$ 2.30, 2.02]
+[ $-$ 2.56, 0.41]
+[ $-$ 3.75, 2.50]
+[ $-$ 1.04, 4.38]
+[ $-$ 1.01, 1.01]
+
+Table 13: Paired differences in percentage points among our run-1 models, with 95% paired bootstrap intervals.
+
+Model
+Clipped steps
+Resp. length
+Student entropy
+Weighted
+Unweighted
+Mean
+
+(1–50 / 51–200)
+(first / last 50)
+(first / last 50)
+bound. (%)
+resp. (%)
+weight
+
+Vanilla OPD
+43 (36 / 7)
+1464 / 2437
+0.764 / 0.168
+–
+–
+1
+
+AP-OPD (top- $\alpha$ )
+30 (30 / 0)
+1441 / 2432
+0.757 / 0.174
+6.52
+1.57
+0.952
+
+AP-OPD ( $z$ -gate)
+33 (33 / 0)
+1485 / 2408
+0.816 / 0.173
+6.79
+24.22
+0.945
+
+Magnitude-cap
+32 (31 / 1)
+1440 / 2434
+0.726 / 0.175
+6.52
+1.33
+0.961
+
+Table 14: Run-1 training dynamics over 200 steps, reported as means of logged values.
+Clipped steps have pre-clipping gradient norm above 1.
+
+## Appendix D Alternative Reweighting Rules
+
+AP-OPD uniformly scales supervision in the post-jump block using the preceding block’s original block-averaged penalty as a local reference.
+Two alternatives are natural: compensating by upweighting the pre-jump block and down-weighting the post-jump block by a fixed constant.
+We evaluate three such rules at step 100 with 8,192-token evaluation responses, so their numbers are not comparable with Table 1.
+All three select boundaries with the top- $\alpha$ ranking of Eq. (9) with $\alpha=5\%$ .
+The paired rule raises each selected pre-jump block and lowers its post-jump block by the same amount, with the weights normalized over the response.
+The two one-sided rules multiply every selected pre-jump block by 4 or every selected post-jump block by 0.3.
+
+Rule
+MATH500
+AMC23
+Minerva
+Olympiad
+AIME24
+AIME25
+Macro
+Clipped
+Mean $w$ 
+
+Vanilla OPD
+69.90
+43.12
+20.31
+30.67
+11.46
+6.25
+30.29
+–
+1
+
+Paired ( $+$ pre, $-$ post)
+70.00
+41.88
+20.77
+30.33
+11.67
+7.71
+30.39
+32 / 100
+1.006
+
+Pre-jump $\times 4$ 
+69.15
+41.88
+20.50
+31.26
+12.29
+6.25
+30.22
+88 / 100
+1.200
+
+Post-jump $\times 0.3$ 
+70.25
+44.38
+21.23
+31.11
+12.29
+6.88
+31.02
+30 / 100
+0.955
+
+Table 15: Alternative reweighting rules at step 100, reported as Avg@ $k$ in percent from one training run with 8K evaluation responses.
+Clipped: steps whose pre-clipping gradient norm exceeds 1; Mean $w$ : mean token weight.
+
+Table 15 shows that upweighting the pre-jump block brings no gain.
+The pre-jump $\times 4$ rule triggers gradient clipping in 88 of 100 steps.
+The paired rule has a macro average close to vanilla OPD.
+Down-weighting the post-jump block by a constant 0.3, fixed before training, improves over vanilla OPD and has the best macro average.
+AP-OPD uses the preceding block’s original mean to determine the post-jump weight, $D_{i}/D_{i+1}$ , without an additional scaling constant.
+The fixed-weight result shows that a gain can also occur under another post-jump weighting rule; it does not establish that the ratio is superior, since the protocols differ.
+
+## Appendix E Block-Level versus Token-Level Down-Weighting
+
+This appendix gives the protocol and additional numbers for §5.4.
+
+## Setup.
+
+REOPOLD bounds each token’s penalty from above (Ko et al., 2026); in our notation it replaces $r_{t}$ by $\min(r_{t},\kappa)$ with
+
+ $\kappa=\frac{-\log\lambda}{1-\lambda}.$ 
+
+(11)
+
+We use two bounds.
+In the removal-matched setting, $\lambda=0.051$ gives $\kappa=3.131$ , which removes the same 11.6% of penalty mass as AP-OPD on the analysis set.
+Under REOPOLD’s default, $\lambda=0.3$ gives $\kappa=1.720$ , which removes 27.0%.
+On the two 300-step runs of Appendix B we keep both bounds fixed rather than recalibrating them, so the matched bound removes somewhat more than AP-OPD there: 13.2% and 13.4%, compared with 10.7% and 10.6% for AP-OPD, respectively.
+After clipping, we recompute the block profile, rerun the $z=2$ detector, and repeat the split-half measurement of Appendix B.3.
+
+Rollouts
+Bound
+Removed
+Jumps kept
+Rise kept
+Overlap
+Expected
+
+Analysis set
+matched
+11.6
+99.0
+89.8 [86.1, 93.8]
+14.5 [13.1, 15.9]
+12.5
+
+Analysis set
+default
+27.0
+96.3
+71.1 [67.0, 75.8]
+32.3 [30.9, 33.6]
+28.6
+
+Vanilla, 300 steps
+matched
+13.2
+98.9
+86.1 [84.8, 87.4]
+13.3 [13.1, 13.6]
+13.1
+
+Vanilla, 300 steps
+default
+30.1
+95.9
+68.0 [66.7, 69.4]
+31.9 [31.6, 32.2]
+30.2
+
+Paired rule, 300 steps
+matched
+13.4
+98.7
+84.2 [82.9, 85.5]
+13.7 [13.5, 14.0]
+13.1
+
+Paired rule, 300 steps
+default
+30.3
+95.5
+66.4 [65.0, 67.8]
+32.5 [32.1, 32.8]
+30.3
+
+Table 16: Token-level clipping on the analysis set and the two 300-step runs at $B=64$ and $z=2$ .
+Values are percentages; intervals are 95%.
+Matched: $\kappa=3.131$ , which removes as much penalty mass as AP-OPD on the analysis set; default: REOPOLD’s $\kappa=1.720$ .
+Removed: penalty mass removed by clipping, averaged over responses.
+Jumps kept: original jumps detected again after clipping.
+Rise kept: held-out rise $U_{0:64}$ after clipping relative to no clipping.
+Overlap: share of AP-OPD’s removal that lies above the bound.
+Expected: share of all penalty mass above the bound, the overlap expected if AP-OPD’s removal were unrelated to token size.
+Overlap and Expected pool mass over tokens.
+
+## Rise after clipping.
+
+Table 16 shows that at both bounds and on all three sets of rollouts, nearly all jumps are detected again and most of the held-out rise remains.
+At the matched bound on the analysis set, the held-out rise still exceeds each of the three matched controls in both detection directions under the paired bootstrap of Appendix B.3, as it does at the default bound.
+Clipping also changes block variances and creates new jumps.
+The detector finds 1,124 jumps at the matched bound and 1,296 at the default bound, compared with 978 without clipping.
+The retained rise therefore compares two detected sets rather than following each original jump.
+
+## Overlap of removed mass.
+
+With AP-OPD’s selections and weights fixed on the unclipped signal, we split each removed amount $(1-w_{t})d_{t}$ into the part above $\kappa$ , which clipping would also remove, and the part below it.
+If AP-OPD’s removal were unrelated to token size, the part above $\kappa$ would equal the share of all penalty mass that lies above $\kappa$ .
+Table 16 shows that the overlap stays close to this reference at both bounds and on all three sets of rollouts.
+On the two 300-step runs at the matched bound, it nearly coincides with the reference. The two rules therefore remove largely different supervision.

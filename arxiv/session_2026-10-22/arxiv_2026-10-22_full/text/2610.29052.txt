@@ -1,0 +1,1281 @@
+## Our Own Jev: Typed Decisions in One Forward Pass,
+
+from an In-House Judge to Open LoRA Models
+
+Yuchuan Weng
+
+Chi Liu
+
+Xin Chen
+
+Srinivasan Manoharan
+
+Affiliation: PayPal.AI
+
+Abstract
+
+A typed decision maps evidence, a question and a fixed set of options to a probability for every option,
+computed in one forward pass, by reading a language model’s logits or a small head over its hidden states,
+instead of generating and parsing text.
+The commercial system Jev popularised this System 1 interface, and open reproductions have followed. We
+report two uses of the pattern. Part I describes an in-house System 1 judge that triages about 148K
+agentic coding session records for a training corpus. It replaces a frontier LLM judge that cost on the order of
+$1,000 per pass and whose stored labels matched a fresh two-judge consensus on only 26.9% of the sessions
+where the two judges agreed; a self-hosted frozen backbone with a rank-16 LoRA adapter and a pointer head
+answers three typed questions in one forward pass, judges 1,000 sessions in about three minutes of one GPU,
+about $0.06 at a reference rate and roughly 1% of the frontier judge’s cost, and keeps every session inside
+the organisation. Part II asks whether a readout that adds no parameters can be competitive and whether training one
+helps. Applying the public Eikos recipe and corpus of about 25K decisions to three further backbones
+(1B, 2B and 35B), we read the frozen output layer of a LoRA-adapted decoder. On the 111 public hard items of
+JevBench our single-seed 35B, developed with those items in view, scores 79.3%, not significantly different from the commercial reference (73.0%, unadjusted
+ $p=0.12$ ) and ahead of five open systems after Holm–Bonferroni correction; our 2B is ahead of all four kev
+checkpoints on the leaderboard. A single-seed ablation finds no detectable benefit from training the 26 letter rows of the output layer, and a retrain
+on a later corpus release moves the 2B’s hard-tier accuracy by 11.7 points, which shows how little small evaluations
+resolve.
+
+## 1 Introduction
+
+“System 1 operates automatically and quickly, with little or no effort and no sense of voluntary
+control. System 2 allocates attention to the effortful mental activities that demand it.”
+ — Kahneman (2011)
+
+Many operational decisions have a fixed set of allowed answers: which queue a ticket goes to, whether a
+clause in a document is satisfied, whether a coding session is worth keeping as training data. Today they are
+usually automated with System 2 machinery: prompt a chat model, ask it for JSON and parse the reply. That spends
+hundreds of generated tokens on a choice among a handful of options, fails whenever the model writes prose instead
+of an object, and returns a confidence value the model composes as text rather than computes.
+
+A typed decision interface is the System 1 alternative. Given evidence, a question and the
+options, the model returns a probability for every option from a single forward pass, read from the model’s outputs
+(its logits, or a small head over its hidden states) rather than generated. The commercial system Jev
+(TypeSafe AI, 2026) popularised this interface, and JevBench (Standhartinger, 2026) benchmarks systems that implement
+it on accuracy, calibration, speed and cost. Because the product is closed, an open-source race followed, with
+reproductions built on encoders, frozen base models, pointer heads and new readouts (Section 2);
+a fifth project, Eikos (Vicentino, 2026), releases a corpus, a training recipe, an evaluation harness and models that
+read letter logits without adding parameters.
+
+This paper reports two efforts with the same pattern in two settings.
+
+Part I: an in-house System 1 judge (§2–2). We
+collect agentic coding sessions, about 148,000 session records and growing, as training data for an in-house
+coding model, and each must be triaged by three typed questions before it enters the corpus. A frontier
+LLM judge cost on the order of $1,000 per pass, needed about 73 hours of judging time, and its stored labels
+had drifted to the point that, where two fresh judges agreed, their label matched the stored one on only
+26.9% of sessions; the data also could not leave the organisation. A self-hosted judge built on the kev
+architecture (a frozen 4B or 27B backbone, a rank-16 LoRA adapter and a pointer head) answers all three
+questions in one forward pass, judges 1,000 sessions in about three minutes of one GPU, about $0.06 at a
+reference rate and roughly a hundredth of the frontier judge’s cost, and reaches 83–85% (coding),
+91–92.5% (in-domain) and 68–69.5% (eight-way domain) agreement with frontier-judge labels on a fixed,
+class-balanced held-out set of 200 sessions (1.5 to 3.8 points lower on the 144 of them that share no state
+with the training records).
+
+Part II: open typed-decision models (§5–9). Part II asks whether a readout that adds no parameters can be competitive, and whether training one helps. We read the existing output layer of a decoder language
+model at the single position where the answer letter would be generated, restrict it to the letters in play, and
+train only a LoRA adapter (Hu et al., 2022) with soft cross-entropy. The prompt format (SemIf’s), the training
+recipe, the evaluation battery and the corpus of about 25K public decisions are those of the open Eikos project, which
+pairs a letter-logit readout with task training; ours are the adapters for three further backbones (a 1B, a 2B and a
+35B mixture of experts), the paired comparisons on JevBench’s 111 public hard items and a single-seed test of
+whether training the readout helps. The 35B reaches 79.3%: after Holm–Bonferroni correction it is significantly
+ahead of five open systems, but not significantly different from the commercial reference (73.0%, unadjusted
+ $p=0.12$ ). Training the readout buys nothing we can measure, and a
+retrain of the 2B on a later corpus release moved its hard-tier accuracy from 61.3% to 73.0% although the two runs
+differ in more than the seed (Sections 8 and 9).
+
+All JevBench numbers in Sections 6–8 are on the public half (version 1.4.2.2); the
+sealed half is scored only by its operator. Section 9 discloses provenance and which builds were
+developed with the public items in view.
+
+## 2 Background and related work
+
+Typed decisions and JevBench.
+
+An item consists of a state $s$ (free text or structured evidence), a question $q$ of one of three types
+(boolean, categorical choice, or ordinal score), and options $O=(o_{1},\dots,o_{K})$ ; a system returns
+ $p\in\Delta^{K-1}$ . JevBench (Standhartinger, 2026), in version 1.4.2.2, publishes 231 items in three tiers (easy 48,
+standard 72, hard 111); the rest, including a judge tier, are held by the operator and scored only on submission.
+
+Open reproductions.
+
+Table 1 summarises the open reproductions whose code we read; they differ mainly in where the
+decision is computed. Laya (Convai Innovations, 2026) is a ModernBERT encoder (Warner et al., 2024). SemIf (Lee, 2026) reads option-letter logits from an unmodified Qwen3.5-4B, with a
+structured prompt that Eikos later adopted. kev (Palmer, 2026) adds a pointer head and a block-causal option-isolation
+mask that lets one pass answer several questions (Part I builds on kev). imajev (Garg, 2026) adds a 256-code
+readout, copied from the output layer and then trained on about a million decisions. Eikos (Vicentino, 2026), the
+source of Part II’s recipe, data and evaluation battery, reads the same letter logits with no added parameters from
+LoRA-adapted Qwen backbones trained on its own corpus of about 25K decisions. The other systems we compare, from
+the JevBench leaderboard (“the board”), are reflex (kshetrajna12, 2026) (a Qwen model read by direct logits),
+Winnow (Ring, 2026) (a LoRA-tuned Gemma), djev (Maisa, 2026) (an inference method on a diffusion language
+model), jqv (Octalab, 2026) (a zero-shot Qwen3-32B) and OpenJev Verdict (heman10x, 2026) (a 151M encoder). None of
+Laya, SemIf, kev and imajev combines task training with a readout that adds no parameters; Eikos does (as do other
+board entries such as reflex-4B), and we build on that idea rather than claim it. Part II supplies evidence on other
+backbones, paired comparisons with a selection of the field, and a test of whether the readout needs training at all.
+
+Table 1: Open typed-decision reproductions, as described by each project’s published code and
+documentation at the time of writing, and Part II’s.
+
+Backbone
+
+Readout
+
+Training
+
+Stated or observed limit
+
+Laya
+
+ModernBERT-large (421M)
+
+softmax over option markers
+
+own recipe
+
+512-token budget
+
+SemIf
+
+Qwen3.5-4B, unmodified
+
+option-letter logits
+
+none
+
+score questions excluded
+
+kev
+
+Qwen decoder
+
+new pointer head
+
+LoRA + head from scratch
+
+mask not applied on hybrid backbones
+
+imajev
+
+Qwen3.5 2B/4B/9B
+
+256-code layer copied from the output layer
+
+LoRA, 5 stages, $\sim$ 1M decisions
+
+raw hard-tier calibration error 0.113
+
+Eikos
+
+Qwen3.5-4B, Qwen3.8-27B
+
+option-letter logits, frozen output layer
+
+LoRA, soft targets, $\sim$ 25K decisions
+
+self-reported hard tier 72.1 (4B), 82.9 (27B)
+
+Ours (Part II)
+
+MiniCPM5-1B/2B, Qwen3.6-35B-A3B
+
+frozen output layer; no new parameters
+
+Eikos recipe and corpus
+
+26 letters per pass
+
+Related techniques.
+
+Scoring multiple-choice answers by the probability of an option symbol is standard in LLM evaluation
+(Hendrycks et al., 2021; Robinson & Wingate, 2023) and can be well calibrated (Kadavath et al., 2022); models are
+sensitive to option order and label bias (Zheng et al., 2024a; Pezeshkpour & Hruschka, 2024; Zhao et al., 2021), which
+motivates our per-example reshuffling.
+We measure calibration with expected calibration error (Naeini et al., 2015; Guo et al., 2017), consider
+temperature scaling and report error under selective prediction (El-Yaniv & Wiener, 2010; Geifman & El-Yaniv, 2017).
+Soft targets follow knowledge distillation (Hinton et al., 2015), the rationale loss follows
+Hsieh et al. (2023), and we adapt with LoRA through PEFT (Mangrulkar et al., 2022). Our analysis draws on work on
+significance testing and power in NLP (Card et al., 2020; Dror et al., 2018; Berg-Kirkpatrick et al., 2012), error
+bars and small test sets (Miller, 2024; Bowyer et al., 2025) and seed and numerical variance
+(Dodge et al., 2020; Bouthillier et al., 2021; Madaan et al., 2024; Summers & Dinneen, 2021; Zhuang et al., 2022),
+and uses McNemar’s exact test (McNemar, 1947; Dietterich, 1998), the paired bootstrap
+(Efron & Tibshirani, 1993) and the Holm–Bonferroni correction (Holm, 1979). Our contamination check is an
+ $n$ -gram overlap test in the tradition of Brown et al. (2020), with the caveats of Sainz et al. (2023). The judge
+of Part I replaces an LLM-as-a-judge (Zheng et al., 2023).
+
+## 5 Part II. Open typed-decision models: readout, recipe and data
+
+The judge of Part I reads its answer through kev’s trained pointer head. Part II asks whether a readout that
+adds no parameters at all can be competitive, and whether training one helps. The recipe, the corpus and the
+evaluation battery are those of the open Eikos project (Vicentino, 2026), whose released models already read letter
+logits this way; Part II adds adapters for three further backbones, paired comparisons with the commercial system
+and a selection of the open field on JevBench, and a single-seed test of whether training the readout helps
+(§8). It does not compare a pointer head with the letter readout under matched conditions.
+The two parts share an interface and a lesson, not an experiment: Part I shows what the pattern buys in a deployment,
+Part II tests the readout on a public benchmark, and in both the evaluation sets (200 sessions, 111 items) are too
+small to resolve the differences that matter.
+
+## 5.1 A readout with no new parameters
+
+We render the state, the question and the options into a prompt in which option $k$ is introduced
+by a letter token $\ell_{k}\in\{\texttt{A},\texttt{B},\dots\}$ , and end the prompt exactly where the
+answer letter would be generated. The prompt is SemIf’s structured format (Lee, 2026) as adopted by Eikos:
+a JSON object with the evidence, the criterion and a list of options, each with a letter and a description, under a
+system instruction to answer with the uppercase letter of one option. Let $h_{t}(\theta)$ be the final hidden state at
+that position for a backbone with frozen weights and LoRA parameters $\theta$ , and let $W_{\!U}$ be the backbone’s
+own, frozen, unembedding matrix. The decision is
+
+ $p_{\theta}(o_{k}\mid s,q,O)\;=\;\frac{\exp\big(z_{\ell_{k}}\big)}{\sum_{j=1}^{K}\exp\big(z_{\ell_{j}}\big)},\qquad z=W_{\!U}\,h_{t}(\theta).$ 
+
+(1)
+
+We call this the letter readout (Figure 5). Only $\theta$ is trained. Boolean, choice and ordinal score questions share
+it. With single-letter labels, the configuration we use, one pass handles up to 26 options; larger sets are
+answered by a tournament over blocks of at most 26 whose winners are asked again.
+
+Equation 1 is the standard way of reading a class probability from a pretrained output layer, as in the
+verbalizers of prompt-based fine-tuning (Schick & Schütze, 2021; Gao et al., 2021) and monoT5’s “true”/“false”
+logits (Nogueira et al., 2020), and it keeps the backbone’s calibration over those letters. kev learns a pointer
+head from scratch and imajev trains a new $256\times d$ layer initialised from the rows of $W_{\!U}$ ; SemIf and Eikos add no
+parameters. Section 8 tests training the 26 letter rows.
+
+Prompt
+evidence $s$   criterion $q$ 
+options A  $o_{1}$   B  $o_{2}$   C  $o_{3}$ 
+answer position $t$ 
+
+Decoder backbone
+all weights frozen
+
+LoRA $\Delta W{=}BA$ , rank 64,
+on every linear layer
+
+Output layer $W_{\!U}$ 
+the model’s own, frozen;
+no new parameters
+
+logits of A,B,C
+ $\rightarrow$ softmax
+ $\rightarrow$ $p(o_{1}),p(o_{2}),p(o_{3})$ 
+ $h_{t}$ 
+
+training: soft cross-entropy
+to target distribution $y$ 
+ $+\,0.3\times$ rationale LM loss
+
+Figure 5: The model. One forward pass; the decision is read from the backbone’s own output layer at a
+single position, restricted to the letters in play. Only the LoRA matrices (blue) are trained; the
+rationale loss is used in training only.
+
+## 5.2 Recipe and data
+
+The recipe is Eikos’s and we tuned none of it: LoRA adapters of rank 64 on every linear projection, one epoch,
+learning rate $10^{-4}$ , effective batch 32, soft cross-entropy against a full target distribution over the options, an
+auxiliary loss on a short written rationale (weight 0.3, never used at inference (Hsieh et al., 2023)) and
+option order re-permuted per example. The 1B and 2B follow Eikos’s 4B settings (its first run, without weight
+averaging or auxiliary terms) and add a symmetric KL divergence (weight 0.5) between the option distributions of an item
+and of its English or Brazilian-Portuguese view; the 35B follows its 27B settings (no views, a 14,000-token context).
+Apart from the readout we ablated none of these choices. The data is the public eikos-decisions corpus (Vicentino, 2026) (CC BY 4.0), as cloned on 2026-09-24:
+programmatically generated items with computed answers, teacher distributions, derivatives of FinEntity
+(Tang et al., 2023), TAT-QA and GSM8K training data, long-context dossiers and the views. Our 1B and 2B used
+a snapshot of 25,130 rows (a task family, a topic and a language held out whole, 1,191 rows) plus 1,619 view rows;
+our 35B used 24,447 rows. A subset was retracted by the corpus author after our snapshot was taken
+(Section 9). Inference is one forward pass and a softmax over at most 26 logits at temperature 1;
+several questions about one state share a prefix, as in Eikos’s serving code
+(Kwon et al., 2023; Zheng et al., 2024b).
+
+## 6 Experimental setup
+
+Models and benchmark.
+
+We adapt MiniCPM5-1B, MiniCPM5-2B (Hu et al., 2024) and Qwen3.6-35B-A3B
+(Qwen Team, 2025) with Eikos’s settings by size (Section 5.2); each is
+trained once, with a single seed, and the 2B is released as a merged standalone model (Kailune-AI, 2026). We score the
+231 public JevBench items (commit fd54ea7, v1.4.2.2; later versions are not rerun) and recompute competitors from its published per-item records, so comparisons are paired (52
+systems have such records; we use 15, selected by us; imajev-4b publishes aggregates only). To measure what 111
+items cannot, we also use the seven-suite battery of the Eikos repository (7,371 items: the JevBench public items,
+DecisionBench, Eikos’s template-generated trade and rulebook suites, which make up 31%, a general battery and two
+finance suites) and its policy of deciding at confidence $\geq 0.9$ .
+
+Statistics.
+
+Paired comparisons use the exact McNemar test, and 95% intervals are exact Clopper–Pearson
+intervals (mapped to the difference for paired comparisons), except the ECE interval, a 20,000-sample bootstrap.
+Because we report many paired tests, we apply the Holm–Bonferroni correction (Holm, 1979) within the
+comparisons we report for each model (11 for the 35B, 15 for the 2B and 3 for the 1B, whose comparison with the
+commercial reference is descriptive; our selection, not preregistered), call a difference significant only if its
+adjusted $p$ is below 0.05, and call the rest not significant, which on 111 items is not evidence of equivalence. A
+111-item tier has 80% power only for differences of about ten points between two runs of one recipe (twelve to
+twenty between unrelated systems, which disagree on more items).
+
+## 7 Results on JevBench
+
+## 7.1 Accuracy and paired comparisons
+
+Table 3 gives hard-tier accuracy for 15 of the 52 systems whose outcomes the benchmark publishes (our
+selection; imajev-4b is added from its published aggregates) and the paired differences of our 35B and 2B from each.
+Of the 37 systems we did not compare, 11 score higher than our 2B (up to 76.6%) and none higher than our 35B.
+The 35B is significantly ahead of five open systems (Laya, kev 8B, reflex-4B, SemIf and jqv, the last two untrained)
+and behind the two frontier LLMs by 17.1 points. Against the commercial reference it is $+6.3$ points (unadjusted
+ $p=0.119$ ), so on 111 items we can say neither that it is better nor that the two are equivalent; so does djev, Winnow-12B and reflex-27B. The 35B’s five “ahead” rows do not depend on the choice of Holm family (the largest raw $p$ is 0.0003). The 2B is significantly ahead of Laya and of all four kev checkpoints, significantly behind reflex-27B
+and the frontier LLMs, and not significantly different from SemIf, jqv and reflex-4B (60–61% on the hard tier); the 1B is
+significantly ahead of kev 4B and Laya (a family of three, excluding the reference) and trails the commercial
+reference by 18.9 points. Three of the 2B’s verdicts sit at the edge: kev 8B, kev 0.6B and reflex-27B would not survive a correction over all 52 systems (adjusted
+ $p=0.148$ , 0.154 and 0.182), whereas “ahead of every kev checkpoint”, read as a conjunction, needs only that each
+raw $p$ is below 0.05 (the largest is 0.0055). Part II’s first question, whether a readout with no new parameters can
+be competitive, therefore has only a weak answer: the 35B is significantly ahead of five open systems and not shown to
+be worse than the commercial reference.
+
+Accuracy rises with size across our builds (54.1, 61.3 and 79.3) but not across kev’s checkpoints (29.7, 43.2, 36.9
+and 45.0 at 0.5B, 0.6B, 4B and 8B; the 8B is two items ahead of the 0.6B, $p=0.87$ ), which is the evidence behind
+Part I’s remark that kev scales poorly. Both patterns are suggestive only: our builds use different backbones and
+one seed each, the 1B–2B gap is below what a 111-item tier can resolve (Section 8), and kev’s
+checkpoints are of a previous generation, with a Qwen2.5 base at 0.5B (the Qwen3.5-based kev of Part I is not on the
+board); their 0.6B–4B inversion is seven items (exact McNemar $p=0.28$ ). SemIf’s 61.3 from an unmodified 4B is what
+letter logits give without task training, which our 2B matches at about 60% of the parameters; since the 35B’s lead
+over the untrained reflex-27B is not significant, these data do not show how much of its score comes from training.
+Two board systems run the same Qwen3.6-35B-A3B backbone (SimpleJev, 65.8, direct logits, and openjev-sglang, 73.0; the
+board describes no training for either); our 79.3 is 13.5 and 6.3 points above them, with no 35B per-item scores to
+pair. Eikos’s own models report 72.1 (4B) and 82.9 (27B) in its README, without per-item records, 11 and 4 points above our
+2B and 35B, so we do not claim that the recipe transfers without loss.
+
+Table 3: Hard-tier accuracy (111 public items, v1.4.2.2) and paired differences of our 35B and 2B from each system
+(points; Holm-adjusted $p$ in parentheses, within each model’s reported comparisons: 11 for the 35B, 15 for the 2B;
+∗ adjusted $p<0.05$ ; – not in that model’s family). “Training” is what the board or the project’s documentation
+says is trained. 2B rows are recomputed from per-item scores; 35B rows come from the original evaluation (merged rows share one recorded
+difference).
+
+System
+Training
+Hard
+35B vs. system
+2B vs. system
+
+DeepSeek Flash; GPT-5.6 Luna
+generative
+96.4
+ $-17.1$ ( $<$ .002)∗
+ $-35.1$ ( $<$ .0001)∗
+
+Ours 35B-A3B
+LoRA
+79.3
+
+reflex-27B
+none
+75.7
+ $+3.6$ (.48)
+ $-14.4$ (.049)∗
+
+Winnow-12B
+LoRA
+73.0
+ $+6.3$ (.42)
+ $-11.7$ (.18)
+
+Jev 1.13.0
+closed
+73.0
+ $+6.3$ (.36)
+ $-11.7$ (.088)
+
+imajev-4b
+LoRA, readout
+72.1
+–
+–
+
+djev
+none
+67.6
+ $+11.7$ (.096)
+ $-6.3$ (1.0)
+
+jqv; SemIf 4B
+none
+61.3
+ $+18.0$ (.002)∗
+ $0.0$ (1.0)
+
+Ours 2B
+LoRA
+61.3
+
+reflex-4B
+LoRA
+60.4
+ $+18.9$ ( $<$ .002)∗
+ $+0.9$ (1.0)
+
+Ours 1B
+LoRA
+54.1
+
+kev 8B
+LoRA, head
+45.0
+ $+34.2$ ( $<$ .002)∗
+ $+16.2$ (.046)∗
+
+kev 0.6B
+LoRA, head
+43.2
+–
+ $+18.0$ (.046)∗
+
+OpenJev Verdict 1.4
+encoder, trained
+36.9
+–
+ $+24.3$ (.001)∗
+
+kev 4B
+LoRA, head
+36.9
+–
+ $+24.3$ (.0002)∗
+
+Laya
+encoder, trained
+35.1
+ $+44.1$ ( $<$ .002)∗
+ $+26.1$ (.003)∗
+
+kev 0.5B
+LoRA, head
+29.7
+–
+ $+31.5$ ( $<$ .0001)∗
+
+## 7.2 Calibration and selective decisions
+
+For a decision system the operative question is often how wrong it is when it is confident enough to act without
+review. Table 4 reports, on the 7,371-item battery, the share of decisions made at confidence
+ $\geq 0.9$ and the error among them: the 35B commits on 42.3% of items and is wrong on 1.9% of those. Two cautions
+apply. First, up to 31% of the battery is template siblings of the training data, where the models are far more accurate:
+for the 2B the error among confident decisions is 4.2% on the full battery but 7.7% (95% interval 6.0–9.7) on the
+four external suites we could score per item. Second, the commercial system’s 5.9% is Eikos’s figure on six suites
+that exclude the JevBench public items and we did not rerun Jev, so the two are not comparable. On the hard tier
+our expected calibration error (ECE) is 0.084 (35B), 0.090 (1B) and 0.120 (2B), against imajev-4b’s published 0.082 after
+its fitted temperature, but ECE on 111 items is noisy (a bootstrap 95% interval for the 2B’s is $[0.079,0.208]$ ). A fitted temperature does not help our larger models: it comes out below one (0.80
+for the 35B, 0.95 for the 2B) and worsens hard-tier ECE on held-out halves of the public items. No held-out family, topic or language
+collapses toward chance at any size (Table 4, bottom).
+
+Table 4: Top: selective decisions and ECE on the 7,371-item battery, and for the 2B on the four external suites
+we could score per item (4,403 items); Jev’s figure is Eikos’s, on six other suites, and not comparable. Bottom: categorical held-out sets, accuracy (%) / ECE.
+
+Decided at $\geq$ 0.9
+Error among those
+ECE
+
+Ours 35B
+42.3%
+1.9%
+0.028
+
+Ours 2B
+27.0%
+4.2%
+0.021
+
+Ours 1B
+6.9%
+4.3%
+0.060
+
+Ours 2B, external suites
+19.1%
+7.7%
+–
+
+Jev 1.13.0
+–
+5.9%
+–
+
+Held out
+35B
+2B
+1B
+
+Family: tradeoff
+93.6 / .074
+85.9 / .051
+71.8 / .064
+
+Topic: healthcare adm.
+96.1 / .050
+90.5 / .056
+81.6 / .072
+
+Language: Spanish
+93.5 / .045
+89.0 / .041
+77.7 / .057
+
+## 8 Does the readout need to be trained?
+
+imajev-4b trains its readout rows and ships a frozen-rows fallback without
+comparing them. We ran that comparison as a single-variable ablation at two sizes, which also shows how much two
+single-seed runs can differ.
+
+Design.
+
+For MiniCPM5-1B and 2B we trained two arms with identical data, schedule and seed. In
+trained, the letter rows of $W_{\!U}$ are copied into a separate fp32 linear layer and unfrozen; in frozen,
+the same copied layer stays frozen. The arms differ only in whether those rows receive gradients (the readout gradient also enters the global
+clipping norm); the trained rows moved 5.4% (2B) and 4.1% (1B) in relative norm. This tests the mechanism, not imajev’s shipped configuration (256 rows, 655K parameters at
+4B, about a million decisions, five stages): ours updates 26 rows (53K parameters at 2B) on about 23K decisions.
+
+Table 5: Trained vs. frozen readout rows, one seed per arm (hard tier: 111 items; battery: 7,371 paired items).
+Control rows: frozen arm vs. released model of the same size (same readout rows; fp32 linear vs. bf16 gather; different
+trainer file); 1B interval not recomputed.
+
+Accuracy (%)
+
+Size
+Set
+trained
+frozen
+ $\Delta$ (pp)
+95% CI
+ $p$ 
+
+2B
+hard tier
+63.1
+67.6
+ $-4.5$ 
+ $[-11.0,+3.6]$ 
+0.332
+
+1B
+hard tier
+48.6
+54.1
+ $-5.4$ 
+ $[-11.2,+2.5]$ 
+0.210
+
+2B
+battery
+70.6
+70.2
+ $+0.41$ 
+ $[-0.43,+1.24]$ 
+0.348
+
+1B
+battery
+59.2
+58.8
+ $+0.41$ 
+ $[-0.40,+1.21]$ 
+0.330
+
+2B
+battery, control
+frozen vs. released
+ $-1.11$ 
+ $[-1.88,-0.34]$ 
+0.0046
+
+1B
+battery, control
+frozen vs. released
+ $+0.62$ 
+–
+0.059
+
+Result.
+
+Table 5 shows no detectable effect. On the hard tier the trained readout is
+nominally worse at both sizes, but neither difference is significant, and that tier’s minimum detectable effect is
+about ten points. On the 7,371-item battery the differences are $+0.41$ points at both sizes, with intervals whose upper ends are $+1.24$ 
+and $+1.21$ points, which reflect item sampling only, not the variation between training runs (below). With one seed per arm, training the readout buys
+no accuracy we can measure; that is a statement about benefits of about two points or more, and about this 26-row
+version of the idea.
+
+Run-to-run floor.
+
+A frozen arm and the released model of the same size have identical readout rows but
+compute the logits through an fp32 matrix product rather than a bf16 gather (identical in exact arithmetic, not
+numerically), come from different trainer files and share a seed. After 708 steps they differ by $-1.11$ points on the
+battery at $p=0.0046$ (2B) and $+0.62$ at $p=0.059$ (1B), and by $+6.3$ and $0.0$ points on the hard tier. McNemar’s
+test conditions on items but not on the variance between training trajectories, which here is confounded with the
+treatment. Two pairs cannot estimate run-to-run spread, but near-identical runs can differ by about a
+point on the battery and several points on the hard tier, so we treat pooled-battery differences below about 1.5
+points as unresolved regardless of $p$ .
+
+The hard-tier floor.
+
+A 2B retrained with Eikos’s 27B settings on the corpus release that applies the
+retraction of Section 9 (seed 7) scores 73.0% on the hard tier against 61.3% for the released
+2B: $+11.7$ points (95% interval $[+2.6,+17.6]$ , exact McNemar $p=0.011$ ). The runs differ in more than the seed
+(corpus release, code version of the imported Eikos modules, batch shape, context limit, and a loss with no view rows
+or view term), so the difference cannot be attributed to the seed, to the retraction or to any one other change. The
+2B-class runs we have (released 61.3, trained readout 63.1, frozen readout 67.6, an exploratory ordinal-loss arm 66.7,
+the retrain 73.0) span 61.3 to 73.0. Two pilot arms on that release added 2,400 generated drill rows (designed after
+inspecting public-item failures) or 1,739 CC BY sentiment rows and score 65.8 and 62.2, 7.2 and 10.8 below the
+retrain, so data changes alone moved the tier by 7 to 11 points. We read hard-tier differences below about ten points
+between 2B-class systems as unresolved.
+
+Relation to Part I.
+
+Part I (Section 4.4) found that a pointer head trained from scratch on other questions
+answered the untrained eight-way question at about chance (14% for the 27B; 4B heads initialised from kev’s checkpoint
+scored 52–59%). A readout with no new parameters has no such head, but we did not test the eight-way question with it; the held-out family, topic and language of Table 4 are the closest
+evidence that the letter readout transfers to question types unseen in training.
+
+## 9 Provenance, contamination and selection
+
+Training data and a retraction.
+
+All training data of the Part II models is the public
+eikos-decisions corpus (CC BY 4.0), apart from 1.7–2.4K public or programmatically generated rows added
+in two of the further runs of Section 8; no proprietary or internal data and no outputs of the
+commercial system were used. On 2026-09-27 the corpus author removed 1,994 FinEntity-derived rows,
+because those documents are test items of another benchmark suite (not the DecisionBench of our battery), and asked that they be excluded from future training. Our snapshots were taken on
+2026-09-24, so every Part II model, including the released 2B, was trained on them. We report no result on that
+suite, and an exact match of all 968 documents against five of our evaluation suites found no overlap. We retrained the 2B only without them. The retrain loses 23.0 points on the
+300-item financial-sentiment task of the battery’s finance suite (71.7% to 48.7%), a task closely related to what the
+retracted rows teach, with no significant change on the other two finance tasks (pooled $-2.5$ points, 95% interval
+ $[-6.6,+1.6]$ ), DecisionBench or the general battery, and gains 11.7 points on the JevBench hard tier
+(Section 8). The finance numbers in this paper therefore very probably depend on the retracted
+rows; the 1B and the 35B have not been retrained.
+
+Contamination.
+
+We applied the corpus author’s published check (word 8-grams over the state and the
+question instructions, containment in both directions, flagged above 0.15). Against the 231 public items, no row of
+the 1B/2B snapshot or of the 35B snapshot is flagged; the maximum containment is 0.0398 and positive controls fire. The check is lexical: it cannot
+detect paraphrase, translation or regeneration from a shared template, five public items are too short for it, and the teacher model that produced the soft
+labels may itself have seen the benchmark, a channel we cannot measure. The corpus also deliberately covers the
+benchmark’s task taxonomy.
+
+Selection.
+
+The released 2B was trained on 2026-09-24, before the benchmark was first downloaded to our
+machines; its development set is a hash split of our own corpus, it was trained once on a fixed schedule with no
+checkpoint selection, and it ships at temperature 1. The same cannot be said of the 1B or the 35B (both were trained or selected after public-item scores of earlier builds
+had been seen), of the drill arm of Section 8 (its rows were designed after inspecting public-item
+failures) or of further builds that we trained and do not report. We report the exact-recipe 35B, chosen when both 35B builds’ public scores were known (79.3 versus
+80.2 on hard), launched on 2026-09-27, the day of the retraction, from the snapshot of 2026-09-24. Their public-item
+numbers are therefore optimistic in the usual way. Nor are the recipe and the corpus independent of the public items:
+in its own JevBench submission the corpus author states that the 231 public items were one of the project’s
+development evaluation sets, used to choose its final checkpoint, and that they were never trained on. Our
+hyperparameters are the upstream ones, so the exposure is indirect. The comparison systems were
+likewise selected by us from the 52 with published per-item records.
+
+Reproducibility.
+
+Part II uses only public inputs (the Eikos corpus and code as cloned on 2026-09-24, the base
+models, JevBench’s public items and per-item records). Our released 2B is a merged standalone model
+(Kailune-AI, 2026); the 1B and 35B adapters and their per-item scores are not released. Part I’s inputs are internal session records and cannot be
+released (Section 2). Appendix F is the only appendix (Part I’s lettering and Tables 14–16).
+
+## 10 Limitations
+
+• 
+
+Part I evidence. The in-house judge uses kev’s pointer head rather than the readout of
+Part II. It is evaluated against the labels of a single frontier judge, which also confirmed the bank
+strata, on 200 class-balanced held-out sessions, 56 of which overlap the training records (the conclusions
+hold without them). The domain question covers eight of fourteen legacy categories, with no “other”
+option. Numbers come from the deployment’s own harness; self-hosted costs are GPU time priced at a reference
+rate, and full-pool figures are projections from measured latency.
+
+• 
+
+Borrowed recipe, data and evaluation. The training recipe, the corpus, the prompt format and
+the seven-suite evaluation battery with its confidence-0.9 decision policy are Eikos’s. Besides the readout we
+ablated only an exploratory ordinal-loss arm and two data-addition runs (Section 8), and our adapters inherit the corpus’s coverage, its teacher and its licence mix.
+
+• 
+
+No matched comparison and no untrained baselines of our own. We did not train a pointer head or
+an encoder on the same backbone and data, so the comparison with kev is across checkpoints that differ in base
+model, data and training, and we did not score our own backbones untrained, so what the adapters add is not
+measured (two board systems run the 35B’s backbone, Section 7). Nor did we train a cheap non-LLM
+classifier on Part I’s rendered state, the natural cost competitor to the typed judge, so Part I does not show that
+the typed interface is needed for its savings. The ablation tests a 26-row version of imajev’s readout, not its shipped configuration.
+
+• 
+
+No sealed measurement. Every JevBench number above is on the public half of v1.4.2.2, and systems score
+far lower on the sealed half than on the public items; we report no sealed result.
+
+• 
+
+One seed and selection. The observed difference between near-identical runs is about one point on a 7,371-item battery
+(1.1 and 0.6 in two pairs; we treat differences below 1.5 as unresolved)
+and, from one retrain that differs in more than the seed, about ten points on the hard tier; effects below those
+sizes are unresolved, including the readout ablation. The 1B
+and the 35B were developed with the public items visible, the upstream recipe was itself exposed to them indirectly
+(§9), and we chose the comparison systems and multiplicity families from 52 systems with
+per-item records.
+
+• 
+
+Retracted training rows. All Part II models were trained on since-retracted rows; only the 2B was
+retrained without them, in a run that differs in more than the data.
+
+• 
+
+Evaluation suites. The trade and rulebook suites are template siblings of training data (up to 31% of the
+battery), so battery-wide confident-error rates are lower than on external suites. The commercial reference appears
+only through JevBench’s per-item records and, for confident-decision error, Eikos’s published figure. The raw $p$ -values of the 35B and 1B comparisons come from the original
+evaluation, whose per-item files are not released; the Holm adjustments were applied here. The 35B needs about 80 GB of memory.
+
+## 11 Conclusion and next steps
+
+The typed-decision pattern holds up in both settings we studied. In-house (Part I), a self-hosted
+System 1 judge turns a projected $1,000, 73-hour LLM-judge pass over 148K coding session records into about
+seven GPU-hours, without any session leaving the organisation, at accuracy that 200 held-out sessions cannot
+distinguish between a 4B and a 27B backbone. In the open (Part II), reading a language model’s own output
+layer in one forward pass, with a LoRA adapter trained on about 25K public decisions under the Eikos recipe and no
+new parameters, gives a 35B that is significantly ahead of five open systems (two without task training) on
+the hard tier and not significantly different from the commercial reference, and a 2B that is ahead of all four kev
+checkpoints on the board; training 26 letter rows on top of the output layer bought nothing we could measure at
+one seed. Small evaluation sets bound what either part can claim: a 111-item tier has 80% power only for differences
+of about ten points between two runs of one recipe and a retrain on a later corpus release (with other changes) moved
+our 2B by 11.7 points on it.
+
+Three steps follow. First, a sealed evaluation of our 2B, together with a multi-seed replication of the readout ablation and a
+retraining of every model without the retracted rows. Second, the 2B rather than the 35B as the candidate deployable
+open model, once retrained without the retracted rows: its single-question latency on one H100 is about a quarter of
+the 35B’s (20.5 against 83.2 ms). Third, pointing the open recipe at our own
+decisions: other bounded, high-volume decisions in the organisation (for example triage, routing and
+categorisation) share the evidence, question and options shape of Part I, and there we will compare the zero-parameter letter readout against the pointer
+head directly.
+
+## Broader Impact Statement
+
+Typed-decision models are built to automate high-volume decisions, some of which affect people: eligibility,
+prioritisation and routing of requests. Calibrated probabilities and the low error rate we measure
+among confident decisions make it tempting to let such systems act without review. Those error rates
+are measured on benchmark items, not on any deployment distribution, and Section 8
+shows how little a small public tier can resolve. Deployments should
+re-measure calibration on their own traffic, keep humans in the loop for consequential decisions,
+and treat the confidence threshold as a policy choice. On the positive side, self-hosting keeps
+sensitive inputs within the organisation that holds them and makes model versions auditable.
+
+## Acknowledgments
+
+We thank the author of Eikos for the open corpus, recipe and code, and the JevBench maintainer for the per-item records.
+
+## References
+
+Berg-Kirkpatrick et al. (2012)
+
+Taylor Berg-Kirkpatrick, David Burkett, and Dan Klein.
+
+An empirical investigation of statistical significance in NLP.
+
+In Joint Conference on Empirical Methods in Natural Language Processing and Computational Natural Language Learning, pp. 995–1005, 2012.
+
+URL https://aclanthology.org/D12-1091/.
+
+Bouthillier et al. (2021)
+
+Xavier Bouthillier, Pierre Delaunay, Mirko Bronzi, Assya Trofimov, Brennan Nichyporuk, Justin Szeto, Nazanin Mohammadi Sepahvand, Edward Raff, Kanika Madan, Vikram Voleti, Samira Ebrahimi Kahou, Vincent Michalski, Tal Arbel, Chris Pal, Gaël Varoquaux, and Pascal Vincent.
+
+Accounting for variance in machine learning benchmarks.
+
+In Proceedings of Machine Learning and Systems, 2021.
+
+Bowyer et al. (2025)
+
+Sam Bowyer, Laurence Aitchison, and Desi R. Ivanova.
+
+Position: Don’t use the CLT in LLM evals with fewer than a few hundred datapoints.
+
+In International Conference on Machine Learning, pp. 81143–81184, 2025.
+
+URL https://proceedings.mlr.press/v267/bowyer25a.html.
+
+arXiv:2503.01747.
+
+Brier (1950)
+
+Glenn W. Brier.
+
+Verification of forecasts expressed in terms of probability.
+
+Monthly Weather Review, 78(1):1–3, 1950.
+
+Brown et al. (2020)
+
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al.
+
+Language models are few-shot learners.
+
+In Advances in Neural Information Processing Systems, 2020.
+
+Card et al. (2020)
+
+Dallas Card, Peter Henderson, Urvashi Khandelwal, Robin Jia, Kyle Mahowald, and Dan Jurafsky.
+
+With little power comes great responsibility.
+
+In Conference on Empirical Methods in Natural Language Processing, 2020.
+
+Clopper & Pearson (1934)
+
+C. J. Clopper and E. S. Pearson.
+
+The use of confidence or fiducial limits illustrated in the case of the binomial.
+
+Biometrika, 26(4):404–413, 1934.
+
+Cohen (1960)
+
+Jacob Cohen.
+
+A coefficient of agreement for nominal scales.
+
+Educational and Psychological Measurement, 20(1):37–46, 1960.
+
+Convai Innovations (2026)
+
+Convai Innovations.
+
+Laya.
+
+https://huggingface.co/convaiinnovations/laya, 2026.
+
+Dietterich (1998)
+
+Thomas G. Dietterich.
+
+Approximate statistical tests for comparing supervised classification learning algorithms.
+
+Neural Computation, 10(7):1895–1923, 1998.
+
+Dodge et al. (2020)
+
+Jesse Dodge, Gabriel Ilharco, Roy Schwartz, Ali Farhadi, Hannaneh Hajishirzi, and Noah Smith.
+
+Fine-tuning pretrained language models: Weight initializations, data orders, and early stopping.
+
+arXiv preprint arXiv:2002.06305, 2020.
+
+Dror et al. (2018)
+
+Rotem Dror, Gili Baumer, Segev Shlomov, and Roi Reichart.
+
+The hitchhiker’s guide to testing statistical significance in natural language processing.
+
+In Annual Meeting of the Association for Computational Linguistics, pp. 1383–1392, 2018.
+
+URL https://aclanthology.org/P18-1128/.
+
+Efron & Tibshirani (1993)
+
+Bradley Efron and Robert J. Tibshirani.
+
+An Introduction to the Bootstrap.
+
+Chapman & Hall, 1993.
+
+El-Yaniv & Wiener (2010)
+
+Ran El-Yaniv and Yair Wiener.
+
+On the foundations of noise-free selective classification.
+
+Journal of Machine Learning Research, 11(53):1605–1641, 2010.
+
+URL https://www.jmlr.org/papers/v11/el-yaniv10a.html.
+
+Gao et al. (2021)
+
+Tianyu Gao, Adam Fisch, and Danqi Chen.
+
+Making pre-trained language models better few-shot learners.
+
+In Annual Meeting of the Association for Computational Linguistics and the International Joint Conference on Natural Language Processing, pp. 3816–3830, 2021.
+
+URL https://aclanthology.org/2021.acl-long.295/.
+
+arXiv:2012.15723.
+
+Garg (2026)
+
+Mohit Garg.
+
+imajev: An open Jev-style decision model for images and text.
+
+https://github.com/mohit67890/imajev, 2026.
+
+Geifman & El-Yaniv (2017)
+
+Yonatan Geifman and Ran El-Yaniv.
+
+Selective classification for deep neural networks.
+
+In Advances in Neural Information Processing Systems, 2017.
+
+Guo et al. (2017)
+
+Chuan Guo, Geoff Pleiss, Yu Sun, and Kilian Q. Weinberger.
+
+On calibration of modern neural networks.
+
+In International Conference on Machine Learning, 2017.
+
+heman10x (2026)
+
+heman10x.
+
+openJev Verdict.
+
+https://huggingface.co/heman10x/rlcd-modernbert-151m, 2026.
+
+Hendrycks et al. (2021)
+
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and Jacob Steinhardt.
+
+Measuring massive multitask language understanding.
+
+In International Conference on Learning Representations, 2021.
+
+Hinton et al. (2015)
+
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean.
+
+Distilling the knowledge in a neural network.
+
+arXiv preprint arXiv:1503.02531, 2015.
+
+Holm (1979)
+
+Sture Holm.
+
+A simple sequentially rejective multiple test procedure.
+
+Scandinavian Journal of Statistics, 6(2):65–70, 1979.
+
+URL https://www.jstor.org/stable/4615733.
+
+Hsieh et al. (2023)
+
+Cheng-Yu Hsieh, Chun-Liang Li, Chih-Kuan Yeh, Hootan Nakhost, Yasuhisa Fujii, Alexander Ratner, Ranjay Krishna, Chen-Yu Lee, and Tomas Pfister.
+
+Distilling step-by-step! outperforming larger language models with less training data and smaller model sizes.
+
+In Findings of the Association for Computational Linguistics: ACL, 2023.
+
+Hu et al. (2022)
+
+Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen.
+
+LoRA: Low-rank adaptation of large language models.
+
+In International Conference on Learning Representations, 2022.
+
+arXiv:2106.09685.
+
+Hu et al. (2024)
+
+Shengding Hu, Yuge Tu, Xu Han, Chaoqun He, Ganqu Cui, Xiang Long, Zhi Zheng, Yewei Fang, Yuxiang Huang, Weilin Zhao, et al.
+
+MiniCPM: Unveiling the potential of small language models with scalable training strategies.
+
+arXiv preprint arXiv:2404.06395, 2024.
+
+Kadavath et al. (2022)
+
+Saurav Kadavath, Tom Conerly, Amanda Askell, Tom Henighan, Dawn Drain, Ethan Perez, Nicholas Schiefer, Zac Hatfield-Dodds, Nova DasSarma, Eli Tran-Johnson, et al.
+
+Language models (mostly) know what they know.
+
+arXiv preprint arXiv:2207.05221, 2022.
+
+Kahneman (2011)
+
+Daniel Kahneman.
+
+Thinking, Fast and Slow.
+
+Farrar, Straus and Giroux, 2011.
+
+Kailune-AI (2026)
+
+Kailune-AI.
+
+pjev-2b: a LoRA typed-decision model on MiniCPM5-2B.
+
+https://huggingface.co/Kailune-AI/pjev-2b, 2026.
+
+kshetrajna12 (2026)
+
+kshetrajna12.
+
+reflex.
+
+https://github.com/kshetrajna12/reflex, 2026.
+
+Kwon et al. (2023)
+
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Stoica.
+
+Efficient memory management for large language model serving with PagedAttention.
+
+In ACM Symposium on Operating Systems Principles, 2023.
+
+Lee (2026)
+
+Theodore Lee.
+
+SemIf, formerly OpenJev.
+
+https://github.com/TheoLeeCJ/openjev, 2026.
+
+Li et al. (2024)
+
+Jeffrey Li, Alex Fang, Georgios Smyrnis, Maor Ivgi, Matt Jordan, Samir Gadre, Hritik Bansal, Etash Guha, Sedrick Keh, Kushal Arora, et al.
+
+DataComp-LM: In search of the next generation of training sets for language models.
+
+arXiv preprint arXiv:2406.11794, 2024.
+
+Madaan et al. (2024)
+
+Lovish Madaan, Aaditya K. Singh, Rylan Schaeffer, Andrew Poulton, Sanmi Koyejo, Pontus Stenetorp, Sharan Narang, and Dieuwke Hupkes.
+
+Quantifying variance in evaluation benchmarks.
+
+arXiv preprint arXiv:2406.10229, 2024.
+
+Maisa (2026)
+
+Maisa.
+
+djev.
+
+https://github.com/Davipar/djev-dev, 2026.
+
+Mangrulkar et al. (2022)
+
+Sourab Mangrulkar, Sylvain Gugger, Lysandre Debut, Younes Belkada, Sayak Paul, Benjamin Bossan, and Marian Tietz.
+
+PEFT: State-of-the-art parameter-efficient fine-tuning methods.
+
+https://github.com/huggingface/peft, 2022.
+
+McNemar (1947)
+
+Quinn McNemar.
+
+Note on the sampling error of the difference between correlated proportions or percentages.
+
+Psychometrika, 12(2):153–157, 1947.
+
+Miller (2024)
+
+Evan Miller.
+
+Adding error bars to evals: A statistical approach to language model evaluations.
+
+arXiv preprint arXiv:2411.00640, 2024.
+
+URL https://arxiv.org/abs/2411.00640.
+
+Naeini et al. (2015)
+
+Mahdi Pakdaman Naeini, Gregory F. Cooper, and Milos Hauskrecht.
+
+Obtaining well calibrated probabilities using Bayesian binning.
+
+In AAAI Conference on Artificial Intelligence, 2015.
+
+Nogueira et al. (2020)
+
+Rodrigo Nogueira, Zhiying Jiang, Ronak Pradeep, and Jimmy Lin.
+
+Document ranking with a pretrained sequence-to-sequence model.
+
+In Findings of the Association for Computational Linguistics: EMNLP, pp. 708–718, 2020.
+
+URL https://aclanthology.org/2020.findings-emnlp.63/.
+
+arXiv:2003.06713.
+
+Octalab (2026)
+
+Octalab.
+
+jqv.
+
+https://github.com/Octalab-Inc/jqv, 2026.
+
+Palmer (2026)
+
+Jared Palmer.
+
+kev: Typed decisions with a pointer head.
+
+https://github.com/jaredpalmer/kev, 2026.
+
+Penedo et al. (2024)
+
+Guilherme Penedo, Hynek Kydlíček, Loubna Ben Allal, Anton Lozhkov, Margaret Mitchell, Colin Raffel, Leandro Von Werra, and Thomas Wolf.
+
+The FineWeb datasets: Decanting the web for the finest text data at scale.
+
+arXiv preprint arXiv:2406.17557, 2024.
+
+Pezeshkpour & Hruschka (2024)
+
+Pouya Pezeshkpour and Estevam Hruschka.
+
+Large language models sensitivity to the order of options in multiple-choice questions.
+
+In Findings of the Association for Computational Linguistics: NAACL, 2024.
+
+Qwen Team (2025)
+
+Qwen Team.
+
+Qwen3 technical report.
+
+arXiv preprint arXiv:2505.09388, 2025.
+
+Ring (2026)
+
+Eldan Ring.
+
+Winnow-12B.
+
+https://huggingface.co/EldanRing/Winnow-12B, 2026.
+
+Robinson & Wingate (2023)
+
+Joshua Robinson and David Wingate.
+
+Leveraging large language models for multiple choice question answering.
+
+In International Conference on Learning Representations, 2023.
+
+Sainz et al. (2023)
+
+Oscar Sainz, Jon Ander Campos, Iker García-Ferrero, Julen Etxaniz, Oier Lopez de Lacalle, and Eneko Agirre.
+
+NLP evaluation in trouble: On the need to measure LLM data contamination for each benchmark.
+
+In Findings of the Association for Computational Linguistics: EMNLP, 2023.
+
+Schick & Schütze (2021)
+
+Timo Schick and Hinrich Schütze.
+
+Exploiting cloze-questions for few-shot text classification and natural language inference.
+
+In Conference of the European Chapter of the Association for Computational Linguistics, pp. 255–269, 2021.
+
+URL https://aclanthology.org/2021.eacl-main.20/.
+
+arXiv:2001.07676.
+
+Standhartinger (2026)
+
+Florian Standhartinger.
+
+JevBench: A benchmark for typed one-pass decision models.
+
+https://github.com/fstandhartinger/jevbench; leaderboard at https://benchmarkheaven.com/jev-models, 2026.
+
+Public split at commit fd54ea7.
+
+Summers & Dinneen (2021)
+
+Cecilia Summers and Michael J. Dinneen.
+
+Nondeterminism and instability in neural network optimization.
+
+In International Conference on Machine Learning, pp. 9913–9922, 2021.
+
+URL https://proceedings.mlr.press/v139/summers21a.html.
+
+arXiv:2103.04514.
+
+Tang et al. (2023)
+
+Yixuan Tang, Yi Yang, Allen H. Huang, Andy Tam, and Justin Z. Tang.
+
+FinEntity: Entity-level sentiment classification for financial texts.
+
+In Conference on Empirical Methods in Natural Language Processing, 2023.
+
+TypeSafe AI (2026)
+
+TypeSafe AI.
+
+Jev: Typed decisions from language models.
+
+Commercial API, 2026.
+
+Version 1.13.0 as evaluated on JevBench.
+
+Vicentino (2026)
+
+Caio Vicentino.
+
+Eikos: Open, calibrated, single-pass typed-decision models for finance and trading.
+
+https://github.com/caiovicentino/eikos; dataset at https://huggingface.co/datasets/caiovicentino1/eikos-decisions (CC BY 4.0), 2026.
+
+Warner et al. (2024)
+
+Benjamin Warner, Antoine Chaffin, Benjamin Clavié, Orion Weller, Oskar Hallström, Said Taghadouini, Alexis Gallagher, Raja Biswas, Faisal Ladhak, Tom Aarsen, Nathan Cooper, Griffin Adams, Jeremy Howard, and Iacopo Poli.
+
+Smarter, better, faster, longer: A modern bidirectional encoder for fast, memory efficient, and long context finetuning and inference.
+
+arXiv preprint arXiv:2412.13663, 2024.
+
+Zhao et al. (2021)
+
+Tony Z. Zhao, Eric Wallace, Shi Feng, Dan Klein, and Sameer Singh.
+
+Calibrate before use: Improving few-shot performance of language models.
+
+In International Conference on Machine Learning, pp. 12697–12706, 2021.
+
+URL https://proceedings.mlr.press/v139/zhao21c.html.
+
+arXiv:2102.09690.
+
+Zheng et al. (2024a)
+
+Chujie Zheng, Hao Zhou, Fandong Meng, Jie Zhou, and Minlie Huang.
+
+Large language models are not robust multiple choice selectors.
+
+In International Conference on Learning Representations, 2024a.
+
+Zheng et al. (2023)
+
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric P. Xing, Hao Zhang, Joseph E. Gonzalez, and Ion Stoica.
+
+Judging LLM-as-a-judge with MT-Bench and Chatbot Arena.
+
+In Advances in Neural Information Processing Systems, Datasets and Benchmarks Track, 2023.
+
+Zheng et al. (2024b)
+
+Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E. Gonzalez, Clark Barrett, and Ying Sheng.
+
+SGLang: Efficient execution of structured language model programs.
+
+In Advances in Neural Information Processing Systems, 2024b.
+
+Zhuang et al. (2022)
+
+Donglin Zhuang, Xingyao Zhang, Shuaiwen Leon Song, and Sara Hooker.
+
+Randomness in neural network training: Characterizing the impact of tooling.
+
+In Proceedings of Machine Learning and Systems, pp. 316–336, 2022.
+
+URL https://proceedings.mlsys.org/paper_files/paper/2022/hash/427e0e886ebf87538afdf0badb805b7f-Abstract.html.
+
+arXiv:2106.11872.
+
+4, 7, 8, 24, 27, 41, 32, 42, 57

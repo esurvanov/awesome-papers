@@ -1,0 +1,2268 @@
+## VPFlow: Value-Predictive Planning with Imperfect World Models for Offline Goal Reaching
+
+Yunzhe Hu, Dong Xu
+
+Affiliation: School of Computing and Data Science 
+
+The University of Hong Kong
+
+Abstract
+
+Offline goal-conditioned reinforcement learning enables skill acquisition by reaching any goal from any state without dense rewards. Model-based methods allow for planning by scaling test-time compute to solve complex tasks. Combining both holds appealing promise for pre-training on suboptimal demonstrations and zero-shot adaptation via goal specification and planning. Yet existing methods assume effective planning requires accurate next-state prediction in pixel or latent space. In this work, we show that value prediction is more useful for planning, whereas accurate state prediction is often unnecessary. Our key insight is that offline goal reaching naturally admits a closed-form Monte Carlo return, enabling value regression to replace temporal-difference bootstrapping. We use this return as the sole supervision for latent world models: imagined latents are trained to predict goal-reaching value rather than match future states, implicitly preventing representation collapse. These planning-oriented representations let imperfect world models imagine on the level sets of value field beyond dataset transitions. We then present VPFlow, a value-predictive planner that pairs the world models with a one-step flow policy and plans in its noise space via evolutionary search. It enables policy improvement with imagined generalized advantage and reduces out-of-distribution queries common in action-space planning. On 30 state and pixel OGBench datasets, VPFlow surpasses model-free baselines by at least 30.3 and 10.1 percentage points in success rate, respectively, and outperforms latent planners LeWorldModel, PLDM, and TD-MPC2. It achieves this despite a latent prediction error orders of magnitude larger than with state prediction, while minimizing this error lowers success rates. This demonstrates that value-predictive representations, not exact state prediction, are what offline planning requires.
+
+††correspondence: yzhu@cs.hku.hk
+
+## 1 Introduction
+
+Offline reinforcement learning (RL) seeks to learn reusable behaviors purely from previously
+collected trajectories with no additional environment interaction (Levine et al., 2020).
+In its goal-conditioned setting, an agent is tasked with reaching a desired goal at test time without optimizing a hand-designed reward (Kaelbling, 1993; Schaul et al., 2015; Park et al., 2025a).
+This makes offline goal reaching especially attractive for reward-free skill acquisition: relabeling future observations as goals turns one unlabeled dataset into supervision for many tasks (Andrychowicz et al., 2017).
+Pairing it with model-based planning is a natural next step: pre-train on offline data once, then adapt to new goals in zero shot by searching over imagined futures at test time.
+This combination is promising, yet comparatively unexplored.
+
+Figure 1: State-predictive and value-predictive action-conditioned latent world models.
+Left: Joint-embedding predictive architecture (JEPA) aligns predicted and future
+latents with a joint encoder and explicit regularization, e.g., variance-invariance-covariance
+regularization (VICReg) or sketched isotropic Gaussian regularization (SIGReg).
+Middle: TD-MPC learns values from one-step
+temporal-difference (TD) targets, with source and target encoders, stop-gradient, and
+exponential moving average (EMA) heuristics.
+Right: VPFlow trains the latent dynamics and encoders jointly via value prediction:
+predicted latent states seek accurate goal-reaching value estimates, not future states.
+Closed-form hindsight Monte Carlo (MC) returns provide the temporal signal and act as an implicit regularizer.
+
+Strong offline goal-conditioned methods, spanning implicit Q-learning (Kostrikov et al., 2022), contrastive learning (Eysenbach et al., 2022), and quasi-metric representations (Wang et al., 2023; Myers et al., 2025), learn a reactive policy or value function from relabeled
+trajectories and act greedily at deployment.
+While robust and efficient, they are static at test time: once training ends, additional inference compute cannot improve decisions on challenging tasks.
+Model-based planning offers a complementary advantage.
+From Dyna to TD-MPC (Sutton, 1991; Hafner et al., 2019; Hafner et al., 2020; Hansen et al., 2022), learned world models convert extra test-time compute into better decisions by searching over imagined futures.
+Yet these methods share a foundational assumption that has migrated from pixels to latents largely unquestioned: the world model must accurately predict the next state, or the next latent embedding,
+for planning to succeed (Hafner et al., 2019; Schwarzer et al., 2021; Sobal et al., 2025; Maes et al., 2026b).
+
+We argue that this state-predictive assumption is both overly restrictive and misdirected.
+What a planner needs is not a model that reproduces the next observation, but one that preserves the
+relative ordering of candidate futures according to their goal-reaching value.
+This view builds on a rich lineage: value prediction networks learn dynamics only as much as they
+reproduce Bellman backups (Oh et al., 2017); universal value functions and successor representations
+factor value into future occupancy and a goal-dependent readout
+(Dayan, 1993; Schaul et al., 2015; Barreto et al., 2017); and the value-equivalence
+principle formalizes when a model that is inaccurate as a simulator remains exact for control
+(Grimm et al., 2020).
+We take this principle a step further: an imagined latent only needs to land on the right level set
+of the value field, so the representation worth learning for planning is value-predictive rather than state-predictive.
+Offline goal reaching makes this directly actionable.
+Because the relabeled reward is sparse, the Monte Carlo (MC) return from any state to any future
+goal on its trajectory is a closed-form function of their temporal distance.
+Value learning thus simplifies from temporal-difference bootstrapping to direct regression, and
+that regression target can supervise the latent dynamics end to end, acting as an implicit
+regularizer against representation collapse.
+A model trained this way may be an imperfect simulator yet remain an effective planner.
+
+Motivated by this view, we introduce Value-Predictive Flow (VPFlow), which plans for offline goal-reaching tasks with a deliberately imperfect world model.
+VPFlow jointly learns an observation encoder, a goal-agnostic latent dynamics model, and goal-conditioned value heads alongside a distilled flow-matching policy with action chunks.
+Imagined latents are trained purely to be value-predictive: rolled forward with dataset
+actions, the value predicted at each imagined latent is regressed towards the closed-form return of
+the corresponding future state.
+No observation is reconstructed, no target latent is matched, and no bootstrapped target network is
+required.
+Figure 1 contrasts alternative latent-predictive architectures with ours.
+
+To translate a value-predictive model into reliable control, the planner must propose feasible,
+in-support actions.
+Standard zeroth-order planners such as the cross-entropy method (CEM) and model predictive path
+integral (MPPI) (Rubinstein, 1999; Williams et al., 2017) perturb raw action sequences, which in
+offline settings quickly leave the data support and expose the value function to out-of-distribution
+(OOD) queries.
+VPFlow instead searches in the noise space of its one-step flow policy (Park et al., 2025c),
+where each candidate noise vector decodes into action chunks at the current latent state.
+Because of behavior-cloning regularization, the noise search warm-starts at multi-modal, in-support
+proposals and stays anchored to the data manifold.
+We guide this noise steering using the generalized advantage estimator (GAE) (Schulman et al., 2016)
+over imagined rollouts, instantiated as an evolution strategy via annealed mutation and
+elite selection.
+
+Across 30 locomotion and manipulation datasets from OGBench (Park et al., 2025a), VPFlow
+raises the mean success rate from $32.9\%$ to $63.2\%$ over 17 state datasets and from $27.5\%$ to
+ $37.6\%$ over 13 pixel datasets relative to the strongest non-hierarchical baselines, while
+substantially outperforming the latent state-predictive planners LeWorldModel (Maes et al., 2026b), PLDM (Sobal et al., 2025), and TD-MPC2 (Hansen et al., 2024).
+Crucially, these gains hold while the model’s next-latent prediction error sits orders of magnitude
+above that of its state-predictive counterpart; conversely, enforcing state prediction closes that
+gap at the cost of lowering the success rate.
+This demonstrates that offline planning does not require a faithful state simulator, but
+rather a value-predictive one. Our contributions are as follows:
+
+1. 
+
+We argue and demonstrate that value-predictive latent world models, trained solely via
+closed-form Monte Carlo return regression, avoid representation collapse and suffice for offline
+planning even as state-prediction error grows, challenging the pervasive assumption of
+learning state-predictive world models for planning.
+
+2. 
+
+We propose a test-time planning algorithm tailored to generative flow policies in their
+noise space, steering initial noise towards higher imagined generalized advantage while avoiding
+the out-of-distribution action queries of existing action-space planning methods.
+
+3. 
+
+We show across 30 state and pixel datasets on OGBench that VPFlow surpasses model-free
+baselines and latent state-predictive planners, and scales favorably with test-time compute on
+long-horizon tasks.
+
+\titlespacing
+
+*
+
+## 2 
+
+0pt2.4ex plus 0.5ex minus 0.2ex1.4ex plus 0.2ex
+
+## 3 Related Work
+
+We position VPFlow within three lines of work with broader literature in
+Appendix A.
+
+Offline goal-conditioned RL.
+Offline RL learns a policy from pre-collected datasets without interacting with the environment,
+and needs techniques to keep actions on the data manifold during value learning
+(Levine et al., 2020; Kostrikov et al., 2022; Kumar et al., 2020; Fujimoto and Gu, 2021; Park et al., 2025c). In the goal-conditioned setting, an
+agent aims to reach any goal from any state (Kaelbling, 1993), and hindsight
+relabeling (Andrychowicz et al., 2017) can convert any trajectories, even failed ones, into
+successful ones with the goal actually reached. With high-coverage datasets, this may enable
+learning a universal value function that empowers the policy to generalize to unseen goals in
+zero shot (Schaul et al., 2015; Park et al., 2024).
+
+Representations for planning with world models.
+World models seek a compact representation and transition dynamics from observations, where value
+can be learned in imagination (Sutton, 1991; Ha and Schmidhuber, 2018; Hafner et al., 2020; Hansen et al., 2022). Yet what representations are more effective for planning is
+still an open question. Reconstruction-based methods harness the dense supervision from pixels and
+have achieved remarkable success (Hafner et al., 2019; Hafner et al., 2025a). Self-predictive
+representation holds promise for a more powerful model
+(Schwarzer et al., 2021; LeCun, 2022; Bagatella et al., 2026), but needs stop-gradient, EMA,
+or regularization to prevent collapse (Sobal et al., 2025; Maes et al., 2026b). More critically,
+it fails to exploit the rich temporal-distance supervision naturally available from goal reaching.
+This makes its usefulness for planning not directly obvious. Our work aims to reveal what is
+essential and necessary for planning-oriented representations.
+
+Test-time search.
+With a learned world model, previous studies primarily plan actions by sampling-based optimization
+(Williams et al., 2017; Janner et al., 2019; Hafner et al., 2019; Hansen et al., 2022; Park et al., 2026) or
+search (Schrittwieser et al., 2020). Yet action-space planning may suffer heavily in the offline
+setting, especially with low-coverage data, in that off-manifold actions can severely exploit the
+planning objective.
+Advances in generative policies have turned to steering the noise at test time
+to keep actions in-distribution, but they need reward or other external signals and have yet to
+show scaling effectiveness (Yang et al., 2024; Wagenmaker et al., 2025; Patil et al., 2026).
+In contrast, VPFlow can improve itself at test time by noise steering11
+ 1
+
+ We use “steering”, “planning”, and “searching” interchangeably in this paper. with imagined
+rollouts, even with imperfect world models.
+
+## 4 Problem Statement and Preliminaries
+
+Offline goal reaching.
+We consider the offline goal-conditioned reinforcement learning problem as a reward-free controlled
+Markov decision process (MDP) $\mathcal{M}=(\mathcal{S},\mathcal{A},\gamma,P)$ , where
+ $\mathcal{S}$ denotes the state space, $\mathcal{A}$ denotes the action space, $\gamma\in[0,1)$ 
+denotes the discount factor, and $P:\mathcal{S}\times\mathcal{A}\to\Delta(\mathcal{S})$ 
+denotes the transition dynamics mapping state and action to another state distribution
+ $\Delta(\cdot)$ . Given a dataset $\mathcal{D}=\{\tau^{(i)}\}_{i=1}^{N_{\mathcal{D}}}$ of
+ $N_{\mathcal{D}}$ 
+trajectories $\tau^{(i)}=(s_{0}^{(i)},a_{0}^{(i)},s_{1}^{(i)},\dots,s_{T_{i}}^{(i)})$ of length $T_{i}$ ,
+collected by a behavior policy22
+ 2
+
+ No assumption on its optimality., the objective is
+to learn a goal-conditioned policy $\pi(a\mid s,g)$ that maximizes the expected discounted
+utility $\mathbb{E}_{\tau}[\sum_{t=0}^{\infty}\gamma^{t}\delta_{g}(s_{t})]$ for any goal $g\in\mathcal{S}$ . Here, $\delta_{g}(s_{t})$ has been referred to as the
+“Dirac delta function” (Park et al., 2025a). In practice, we consider it as the indicator
+function $\mathds{1}_{\{s_{t}=g\}}$ that represents the relabeled sparse reward:
+
+ $r(s_{t},g)\coloneqq\begin{cases}1,&\text{if }s_{t}=g,\\
+0,&\text{otherwise}.\end{cases}$ 
+
+(1)
+
+Model predictive control.
+Given a transition dynamics model $f:\mathcal{S}\times\mathcal{A}\to\mathcal{S}$ , model
+predictive control (MPC) addresses an online constrained optimal control problem with a lookahead
+horizon $H$ and an action sequence $a_{t:t+H-1}=(a_{t},\dots,a_{t+H-1})$ at the current state $s_{t}$ ,
+then executes the first action $a_{t}$ , and re-plans at the next state. More formally, MPC solves the
+following optimization problem at time step $t$ :
+
+ $\min_{a_{t:t+H-1}}\sum_{h=0}^{H-1}\ell_{t}(s_{t+h},a_{t+h})+\ell_{f}(s_{t+H}),\quad\text{s.t.}\quad s_{t+1}=f(s_{t},a_{t}),$ 
+
+(2)
+
+where $\ell_{t}(s,a)$ and $\ell_{f}(s)$ are the running and terminal cost functions of interest. After
+finding the minimizer $a_{t:t+H-1}^{\star}$ of Equation 2, only the first action $a_{t}^{\star}$ 
+is applied due to the compounding error in the dynamics.
+In the model-based RL context, the cost has been instantiated using negative reward $r_{t}(s_{t},a_{t})$ and the value function $Q(s_{t},a_{t})$ or $V(s_{t})$ . Both are learned as part of
+the world model $f(s_{t},a_{t})$ , which can be used to plan without interacting with the real
+environment (Hafner et al., 2019; Hafner et al., 2020; Hansen et al., 2022). Planning is widely done by sampling-based trajectory optimizers (Rubinstein, 1999; Williams et al., 2017).
+Another emerging way is to learn planning-enabled representations without the reward and value
+function, and use a simple $\ell_{2}$ distance to the goal as the cost
+(Assran et al., 2025; Sobal et al., 2025; Maes et al., 2026b).
+Both lines of work assume the optimal objective is to predict the next state when learning world models. In this work, we provide evidence for another value-predictive representation view and show that it is more useful for planning.
+
+## 5 VPFlow: Planning with Imperfect World Models
+
+## 5.1 Value Equivalence Principle
+
+Figure 2: The value equivalence principle view of world modeling. The value-predictive
+representations of the same timestep constitute a level set of the value field.
+
+We motivate VPFlow through the value equivalence principle (Grimm et al., 2020), which states
+that two dynamics and reward models are value-equivalent with respect to a set of value functions if they induce the same Bellman operator. Consequently, one can learn another set of dynamics and reward models beyond the training examples but still keep the same effect for policy learning.
+
+We extend this view to world modeling for offline goal reaching: two predictive representations $\hat{s},\hat{s}^{\prime}\in\mathcal{S}$ are value-equivalent with respect to a goal if they are evaluated identically by the goal-conditioned value function, i.e., $V_{\phi}(\hat{s},g)=V_{\phi}(\hat{s}^{\prime},g)$ (Figure 2).
+In this setting, the Bellman operator can be written in closed form with sparse reward given a goal state, reducing recursive temporal-difference learning (Oh et al., 2017; Schrittwieser et al., 2020) to direct regression on fixed targets.
+Intuitively, rather than constraining the dynamics models to match the future states, this principle only requires the predicted representations to lie on the corresponding level sets of value functions, and this relaxation can potentially expand the reachable space of dynamics models.
+
+## 5.2 Hindsight Monte Carlo Return Supervision
+
+Figure 3: VPFlow objectives.
+VPFlow alternately trains (a) the goal-conditioned value function $V_{\phi}$ ,
+latent dynamics $f_{\phi}$ , and encoder $E_{\phi}$ jointly, and (b) a distilled one-step flow policy
+ $\pi_{\theta}$ .
+The value function regresses the closed-form Monte Carlo returns $R_{h}$ on imagined rollouts. The
+policy is improved by maximizing the imagined value from the learned dynamics model, regularized
+by conditional flow matching to stay close to the
+data manifold.
+
+Q-learning typically uses bootstrapping that predicts Bellman backup online with a target network
+and EMA to learn the action-value function $Q(s,a)$ . Though this heuristic stabilizes training
+(Tang et al., 2023), it makes TD learning less principled for scaling on larger datasets
+(Park et al., 2025b).
+
+With hindsight relabeling, every trajectory in the dataset can be relabeled with a goal as if the
+agent in that trajectory has reached that goal. This naturally admits a cleaner and simpler
+objective for value learning. Concretely, the target value for a state $s_{t}$ is the discounted
+Monte Carlo return from $s_{t}$ to the relabeled goal $g=s_{t+d}$ on the same trajectory:
+
+ $R(s_{t},g)=R(d)=\sum_{k=0}^{d}\gamma^{k}r(s_{t+k},g)=\begin{cases}\gamma^{d},&r(s,g)=\mathds{1}_{\{s=g\}}\\
+\frac{1-\gamma^{d}}{\gamma-1},&r(s,g)=\mathds{1}_{\{s=g\}}-1\end{cases},$ 
+
+(3)
+
+where $d\geq 0$ is the temporal distance, i.e., the number of steps from $s_{t}$ to the goal $g$ on
+the same trajectory. In practice, we use the sparse reward $r(s,g)=\mathds{1}_{\{s=g\}}-1$ ,
+following prior work (Physical Intelligence et al., 2025; Park et al., 2025a).
+Intuitively, this quantity measures how far the agent is from the goal as a progress signal.
+
+The training of VPFlow alternates between the value prediction and policy learning
+objectives, as shown in Figure 3 and elaborated below.
+
+## 5.3 Value-Predictive Latent Dynamics
+
+Given this closed-form Monte Carlo return in Equation 3, VPFlow learns the observation
+encoder $E_{\phi}:\mathcal{S}\to\mathcal{Z}$ for a latent space $\mathcal{Z}$ , latent dynamics
+ $f_{\phi}$ , and a goal-conditioned value function
+ $V_{\phi}:\mathcal{Z}\times\mathcal{Z}\to\mathbb{R}$ . All three components are optimized
+jointly with the value-prediction (VP) objective. In particular, we use the action chunk
+representation of horizon $H$ as ${\bm{a}}_{t}=a_{t:t+H-1}$ , which allows for a certain level of temporal
+abstraction (Li et al., 2025).
+After encoding the state and goal with $E_{\phi}$ :
+
+ $z_{t}=E_{\phi}(s_{t}),\quad z_{g}=E_{\phi}(g),$ 
+
+(4)
+
+the latent dynamics predicts each future latent with an action prefix:
+
+ $\hat{z}_{t+h}=f_{\phi}(z_{t},a_{t:t+h-1}),\quad h=1,\ldots,H,\quad\hat{z}_{t}\coloneqq z_{t}.$ 
+
+(5)
+
+Unrolling $f_{\phi}$ with the action chunk ${\bm{a}}_{t}$ yields intermediate latents $\hat{z}_{t+1},\dots,\hat{z}_{t+H}$ , where $\hat{z}_{t+H}=f_{\phi}(z_{t},{\bm{a}}_{t})$ denotes the final predicted latent. The VP loss is then defined as:
+
+ $\mathcal{L}_{\mathrm{VP}}(\phi)\coloneqq\mathbb{E}_{(s_{t},{\bm{a}}_{t})\sim\mathcal{D},g\sim\mathcal{S}}\left[\frac{1}{H+1}\sum_{h=0}^{H}M_{t+h}\odot\|V_{\phi}(\hat{z}_{t+h},z_{g})-R_{t+h}\|_{2}^{2}\right],\quad\hat{z}_{t}\coloneqq z_{t},$ 
+
+(6)
+
+where $R_{t+h}=R(s_{t+h},g)$ is the target of Equation 3 for the dataset state $s_{t+h}$ 
+and does not depend on $\phi$ , $\odot$ is the Hadamard product, and the mask $M_{t+h}\in\{0,1\}$ 
+filters out goals behind time $t+h$ and across trajectories such that the value function only
+exploits the clean temporal distance signal on the same trajectory.
+
+Equation 6 trains the encoder, latent dynamics, and value function jointly.
+The value supervision nudges the predictive representation of each rollout horizon towards the level
+set of the value function defined by the state-goal temporal distance, instead of aiming for perfect
+state prediction. It structures the representation space with explicit meaning as progress towards
+reaching the goal, unlike the regularizers that are only statistically meaningful
+(Bardes et al., 2022; Balestriero and LeCun, 2025). It also expands the hypothesis space for the policy
+without being too conservative inside the data manifold, as we discussed in
+Section 5.1.
+
+## 5.4 Flow Policy as a Behavior Prior
+
+For a more expressive policy to handle the multimodality of offline datasets, we opt for a
+flow-based policy similar to Flow Q-learning (Park et al., 2025c). Beyond that, the
+generative policy as a behavior prior is also a key design choice to enable planning with the data
+manifold constraint at test time.
+
+The policy improvement objective is to maximize the Q-function of an action chunk
+(Li et al., 2025) given encoded state and goal, $z_{t}=E_{\phi}(s_{t}),z_{g}=E_{\phi}(g)$ ,
+using the learned world models:
+
+ $\displaystyle Q(z_{t},{\bm{a}}_{t},z_{g})$ 
+ $\displaystyle\coloneqq\mathbb{E}_{\hat{z}_{t+H}\sim f_{\phi}(z_{t},{\bm{a}}_{t})}\left[\sum_{h=0}^{H-1}\gamma^{h}r(z_{t+h},z_{g})+\gamma^{H}V_{\phi}(\hat{z}_{t+H},z_{g})\right]$ 
+
+(7)
+
+ $\displaystyle\approx\mathbb{E}_{\hat{z}_{t+H}\sim f_{\phi}(z_{t},{\bm{a}}_{t})}\left[\gamma^{H}V_{\phi}(\hat{z}_{t+H},z_{g})\right]\qquad\text{(no $\theta$ in reward)},$ 
+
+where the action chunk ${\bm{a}}_{t}=a_{t:t+H-1}$ is decoded from Gaussian noise
+ $\bm{\varepsilon}\sim\mathcal{N}({\bm{0}},I)$ by the one-step flow policy
+ $\pi_{\theta}(z_{t},z_{g},\bm{\varepsilon})$ with parameters $\theta$ . Together with a velocity field
+ $v_{\theta}$ , the policy learning loss is defined as:
+
+ $\mathcal{L}_{\pi}(\theta)\coloneqq-Q(z_{t},{\bm{a}}_{t},z_{g})+\alpha_{\mathrm{CFM}}\mathcal{L}_{\mathrm{CFM}}+\alpha_{\mathrm{Distill}}\mathcal{L}_{\mathrm{Distill}}.$ 
+
+(8)
+
+Here, $\mathcal{L}_{\mathrm{CFM}}$ is the conditional flow matching (CFM) loss that fits $v_{\theta}$ 
+to the dataset actions, $\mathcal{L}_{\mathrm{Distill}}$ distills the multi-step decoding process
+using $v_{\theta}$ into $\pi_{\theta}$ , and $\alpha_{\mathrm{CFM}},\alpha_{\mathrm{Distill}}$ are their
+weights. The one-step policy makes noise steering more efficient.
+Detailed objective functions are explained in Appendix B.3.
+
+## 5.5 Steering Noise as Planning
+
+Planning objective.
+VPFlow instantiates the cost objective in Equation 2 with the reward function $r_{t}$ defined
+in Equation 1 and optimizes the action chunk ${\bm{a}}_{t}=a_{t:t+H-1}$ at state $z_{t}$ .
+Yet, credit assignment is challenging for sparse reward. As such, we densify it with the
+potential-based reward shaping (Ng et al., 1999) using imagined rollouts, which yields the
+reshaped reward as:
+
+ $\delta_{t}=r_{t}+\gamma V_{\phi}(\hat{z}_{t+1},z_{g})-V_{\phi}(\hat{z}_{t},z_{g}).$ 
+
+(9)
+
+We design the planning objective to maximize the $(\gamma\lambda)$ -discounted sum of the reshaped
+reward over the planning horizon $H$ , where $\lambda\in[0,1]$ is the trace-decay coefficient:
+
+ $A(z_{t},{\bm{a}}_{t},z_{g})=A_{t}\coloneqq\sum_{h=0}^{H-1}(\gamma\lambda)^{h}\delta_{t+h},\quad\text{s.t.}\quad\hat{z}_{t+h}=f_{\phi}(\hat{z}_{t},a_{t:t+h-1}),\quad\hat{z}_{t}\coloneqq z_{t}.$ 
+
+(10)
+
+Algorithm 1 $\varepsilon$ -ES: evolutionary search in noise space with the generalized advantage estimator.
+
+Input: state $s_{t}$ , goal $g$ ; chunk length $H$ ; number of chunks $n_{c}$ ; elites $1\leq N_{\mathrm{e}}\leq N$ ;
+population $N$ ; iterations $K\geq 0$ ; mutation scale bounds
+ $\sigma_{\min},\sigma_{\max}$ ; decay $\rho$ ; inverse temperature $\beta$ ; execution length
+ $H_{\mathrm{exec}}$ 
+
+Output: first $H_{\mathrm{exec}}$ actions ( $[{:}H_{\mathrm{exec}}]$ denotes slicing)
+
+ 1
+ $z_{t}\leftarrow E_{\phi}(s_{t})$ , $z_{g}\leftarrow E_{\phi}(g)$ 
+
+ 2
+ function $\operatorname{Dec}(\bm{\varepsilon}=(\bm{\varepsilon}_{0},\ldots,\bm{\varepsilon}_{n_{c}-1}))$ 
+
+ 3
+ $\hat{z}_{t}\leftarrow z_{t}$ 
+
+ 4
+ for $c=0,\ldots,n_{c}-1$ do
+
+ 5
+ ${\bm{a}}_{c}\leftarrow\operatorname{clip}(\pi_{\theta}(\hat{z}_{t+cH},z_{g},\bm{\varepsilon}_{c}),-1,1)$ 
+
+ 6
+ $\hat{z}_{t+(c+1)H}\leftarrow f_{\phi}(\hat{z}_{t+cH},{\bm{a}}_{c})$ 
+ $\triangleright$  Equation 5, latent rollouts
+
+ 7
+ return concatenation of $({\bm{a}}_{0},\ldots,{\bm{a}}_{n_{c}-1})$ 
+
+ 8
+ if $K=0$ then
+
+ 9
+ return $\operatorname{Dec}({\bm{0}})[{:}H_{\mathrm{exec}}]$ $\triangleright$  No search
+
+ 10
+ $A_{0}\leftarrow A(z_{t},\operatorname{Dec}({\bm{0}}),z_{g})$ $\triangleright$  Equation 10,
+GAE
+
+ 11
+ $(\bm{\varepsilon}^{(e)},A_{e})\leftarrow({\bm{0}},A_{0})$ , $e=1,\ldots,N_{\mathrm{e}}$ $\triangleright$  Policy initialization
+at zero
+
+ 12
+ for $k=0,\ldots,K-1$ do
+
+ 13
+ $\sigma_{k}\leftarrow\max(\sigma_{\min},\sigma_{\max}\rho^{k})$ $\triangleright$  Annealed mutation
+scale
+
+ 14
+ for $e=1,\ldots,N_{\mathrm{e}}$ do
+
+ 15
+ for $j=1,\ldots,N/N_{\mathrm{e}}$ do
+
+ 16
+ $\tilde{\bm{\varepsilon}}^{(j)}\sim\mathcal{N}(\bm{\varepsilon}^{(e)},\sigma_{k}^{2}I)$ $\triangleright$  Mutate elites
+
+ 17
+ $\tilde{A}_{j}\leftarrow A(z_{t},\operatorname{Dec}(\tilde{\bm{\varepsilon}}^{(j)}),z_{g})$ 
+ $\triangleright$  Evaluate rollouts
+with GAE
+
+ 18
+ $j^{\star}\leftarrow\argmax_{j\in\{1,\dots,N/N_{\mathrm{e}}\}}\tilde{A}_{j}$ 
+
+ 19
+ if $\tilde{A}_{j^{\star}}>A_{e}$ then
+
+ 20
+ $(\bm{\varepsilon}^{(e)},A_{e})\leftarrow(\tilde{\bm{\varepsilon}}^{(j^{\star})},\tilde{A}_{j^{\star}})$ 
+ $\triangleright$  Greedy
+improvement
+
+ 21
+ $w_{e}\leftarrow\exp(\beta A_{e})/\sum_{j=1}^{N_{\mathrm{e}}}\exp(\beta A_{j})$ , $e=1,\ldots,N_{\mathrm{e}}$ 
+
+ 22
+ $e^{\star}\sim\operatorname{Categorical}((w_{e})_{e=1}^{N_{\mathrm{e}}})$ $\triangleright$  Sample elite
+
+ 23
+ return $\operatorname{Dec}(\bm{\varepsilon}^{(e^{\star})})[{:}H_{\mathrm{exec}}]$ $\triangleright$  Receding-horizon execution
+
+It corresponds to the generalized advantage estimator (GAE) (Schulman et al., 2016) of horizon $H$ .
+The score $A$ measures predicted progress towards the goal relative to the current state.
+We discuss this planning objective in Appendix .
+
+Noise space steering. Planning has been widely conducted by directly optimizing
+open-loop actions on an unconstrained support.
+For long-horizon rollouts, actions tend to drift away from the data distribution, making the
+planning objective unreliable.
+One of the key benefits of a generative policy is that after training, its
+noise space can be optimized to search for better actions while still being close to the training
+distribution (Yang et al., 2024; Wagenmaker et al., 2025).
+We adopt this strategy to steer the noise to optimize Equation 10 that uses the
+imagined states unrolled from the learned dynamics.
+
+ $\varepsilon$ -ES: evolution strategy in noise space.
+CEM planners used in model-based methods maintain an elite set of actions, from which an online mean
+and standard deviation are updated (Janner et al., 2019; Hansen et al., 2022; Maes et al., 2026b).
+However, this design choice does not directly translate to the noise space, as their distribution
+differs. Inspired by a previous gradient-free optimizer for diffusion noise
+(Yang et al., 2024), we instead develop an evolution strategy that mutates samples of each
+elite in noise space and greedily keeps the ones that score higher by the objective in
+Equation 10. This allows the policy prior learned during training to improve
+itself by adding more compute at test time without weight updates. We present the search process,
+which runs for $K$ iterations, in Algorithm 1 with
+more details in Appendix B.6.
+
+\titlespacing
+
+*
+
+## 5.6 
+
+0pt1.8ex plus 0.4ex minus 0.2ex0.8ex plus 0.2ex
+
+## 6 Experiments
+
+We aim to address four questions in this section: Q1: How does VPFlow compare with
+model-free baselines and model-based methods that similarly plan with latent world models for offline goal-reaching tasks? Q2: Are state-predictive representations useful for planning, or do the value-predictive ones play a more essential role? Q3: Does test-time planning help, and does the search space matter more than the search algorithm? Q4: How does the learned latent actually behave during rollouts?
+
+Setup.
+We use the official OGBench datasets and tasks (Park et al., 2025a): 17 state-based datasets and
+13 pixel-based datasets. The metric is the goal-reaching success rate ( $\%$ , $\uparrow$ ), averaged
+over the five tasks within each dataset. Model-free baselines are the non-hierarchical methods
+reported by OGBench: goal-conditioned behavioral cloning (GCBC)
+(Ghosh et al., 2021), goal-conditioned implicit value learning (GCIVL) and
+goal-conditioned implicit Q-learning (GCIQL) (Kostrikov et al., 2022), quasi-metric RL
+(QRL) (Wang et al., 2023), and contrastive RL (CRL)
+(Eysenbach et al., 2022).
+Model-based baselines are the latent planners LeWorldModel (LeWM)
+(Maes et al., 2026b), PLDM
+(Sobal et al., 2025), and TD-MPC2 (Hansen et al., 2024). Implementation details are in Appendix B, and hyperparameters are in Appendix .
+
+Table 1: Success rate ( $\%$ , $\uparrow$ ) on OGBench compared against model-free
+baselines. Entries are mean success rates over the datasets in each environment, with
+the number of datasets in parentheses. The best and second best results in each row are in bold
+and underlined, respectively.
+
+Input
+Task Type
+Environment
+GCBC
+GCIVL
+GCIQL
+QRL
+CRL
+VPFlow
+
+State
+Locomotion
+PointMaze (4 datasets)
+16.0
+38.2
+27.8
+60.0
+29.8
+87.8
+
+AntMaze (4 datasets)
+19.8
+31.8
+35.0
+53.0
+61.8
+68.0
+
+Manipulation
+Cube (4 datasets)
+2.0
+22.5
+27.8
+1.5
+8.2
+42.2
+
+Scene (1 dataset)
+5.0
+42.0
+51.0
+5.0
+19.0
+78.0
+
+Puzzle (4 datasets)
+0.5
+9.0
+36.8
+0.2
+2.0
+51.0
+
+Overall (17 datasets)
+9.3
+26.4
+32.9
+27.3
+25.1
+63.2
+
+Pixel
+Locomotion
+AntMaze (4 datasets)
+5.0
+9.0
+5.2
+1.5
+68.2
+61.0
+
+Manipulation
+Cube (4 datasets)
+7.2
+21.0
+13.2
+16.8
+13.5
+34.8
+
+Scene (1 dataset)
+12.0
+25.0
+12.0
+10.0
+11.0
+33.0
+
+Puzzle (4 datasets)
+4.2
+28.2
+6.5
+0.2
+4.8
+18.3
+
+Overall (13 datasets)
+6.0
+19.8
+8.6
+6.5
+27.5
+37.6
+
+## 6.1 Q1: How Does VPFlow Perform for Offline Goal Reaching?
+
+Comparison against model-free baselines.
+Table 1 reports the results grouped by environment (full numerics in
+Appendix ). Averaged over the $17$ state datasets, VPFlow nearly doubles the strongest baseline ( $63.2$ vs.
+ $32.9$ for GCIQL) and leads every environment group. The gains
+concentrate on manipulation and shrink on
+navigation (AntMaze $68.0$ vs. $61.8$ ), where a reactive policy may already solve much of the task. This suggests that model-based planning can be more suitable for contact-rich tasks, where
+test-time compute translates more directly to success. On pixel-based datasets, the gains become relatively modest ( $37.6$ vs. $27.5$ for CRL) as VPFlow trails behind in a long-horizon Visual AntMaze dataset.
+
+Figure 4: Success rate of planners with latent world models on
+the only pixel dataset where the baselines do not completely fail.
+
+Comparison against latent planning methods.
+To our surprise, on 12 of the 13 pixel datasets, all three model-based baselines score zero,
+so Figure 4 reports the only dataset on which any one of them achieves a
+non-zero success rate. All three train their latent to predict a future state and then plan
+over action sequences. On diverse play data, neither practice stands out as the optimal
+design choice. We next reveal more about the possible failure modes on these two patterns.
+
+## 6.2 Q2: Value-Predictive or State-Predictive Latents?
+
+This experiment aims to verify which representations are more favorable for planning. The default model trains the rollout with the value-prediction
+loss $\mathcal{L}_{\mathrm{VP}}$ (Equation 6); the state-predictive model
+trains it with the latent-prediction loss $\mathcal{L}_{\mathrm{LP}}$ (Equation 13), which
+matches the predicted latents to the encoded states. Other configurations stay the same. Figure 5 tracks the success rate and the next-latent prediction error during training on four datasets.
+
+((a)) scene-play-v0
+
+((b)) visual-scene-play-v0
+
+((c)) visual-cube-single-
+
+play-v0
+
+((d)) visual-antmaze-large-
+
+navigate-v0
+
+Figure 5: Comparison of value-predictive and state-predictive representations. Success
+rate (left axis) and next-latent prediction error (right axis, log scale)
+during training, for value-predictive (solid) and state-predictive (dashed) models. The error
+is the mean Euclidean distance $\|\hat{z}_{t+h}-z_{t+h}\|_{2}$ between the predicted and encoded
+next latents. On state and pixel inputs, the value-predictive representation achieves higher
+success even when its state prediction error is larger by orders of magnitude.
+
+Lower state prediction error, worse planning.
+The state-predictive controller reduces the next-latent error by one to eight orders of magnitude,
+yet its success does not improve on any of the four datasets and falls most sharply on
+scene-play ( $78.4\%$ to
+ $28.0\%$ , Figure 5(a)) and visual-cube-single ( $79.2\%$ to $0.0\%$ , Figure 5(c)). A model that predicts its own next latent almost perfectly is therefore not
+necessarily a model that plans well. Predicting the value is more essential for planning.
+
+The failure mode is collapse, and value prediction prevents it.
+On visual-cube-single (Figure 5(c)), the latent prediction term collapses to near
+zero: the encoder finds a trivially predictable latent and the agent never reaches the goal, the
+degeneracy that self-predictive objectives prevent through explicit anti-collapse techniques, none
+of which our architecture has. In contrast, value prediction in Equation 6 promotes temporally ordered latents that implicitly prevent collapse. Appendix provides ablations on explicit regularization over latent prediction.
+
+## 6.3 Q3: Does Steering Help, and Where Should It Search?
+
+Planner
+Space
+Loco.
+Manip.
+All
+
+w/o steering
+–
+57.5
+8.3
+28.0
+
+w/ $\mathcal{A}$ -CEM
+action
+22.6
+1.6
+10.0
+
+w/ $\varepsilon$ -CEM
+noise
+53.2
+31.5
+40.2
+
+VPFlow
+noise
+72.2
+38.7
+52.1
+
+Table 2: Ablations on steering algorithm and search space. Success rate
+( $\%$ , $\uparrow$ ) averaged over the 12 locomotion (Loco.), 18 manipulation (Manip.), and all
+30 datasets.
+Action-space
+planning
+worsens the success rate relative to direct action output.
+
+Figure 6: Success rate ( $\%$ ) against the number of steering iterations $K$ on
+cube-double-play-v0, scene-play-v0, and visual-scene-play-v0. More
+iterations generally steer the policy towards a higher success rate. $K=0$ means the reactive
+policy without steering.
+
+Test-time steering enables policy improvement with imagination.
+Without steering ( $K{=}0$ ), VPFlow executes the policy’s actions directly and achieves inferior
+performance (Table 2). Extra test-time compute, by updating the noise
+greedily towards maximal advantage in the imagined future, raises success as $K$ grows
+(Figure 6). This supports
+Equation 10 as an effective objective enabling policy improvement via search
+without external signals, and planning with more compute can be made possible with imperfect world models.
+
+Noise space proves more effective than action space for planning.
+Replacing $\varepsilon$ -ES with $\varepsilon$ -CEM that updates noise with standard CEM lowers the success rate.
+This is expected, as noise is updated by advantage on the decoded actions rather than the noise
+itself. More notably, the success rate of CEM in action space, $\mathcal{A}$ -CEM, is even worse than the direct output ( $10.0$ vs. $28.0$ ) and not even close to its noise-space counterpart ( $10.0$ vs. $40.2$ ). This can be attributed to the advantage exploitation of off-manifold
+actions, and it explains why the action-space planning design choices in PLDM and LeWM
+(Sobal et al., 2025; Maes et al., 2026b) could be suboptimal with offline data. The
+closed-loop
+planning in the noise space of a generative policy prevents this in that its decoded actions are
+trained to be in the support of the data distribution.
+
+## 6.4 Q4: How Do the Latents Behave in Rollouts?
+
+((a)) visual-antmaze-large-navigate-v0 Task 1
+
+((b)) visual-antmaze-large-navigate-v0 Task 3
+
+Figure 7: t-SNE visualization of latent trajectories from successful Visual AntMaze episodes. The solid circle is the encoded current state,
+and the dashed circles are the imagined latents via dynamics for that step. Under
+value-predictive training, the imagined latents leave the trajectory manifold at test time, but
+the agent can still reach the goal.
+
+Figure 7 depicts the geometry of imagined rollouts on Visual AntMaze to demonstrate the behavior of imperfect yet planning-effective learned world models.
+Under value-predictive training, the dynamics model evolves latents to where the correct goal-reaching value is forecasted by the value function, without being constrained to match the corresponding embeddings from the encoder.
+This helps explain why the value-predictive controller plans effectively despite the large next-latent prediction error demonstrated in Section 6.2.
+It also suggests how value prediction harnesses exploratory play data more effectively: closed-form value regression structures the latent space by temporal proximity to the goal, allowing it to leave out irrelevant routes and discover a latent geometry suited to reaching the goal.
+In contrast, a state-predictive world model is trained to faithfully fit latent transitions in the dataset, which may limit its generalization to unseen goals.
+
+To examine this value-equivalent behavior more quantitatively, Figure 8 compares agents trained with value prediction $\mathcal{L}_{\mathrm{VP}}$ and latent prediction $\mathcal{L}_{\mathrm{LP}}$ on successful episodes from visual-scene-play-v0.
+Starting from the same encoded state, each agent unrolls its own executed actions in both the real environment and the learned world model.
+Although VP exhibits larger relative latent error across the 16-step rollout, its value gap is typically smaller than LP’s (Figure 8(a)).
+The value field provides a microscopic illustration: while VP’s observed and imagined latents are further apart in Euclidean space, they lie closer in the value space (Figure 8(b)).
+The value-predictive latent also moves towards higher value, reflecting closer proximity to the goal.
+
+((a)) Relative latent error $\|\hat{z}_{h}-z_{h}\|_{2}/\|z_{h}\|_{2}$ and value error $|V(\hat{z}_{h},z_{g})-V(z_{h},z_{g})|$ along rollout horizons with mean and standard deviation over 4 evaluation seeds.
+
+((b)) Value fields and level sets of each agent’s learned critic measured on the current, observed, and predicted next latents.
+
+Figure 8: Rollouts in the environment and learned world models, with their value fields. With value prediction, the agent maintains a lower value error and reaches the goal successfully despite substantially larger latent prediction error.
+
+Taken together, these results demonstrate that accurate latent-state prediction is not strictly necessary for successful planning.
+Imperfect world models can remain effective and even yield superior performance (Figure ), provided that they preserve value equivalence.
+The evidence that the agent can successfully reach the goal despite substantial latent prediction error suggests that latent error is an unreliable indicator of planning success; instead, value prediction should serve as a more informative metric.
+
+## 7 Conclusions
+
+We have challenged the pervasive assumption that planning requires a state-predictive world model.
+VPFlow trains its observation encoder and latent dynamics solely via closed-form Monte Carlo
+return regression—a supervision signal naturally available in sparse-reward offline goal
+reaching—and plans at test time by steering a distilled one-step flow policy within its noise space to maximize imagined generalized advantage.
+Across 30 state and pixel datasets on OGBench, VPFlow substantially improves upon model-free baselines and latent-predictive planners despite much higher next-latent prediction error.
+In contrast, enforcing state prediction closes that error gap at the cost of degraded planning performance.
+Moreover, test-time noise steering reliably elevates the reactive policy prior, demonstrating that searching within an in-support noise space matters more than the specific optimization algorithm. More broadly, these findings indicate that effective latent planning favors value-predictive representations for world models and an in-distribution search space for planning, rather than a faithful state simulator.
+We discuss limitations and future directions in Appendix .
+
+## References
+
+Andrychowicz et al. (2017)
+
+Marcin Andrychowicz, Filip Wolski, Alex Ray, Jonas Schneider, Rachel Fong,
+Peter Welinder, Bob McGrew, Josh Tobin, Pieter Abbeel, and Wojciech Zaremba.
+
+Hindsight experience replay.
+
+In Advances in Neural Information Processing Systems,
+volume 30, 2017.
+
+Argenson and Dulac-Arnold (2021)
+
+Arthur Argenson and Gabriel Dulac-Arnold.
+
+Model-based offline planning.
+
+In International Conference on Learning Representations, 2021.
+
+Assran et al. (2025)
+
+Mido Assran, Adrien Bardes, David Fan, Quentin Garrido, Russell Howes, Matthew
+Muckley, Ammar Rizvi, Claire Roberts, Koustuv Sinha, Artem Zholus, et al.
+
+V-JEPA 2: Self-supervised video models enable understanding,
+prediction and planning.
+
+arXiv preprint arXiv:2506.09985, 2025.
+
+Ba et al. (2016)
+
+Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E Hinton.
+
+Layer normalization.
+
+arXiv preprint arXiv:1607.06450, 2016.
+
+Bagatella et al. (2026)
+
+Marco Bagatella, Matteo Pirotta, Ahmed Touati, Alessandro Lazaric, and Andrea
+Tirinzoni.
+
+TD-JEPA: Latent-predictive representations for zero-shot
+reinforcement learning.
+
+In International Conference on Learning Representations, 2026.
+
+Balestriero and LeCun (2025)
+
+Randall Balestriero and Yann LeCun.
+
+LeJEPA: Provable and scalable self-supervised learning without the
+heuristics.
+
+arXiv preprint arXiv:2511.08544, 2025.
+
+Bardes et al. (2022)
+
+Adrien Bardes, Jean Ponce, and Yann LeCun.
+
+VICReg: Variance-invariance-covariance regularization for
+self-supervised learning.
+
+In International Conference on Learning Representations, 2022.
+
+Barreto et al. (2017)
+
+André Barreto, Will Dabney, Rémi Munos, Jonathan J Hunt, Tom Schaul,
+Hado Van Hasselt, and David Silver.
+
+Successor features for transfer in reinforcement learning.
+
+Advances in Neural Information Processing Systems, 30, 2017.
+
+Barreto et al. (2018)
+
+Andre Barreto, Diana Borsa, John Quan, Tom Schaul, David Silver, Matteo Hessel,
+Daniel Mankowitz, Augustin Zidek, and Remi Munos.
+
+Transfer in deep reinforcement learning using successor features and
+generalised policy improvement.
+
+In International Conference on Machine Learning, pages
+501–510, 2018.
+
+Black et al. (2025)
+
+Kevin Black, Noah Brown, Danny Driess, Adnan Esmail, Michael Equi, Chelsea
+Finn, Niccolo Fusai, Lachy Groom, Karol Hausman, Brian Ichter, et al.
+
+ $\pi_{0}$ : A vision-language-action flow model for general robot
+control.
+
+In Robotics: Science and Systems, 2025.
+
+Blier et al. (2021)
+
+Léonard Blier, Corentin Tallec, and Yann Ollivier.
+
+Learning successor states and goal-dependent values: A mathematical
+viewpoint.
+
+arXiv preprint arXiv:2101.07123, 2021.
+
+Borsa et al. (2019)
+
+Diana Borsa, Andre Barreto, John Quan, Daniel J. Mankowitz, Hado van Hasselt,
+Remi Munos, David Silver, and Tom Schaul.
+
+Universal successor features approximators.
+
+In International Conference on Learning Representations, 2019.
+
+Bradbury et al. (2018)
+
+James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Yash
+Katariya, Chris Leary, Dougal Maclaurin, George Necula, Adam Paszke, Jake
+VanderPlas, Skye Wanderman-Milne, and Qiao Zhang.
+
+JAX: composable transformations of Python+NumPy programs,
+2018.
+
+http://github.com/jax-ml/jax.
+
+Carvalho et al. (2024)
+
+Wilka Carvalho, Momchil S. Tomov, William de Cothi, Caswell Barry, and
+Samuel J. Gershman.
+
+Predictive representations: Building blocks of intelligence.
+
+Neural Computation, 36(11):2225–2298,
+2024.
+
+10.1162/neco_a_01705.
+
+Dawid and LeCun (2024)
+
+Anna Dawid and Yann LeCun.
+
+Introduction to latent variable energy-based models: a path toward
+autonomous machine intelligence.
+
+Journal of Statistical Mechanics: Theory and Experiment,
+2024(10):104011, 2024.
+
+10.1088/1742-5468/ad292b.
+
+Dayan (1993)
+
+Peter Dayan.
+
+Improving generalization for temporal difference learning: The
+successor representation.
+
+Neural Computation, 5(4):613–624, 1993.
+
+10.1162/neco.1993.5.4.613.
+
+Deisenroth and Rasmussen (2011)
+
+Marc Deisenroth and Carl E Rasmussen.
+
+PILCO: A model-based and data-efficient approach to policy search.
+
+In International Conference on Machine Learning, pages
+465–472, 2011.
+
+Du et al. (2020)
+
+Yilun Du, Toru Lin, and Igor Mordatch.
+
+Model-based planning with energy-based models.
+
+In Conference on Robot Learning, volume 100, pages 374–383.
+PMLR, 2020.
+
+Espeholt et al. (2018)
+
+Lasse Espeholt, Hubert Soyer, Remi Munos, Karen Simonyan, Vlad Mnih, Tom Ward,
+Yotam Doron, Vlad Firoiu, Tim Harley, Iain Dunning, et al.
+
+IMPALA: Scalable distributed deep-RL with importance weighted
+actor-learner architectures.
+
+In International Conference on Machine Learning, pages
+1407–1416, 2018.
+
+Eysenbach et al. (2022)
+
+Benjamin Eysenbach, Tianjun Zhang, Sergey Levine, and Russ R Salakhutdinov.
+
+Contrastive learning as goal-conditioned reinforcement learning.
+
+Advances in Neural Information Processing Systems,
+35:35603–35620, 2022.
+
+Finn and Levine (2017)
+
+Chelsea Finn and Sergey Levine.
+
+Deep visual foresight for planning robot motion.
+
+In IEEE International Conference on Robotics and Automation,
+pages 2786–2793. IEEE, 2017.
+
+Fujimoto and Gu (2021)
+
+Scott Fujimoto and Shixiang Shane Gu.
+
+A minimalist approach to offline reinforcement learning.
+
+Advances in Neural Information Processing Systems,
+34:20132–20145, 2021.
+
+Fujimoto et al. (2019)
+
+Scott Fujimoto, David Meger, and Doina Precup.
+
+Off-policy deep reinforcement learning without exploration.
+
+In International Conference on Machine Learning, pages
+2052–2062, 2019.
+
+Fujimoto et al. (2025)
+
+Scott Fujimoto, Pierluca D'Oro, Amy Zhang, Yuandong Tian, and
+Michael Rabbat.
+
+Towards general-purpose model-free reinforcement learning.
+
+In International Conference on Learning Representations, 2025.
+
+Ghosh et al. (2021)
+
+Dibya Ghosh, Abhishek Gupta, Ashwin Reddy, Justin Fu, Coline Manon Devin,
+Benjamin Eysenbach, and Sergey Levine.
+
+Learning to reach goals via iterated supervised learning.
+
+In International Conference on Learning Representations, 2021.
+
+Grimm et al. (2020)
+
+Christopher Grimm, André Barreto, Satinder Singh, and David Silver.
+
+The value equivalence principle for model-based reinforcement
+learning.
+
+Advances in Neural Information Processing Systems,
+33:5541–5552, 2020.
+
+Guo et al. (2022)
+
+Zhaohan Guo, Shantanu Thakoor, Miruna Pîslar, Bernardo Avila Pires,
+Florent Altché, Corentin Tallec, Alaa Saade, Daniele Calandriello,
+Jean-Bastien Grill, Yunhao Tang, et al.
+
+BYOL-Explore: Exploration by bootstrapped prediction.
+
+Advances in Neural Information Processing Systems,
+35:31855–31870, 2022.
+
+Ha and Schmidhuber (2018)
+
+David Ha and Jürgen Schmidhuber.
+
+Recurrent world models facilitate policy evolution.
+
+Advances in neural information processing systems, 31, 2018.
+
+Hafner et al. (2019)
+
+Danijar Hafner, Timothy Lillicrap, Ian Fischer, Ruben Villegas, David Ha,
+Honglak Lee, and James Davidson.
+
+Learning latent dynamics for planning from pixels.
+
+In International Conference on Machine Learning, pages
+2555–2565, 2019.
+
+Hafner et al. (2020)
+
+Danijar Hafner, Timothy Lillicrap, Jimmy Ba, and Mohammad Norouzi.
+
+Dream to control: Learning behaviors by latent imagination.
+
+In International Conference on Learning Representations, 2020.
+
+Hafner et al. (2025a)
+
+Danijar Hafner, Jurgis Pasukonis, Jimmy Ba, and Timothy Lillicrap.
+
+Mastering diverse control tasks through world models.
+
+Nature, 640(8059):647–653,
+2025a.
+
+10.1038/s41586-025-08744-2.
+
+Hafner et al. (2025b)
+
+Danijar Hafner, Wilson Yan, and Timothy Lillicrap.
+
+Training agents inside of scalable world models.
+
+arXiv preprint arXiv:2509.24527, 2025b.
+
+Hansen et al. (2022)
+
+Nicklas Hansen, Hao Su, and Xiaolong Wang.
+
+Temporal difference learning for model predictive control.
+
+In International Conference on Machine Learning, volume 162,
+pages 8387–8406. PMLR, 2022.
+
+Hansen et al. (2024)
+
+Nicklas Hansen, Hao Su, and Xiaolong Wang.
+
+TD-MPC2: Scalable, robust world models for continuous control.
+
+In International Conference on Learning Representations, 2024.
+
+Hendrycks and Gimpel (2016)
+
+Dan Hendrycks and Kevin Gimpel.
+
+Gaussian error linear units (GELUs).
+
+arXiv preprint arXiv:1606.08415, 2016.
+
+Janner et al. (2019)
+
+Michael Janner, Justin Fu, Marvin Zhang, and Sergey Levine.
+
+When to trust your model: Model-based policy optimization.
+
+Advances in Neural Information Processing Systems, 32, 2019.
+
+Kaelbling (1993)
+
+Leslie Pack Kaelbling.
+
+Learning to achieve goals.
+
+In International Joint Conference on Artificial Intelligence,
+pages 1094–8, 1993.
+
+Kidambi et al. (2020)
+
+Rahul Kidambi, Aravind Rajeswaran, Praneeth Netrapalli, and Thorsten Joachims.
+
+MOReL: Model-based offline reinforcement learning.
+
+Advances in Neural Information Processing Systems,
+33:21810–21823, 2020.
+
+Kidger and Garcia (2021)
+
+Patrick Kidger and Cristian Garcia.
+
+Equinox: neural networks in JAX via callable PyTrees and
+filtered transformations.
+
+arXiv preprint arXiv:2111.00254, 2021.
+
+Kingma and Ba (2015)
+
+Diederik P. Kingma and Jimmy Ba.
+
+Adam: A method for stochastic optimization.
+
+In International Conference on Learning Representations, 2015.
+
+Kostrikov et al. (2022)
+
+Ilya Kostrikov, Ashvin Nair, and Sergey Levine.
+
+Offline reinforcement learning with implicit Q-learning.
+
+In International Conference on Learning Representations, 2022.
+
+Kumar et al. (2020)
+
+Aviral Kumar, Aurick Zhou, George Tucker, and Sergey Levine.
+
+Conservative Q-learning for offline reinforcement learning.
+
+Advances in Neural Information Processing Systems,
+33:1179–1191, 2020.
+
+LeCun (2022)
+
+Yann LeCun.
+
+A path towards autonomous machine intelligence.
+
+OpenReview preprint, 2022.
+
+Version 0.9.2.
+
+Levine et al. (2020)
+
+Sergey Levine, Aviral Kumar, George Tucker, and Justin Fu.
+
+Offline reinforcement learning: Tutorial, review, and perspectives on
+open problems.
+
+arXiv preprint arXiv:2005.01643, 2020.
+
+Li et al. (2022)
+
+Jinning Li, Chen Tang, Masayoshi Tomizuka, and Wei Zhan.
+
+Hierarchical planning through goal-conditioned offline reinforcement
+learning.
+
+IEEE Robotics and Automation Letters, 7(4):10216–10223, 2022.
+
+10.1109/LRA.2022.3190100.
+
+Li et al. (2025)
+
+Qiyang Li, Zhiyuan (Paul) Zhou, and Sergey Levine.
+
+Reinforcement learning with action chunking.
+
+In Advances in Neural Information Processing Systems,
+volume 38, pages 55518–55553, 2025.
+
+10.52202/085713-1856.
+
+Lipman et al. (2023)
+
+Yaron Lipman, Ricky T. Q. Chen, Heli Ben-Hamu, Maximilian Nickel, and Matthew
+Le.
+
+Flow matching for generative modeling.
+
+In International Conference on Learning Representations, 2023.
+
+Littman and Sutton (2001)
+
+Michael Littman and Richard S. Sutton.
+
+Predictive representations of state.
+
+Advances in Neural Information Processing Systems, 14, 2001.
+
+Lynch et al. (2020)
+
+Corey Lynch, Mohi Khansari, Ted Xiao, Vikash Kumar, Jonathan Tompson, Sergey
+Levine, and Pierre Sermanet.
+
+Learning latent plans from play.
+
+In Conference on Robot Learning, pages 1113–1132, 2020.
+
+M. Moerland et al. (2023)
+
+Thomas M. Moerland, Joost Broekens, Aske Plaat, and Catholijn M. Jonker.
+
+Model-based reinforcement learning: A survey.
+
+Foundations and Trends in Machine Learning, 16(1):1–118, 2023.
+
+Maes et al. (2026a)
+
+Lucas Maes, Quentin Le Lidec, Luiz Facury, Nassim Massaudi, Ayush Chaurasia,
+Francesco Capuano, Richard Gao, Taj Gillin, Dan Haramati, Damien Scieur, Yann
+LeCun, and Randall Balestriero.
+
+stable-worldmodel: A platform for reproducible world modeling
+research and evaluation, 2026a.
+
+Maes et al. (2026b)
+
+Lucas Maes, Quentin Le Lidec, Damien Scieur, Yann LeCun, and Randall
+Balestriero.
+
+LeWorldModel: Stable end-to-end joint-embedding predictive
+architecture from pixels.
+
+arXiv preprint arXiv:2603.19312, 2026b.
+
+Myers et al. (2025)
+
+Vivek Myers, Bill Zheng, Benjamin Eysenbach, and Sergey Levine.
+
+Offline goal-conditioned reinforcement learning with quasimetric
+representations.
+
+In Advances in Neural Information Processing Systems, 2025.
+
+10.52202/085713-0661.
+
+Ng et al. (1999)
+
+Andrew Y Ng, Daishi Harada, and Stuart Russell.
+
+Policy invariance under reward transformations: Theory and
+application to reward shaping.
+
+In International Conference on Machine Learning, pages
+278–287, 1999.
+
+Ni et al. (2024)
+
+Tianwei Ni, Benjamin Eysenbach, Erfan Seyedsalehi, Michel Ma, Clement Gehring,
+Aditya Mahajan, and Pierre-Luc Bacon.
+
+Bridging state and history representations: Understanding
+self-predictive RL.
+
+In International Conference on Learning Representations, 2024.
+
+Oh et al. (2017)
+
+Junhyuk Oh, Satinder Singh, and Honglak Lee.
+
+Value prediction network.
+
+Advances in Neural Information Processing Systems, 30, 2017.
+
+Park et al. (2026)
+
+Kwanyoung Park, Seohong Park, Youngwoon Lee, and Sergey Levine.
+
+Scalable offline model-based RL with action chunks.
+
+In International Conference on Learning Representations, 2026.
+
+Park et al. (2023)
+
+Seohong Park, Dibya Ghosh, Benjamin Eysenbach, and Sergey Levine.
+
+HIQL: Offline goal-conditioned RL with latent states as actions.
+
+Advances in Neural Information Processing Systems,
+36:34866–34891, 2023.
+
+Park et al. (2024)
+
+Seohong Park, Tobias Kreiman, and Sergey Levine.
+
+Foundation policies with Hilbert representations.
+
+In International Conference on Machine Learning, 2024.
+
+Park et al. (2025a)
+
+Seohong Park, Kevin Frans, Benjamin Eysenbach, and Sergey Levine.
+
+OGBench: Benchmarking offline goal-conditioned RL.
+
+In International Conference on Learning Representations,
+2025a.
+
+Park et al. (2025b)
+
+Seohong Park, Kevin Frans, Deepinder Mann, Benjamin Eysenbach, Aviral Kumar,
+and Sergey Levine.
+
+Horizon reduction makes RL scalable.
+
+Advances in Neural Information Processing Systems,
+38:8350–8389, 2025b.
+
+Park et al. (2025c)
+
+Seohong Park, Qiyang Li, and Sergey Levine.
+
+Flow Q-learning.
+
+In International Conference on Machine Learning,
+2025c.
+
+Patil et al. (2026)
+
+Omkar Patil, Ondrej Biza, Thomas Weng, Karl Schmeckpeper, Wil Thomason, Xiaohan
+Zhang, Kausik Sivakumar, Robin Walters, Nakul Gopalan, Sebastian Castro,
+et al.
+
+You’ve got a golden ticket: Improving generative robot policies with
+a single noise vector.
+
+arXiv preprint arXiv:2603.15757, 2026.
+
+Peng et al. (2019)
+
+Xue Bin Peng, Aviral Kumar, Grace Zhang, and Sergey Levine.
+
+Advantage-weighted regression: Simple and scalable off-policy
+reinforcement learning.
+
+arXiv preprint arXiv:1910.00177, 2019.
+
+Physical Intelligence et al. (2025)
+
+Physical Intelligence, Ali Amin, Raichelle Aniceto, Ashwin Balakrishna, Kevin
+Black, Ken Conley, Grace Connors, James Darpinian, Karan Dhabalia, Jared
+DiCarlo, et al.
+
+ $\pi^{*}_{0.6}$ : A VLA that learns from experience.
+
+arXiv preprint arXiv:2511.14759, 2025.
+
+Pirotta et al. (2024)
+
+Matteo Pirotta, Andrea Tirinzoni, Ahmed Touati, Alessandro Lazaric, and Yann
+Ollivier.
+
+Fast imitation via behavior foundation models.
+
+In International Conference on Learning Representations, 2024.
+
+Rubinstein (1999)
+
+Reuven Rubinstein.
+
+The cross-entropy method for combinatorial and continuous
+optimization.
+
+Methodology and Computing in Applied Probability, 1(2):127–190, 1999.
+
+10.1023/A:1010091220143.
+
+Salimans et al. (2017)
+
+Tim Salimans, Jonathan Ho, Xi Chen, Szymon Sidor, and Ilya Sutskever.
+
+Evolution strategies as a scalable alternative to reinforcement
+learning.
+
+arXiv preprint arXiv:1703.03864, 2017.
+
+Schaul et al. (2015)
+
+Tom Schaul, Daniel Horgan, Karol Gregor, and David Silver.
+
+Universal value function approximators.
+
+In International Conference on Machine Learning, pages
+1312–1320, 2015.
+
+Schrittwieser et al. (2020)
+
+Julian Schrittwieser, Ioannis Antonoglou, Thomas Hubert, Karen Simonyan,
+Laurent Sifre, Simon Schmitt, Arthur Guez, Edward Lockhart, Demis Hassabis,
+Thore Graepel, et al.
+
+Mastering Atari, Go, chess and shogi by planning with a learned
+model.
+
+Nature, 588(7839):604–609, 2020.
+
+10.1038/s41586-020-03051-4.
+
+Schulman et al. (2016)
+
+John Schulman, Philipp Moritz, Sergey Levine, Michael Jordan, and Pieter
+Abbeel.
+
+High-dimensional continuous control using generalized advantage
+estimation.
+
+In International Conference on Learning Representations, 2016.
+
+Schwarzer et al. (2021)
+
+Max Schwarzer, Ankesh Anand, Rishab Goel, R. Devon Hjelm, Aaron Courville, and
+Philip Bachman.
+
+Data-efficient reinforcement learning with self-predictive
+representations.
+
+In International Conference on Learning Representations, 2021.
+
+Sobal et al. (2025)
+
+Uladzislau Sobal, Wancong Zhang, Kyunghyun Cho, Randall Balestriero, Tim G. J.
+Rudner, and Yann LeCun.
+
+Learning from reward-free offline data: A case for planning with
+latent dynamics models.
+
+In Advances in Neural Information Processing Systems, 2025.
+
+Su et al. (2024)
+
+Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu.
+
+RoFormer: Enhanced transformer with rotary position embedding.
+
+Neurocomputing, 568:127063, 2024.
+
+Sutton (1991)
+
+Richard S. Sutton.
+
+Dyna, an integrated architecture for learning, planning, and
+reacting.
+
+ACM SIGART Bulletin, 2(4):160–163, 1991.
+
+10.1145/122344.122377.
+
+Tang et al. (2023)
+
+Yunhao Tang, Zhaohan Daniel Guo, Pierre Harvey Richemond, Bernardo Avila Pires,
+Yash Chandak, Rémi Munos, Mark Rowland, Mohammad Gheshlaghi Azar,
+Charline Le Lan, Clare Lyle, et al.
+
+Understanding self-predictive learning for reinforcement learning.
+
+In International Conference on Machine Learning, pages
+33632–33656, 2023.
+
+Tian et al. (2021)
+
+Stephen Tian, Suraj Nair, Frederik Ebert, Sudeep Dasari, Benjamin Eysenbach,
+Chelsea Finn, and Sergey Levine.
+
+Model-based visual planning with self-supervised functional
+distances.
+
+In International Conference on Learning Representations, 2021.
+
+Touati and Ollivier (2021)
+
+Ahmed Touati and Yann Ollivier.
+
+Learning one representation to optimize all rewards.
+
+Advances in Neural Information Processing Systems,
+34:13–23, 2021.
+
+Van Assel et al. (2025)
+
+Hugues Van Assel, Mark Ibrahim, Tommaso Biancalani, Aviv Regev, and Randall
+Balestriero.
+
+Joint-embedding vs reconstruction: Provable benefits of latent space
+prediction for self-supervised learning.
+
+In Advances in Neural Information Processing Systems, 2025.
+
+Vaswani et al. (2017)
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+Aidan N Gomez, Ł ukasz Kaiser, and Illia Polosukhin.
+
+Attention is all you need.
+
+In Advances in Neural Information Processing Systems,
+volume 30, 2017.
+
+Wagenmaker et al. (2025)
+
+Andrew Wagenmaker, Yunchu Zhang, Mitsuhiko Nakamoto, Seohong Park, Waleed
+Yagoub, Anusha Nagabandi, Abhishek Gupta, and Sergey Levine.
+
+Steering your diffusion policy with latent space reinforcement
+learning.
+
+In Conference on Robot Learning, 2025.
+
+Wang et al. (2024)
+
+Mianchu Wang, Rui Yang, Xi Chen, Hao Sun, Meng Fang, and Giovanni Montana.
+
+GOPlan: Goal-conditioned offline reinforcement learning by planning
+with learned models.
+
+Transactions on Machine Learning Research, 2024.
+
+ISSN 2835-8856.
+
+Wang et al. (2023)
+
+Tongzhou Wang, Antonio Torralba, Phillip Isola, and Amy Zhang.
+
+Optimal goal-reaching reinforcement learning via quasimetric
+learning.
+
+In International Conference on Machine Learning, pages
+36411–36430, 2023.
+
+Watter et al. (2015)
+
+Manuel Watter, Jost Springenberg, Joschka Boedecker, and Martin Riedmiller.
+
+Embed to control: A locally linear latent dynamics model for control
+from raw images.
+
+Advances in Neural Information Processing Systems, 28, 2015.
+
+Williams et al. (2017)
+
+Grady Williams, Andrew Aldrich, and Evangelos A. Theodorou.
+
+Model predictive path integral control: From theory to parallel
+computation.
+
+Journal of Guidance, Control, and Dynamics, 40(2):344–357, 2017.
+
+10.2514/1.G001921.
+
+Wu et al. (2019)
+
+Yifan Wu, George Tucker, and Ofir Nachum.
+
+Behavior regularized offline reinforcement learning.
+
+arXiv preprint arXiv:1911.11361, 2019.
+
+Yang et al. (2024)
+
+Brian Yang, Huangyuan Su, Nikolaos Gkanatsios, Tsung-Wei Ke, Ayush Jain, Jeff
+Schneider, and Katerina Fragkiadaki.
+
+Diffusion-ES: Gradient-free planning with diffusion for autonomous
+and instruction-guided driving.
+
+In IEEE/CVF Conference on Computer Vision and Pattern
+Recognition, pages 15342–15353. IEEE, 2024.
+
+Yu et al. (2020)
+
+Tianhe Yu, Garrett Thomas, Lantao Yu, Stefano Ermon, James Y Zou, Sergey
+Levine, Chelsea Finn, and Tengyu Ma.
+
+MOPO: Model-based offline policy optimization.
+
+Advances in Neural Information Processing Systems,
+33:14129–14142, 2020.
+
+Yu et al. (2021)
+
+Tianhe Yu, Aviral Kumar, Rafael Rafailov, Aravind Rajeswaran, Sergey Levine,
+and Chelsea Finn.
+
+COMBO: Conservative offline model-based policy optimization.
+
+Advances in Neural Information Processing Systems,
+34:28954–28967, 2021.
+
+Zhang et al. (2026)
+
+Wancong Zhang, Basile Terver, Artem Zholus, Soham Chitnis, Harsh Sutaria, Mido
+Assran, Randall Balestriero, Amir Bar, Adrien Bardes, Yann LeCun, et al.
+
+Hierarchical planning with latent world models.
+
+arXiv preprint arXiv:2604.03208, 2026.
+
+## Appendix A Extended Related Work
+
+This appendix expands upon the three lines of work discussed in Section 3,
+positioning VPFlow within the broader literature.
+
+## A.1 Offline and Goal-Conditioned Reinforcement Learning
+
+Offline RL learns policies from static datasets without environment interaction, mitigating
+distribution shift either by biasing the policy towards the behavior distribution
+(Fujimoto et al., 2019; Wu et al., 2019; Peng et al., 2019; Fujimoto and Gu, 2021) or by regularizing critic
+updates (Kumar et al., 2020; Kostrikov et al., 2022). To capture multi-modal play data and
+improve long-horizon credit assignment, Flow Q-learning (FQL) distills a conditional flow-matching
+policy into a one-step network (Lipman et al., 2023; Park et al., 2025c), and action chunking introduces
+temporal abstraction (Li et al., 2025; Park et al., 2025b). In goal-reaching settings
+(Kaelbling, 1993), universal value function approximators (Schaul et al., 2015)
+and hindsight relabeling (Andrychowicz et al., 2017) extract supervision from reward-free
+trajectories, which offline methods combine with iterated supervised learning
+(Ghosh et al., 2021), latent plans from play (Lynch et al., 2020), contrastive learning
+(Eysenbach et al., 2022), quasi-metric representations (Wang et al., 2023; Myers et al., 2025),
+and subgoal hierarchies (Park et al., 2023), standardized by OGBench (Park et al., 2025a).
+VPFlow adopts a distilled action-chunk flow policy as its behavior prior
+(Park et al., 2025c; Li et al., 2025) but departs from these static, model-free methods in two
+ways: it replaces TD, contrastive, or quasi-metric representation learning with closed-form
+Monte Carlo return regression over multi-step imagined rollouts, and it scales test-time compute via
+receding-horizon noise steering rather than acting greedily at deployment.
+
+## A.2 Model-Based RL and World Models
+
+Model-based RL dates back to Dyna (Sutton, 1991) and Gaussian-process policy search
+(Deisenroth and Rasmussen, 2011), with deep variants learning dynamics via pixel reconstruction
+(Watter et al., 2015; Finn and Levine, 2017; Hafner et al., 2019) or latent imagination
+(Ha and Schmidhuber, 2018; Hafner et al., 2020; Hafner et al., 2025a; Hafner et al., 2025b) and limiting compounding
+error through short rollouts (Janner et al., 2019; Park et al., 2026).
+Offline model-based methods such as MOPO (Yu et al., 2020), MOReL (Kidambi et al., 2020), COMBO
+(Yu et al., 2021), and MBOP (Argenson and Dulac-Arnold, 2021) penalize or truncate rollouts where the model is uncertain, or plan with an ensemble model and a behavior prior like MBOP (Argenson and Dulac-Arnold, 2021).
+Yet they still assume that accurate state prediction is a prerequisite for
+planning.
+Value-equivalent models take an alternative position (Grimm et al., 2020; M. Moerland et al., 2023): value
+prediction networks (VPN) (Oh et al., 2017) and MuZero (Schrittwieser et al., 2020) train
+dynamics purely through predicted rewards, values, and policies.
+VPFlow belongs to the value-equivalent family, but unlike online methods VPN and MuZero, it exploits closed-form hindsight Monte Carlo returns in offline goal reaching as the sole supervision for both the encoder and dynamics, eliminating target networks, EMA, state-matching loss, and TD learning from training.
+
+## A.3 Predictive Representations
+
+Predictive representations characterize a state by its future outcomes rather than its sensory
+appearance (Littman and Sutton, 2001; Carvalho et al., 2024). One line of work builds on
+successor representations and features
+(Dayan, 1993; Barreto et al., 2017; Barreto et al., 2018; Borsa et al., 2019), forward-backward
+representations (Touati and Ollivier, 2021; Blier et al., 2021), and behavior foundation models
+(Pirotta et al., 2024; Park et al., 2024) to predict discounted future occupancy for zero-shot reactive
+readout.
+A parallel line learns with a self-predictive objective that forecasts future latent embeddings, relying on target encoders, stop-gradients (Schwarzer et al., 2021; Guo et al., 2022; Tang et al., 2023; Ni et al., 2024; Fujimoto et al., 2025; Bagatella et al., 2026), or explicit regularizers (LeCun, 2022; Dawid and LeCun, 2024; Assran et al., 2025; Van Assel et al., 2025) to prevent collapse. Whereas occupancy-based representations omit multi-step lookahead search at test time and self-predictive world models require explicit anti-collapse heuristics without exploiting temporal-distance signals, VPFlow bridges both perspectives: it supervises multi-step latent rollouts with goal-conditioned values, which implicitly prevents collapse and organizes the latent space around temporal proximity to the goal.
+
+## A.4 Planning in Latent Space
+
+Sampling-based optimizers such as CEM and MPPI (Rubinstein, 1999; Williams et al., 2017) are
+standard planners in world models (Hafner et al., 2019; Janner et al., 2019; Hansen et al., 2022),
+complemented in visual and offline domains by energy-based or functional-distance costs
+(Du et al., 2020; Tian et al., 2021), hierarchical subgoal search
+(Li et al., 2022; Zhang et al., 2026), and generative adversarial behavior priors in
+GOPlan (Wang et al., 2024).
+Closest to our setting, PLDM (Sobal et al., 2025) and LeWorldModel (Maes et al., 2026b) train latent-predictive dynamics with VICReg (Bardes et al., 2022)
+or SIGReg (Balestriero and LeCun, 2025) regularization and plan in action space via CEM to minimize
+Euclidean distance to the goal embedding, whereas recent generative policy methods steer diffusion
+or flow noise at test time using external rewards or online interaction
+(Salimans et al., 2017; Yang et al., 2024; Wagenmaker et al., 2025; Patil et al., 2026). In
+contrast, VPFlow avoids both the out-of-distribution action queries of open-loop action-space CEM
+and the external reward requirements of prior noise-steering methods: it searches directly in the noise space of its distilled flow policy to maximize imagined generalized advantage under its value-predictive world model, keeping planned actions on the data manifold.
+
+## Appendix B Implementation Details
+
+This section specifies the datasets (Section B.1), network
+details (Section B.2), training objectives (Section B.3),
+optimization (Sections B.4 and B.5), evaluation protocol
+(Section B.6), planner variants of VPFlow (Section B.7),
+other model-based planning baselines in the latent space
+(Section B.8), and software and hardware
+(Section ). Configurations and hyperparameters are detailed in
+Appendix .
+
+## B.1 Datasets and Preprocessing
+
+Datasets.
+We use the official OGBench datasets (Park et al., 2025a) covering both locomotion and robotic
+manipulation tasks without
+modification. The state suite comprises 17 datasets: pointmaze-{medium, large, giant,
+teleport}-navigate, antmaze-{medium, large, giant, teleport}-navigate,
+cube-{single, double, triple, quadruple}-play, scene-play, and
+puzzle-{3x3, 4x4, 4x5, 4x6}-play. The pixel suite comprises the 13 visual-
+counterparts of the AntMaze, Cube, Scene, and Puzzle datasets, with $64\times 64\times 3$ 
+observations. Each dataset has five evaluation tasks specified by start-goal pairs.
+
+Training samples and goal relabeling.
+A training sample is a length- $H$ segment $(s_{t},a_{t},\ldots,a_{t+H-1})$ drawn uniformly from the
+dataset trajectories, with the chunk length $H$ in Table . The value goal
+ $g^{V}$ ( $g$ in Section 5.3) is sampled from a mixture of three sources, with the
+probabilities in Table : the current observation $s_{t}$ ; a future observation
+ $s_{t+d}$ on the same trajectory, with the offset $d$ drawn from the geometric distribution
+ $\mathrm{Geom}(1-\gamma)$ ; and a uniformly random dataset observation. For each offset
+ $h\in\{0,\ldots,H\}$ , the MC target is $R_{t+h}=(1-\gamma^{d_{h}})/(\gamma-1)$ with $d_{h}$ as the
+number of temporal steps from $s_{t+h}$ to $g^{V}$ , and the mask $M_{t+h}$ is one if and only if $g^{V}$ 
+is on the same trajectory at or after index $t+h$ .
+Random goals therefore contribute no value target.
+The policy goal $g^{\pi}$ ( $g$ in Section 5.4) is randomly sampled from a future
+observation on the same trajectory.
+
+Data augmentation.
+For pixel-based tasks, we apply random-crop augmentation (edge padding, then cropping back to
+ $64\times 64$ ; Table ) using one shared crop per sample for the sampled
+observation and both goals, except for the Visual AntMaze environment, following the practice in
+OGBench.
+
+## B.2 Networks
+
+Observation encoder.
+State-based tasks use the identity encoder $E_{\phi}(s)=s$ . Pixel-based tasks use one IMPALA-Small
+convolutional
+encoder (Espeholt et al., 2018) shared by
+observations and goals, followed by a multilayer perceptron (MLP) head that produces the latent
+(Table ).
+
+Dynamics model.
+The predictive world model $f_{\phi}$ maps the current latent $z_{t}$ and the action sequence
+ $a_{t:t+H-1}$ to subsequent latents $\hat{z}_{t+1:t+H}$ .
+To enable parallel rollouts, we instantiate $f_{\phi}$ as a Transformer (Vaswani et al., 2017)
+with cross-attention and causal mask in which the current latent $z_{t}$ is the query and action
+chunks $a_{t:t+H-1}$ are keys and values, as depicted in Figure 9.
+It uses rotary position embeddings (Su et al., 2024), and its configuration is listed in
+Table .
+The prediction for prefix $h$ attends only to $a_{t:t+h-1}$ , so all $H$ prefix latents of a chunk are
+produced in one parallel call.
+
+Figure 9: World model architecture. A Transformer with cross-attention and causal mask
+enables parallel rollouts of future latents induced by action chunks. $B$ is the batch size, $H$ 
+the chunk length, $d_{a}$ the action dimension, $d_{z}$ the latent dimension, $d$ the Transformer
+width.
+
+Value heads.
+Following previous practices to handle value overestimation and uncertainty
+(Fujimoto and Gu, 2021; Kostrikov et al., 2022), we adopt a twin-value-head structure, where
+each head is an MLP with layer normalization (Ba et al., 2016) and GELU activations
+(Hendrycks and Gimpel, 2016) (Table ), acting on the
+concatenation of the encoded state $z$ and goal $z_{g}$ . Policy improvement and planning use the minimum
+of the two heads, i.e., $\min\{V_{\phi,1},V_{\phi,2}\}$ . The default MC objective uses no target
+value network.
+
+Flow policy.
+The velocity field $v_{\theta}$ and the distilled one-step decoder $\pi_{\theta}$ are Transformers with
+sinusoidal position embeddings whose size is tuned per dataset
+(Table ). Each network outputs action chunks of length
+ $H$ , the same as the horizon of training samples.
+
+State and goal conditioning adopts a similar design to that of $\pi_{0}$ (Black et al., 2025): the
+projected latent $z$ and goal $z_{g}$ are prefix tokens that the $H$ action tokens attend to, and the
+flow time $u$ enters through a sinusoidal embedding fused into each action token by a two-layer MLP.
+The prefix tokens attend only to each other while the action tokens attend to both the prefix and
+themselves bidirectionally. The velocity field $v_{\theta}$ and the one-step policy $\pi_{\theta}$ share
+this design.
+
+## B.3 Objectives
+
+Value-predictive model.
+VPFlow trains its dynamics model and observation encoders by minimizing
+ $\mathcal{L}_{\mathrm{VP}}$ in Equation 6.
+The squared error is summed over the two value heads, and the per-sample loss is clipped at a
+dataset-specific threshold.
+
+Conditional flow matching.
+Behavior cloning regularization is a critical technique to reduce OOD actions in offline RL
+(Fujimoto and Gu, 2021). Nonetheless, trajectories in the offline play dataset $\mathcal{D}$ 
+are mostly multi-modal, so a uni-modal Gaussian policy is not expressive enough as the behavior
+prior. We follow FQL (Park et al., 2025c) in using conditional flow matching as the
+behavior-cloning loss and a distilled one-step flow policy to predict multimodal actions.
+
+Conditional flow matching (Lipman et al., 2023) learns a velocity field $v_{\theta}$ that
+transports samples from a source distribution $\bm{\varepsilon}\sim\mathcal{N}({\bm{0}},I)$ to a provided
+action distribution ${\bm{a}}$ along the linear path ${\bm{x}}_{u}=(1-u)\bm{\varepsilon}+u{\bm{a}}$ with flow time
+ $u\in[0,1]$ , whose target velocity is ${\bm{a}}-\bm{\varepsilon}$ :
+
+ $\mathcal{L}_{\mathrm{CFM}}(\theta)\coloneqq\mathbb{E}_{(s,{\bm{a}},g)\sim\mathcal{D},\,\bm{\varepsilon},\,u}\!\left[\left\|v_{\theta}({\bm{x}}_{u},u,E_{\phi}(s),E_{\phi}(g))-({\bm{a}}-\bm{\varepsilon})\right\|_{2}^{2}\right].$ 
+
+(11)
+
+Distillation.
+The distillation trains the one-step flow policy $\pi_{\theta}(z,z_{g},\bm{\varepsilon})$ , conditioned on
+the encoded state $z$ and goal $z_{g}$ , to match the action chunks decoded from the multi-step
+integration of velocity $v_{\theta}$ using the same noise $\bm{\varepsilon}\sim\mathcal{N}({\bm{0}},I)$ by
+minimizing:
+
+ $\mathcal{L}_{\mathrm{Distill}}(\theta)\coloneqq\mathbb{E}_{(s,g)\sim\mathcal{D},\,\bm{\varepsilon}}\Big[\big\|\pi_{\theta}(E_{\phi}(s),E_{\phi}(g),\bm{\varepsilon})-\operatorname{sg}\!\big(\operatorname{EulerIntegration}(v_{\theta},\bm{\varepsilon})\big)\big\|_{2}^{2}\Big],$ 
+
+(12)
+
+where $\operatorname{sg}$ is the stop-gradient operation and
+ $\operatorname{EulerIntegration}(v_{\theta},\bm{\varepsilon})$ is the action chunk obtained by integrating
+ $v_{\theta}$ 
+with the Euler method from $u=0$ (the noise
+ $\bm{\varepsilon}$ ) to $u=1$ with the number of steps in Table .
+
+Policy improvement.
+The policy minimizes Equation 8 with the predictive model frozen.
+Policy improvement imagines the future states with one chunk ( $H$ actions) with the value term
+in Equation 7 divided by its stop-gradient batch mean $|Q_{\theta}|$ , stabilized by a small
+constant $\epsilon_{Q}$ .
+
+State-predictive model.
+
+The (latent) state-predictive model described in Section 6.2 trains the value
+heads on encoded states $z_{t+h}=E_{\phi}(s_{t+h}),h\in[0,H]$ and includes an additional term with
+the weight $\lambda_{\mathrm{state}}$ (Table ) to train the rollout $\hat{z}_{t+h}$ to predict the next latent $z_{t+h}$ , using the latent-prediction (LP) loss:
+
+ $\mathcal{L}_{\mathrm{LP}}(\phi;\lambda_{\mathrm{state}})\coloneqq\mathbb{E}_{({\bm{s}}_{t},{\bm{a}}_{t},{\bm{s}}_{t+1})\sim\mathcal{D},\,g\sim\mathcal{S}}\left[\frac{1}{H+1}\sum_{h=0}^{H}M_{t+h}\odot\|V_{\phi}(z_{t+h},z_{g})-R_{t+h}\|_{2}^{2}+\lambda_{\mathrm{state}}\frac{1}{H}\sum_{h=1}^{H}\|\hat{z}_{t+h}-z_{t+h}\|_{2}^{2}\right].$ 
+
+(13)
+
+The target latent $z_{t+h}$ has no stop-gradient operation, so the pixel encoder can be updated by
+gradients from self-prediction.
+
+## B.4 Training Loop
+
+Algorithm 2 VPFlow training.
+
+Input: offline dataset $\mathcal{D}$ ; chunk length $H$ ; policy update interval $U$ ; training steps
+ $T$ ;
+learning rates $\eta_{\phi},\eta_{\theta}$ 
+
+Output: trained parameters $\phi$ and $\theta$ 
+
+ 1
+ Initialize $\phi$ for $(E_{\phi},f_{\phi},V_{\phi,1},V_{\phi,2})$ and $\theta$ for $(v_{\theta},\pi_{\theta})$ 
+
+ 2
+ for $k=1,\ldots,T$ do
+
+ 3
+ $(s_{t:t+H},{\bm{a}}_{t}=a_{t:t+H-1})\sim\mathcal{D}$ ; sample goals $g^{V},g^{\pi}$ 
+
+ 4
+ $z_{t}\leftarrow E_{\phi}(s_{t})$ , $z_{g^{V}}\leftarrow E_{\phi}(g^{V})$ 
+
+ 5
+ $\hat{z}_{t}\leftarrow z_{t}$ 
+
+ 6
+ $\hat{z}_{t+h}\leftarrow f_{\phi}(z_{t},a_{t:t+h-1})$ , $h=1,\ldots,H$ 
+ $\triangleright$  Equation 5
+
+ 7
+ $d_{h}\leftarrow\operatorname{steps}(s_{t+h}\to g^{V})$ , $h=0,\ldots,H$ $\triangleright$  Temporal distance to goal
+
+ 8
+ $R_{t+h}\leftarrow(1-\gamma^{d_{h}})/(\gamma-1)$ $\triangleright$  Equation 3
+
+ 9
+ $M_{t+h}\leftarrow\mathds{1}_{\{d_{h}\geq 0\}}$ 
+
+ 10
+ $\phi\leftarrow\operatorname{AdamStep}(\phi,\nabla_{\phi}\mathcal{L}_{\mathrm{VP}};\eta_{\phi})$ 
+ $\triangleright$  Equation 6, $\mathcal{L}_{\mathrm{VP}}$ 
+
+ 11
+ if $k\bmod U=0$ then
+
+ 12
+ $z_{t}\leftarrow\operatorname{sg}(E_{\phi}(s_{t}))$ ,
+ $z_{g^{\pi}}\leftarrow\operatorname{sg}(E_{\phi}(g^{\pi}))$ 
+
+ 13
+ $\bm{\varepsilon}\sim\mathcal{N}({\bm{0}},I)$ 
+
+ 14
+ ${\bm{a}}\leftarrow\operatorname{clip}(\pi_{\theta}(z_{t},z_{g^{\pi}},\bm{\varepsilon}),-1,1)$ 
+
+ 15
+ $\hat{z}_{t+H}\leftarrow f_{\phi}(z_{t},{\bm{a}})$ 
+
+ 16
+ $Q_{\theta}\leftarrow\gamma^{H}\min_{j\in\{1,2\}}V_{\phi,j}(\hat{z}_{t+H},z_{g^{\pi}})$ 
+
+ 17
+ $\theta\leftarrow\operatorname{AdamStep}(\theta,\nabla_{\theta}\mathcal{L}_{\pi};\eta_{\theta})$ 
+ $\triangleright$  Equation 8, $\mathcal{L}_{\pi}$ 
+
+ 18
+ return $(\phi,\theta)$ 
+
+Algorithm 2 summarizes the training process in Figure 3.
+The operator $\operatorname{AdamStep}$ denotes an Adam update step.
+The goal-sampling rules and target masks follow Section B.1; $\operatorname{steps}$ 
+returns
+ $-1$ for goals on another trajectory or before the predicted state.
+Hyperparameters are specified in Table .
+
+## B.5 Optimization
+
+All networks are trained with Adam (Kingma and Ba, 2015), with the
+optimizer settings in Tables and . The number of
+training steps follows the
+benchmarking standards in OGBench (Park et al., 2025a). The predictive model with value heads and
+the policy networks are updated alternately at every step, i.e., the policy update interval
+ $U=1$ .
+
+## B.6 Planning and Evaluation Protocol
+
+Planning setup.
+At each planning step, we encode the current observation and goal and maximize the imagined
+advantage $A$ in Equation 10, keeping the model and policy weights fixed.
+The default horizon is one training-sized action chunk ( $n_{c}=1$ , $H=16$ ).
+We execute the first $H_{\mathrm{exec}}$ actions and replan from the resulting observation.
+Shared planner hyperparameters like the population size $N$ and elite count $N_{\mathrm{e}}$ are listed in
+Table , and dataset-specific hyperparameters like execution horizons
+ $H_{\mathrm{exec}}$ are listed in Table .
+
+Noise-space decoding.
+The distilled policy maps source noise to an action chunk, ${\bm{a}}=\pi_{\theta}(z,z_{g},\bm{\varepsilon})$ , with
+ $\bm{\varepsilon}\sim\mathcal{N}({\bm{0}},I)$ in $\mathbb{R}^{Hd_{a}}$ during training, where $d_{a}$ is the action dimension.
+Planning optimizes this noise through the decoder $\operatorname{Dec}$ in
+Algorithm 1;
+ $\bm{\varepsilon}={\bm{0}}$ gives the deterministic policy output, which we call the policy mode.
+For multiple chunks ( $n_{c}\geq 1$ ), the decoder conditions each chunk $c$ on the latent reached by the
+preceding chunk using its noise vector $\bm{\varepsilon}_{c}$ , where $\bm{\varepsilon}=(\bm{\varepsilon}_{0},\ldots,\bm{\varepsilon}_{n_{c}-1})$ ,
+keeping dynamics queries within the training context length.
+The score in Equation 10 then extends over $n_{c}H$ steps.
+Shorter planning horizons use a prefix of the decoded chunk.
+Setting $K=0$ bypasses search and executes the policy mode.
+
+((a)) Evolution of the noise population.
+
+((b)) GAE is optimized via noise-space search.
+
+Figure 10: Noise-space evolutionary search with $\varepsilon$ -ES on
+pointmaze-giant-navigate-v0.
+Gray points denote candidate noises, orange points denote elites, and the blue star marks the
+selected noise at each generation.
+The right panel shows the corresponding advantage scores.
+
+Zeroth-order steering.
+ $\varepsilon$ -ES (Algorithm 1) uses forward evaluations of $A$ , allowing search without
+informative gradients.
+It initializes $N_{\mathrm{e}}$ elites at the policy mode and generates $N$ Gaussian mutations per
+iteration, distributed evenly among the elites.
+The mutation scale is annealed as $\sigma_{k}=\max(\sigma_{\min},\sigma_{\max}\rho^{k})$ for
+ $k=0,\ldots,K-1$ .
+Each parent is replaced only by a child with a higher score, so every elite’s score remains at least
+as high as the initial policy score and the best score is non-decreasing.
+The final plan is sampled from the elites with probabilities proportional to $\exp(\beta A_{e})$ ,
+retaining several high-scoring alternatives rather than selecting only the maximum.
+The selected plan therefore also matches or exceeds the policy mode’s score under the learned
+objective $A$ .
+Figure 10 illustrates the population and score evolution on PointMaze.
+
+Algorithm 3 $\varepsilon$ -SGD and $\varepsilon$ -Adam: first-order noise steering.
+
+Input: state $s_{t}$ , goal $g$ ; optimizer $o\in\{\mathrm{SGD},\mathrm{Adam}\}$ ; steps $K\geq 0$ ;
+step size $\eta$ ; decay $\rho$ ; execution length $H_{\mathrm{exec}}$ ;
+decoder $\operatorname{Dec}$ of Algorithm 1
+
+Output: first $H_{\mathrm{exec}}$ actions of the final iterate
+
+ 1
+ $z_{t}\leftarrow E_{\phi}(s_{t})$ , $z_{g}\leftarrow E_{\phi}(g)$ 
+
+ 2
+ if $K=0$ then
+
+ 3
+ return $\operatorname{Dec}({\bm{0}})[{:}H_{\mathrm{exec}}]$ 
+
+ 4
+ $\bm{\varepsilon}\leftarrow{\bm{0}}$ $\triangleright$  Policy initialization at zero
+
+ 5
+ ${\bm{m}}\leftarrow{\bm{0}}$ , ${\bm{v}}\leftarrow{\bm{0}}$ 
+
+ 6
+ for $k=1,\ldots,K$ do
+
+ 7
+ $\eta_{k}\leftarrow\eta\rho^{k-1}$ $\triangleright$  Annealed step size
+
+ 8
+ ${\bm{u}}\leftarrow\nabla_{\bm{\varepsilon}}A(z_{t},\operatorname{Dec}(\bm{\varepsilon}),z_{g})$ 
+ $\triangleright$  Equation 14
+
+ 9
+ if $o=\mathrm{SGD}$ then
+
+ 10
+ $\bm{\varepsilon}\leftarrow\bm{\varepsilon}+\eta_{k}{\bm{u}}$ 
+
+ 11
+ else
+
+ 12
+ ${\bm{m}}\leftarrow 0.9\,{\bm{m}}+0.1\,{\bm{u}}$ 
+
+ 13
+ ${\bm{v}}\leftarrow 0.999\,{\bm{v}}+0.001\,{\bm{u}}^{2}$ 
+
+ 14
+ $\hat{\bm{m}}\leftarrow{\bm{m}}/(1-0.9^{k})$ , $\hat{\bm{v}}\leftarrow{\bm{v}}/(1-0.999^{k})$ 
+
+ 15
+ $\bm{\varepsilon}\leftarrow\bm{\varepsilon}+\eta_{k}\hat{\bm{m}}/(\sqrt{\hat{\bm{v}}}+10^{-8})$ 
+
+ 16
+ return $\operatorname{Dec}(\bm{\varepsilon})[{:}H_{\mathrm{exec}}]$ 
+
+First-order steering.
+In practice, we find that first-order planners generally yield higher success rates than $\varepsilon$ -ES on
+locomotion tasks (Table ).
+As a result, we steer the noise by gradient ascent with stochastic gradient descent (SGD) or Adam,
+and denote the resulting planners $\varepsilon$ -SGD and $\varepsilon$ -Adam, respectively.
+The main results in Table 1, with complete evaluations in
+Table , use these first-order planners for locomotion and state-based
+cube-single-play-v0 datasets, and $\varepsilon$ -ES for the remaining manipulation datasets.
+
+Both first-order planners (Algorithm 3) optimize a single noise candidate
+initialized at $\bm{\varepsilon}^{(0)}={\bm{0}}$ .
+Each of the $K$ ascent steps differentiates through the policy decoder, latent dynamics, and value
+function:
+
+ ${\bm{u}}^{(k)}=\nabla_{\bm{\varepsilon}}A\big(z_{t},\operatorname{Dec}(\bm{\varepsilon}),z_{g}\big)\Big|_{\bm{\varepsilon}=\bm{\varepsilon}^{(k-1)}}.$ 
+
+(14)
+
+ $\varepsilon$ -SGD updates $\bm{\varepsilon}^{(k)}=\bm{\varepsilon}^{(k-1)}+\eta_{k}{\bm{u}}^{(k)}$ , with $\eta_{k}=\eta\rho^{k-1}$ .
+ $\varepsilon$ -Adam uses bias-corrected Adam ascent (Kingma and Ba, 2015) with the same step-size schedule
+and the moment constants in Table .
+Adam rescales coordinates using running gradient moments, so its step size is tuned separately from
+that of $\varepsilon$ -SGD.
+Powers, square roots, and vector division are element-wise.
+Noise is unconstrained, while decoded actions are clipped to $[-1,1]$ .
+We execute the final iterate without the elitist score guarantee of $\varepsilon$ -ES.
+
+Planning complexity.
+Ignoring initialization and final decoding, $\varepsilon$ -ES evaluates $KN$ candidate rollouts, whereas
+first-order steering uses $K$ forward-backward evaluations of one candidate.
+For a fixed model and rollout horizon, let $C_{\mathrm{fwd}}$ and $C_{\mathrm{bwd}}$ denote the
+per-candidate complexity of decoding and scoring, and of backpropagation, respectively.
+Under sequential computation, the total time complexities are $\mathcal{O}(KNC_{\mathrm{fwd}})$ for
+ $\varepsilon$ -ES and $\mathcal{O}(K(C_{\mathrm{fwd}}+C_{\mathrm{bwd}}))$ for first-order steering.
+The planner comparisons use separately tuned settings rather than matched compute budgets.
+
+Evaluation.
+We evaluate the final training checkpoint on each dataset’s five official OGBench tasks, using $25$ 
+episodes per task in vectorized environments (Park et al., 2025a).
+Each episode retains its task goal, and success is determined by the environment’s native indicator
+within its time limit.
+For each training seed, the dataset success rate is averaged over the five tasks.
+We report the mean and standard deviation of success rate across 8 training seeds for state inputs
+and 4 for pixel inputs, the same as in OGBench (Park et al., 2025a).
+
+## B.7 Planner Variants
+
+The CEM variants in Table 2 optimize the same advantage $A$ as $\varepsilon$ -ES,
+but refit a diagonal Gaussian at each iteration rather than retain and mutate individual elites.
+Each iteration scores $N$ candidates and refits the mean and standard deviation using the top
+ $N_{\mathrm{e}}$ candidates with normalized weights $w_{e}\propto\exp(\beta A_{e})$ .
+This distribution refit does not preserve $\varepsilon$ -ES’s monotonic elite-score guarantee.
+
+Noise-space CEM.
+ $\varepsilon$ -CEM (Algorithm 4) applies the CEM refitting scheme in the policy’s noise
+space, initializing the sampling distribution as $\mathcal{N}({\bm{0}},I)$ .
+Candidate noises are decoded through $\operatorname{Dec}$ of Algorithm 1 and ranked
+by
+ $A$ .
+After each refit, the coordinate-wise standard deviations $\bm{\sigma}$ are clipped between $\sigma_{\min}$ and
+the annealed upper bound $\sigma_{k}=\max(\sigma_{\min},\sigma_{\max}\rho^{k})$ , with $k$ indexed
+from zero.
+The final plan is decoded from an elite sampled with the same softmax weights.
+
+Action-space CEM.
+ $\mathcal{A}$ -CEM (Algorithm 5) searches directly over action sequences, warm-starting the
+initial mean at the policy’s direct output ${\bm{\mu}}_{a}=\operatorname{Dec}({\bm{0}})$ and setting the
+initial
+standard deviation to $\bm{\sigma}_{a}=\sigma_{\max}{\bm{1}}$ .
+This initialization is recomputed at each planning step from the current observation, without
+carrying over the previous plan.
+Candidates are clipped to $[-1,1]$ before scoring, and the sampling standard deviations use the same
+annealed bounds.
+The executed plan is the final fitted action mean.
+
+Both variants execute the first $H_{\mathrm{exec}}$ actions, return the direct policy output when $K=0$ , and
+add no execution noise.
+They reuse $\varepsilon$ -ES’s planning hyperparameters on each dataset (Tables 
+and ).
+In the pseudocode below, $\operatorname{TopK}$ returns elite indices and ${\bm{1}}$ is the all-ones
+vector; vector squaring, square roots, and clipping are element-wise.
+
+Algorithm 4 $\varepsilon$ -CEM: CEM in noise space.
+
+Input: state $s_{t}$ , goal $g$ ; population $N$ ; elites $1\leq N_{\mathrm{e}}\leq N$ ; iterations $K\geq 0$ ;
+scale bounds $\sigma_{\min},\sigma_{\max}$ ; decay $\rho$ ; inverse temperature $\beta$ ;
+execution length $H_{\mathrm{exec}}$ ; decoder $\operatorname{Dec}$ of Algorithm 1
+
+Output: first $H_{\mathrm{exec}}$ actions of the selected plan
+
+ 1
+ $z_{t}\leftarrow E_{\phi}(s_{t})$ , $z_{g}\leftarrow E_{\phi}(g)$ 
+
+ 2
+ if $K=0$ then
+
+ 3
+ return $\operatorname{Dec}({\bm{0}})[{:}H_{\mathrm{exec}}]$ 
+
+ 4
+ ${\bm{\mu}}\leftarrow{\bm{0}}$ , $\bm{\sigma}\leftarrow{\bm{1}}$ $\triangleright$  Gaussian noise initialization
+
+ 5
+ for $k=0,\ldots,K-1$ do
+
+ 6
+ $\sigma_{k}\leftarrow\max(\sigma_{\min},\sigma_{\max}\rho^{k})$ 
+
+ 7
+ for $i=1,\ldots,N$ do
+
+ 8
+ $\bm{\varepsilon}^{(i)}\sim\mathcal{N}({\bm{\mu}},\operatorname{diag}(\bm{\sigma}^{2}))$ $\triangleright$  Noise-space
+sampling
+
+ 9
+ $A_{i}\leftarrow A(z_{t},\operatorname{Dec}(\bm{\varepsilon}^{(i)}),z_{g})$ 
+ $\triangleright$  Equation 10
+
+ 10
+ $\mathcal{E}\leftarrow\operatorname{TopK}((A_{i})_{i=1}^{N},N_{\mathrm{e}})$ 
+
+ 11
+ $w_{i}\leftarrow\exp(\beta A_{i})/\sum_{j\in\mathcal{E}}\exp(\beta A_{j})$ ,
+ $i\in\mathcal{E}$ 
+
+ 12
+ ${\bm{\mu}}\leftarrow\sum_{i\in\mathcal{E}}w_{i}\bm{\varepsilon}^{(i)}$ 
+
+ 13
+ $\bm{\sigma}\leftarrow\sqrt{\sum_{i\in\mathcal{E}}w_{i}(\bm{\varepsilon}^{(i)}-{\bm{\mu}})^{2}}$ 
+
+ 14
+ $\bm{\sigma}\leftarrow\operatorname{clip}(\bm{\sigma},\sigma_{\min},\sigma_{k})$ 
+
+ 15
+ $i^{\star}\sim\operatorname{Categorical}((w_{i})_{i\in\mathcal{E}})$ 
+
+ 16
+ return $\operatorname{Dec}(\bm{\varepsilon}^{(i^{\star})})[{:}H_{\mathrm{exec}}]$ 
+
+Algorithm 5 $\mathcal{A}$ -CEM: CEM in action space.
+
+Input: state $s_{t}$ , goal $g$ ; population $N$ ; elites $1\leq N_{\mathrm{e}}\leq N$ ; iterations $K\geq 0$ ;
+scale bounds $\sigma_{\min},\sigma_{\max}$ ; decay $\rho$ ; inverse temperature $\beta$ ;
+execution length $H_{\mathrm{exec}}$ ; decoder $\operatorname{Dec}$ of Algorithm 1
+
+Output: first $H_{\mathrm{exec}}$ actions of the fitted mean
+
+ 1
+ $z_{t}\leftarrow E_{\phi}(s_{t})$ , $z_{g}\leftarrow E_{\phi}(g)$ 
+
+ 2
+ if $K=0$ then
+
+ 3
+ return $\operatorname{Dec}({\bm{0}})[{:}H_{\mathrm{exec}}]$ 
+
+ 4
+ ${\bm{\mu}}_{a}\leftarrow\operatorname{Dec}({\bm{0}})$ $\triangleright$  Action warm start
+
+ 5
+ $\bm{\sigma}_{a}\leftarrow\sigma_{\max}{\bm{1}}$ 
+
+ 6
+ for $k=0,\ldots,K-1$ do
+
+ 7
+ $\sigma_{k}\leftarrow\max(\sigma_{\min},\sigma_{\max}\rho^{k})$ 
+
+ 8
+ $\bm{\sigma}_{a}\leftarrow\operatorname{clip}(\bm{\sigma}_{a},\sigma_{\min},\sigma_{k})$ 
+
+ 9
+ for $i=1,\ldots,N$ do
+
+ 10
+ ${\bm{a}}^{(i)}\sim\mathcal{N}({\bm{\mu}}_{a},\operatorname{diag}(\bm{\sigma}_{a}^{2}))$ 
+ $\triangleright$  Action-space
+sampling
+
+ 11
+ ${\bm{a}}^{(i)}\leftarrow\operatorname{clip}({\bm{a}}^{(i)},-1,1)$ 
+
+ 12
+ $A_{i}\leftarrow A(z_{t},{\bm{a}}^{(i)},z_{g})$ 
+ $\triangleright$  Equation 10
+
+ 13
+ $\mathcal{E}\leftarrow\operatorname{TopK}((A_{i})_{i=1}^{N},N_{\mathrm{e}})$ 
+
+ 14
+ $w_{i}\leftarrow\exp(\beta A_{i})/\sum_{j\in\mathcal{E}}\exp(\beta A_{j})$ ,
+ $i\in\mathcal{E}$ 
+
+ 15
+ ${\bm{\mu}}_{a}\leftarrow\sum_{i\in\mathcal{E}}w_{i}{\bm{a}}^{(i)}$ 
+
+ 16
+ $\bm{\sigma}_{a}\leftarrow\sqrt{\sum_{i\in\mathcal{E}}w_{i}({\bm{a}}^{(i)}-{\bm{\mu}}_{a})^{2}}$ 
+
+ 17
+ $\bm{\sigma}_{a}\leftarrow\operatorname{clip}(\bm{\sigma}_{a},\sigma_{\min},\sigma_{k})$ 
+
+ 18
+ return ${\bm{\mu}}_{a}[{:}H_{\mathrm{exec}}]$ 
+
+## B.8 Model-Based Latent Planners
+
+We benchmark LeWM (Maes et al., 2026b), PLDM (Sobal et al., 2025), and TD-MPC2
+(Hansen et al., 2024) on the 13 pixel-based datasets in Appendix B.1.
+Our implementations are adapted from the official
+LeWM33
+ 3
+
+ https://github.com/lucas-maes/le-wm and stable-worldmodel
+(Maes et al., 2026a)44
+ 4
+
+ https://github.com/galilai-group/stable-worldmodel
+repositories.
+Each baseline learns a latent world model from the offline data and uses CEM
+(Rubinstein, 1999) to plan towards a goal image.
+Table B.8 summarizes the configurations; the objectives and OGBench adaptations are
+described below.
+
+Table 3: Configurations of latent planning baselines on pixel-based OGBench.
+Merged cells indicate shared settings; – denotes an absent component or an inapplicable
+setting.
+
+Setting
+
+LeWM
+
+PLDM
+
+TD-MPC2b

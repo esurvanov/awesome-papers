@@ -1,0 +1,2997 @@
+## InsightRAG: Aggregating Distributed Scholarly Judgments for Scientific Survey Generation
+
+Yuquan Lin
+††thanks: First author: ylinfp@connect.ust.hk
+Affiliation: The Hong Kong University of Science and Technology
+
+Wenshuo Zhang
+††thanks: Corresponding author: wzhangeb@connect.ust.hk
+Affiliation: The Hong Kong University of Science and Technology
+
+Yilin Ye
+
+Affiliation: The Hong Kong University of Science and Technology
+
+Shuchang Xu
+
+Affiliation: The Hong Kong University of Science and Technology
+
+Zhao Chen, Weiqi Wang, Huamin Qu
+
+Affiliation: The Hong Kong University of Science and Technology
+
+Affiliation: The Hong Kong University of Science and Technology (Guangzhou)
+
+Abstract
+
+The rapid growth of scientific literature makes survey writing increasingly challenging, motivating automatic survey generation.
+Yet, existing systems must search an open space of papers and an open space of concepts with no trace of how the community itself has navigated them, leading to incomplete scope, weak taxonomies, and unreliable citations.
+Our core insight is that author-written Related Work sections contain the human judgments needed to address both limitations:
+authors curate the citations relevant to their contributions and explain how the cited works relate, yielding paths for scope reconstruction and relational evidence for organization.
+We propose InsightRAG. Its insight-guided retrieval follows author-supported citation relations to reconstruct a verified research scope and structure the resulting relational evidence.
+It aggregates these judgments under a minimum-conflict objective into a taxonomy that reflects recurring author-written perspectives in the retrieved literature, guides generation, and bounds each section’s evidence.
+Results on ten topics show gains in scope reconstruction, taxonomy quality, citation support, and reference reliability.
+
+## 1 Introduction
+
+Figure 1: Motivation of InsightRAG. Author-written Related Work sections record how different authors characterize prior work from their own perspectives; aggregating these local views grounds the survey in recurring perspectives within the explored literature.
+
+Writing a scientific survey is labor-intensive: authors must find, assess, and organize relevant work into a coherent taxonomy and narrative.
+As publication rates grow, this cost rises faster than most groups can absorb.
+This motivated automatic survey generation (ASG), which agentizes this workflow into retrieval, reading, planning, and writing (Wang et al., 2024; Zhou et al., 2025).
+Subsequent systems refine its components with memory-driven retrieval and outline planning (Yan et al., 2025), structured preprocessing (Liang et al., 2025), and quality-aware feedback (Bao et al., 2025).
+
+What a survey requires, however, is not a ranked list but a research scope: which works are foundational, which extend or challenge them, and which directions belong to the same topic. Reconstructing it confronts a language model with two open-ended search problems: retrieval must find relevant work in an open space of millions of papers Cohan et al. (2020); Ajith et al. (2024); He et al. (2025), and writing must organize that evidence in an equally open space of concepts, inventing a taxonomy from scratch. Both spaces are too large for a model to navigate reliably—on our ten topics, no existing system recovers more than 11% of a human survey’s reference scope, and every baseline falls below 0.50 correctness. Recent work constrains this search with structure extracted from paper content Pedinotti and Santus (2026); Yang et al. (2026) or citation graphs Zhang et al. (2025b); Hu et al. (2025a), but neither provides the traces the search needs: a paper’s content reflects only its own vantage point, and citation edges record that two papers are linked, not how Wu et al. (2026). The model is thus left to search these open spaces without any trace of how the community itself has navigated them.
+
+These traces already exist, written by authors themselves. When authors write a Related Work section, they do more than cite: they search the same two open spaces and record how they navigated them, selecting relevant prior work and articulating relations such as similarity, difference, limitation, and progression. Across a field, these local judgments accumulate into a crowdsourced account of its intellectual structure, supplying exactly the traces current pipelines discard: curated citation paths for finding literature, and explicit relational statements for organizing it. This motivates our research question: can author-written Related Work judgments serve as a reliable scaffold for reconstructing a field’s scope, taxonomy, and coherent survey narrative?
+
+We answer this question with InsightRAG, which builds one stage of the workflow on each of these two signals.
+Insight-guided retrieval follows the citation paths authors have already curated: from a seed paper, it traverses the citation graph forward and backward, admitting a paper only when an author-written passage supports the relation and the paper lies within the user-defined scope.
+It returns a verified paper set and two records of author judgment: a research-scope graph whose edges carry the relation an author asserted between two papers—improvement, extension, comparison, or critique—and, per paper, a Related Work Tree recording how its authors grouped prior work and placed their own contribution within it.
+Taxonomy construction then aggregates the relational statements themselves: the concept phrases stated on the graph’s edges are merged into a shared candidate concept space, over which a minimum-conflict objective selects a taxonomy and paper assignment that maximize concept support and assignment support while penalizing taxonomy complexity, subject to structural and semantic constraints.
+Since exact optimization is NP-hard, InsightRAG approximates it with a coverage-oriented greedy initializer and a global LLM refinement pass, then assigns each paper to one leaf.
+The taxonomy and its assigned papers then serve as the writing plan: leaf sections synthesize the assigned papers, internal sections explain how their children relate, and each section may cite only its own papers.
+
+Experiments on ten computer-science survey topics, each annotated with a gold reference scope and a gold taxonomy from a human-written survey, evaluate the intermediate artifacts as well as the final text.
+InsightRAG reconstructs research scope far more completely and accurately than retrieval and survey-generation baselines, builds taxonomies that are better organized and better grounded in author-written evidence, and produces surveys with substantially more faithful citations.
+
+Overall, Our contributions are threefold:
+
+• 
+
+We identify author-written Related Work judgments as the scholarly-judgment signal missing from autonomous survey generation, and reorganize the end-to-end workflow around it.
+
+• 
+
+We propose InsightRAG, combining insight-guided citation traversal with minimum-conflict aggregation of distributed author judgments to produce a taxonomy that reflects recurring author-written perspectives in the retrieved literature, bounds the evidence available to each survey section, and guides generation of the final survey.
+
+• 
+
+We introduce an evaluation setting over ten survey topics that scores research-scope reconstruction, taxonomy quality, and final survey quality separately at successive pipeline stages.
+
+## 2 Related Work
+
+Citation-aware scholarly retrieval and exploration. SciCite classifies citation intent as background, method, or result comparison (Cohan et al., 2019), while Valenzuela et al. distinguish important from incidental citations (Valenzuela et al., 2015). Scholarly retrieval also uses lexical or embedding similarity (Cohan et al., 2020) and citation-graph propagation (Zhang et al., 2025b; Hu et al., 2025a); these signals alone do not preserve how citing authors describe prior work. Relatedly helps readers explore Related Work paragraphs across papers and form topic outlines (Palani et al., 2023), but leaves the synthesis of these perspectives to readers. InsightRAG uses passages surrounding citations as author-attributed relational evidence to discover and verify a topic-specific literature scope.
+
+Scholarly taxonomy construction. CHIME organizes a given paper set with expert corrections to category relations and paper assignments (Hsu et al., 2024). HiGTL combines paper text and citation-graph structure for hierarchical clustering and concept naming (Hu et al., 2025b), while Zhu et al. use LLM-generated aspect representations and clustering and introduce TaxoBench-CS (Zhu et al., 2025). These methods do not explicitly use citing authors’ descriptions of prior work as evidence for taxonomy construction. InsightRAG extracts concept phrases from author-written Related Work passages surrounding citations and aggregates their support across papers.
+
+Automatic survey generation. Mohammad et al. combined citation texts with multi-document summarization to generate technical surveys (Mohammad et al., 2009). LLM-based systems commonly follow a retrieve–plan–write pipeline (Wang et al., 2024; Zhou et al., 2025), with later work improving retrieval, preprocessing, feedback, collaboration, and evaluation (Wu et al., 2025a; Yan et al., 2025; Liang et al., 2025; Bao et al., 2025; Go et al., 2026; Guo et al., 2026). Some systems also extract relations or taxonomies from paper content (Pedinotti and Santus, 2026; Yang et al., 2026), but these structures need not capture how subsequent authors position earlier work. InsightRAG carries its reconstructed scope and taxonomy into an evidence-bounded writing plan. Appendix H provides a more detailed comparison.
+
+## 3 Methodology
+
+## 3.1 Workflow and Problem Formulation
+
+InsightRAG operationalizes the two signals recorded in author-written Related Work sections: curated citation paths for reconstructing a research scope, and explicit relational statements for organizing it. Rather than use keywords to retrieve references and infer the field’s structure from scratch, InsightRAG recovers and aggregates these distributed human judgments across the retrieved literature.
+
+The input is $Q=(d,p_{0})$ :
+a scope definition $d$ specifying the survey topic, focus, and literature boundary,
+and a seed paper $p_{0}$ given by the user or retrieved by an LLM.
+Insight-guided retrieval (§3.2) follows from $p_{0}$ the curated citation paths supported by author-written contexts, returning a topic-specific paper set $P$ , a research-scope graph $G$ whose edges carry those contexts, and for each $p\in P$ a Related Work (RW) Tree $R_{p}$ recording how its authors grouped prior work.
+Taxonomy construction (§3.3) takes $(P,G,\{R_{p}\}_{p\in P})$ , builds a draft hierarchy from concept phrases and support weights in the author-written citation contexts of $G$ , refines it into a taxonomy $T$ using the scope definition, compact concept and paper profiles, and RW Tree patterns as auxiliary structural evidence, and assigns papers to its leaves through a map $A$ .
+Together $T$ and $A$ bound the evidence available to every survey section: a leaf is written from its assigned papers alone, while an internal node explains how its children relate. An LLM then generates the final survey.
+Detailed algorithms, backbone models, principal budgets, and resource-use figures are provided in Appendix F; method prompts for all three stages appear in Appendix I.
+
+Figure 2: Overview of InsightRAG. Insight-guided retrieval performs scope-verified forward and backward expansion to construct a verified paper set, a relation-bearing research-scope graph, and per-source Related Work trees. Minimum-conflict taxonomy construction produces and refines the taxonomy, assigns papers to leaves, and validates the resulting structure. Evidence-bounded survey generation then converts taxonomy nodes into writing units with local evidence packages and constrained citation identifiers.
+
+## 3.2 Insight-Guided Retrieval
+
+This stage must recover a research scope rather than a ranked list: which works are foundational, which extend or challenge them, and which directions belong to the same topic.
+InsightRAG recovers it from author-written Related Work sections, which already carry local relevance judgments and explicit statements of how a citing paper relates to the work it cites:
+a citation relation is followed only when such a passage supports it, and the paper it leads to is admitted only after verification against the user-defined research scope.
+
+## 3.2.1 Related Work Tree Extraction
+
+For each accepted paper $p$ , InsightRAG extracts an RW Tree $R_{p}$ from the paper’s author-written Related Work discussion and the citations resolved from that text.
+Its internal nodes are the categories the authors used to organize prior work, so that papers under one internal node form an author-defined conceptual group;
+its leaves are the cited papers, with their meta information and the role the authors assigned them, such as method or limitation;
+and its root is the focal paper with its research context.
+The edges inside the tree $E_{p}$ encode the authors’ conceptual organization, such as the improvement from a leaf paper to the root, rather than the raw citation links used for traversal.
+If the Related Work section does not provide a complete hierarchy, InsightRAG retains only the structure supported by the text instead of asking the model to fill in the missing parts.
+
+## 3.2.2 Research-Scope Reconstruction
+
+Reconstruction turns input $Q$ into the paper set $P$ and the research-scope graph $G$ .
+InsightRAG first converts $d$ into a structured research context holding the scope constraints, the intended perspective, and any temporal requirement, and resolves $p_{0}$ against a scholarly index for its meta information and citation relations; retrieval starts only if the seed’s research problem, methodology, and contribution satisfy the scope.
+
+The search then proceeds in rounds. A candidate is accepted only if it falls within the target scope and then stored as RW Tree $R_{p}$ , then becomes nodes in $G$ , and each directed edge in $G$ stores the supporting passage from the citing paper to the cited paper.
+To support this iterative process, the algorithm maintains three sets: the accepted set $S_{a}$ , the frontier set $S_{f}$ of papers awaiting expansion, and the explored set $S_{e}$ of papers already expanded. The accepted set and the frontier are initialized with the seed, $S_{a}=S_{f}=\{p_{0}\}$ , while the explored set is initially empty, $S_{e}=\emptyset$ .
+
+Forward operator.
+Given a paper $p$ , the forward operator retrieves the papers that cite $p$ , each paired with the citation sentence or Related Work passage in which the citing paper discusses $p$ .
+This direction targets later developments, extensions, applications, comparisons, and critiques.
+When the citing papers are too numerous to process exhaustively, highly cited and recent papers are prioritized to keep the operator technically feasible.
+A permissive pre-filter removes clearly uninformative candidates, and each remaining candidate must pass an admission test against the target scope.
+Admitted candidates are deduplicated against the accepted set $S_{a}$ and, if new, added to it; their supporting passages are incorporated into $G$ as relation evidence.
+
+RW-guided backward operator.
+Given a paper $p$ , the backward operator retrieves the references of $p$ by extracting its RW Tree $R_{p}$ (§3.2.1) and checking whether each leaf of $R_{p}$ , paired with the author-written passage that describes it, passes the same admission test.
+Admitted predecessors are deduplicated against $S_{a}$ and, if new, added to it; their relation evidence is incorporated into $G$ .
+Each admitted predecessor is expanded through its own RW Tree, so backward exploration recursively exposes earlier portions of the verified scope.
+
+Round structure and state update.
+
+Starting from $S_{a}=S_{f}=\{p_{0}\}$ and $S_{e}=\emptyset$ , a run executes a bounded number of forward steps followed by a bounded number of backward steps.
+In each forward step, the forward operator is applied to every paper in the frontier $S_{f}$ ; the expanded papers are added to the explored set $S_{e}$ , newly admitted papers are added to $S_{a}$ , and the frontier is updated to $S_{a}\setminus S_{e}$ .
+The forward phase comes first so that major recent research directions are identified before their earlier foundations are traced.
+Once the forward steps are complete, the frontier is reset to the full accepted set and the explored set is cleared, i.e., $S_{f}\leftarrow S_{a}$ and $S_{e}\leftarrow\emptyset$ , while $S_{a}$ is kept unchanged.
+Each backward step then applies the backward operator to every paper in $S_{f}$ and parses its RW Tree; the expanded papers are added to $S_{e}$ , newly admitted predecessors are added to $S_{a}$ , and the frontier is again updated to $S_{a}\setminus S_{e}$ .
+After the backward steps terminate, a loop-closure step densifies $G$ by recovering missing citation links among accepted papers, merging duplicate nodes, and attaching new author-written evidence to existing relations.
+This completes the reconstruction run.
+
+Post-termination reseeding and graph merging.
+
+After a run terminates, InsightRAG selects new seeds with high in-degree in $G$ , reruns reconstruction independently from each seed, and merges the resulting graphs with deduplication and loop closure.
+The merged graph and its verified papers define $G$ and $P$ , respectively, for taxonomy construction. The RW Trees are retained for global refinement, while the author-written citation contexts on the edges of $G$ provide concept phrases and support weights for the draft hierarchy.
+
+## 3.3 Minimum-Conflict Taxonomy Construction and Survey Generation
+
+The retrieval stage produces a verified literature space but not the global organization a survey requires.
+The author-written citation contexts retained on the edges of $G$ encode local views that may conflict: different citing papers may associate the same paper with different concepts, use different names for similar concepts, or organize the field along different dimensions.
+Semantic clustering provides no hierarchy and can mix abstraction levels; a one-shot LLM offers little control over evidence support;
+and directly following a single RW Tree can privilege one author’s local organization over perspectives from other papers.
+
+InsightRAG therefore treats taxonomy construction as aggregation: given $P$ and $G$ , it seeks an admissible hierarchy that reconciles the author-written judgments encoded in $G$ ’s citation contexts under the minimum-conflict objective, assigns papers to leaves through $A$ , and generates the survey from the result.
+The problem is NP-hard, so InsightRAG follows a greedy-and-refine strategy: a greedy initializer on the combinatorial core, followed by global LLM refinement of category meanings and hierarchical structure.
+
+Candidate concept space.
+
+InsightRAG first constructs a shared candidate concept space from the relation statements carried by the edges of $G$ , so that the greedy initializer begins from relational evidence shared across the retrieved literature. Each directed edge $(p^{\prime},p)\in E(G)$ stores the author-written passage in which the citing paper $p^{\prime}$ states how it categorizes the cited paper $p$ ; let $\phi(p^{\prime},p)$ denote the set of concept phrases stated on edge $(p^{\prime},p)$ .
+The candidate concept set $\mathcal{C}$ collects the concept phrases on all edges, $\bigcup_{(p^{\prime},p)\in E(G)}\phi(p^{\prime},p)$ , and merges semantically equivalent ones using their textual meaning and supporting edges.
+Each concept $c$ is assigned a semantic dimension $\delta(c)\in\mathcal{D}$ , where $\mathcal{D}$ is the set of organizational dimensions.
+The candidate space retains weighted paper assignments, defined below.
+For a paper $p$ and a concept $c$ , the assignment weight $w(c,p)$ counts incoming citation edges whose passages associate $p$ with $c$ :
+
+ $w(c,p)=\sum_{(p^{\prime},p)\in E(G)}\mathbf{1}\bigl[c\in\phi(p^{\prime},p)\bigr],$ 
+
+Conflicts remain explicit: if different edges associate a paper with different concepts, all candidate assignments and their support weights are retained.
+A zero-weight fallback concept $c_{\bot}$ remains available for papers with sparse concept evidence.
+
+Optimization objective.
+
+A taxonomy is a rooted tree $T=(\mathcal{C}(T),E(T))$ over selected concepts $\mathcal{C}(T)\subseteq\mathcal{C}$ , with leaf-category set $L(T)\subseteq\mathcal{C}(T)$ . A map $A:P\rightarrow L(T)$ assigns every paper to exactly one leaf category. Let $\Gamma$ denote a configurable set of structural and semantic constraints, and let $\mathcal{F}(\Gamma)$ be the taxonomy–assignment pairs satisfying them. We solve $(T^{*},A^{*})$ as follows
+
+ $\displaystyle\arg\max_{(T,A)\in\mathcal{F}(\Gamma)}\left[\underbrace{\sum_{c\in\mathcal{C}(T)}\sum_{p\in P}w(c,p)}_{\text{\textcircled{\scriptsize 1}\,concept support}}+\underbrace{\sum_{p\in P}w\bigl(A(p),p\bigr)}_{\text{\textcircled{\scriptsize 2}\,assignment support}}-\underbrace{\lambda\bigl|\mathcal{C}(T)\bigr|}_{\text{\textcircled{\scriptsize 3}\,complexity penalty}}\right].$ 
+
+(1)
+
+Term \scriptsize1⃝ favors concepts carrying strong paper support, term \scriptsize2⃝ rewards agreement with author judgments at the paper-assignment level, and \scriptsize3⃝ controls taxonomy complexity. The constraint set $\Gamma$ can, for example, limit the maximum depth $B$ and branching factor $k$ .
+The constrained optimization is NP-hard; Appendix G specifies the full constraint set and gives the NP-hardness proof.
+
+Greedy taxonomy construction.
+
+Since exact optimization is NP-hard, InsightRAG constructs a draft solution with a greedy top-down procedure over the shared candidate concept space derived from the citation contexts retained in $G$ .
+
+The root initially contains the full paper set $P$ , and the procedure applies the same three-step split recursively at each category.
+Candidate preparation: for the papers currently under a category, it retains the supported categories from the shared candidate space, removes those with insufficient support or that violate the constraints, and selects the organizational dimension with the strongest total support so that the resulting siblings remain coherent.
+Greedy selection: within that dimension, it selects child categories one at a time by marginal coverage, choosing the candidate that adds the most support beyond the children already selected, and stops when the branching budget is reached.
+Assignment and recursion: each paper is assigned to the child with the highest normalized support; low-confidence papers are placed in a fallback category or deferred to the final assignment stage. The procedure then recurses on each child until the depth bound is reached, too few papers remain, or no supported split is available, yielding the draft taxonomy $T_{0}$ and assignment $A_{0}$ . Appendix G provides the formal analysis.
+
+Global refinement and generation.
+
+Structural refinement: The greedy draft may contain vague, redundant, or unevenly granular categories. An LLM refines $T_{0}$ using the scope definition $d$ , compact profiles of its concepts, profiles of the retrieved papers, and recurring category and parent–child patterns aggregated from the RW Trees as auxiliary structural evidence. The draft remains the evidence-grounded starting point; the refinement resolves semantic and structural issues before final paper assignment and deterministic validation.
+
+Paper assignment refinement: Once the refined taxonomy $T$ is fixed, an LLM updates the draft assignment $A_{0}$ only where hierarchy changes create conflicts, ensuring that every paper belongs to exactly one leaf and yielding the final assignment $A$ .
+A deterministic validation pass then repairs any remaining missing or duplicate assignments and prunes unsupported empty leaves. Together, hierarchy refinement, assignment refinement, and validation transform the draft $(T_{0},A_{0})$ into the final $(T,A)$ used in our experiments.
+
+Finally, InsightRAG uses $T$ and $A$ as the writing plan.
+Each category becomes a writing unit with a local evidence package and a fixed set of allowed citations.
+Leaf units synthesize the papers assigned by $A$ , while internal units explain the relations among their child categories.
+The units are generated independently, assembled in taxonomy order, and completed with survey-level sections.
+Thus, $T$ determines the survey organization and $A$ bounds the evidence available to each section.
+
+## 4 Experiments
+
+We evaluate InsightRAG from research-scope reconstruction to final survey generation. We ask three research questions:
+RQ1: Does Related Work-guided retrieval reconstruct a more complete and accurate research scope?
+RQ2: Does Related Work evidence improve taxonomy construction?
+RQ3: Does the resulting taxonomy improve the quality and credibility of the final survey?
+Formal definitions and implementation details for all evaluation metrics are provided in Appendix E.
+
+## 4.1 Research-Scope Reconstruction
+
+Across ten computer-science topics, RQ1 evaluates retrieved paper sets and academic profiles against gold scopes derived from human-survey references and the corresponding topic definitions.
+
+## 4.1.1 Scope Coverage and Correctness
+
+Setting.
+We compare InsightRAG with BM25 and dense retrieval under online and offline access, and with SurveyGen, SurveyForge, and AutoSurvey. We report #Papers, Coverage, Correctness, and F1; Correctness is determined by an LLM judge given the topic definition and each retrieved paper. More details are provided in Appendix E.1.
+The initial seeds are listed in Appendix F.2.
+
+Setting
+Method
+#Papers
+Coverage
+Correctness
+F1
+
+Online
+BM25
+1,995
+0.1058
+0.1014
+0.1036
+
+Online
+Dense Retrieval
+993
+0.1027
+0.1717
+0.1285
+
+Offline
+BM25
+500
+0.0675
+0.1578
+0.0946
+
+Offline
+Dense Retrieval
+500
+0.0765
+0.1900
+0.1091
+
+ASG
+SurveyGen
+246
+0.0951
+0.4911
+0.1593
+
+ASG
+SurveyForge
+1,063
+0.1050
+0.1401
+0.1200
+
+ASG
+AutoSurvey
+2,063
+0.0592
+0.0586
+0.0589
+
+Ours
+InsightRAG
+1,879
+0.4097
+0.9521
+0.5729
+
+Table 1: Research-scope reconstruction across retrieval settings and ASG baselines. #Papers totals retrieved papers over ten topics; bold and underlined values mark the best and second-best results.
+
+Results.
+Table 1 shows that InsightRAG leads in Coverage, Correctness, and F1, expanding the gold scope while maintaining high Correctness over a large retrieved set. This supports author-written Related Work relations as a signal for finding foundational and closely related work.
+We further tested alternative in-scope seeds on two topics. Correctness remained high, while Coverage and F1 varied with the seed (Appendix B.2).
+
+## 4.1.2 Academic Profile of the Scope
+
+Setting.
+We compare retrieved papers with the gold scope using two-sample Kolmogorov–Smirnov tests on Venue H-Index and Year Gap; higher H-Index reflects venue impact, while smaller Year Gap indicates newer work.
+
+Structure
+Outline Quality
+Taxonomy Alignment
+
+Method
+HSR $\uparrow$ 
+CEDS $\uparrow$ 
+Node Ratio $\rightarrow 1$ 
+TU $\uparrow$ 
+SB $\uparrow$ 
+HC $\uparrow$ 
+LO $\uparrow$ 
+Avg. $\uparrow$ 
+RWTA $\uparrow$ 
+PTA $\uparrow$ 
+
+Vanilla LLM
+0.730126
+0.448902
+1.346384
+3.4350
+3.2550
+3.0500
+3.2150
+3.2388
+0.781515
+0.753478
+
+SurveyGen
+0.754168
+0.526661
+1.176255
+3.3000
+3.5500
+3.4000
+3.4250
+3.4188
+0.743593
+0.446429
+
+SurveyForge
+0.712712
+0.478629
+1.309190
+2.7750
+2.6250
+2.4750
+2.5250
+2.6000
+0.705402
+0.129679
+
+AutoSurvey
+0.738040
+0.374903
+2.290563
+2.6850
+2.5200
+2.4050
+2.3750
+2.4962
+0.731652
+0.160142
+
+Deep Research
+0.688150
+0.382977
+0.348203
+3.5000
+2.8750
+3.3750
+3.1250
+3.2188
+0.751199
+0.403720
+
+InsightRAG
+0.742160
+0.408899
+2.289222
+3.4750
+3.7500
+3.5000
+3.6750
+3.6000
+0.797152
+0.747758
+
+Table 2: Taxonomy evaluation. TU, SB, HC, and LO denote Topic Uniqueness, Structural Balance, Hierarchical Clarity, and Logical Organization. RWTA denotes RW–Taxonomy Alignment, and PTA denotes Paper–Taxonomy Assignment Accuracy. Bold values indicate the best result, and underlined values indicate the second-best result.
+
+Figure 3: Research-scope profile distributions for papers retrieved by each method and papers in the golden scope: (a) Venue H-Index and (b) Year Gap. Each violin aggregates papers across all topics; the inner box indicates the median and interquartile range.
+
+Results.
+Figure 3 shows that InsightRAG covers more recent work without shifting the retrieved scope toward lower-impact venues, suggesting that the added papers retain a reasonable academic profile in the pooled ten-topic comparison.
+
+Expert validation.
+Experts judged 90 of 100 sampled papers uniquely retrieved by InsightRAG but absent from the human-curated scope to be valid related work, supporting the LLM-based Correctness measure (Appendix C.1).
+
+## 4.2 Taxonomy Construction
+
+RQ2 evaluates whether Related Work evidence produces a taxonomy that is complete, coherent, and grounded in the retrieved papers.
+
+Setting.
+Using the same ten topics, we take each human-written survey’s section hierarchy as the reference taxonomy and compare six methods. We evaluate similarity to this taxonomy in structure and granularity, outline quality, alignment with author-written Related Work evidence, and paper-assignment accuracy. Metric definitions and score aggregation are provided in Appendix E.2.
+
+Results.
+Table 2 shows that SurveyGen most closely matches the human-survey structure and granularity. InsightRAG achieves the highest overall outline-quality score, leading in Structural Balance, Hierarchical Clarity, and Logical Organization; Deep Research leads slightly in Topic Uniqueness. InsightRAG also has the strongest RWTA and remains competitive in paper-assignment accuracy. Further taxonomy diagnostics appear in Appendix D.1.
+A method-blinded expert comparison on two topics favors InsightRAG’s taxonomy in 5/6 judgments (83.3%); the protocol and interview findings appear in Appendix C.2.
+
+Content Correspondence
+Citation Support
+Reference Reliability
+
+Method
+SS $\uparrow$ 
+KPR $\uparrow$ 
+Cit. Recall $\uparrow$ 
+Cit. Precision $\uparrow$ 
+#References
+VRR $\uparrow$ 
+
+Vanilla LLM
+0.705198
+53
+0.441418
+0.406859
+254
+0.550306
+
+SurveyGen
+0.675570
+52
+0.475770
+0.355161
+249
+0.972690
+
+SurveyForge
+0.626670
+55
+0.178637
+0.122507
+1,063
+0.979134
+
+AutoSurvey
+0.619481
+63
+0.275886
+0.255565
+2,102
+0.950845
+
+Deep Research
+0.704412
+54
+0.301514
+0.264325
+134
+0.898381
+
+InsightRAG
+0.670218
+60
+0.856393
+0.629516
+1,717
+0.995528
+
+Table 3: Content and citation evaluation of generated surveys. SS, KPR, and VRR denote Semantic Similarity, Key-Point Recall, and Verifiable Reference Rate. Bold marks the best result; underlining marks the second-best.
+
+Structure
+Outline Quality
+Taxonomy Alignment
+
+Variant
+HSR $\uparrow$ 
+CEDS $\uparrow$ 
+Node Ratio $\rightarrow 1$ 
+TU $\uparrow$ 
+SB $\uparrow$ 
+HC $\uparrow$ 
+LO $\uparrow$ 
+Avg. $\uparrow$ 
+RWTA $\uparrow$ 
+PTA $\uparrow$ 
+
+w/o taxonomy refinement
+0.750085
+0.299391
+3.081808
+0.6200
+0.5650
+0.3500
+0.3900
+0.4813
+0.733383
+0.257588
+
+InsightRAG (full)
+0.742160
+0.408899
+2.289222
+3.4750
+3.7500
+3.5000
+3.6750
+3.6000
+0.797152
+0.747758
+
+Table 4: Ablation of taxonomy refinement in InsightRAG. The full pipeline is compared with a version without refinement. Metrics follow Table 2. Bold marks the best result; Node Ratio favors values closer to 1.
+
+## 4.3 Taxonomy-Guided Survey Generation
+
+RQ3 evaluates the content, correspondence, and credibility of the final survey. All methods generate a survey for each of the same ten topics.
+
+## 4.3.1 LLM-Judged Survey Quality
+
+Setting.
+GPT-5.2, Gemini 3.1 Pro, and DeepSeek V4 Pro score each method’s surveys for Coverage, Relevance, and Structure on a five-point scale. Averaging the three dimensions yields 30 topic–judge scores per method; aggregation and full results appear in Appendices E.3 and D.2.
+
+Figure 4: Survey quality by topic. Axes average Coverage, Relevance, and Structure across three LLM judges.
+
+Results.
+Figure 4 shows that InsightRAG maintains high survey-quality scores across topics, outperforming SurveyGen, SurveyForge, AutoSurvey, and Deep Research on average while remaining comparable to Vanilla LLM (Appendix D.2).
+In the same expert study, InsightRAG’s survey was preferred in all 6/6 comparisons; semi-structured interviews further examined the reasons for these preferences and remaining weaknesses (Appendix C.2).
+
+## 4.3.2 Content Correspondence and Citation Support of Generated Surveys
+
+Setting.
+SS compares generated and human-survey passages; KPR measures coverage of the human survey’s key points. Citation Recall counts claims supported by their full citation group, whereas Citation Precision counts citation instances that independently or necessarily support their claims. We also report reference count and VRR, the fraction resolved to real papers (Appendix E.3).
+
+Results.
+Table 3 shows that InsightRAG ranks second in KPR and leads in Citation Recall, Citation Precision, and VRR. Vanilla LLM achieves higher SS, but substantially lower citation-support and reference-reliability scores.
+
+## 4.3.3 Passage-Based Citation Faithfulness
+
+Setting. On Multi-Agent Workflow Automation and Video Accessibility, we sample seven claim–citation pairs per survey for the six methods in Table 3 (84 total). An automatic judge reads cited full texts and identifies passages supporting each claim. Unverifiable references count as Unsupported; Supported includes full or partial support. We manually audit two pairs per survey (24 total).
+
+Results. InsightRAG has the highest automatic Supported rate (13/14, 92.9%) and ties Vanilla LLM in the human audit (4/4). Automatic and human judgments agree on 20/24 pairs (83.3%, $\kappa=0.655$ ); the automatic judge is more lenient in all four disagreements. Complete automatic and human results appear in Appendix D.3.
+
+## 4.4 Ablation Study
+
+Setting.
+We independently ablate three scope-reconstruction components and taxonomy refinement, holding other settings fixed; full scope ablation results appear in Appendix B.1.
+
+Scope reconstruction.
+Forward expansion contributes most, followed by backward expansion; loop closure and densification add smaller but consistent gains in Coverage and F1.
+
+Taxonomy construction.
+Table 4 shows that refinement improves OutlineAvg (0.4813 to 3.6000) and PTA (0.2576 to 0.7478), despite slightly lower HSR. Heading correspondence alone does not ensure coherent organization or accurate assignment of retrieved papers to taxonomy leaves.
+
+## 5 Conclusion
+
+We built InsightRAG on a signal automatic survey generation had left unused: the judgments human authors record in Related Work sections about which prior work matters and how it relates.
+Insight-guided retrieval follows only the relations an author’s own words support, and minimum-conflict aggregation organizes the resulting citation-context evidence into a taxonomy that bounds each section’s evidence, improving scope reconstruction, taxonomy quality, citation support, and reference reliability across ten topics.
+More broadly, this work provides a concrete case for reconsidering what human insight is already embedded in existing artifacts and how it can be leveraged to support literature discovery, organization, and synthesis.
+
+## Limitations
+
+Dependence on language models.
+
+InsightRAG relies on LLMs for RW Tree extraction, scope verification, taxonomy refinement, and section writing, while part of the evaluation uses LLM judges. Errors may propagate through the pipeline, so the generated survey and intermediate artifacts still require human verification.
+
+Scope of author perspectives.
+
+InsightRAG draws on author-written Related Work sections to organize and synthesize the retrieved literature. Shared omissions or biases in these sections may carry over into the resulting taxonomy and survey. Because retrieval is limited to the literature reached through citation traversal, some parts of the field may remain underrepresented.
+
+Coverage of recent work.
+
+Citation traversal can miss recent papers that are not yet indexed or connected to the explored graph; when forward candidate pools exceed the processing budget, prioritizing by citation impact and recency may also miss valuable low-citation work.
+
+Risks of over-reliance.
+
+Junior researchers may over-rely on automatically generated surveys instead of developing the skills to search, assess, and synthesize the literature independently.
+This may limit their ability to form their own judgments about a field’s scope and structure. We therefore recommend human–AI co-creation: the generated scope, taxonomy, and text should serve as starting points that researchers inspect, revise, and validate.
+
+API cost.
+
+The cold-start stage requires many LLM calls to extract RW Trees and graph relations and to judge whether papers fall within the target scope. Once processed, the extracted structures and relation evidence can be stored and reused, while relevance decisions can be reused for the same scope. Subsequent runs therefore avoid most repeated extraction and verification costs.
+
+## Ethics Statement
+
+AI assistants were used in preparing this work, in two limited roles.
+For the paper itself, their use was restricted to language polishing and writing assistance;
+AI assistants were also used to write part of the implementation code, which the authors reviewed, tested, and take full responsibility for.
+
+## References
+
+Ajith et al. (2024)
+A. Ajith, M. Xia, A. Chevalier, T. Goyal, D. Chen, and T. Gao
+
+LitSearch: a retrieval benchmark for scientific literature search.
+
+In Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing, Y. Al-Onaizan, M. Bansal, and Y. Chen (Eds.),
+
+Miami, Florida, USA, pp. 15068–15083.
+
+External Links: Link,
+Document
+
+Cited by: §H.1,
+§1.
+
+Al-Mamun et al. (2025)
+A. Al-Mamun, H. Wu, Q. He, J. Wang, and W. G. Aref
+
+A survey of learned indexes for the multi-dimensional space.
+
+ACM Comput. Surv. 58 (4).
+
+External Links: ISSN 0360-0300,
+Link,
+Document
+
+Cited by: Table 5.
+
+Bao et al. (2025)
+T. Bao, M. T. Nayeem, D. Rafiei, and C. Zhang
+
+SurveyGen: quality-aware scientific survey generation with large language models.
+
+In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing, C. Christodoulopoulos, T. Chakraborty, C. Rose, and V. Peng (Eds.),
+
+Suzhou, China, pp. 2712–2736.
+
+External Links: Link,
+Document,
+ISBN 979-8-89176-332-6
+
+Cited by: §H.3,
+§1,
+§2.
+
+Boulch and Marlet (2022)
+A. Boulch and R. Marlet
+
+POCO: point convolution for surface reconstruction.
+
+External Links: 2201.01831,
+Link
+
+Cited by: Table 14.
+
+Chan et al. (2019)
+C. Chan, S. Ginosar, T. Zhou, and A. A. Efros
+
+Everybody dance now.
+
+External Links: 1808.07371,
+Link
+
+Cited by: Table 14.
+
+China Computer Federation (2023)
+China Computer Federation
+
+CCF Recommended International Academic Conferences and Journals: 2022 Edition.
+
+Note: https://www.ccf.org.cn/Academic_Evaluation/By_category/2023-03-08/787209.shtmlAccessed: 2026-01-19
+
+Cited by: Appendix A.
+
+Christodoulides et al. (2025)
+A. Christodoulides, G. K. L. Tam, J. Clarke, R. Smith, J. Horgan, N. Micallef, J. Morley, N. Villamizar, and S. Walton
+
+Survey on 3d reconstruction techniques: large-scale urban city reconstruction and requirements.
+
+IEEE Transactions on Visualization and Computer Graphics 31 (10), pp. 9343–9367.
+
+External Links: Document
+
+Cited by: Table 5.
+
+Cohan et al. (2019)
+A. Cohan, W. Ammar, M. van Zuylen, and F. Cady
+
+Structural scaffolds for citation intent classification in scientific publications.
+
+In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers), J. Burstein, C. Doran, and T. Solorio (Eds.),
+
+Minneapolis, Minnesota, pp. 3586–3596.
+
+External Links: Link,
+Document
+
+Cited by: §H.1,
+§2.
+
+Cohan et al. (2020)
+A. Cohan, S. Feldman, I. Beltagy, D. Downey, and D. Weld
+
+SPECTER: document-level representation learning using citation-informed transformers.
+
+In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, D. Jurafsky, J. Chai, N. Schluter, and J. Tetreault (Eds.),
+
+Online, pp. 2270–2282.
+
+External Links: Link,
+Document
+
+Cited by: §H.1,
+§1,
+§2.
+
+Gao et al. (2025)
+H. Gao, Y. Liu, Y. He, L. Dou, C. Du, Z. Deng, B. Hooi, M. Lin, and T. Pang
+
+FlowReasoner: reinforcing query-level meta-agents.
+
+External Links: 2504.15257,
+Link
+
+Cited by: Table 8.
+
+Garey and Johnson (1979)
+M. R. Garey and D. S. Johnson
+
+Computers and intractability: a guide to the theory of np-completeness.
+
+ W. H. Freeman, San Francisco.
+
+Cited by: §G.2.
+
+Gennaro and Goldfeder (2018)
+R. Gennaro and S. Goldfeder
+
+Fast multiparty threshold ecdsa with fast trustless setup.
+
+In Proceedings of the 2018 ACM SIGSAC Conference on Computer and Communications Security,
+
+CCS ’18, New York, NY, USA, pp. 1179–1194.
+
+External Links: ISBN 9781450356930,
+Link,
+Document
+
+Cited by: Table 14.
+
+Go et al. (2026)
+G. H. T. Go, K. Ly, A. Søgaard, S. A. Tabatabaei, M. de Rijke, and X. Chen
+
+LiRA: a multi-agent framework for reliable and readable literature review generation.
+
+Proceedings of the AAAI Conference on Artificial Intelligence 40 (47), pp. 40456–40464.
+
+External Links: Document,
+Link
+
+Cited by: §H.3,
+§2.
+
+Greshake et al. (2023)
+K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, and M. Fritz
+
+Not what you’ve signed up for: compromising real-world llm-integrated applications with indirect prompt injection.
+
+External Links: 2302.12173,
+Link
+
+Cited by: Table 14.
+
+Guo et al. (2026)
+B. Guo, Z. Wen, J. Gu, H. Shi, J. Wang, S. Wang, H. Li, R. Yang, and S. Liu
+
+SurveyLens: a discipline-aware benchmark for automatic survey generation.
+
+External Links: 2602.11238,
+Link
+
+Cited by: §H.3,
+§2.
+
+Han et al. (2023)
+T. Han, M. Bain, A. Nagrani, G. Varol, W. Xie, and A. Zisserman
+
+AutoAD: movie description in context.
+
+External Links: 2303.16899,
+Link
+
+Cited by: Table 8.
+
+He et al. (2025)
+Y. He, G. Huang, P. Feng, Y. Lin, Y. Zhang, H. Li, and W. E
+
+PaSa: an LLM agent for comprehensive academic paper search.
+
+In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), W. Che, J. Nabende, E. Shutova, and M. T. Pilehvar (Eds.),
+
+Vienna, Austria, pp. 11663–11679.
+
+External Links: Link,
+Document,
+ISBN 979-8-89176-251-0
+
+Cited by: §H.1,
+§1.
+
+Hsu et al. (2024)
+C. Hsu, E. Bransom, J. Sparks, B. Kuehl, C. Tan, D. Wadden, L. Wang, and A. Naik
+
+CHIME: LLM-assisted hierarchical organization of scientific studies for literature review support.
+
+In Findings of the Association for Computational Linguistics: ACL 2024, L. Ku, A. Martins, and V. Srikumar (Eds.),
+
+Bangkok, Thailand, pp. 118–132.
+
+External Links: Link,
+Document
+
+Cited by: §H.2,
+§2.
+
+Hu et al. (2025a)
+Y. Hu, Z. Lei, Z. Dai, A. Zhang, A. Angirekula, Z. Zhang, and L. Zhao
+
+CG-rag: research question answering by citation graph retrieval-augmented llms.
+
+In Proceedings of the 48th International ACM SIGIR Conference on Research and Development in Information Retrieval,
+
+SIGIR ’25, New York, NY, USA, pp. 678–687.
+
+External Links: ISBN 9798400715921,
+Link,
+Document
+
+Cited by: §H.1,
+§1,
+§2.
+
+Hu et al. (2025b)
+Y. Hu, Z. Li, Z. Zhang, C. Ling, R. Kanjiani, B. Zhao, and L. Zhao
+
+Taxonomy tree generation from citation graph.
+
+External Links: 2410.03761,
+Link
+
+Cited by: §H.2,
+§2.
+
+Huang et al. (2021)
+D. Huang, X. Tao, F. Gao, and J. Lu
+
+Deep learning-based image semantic coding for semantic communications.
+
+In 2021 IEEE Global Communications Conference (GLOBECOM),
+
+Vol. , pp. 1–6.
+
+External Links: Document
+
+Cited by: Table 14.
+
+Li et al. (2022)
+X. Li, W. Yu, R. Ruiz, and J. Zhu
+
+Energy-aware cloud workflow applications scheduling with geo-distributed data.
+
+IEEE Transactions on Services Computing 15 (2), pp. 891–903.
+
+External Links: Document
+
+Cited by: Table 14.
+
+Liang et al. (2025)
+X. Liang, J. Yang, Y. Wang, C. Tang, Z. Zheng, S. Song, Z. Lin, Y. Yang, S. Niu, H. Wang, B. Tang, F. Xiong, K. Mao, and Z. li
+
+SurveyX: academic survey automation via large language models.
+
+External Links: 2502.14776,
+Link
+
+Cited by: §H.3,
+§1,
+§2.
+
+Mohammad et al. (2009)
+S. Mohammad, B. Dorr, M. Egan, A. Hassan, P. Muthukrishan, V. Qazvinian, D. Radev, and D. Zajic
+
+Using citations to generate surveys of scientific paradigms.
+
+In Proceedings of Human Language Technologies: The 2009 Annual Conference of the North American Chapter of the Association for Computational Linguistics, M. Ostendorf, M. Collins, S. Narayanan, D. W. Oard, and L. Vanderwende (Eds.),
+
+Boulder, Colorado, pp. 584–592.
+
+External Links: Link
+
+Cited by: §H.3,
+§2.
+
+Nathan et al. (2020)
+V. Nathan, J. Ding, M. Alizadeh, and T. Kraska
+
+Learning multi-dimensional indexes.
+
+In Proceedings of the 2020 ACM SIGMOD International Conference on Management of Data,
+
+SIGMOD/PODS ’20, pp. 985–1000.
+
+External Links: Link,
+Document
+
+Cited by: Table 14.
+
+Palani et al. (2023)
+S. Palani, A. Naik, D. Downey, A. X. Zhang, J. Bragg, and J. C. Chang
+
+Relatedly: scaffolding literature reviews with existing related work sections.
+
+In Proceedings of the 2023 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’23, pp. 1–20.
+
+External Links: Link,
+Document
+
+Cited by: §H.1,
+§2.
+
+Pedinotti and Santus (2026)
+P. Pedinotti and E. Santus
+
+StructSurvey: structured agentic retrieval for automated survey paper generation.
+
+In Proceedings of the First Workshop on Structured Understanding, Retrieval, and Generation in the LLM Era (SURGeLLM 2026), V. Gupta, K. Ding, H. Kokel, Y. Zhao, A. Agarwal, Y. Wang, M. Glass, Y. Zhang, K. Srinivas, X. Chen, O. Hassanzadeh, Q. Zhu, S. Chang, and Y. Luo (Eds.),
+
+San Diego, California, United States, pp. 162–181.
+
+External Links: Link,
+Document,
+ISBN 979-8-89176-406-4
+
+Cited by: §H.3,
+§1,
+§2.
+
+Sedghighadikolaei and Yavuz (2025)
+K. Sedghighadikolaei and A. A. Yavuz
+
+A survey of threshold signatures: nist standards, post-quantum cryptography, exotic techniques, and real-world applications.
+
+ACM Comput. Surv. 58 (6).
+
+External Links: ISSN 0360-0300,
+Link,
+Document
+
+Cited by: Table 5.
+
+Shao et al. (2026)
+C. Shao, F. Xu, and Y. Li
+
+SciNet: evaluating ai agents in relation-aware scientific literature retrieval.
+
+External Links: 2601.03260,
+Link
+
+Cited by: §H.1.
+
+Valenzuela et al. (2015)
+M. Valenzuela, V. A. Ha, and O. Etzioni
+
+Identifying meaningful citations.
+
+In AAAI Workshop: Scholarly Big Data,
+
+External Links: Link
+
+Cited by: §H.1,
+§2.
+
+Van Daele et al. (2024)
+T. Van Daele, A. Iyer, Y. Zhang, J. C. Derry, M. Huh, and A. Pavel
+
+Making short-form videos accessible with hierarchical video summaries.
+
+In Proceedings of the CHI Conference on Human Factors in Computing Systems,
+
+CHI ’24, pp. 1–17.
+
+External Links: Link,
+Document
+
+Cited by: Table 8,
+Table 14.
+
+Wan et al. (2023)
+A. Wan, E. Wallace, S. Shen, and D. Klein
+
+Poisoning language models during instruction tuning.
+
+External Links: 2305.00944,
+Link
+
+Cited by: Table 14.
+
+Wang et al. (2025a)
+S. Wang, T. Zhu, B. Liu, M. Ding, D. Ye, W. Zhou, and P. Yu
+
+Unique security and privacy threats of large language models: a comprehensive survey.
+
+ACM Comput. Surv. 58 (4).
+
+External Links: ISSN 0360-0300,
+Link,
+Document
+
+Cited by: Table 5.
+
+Wang et al. (2024)
+Y. Wang, Q. Guo, W. Yao, H. Zhang, X. Zhang, Z. Wu, M. Zhang, X. Dai, M. Zhang, Q. Wen, W. Ye, S. Zhang, and Y. Zhang
+
+AutoSurvey: large language models can automatically write surveys.
+
+In Advances in Neural Information Processing Systems, A. Globerson, L. Mackey, D. Belgrave, A. Fan, U. Paquet, J. Tomczak, and C. Zhang (Eds.),
+
+Vol. 37, pp. 115119–115145.
+
+External Links: Document,
+Link
+
+Cited by: §H.3,
+§1,
+§2.
+
+Wang et al. (2025b)
+Y. Wang, S. Liu, J. Fang, and Z. Meng
+
+EvoAgentX: an automated framework for evolving agentic workflows.
+
+External Links: 2507.03616,
+Link
+
+Cited by: Table 8.
+
+Wu et al. (2024)
+S. Wu, S. Zhao, M. Yasunaga, K. Huang, K. Cao, Q. Huang, V. N. Ioannidis, K. Subbian, J. Zou, and J. Leskovec
+
+STaRK: benchmarking llm retrieval on textual and relational knowledge bases.
+
+In Advances in Neural Information Processing Systems, A. Globerson, L. Mackey, D. Belgrave, A. Fan, U. Paquet, J. Tomczak, and C. Zhang (Eds.),
+
+Vol. 37, pp. 127129–127153.
+
+External Links: Document,
+Link
+
+Cited by: §H.1.
+
+Wu et al. (2025a)
+S. Wu, C. Liang, Z. Bi, L. Zhao, T. Wang, J. Song, Y. Zhang, K. Chen, B. Peng, and X. Song
+
+AutoSurvey2: empowering researchers with next level automated literature surveys.
+
+External Links: 2510.26012,
+Link
+
+Cited by: §H.3,
+§2.
+
+Wu et al. (2025b)
+Y. Wu, S. Tang, C. Yu, B. Yang, C. Sun, J. Xiao, H. Wu, and J. Feng
+
+Task scheduling in geo-distributed computing: a survey.
+
+IEEE Transactions on Parallel and Distributed Systems 36 (10), pp. 2073–2088.
+
+External Links: Document
+
+Cited by: Table 5.
+
+Wu et al. (2026)
+Y. Wu, D. Zhang, X. Li, J. Xu, Y. Duan, Y. Liu, J. Pan, Q. Zhu, X. Zhou, J. Wei, S. Li, J. Chen, C. He, and C. Tan
+
+Intern-atlas: a methodological evolution graph as research infrastructure for ai scientists.
+
+External Links: 2604.28158,
+Link
+
+Cited by: §H.1,
+§1.
+
+Xu et al. (2025)
+S. Xu, X. Jin, W. Zhang, H. Qu, and Y. Yan
+
+Branch explorer: leveraging branching narratives to support interactive 360° video viewing for blind and low vision users.
+
+In Proceedings of the 38th Annual ACM Symposium on User Interface Software and Technology,
+
+UIST ’25, pp. 1–18.
+
+External Links: Link,
+Document
+
+Cited by: Table 8.
+
+Xu (2025)
+S. Xu
+
+AI-powered interactive systems that improve video accessibility for blind and low vision viewers.
+
+Note: PhD Qualifying Examination report,
+Department of Computer Science and Engineering,
+The Hong Kong University of Science and TechnologyQualifying examination held on November 26, 2025
+
+External Links: Link
+
+Cited by: Table 5,
+Table 8.
+
+Xue et al. (2025)
+H. Xue, X. Luo, Z. Hu, X. Zhang, X. Xiang, Y. Dai, J. Liu, Z. Zhang, M. Li, J. Yang, F. Ma, Z. Wu, C. Yang, Z. Dai, and F. R. Yu
+
+Human motion video generation: a survey.
+
+IEEE Transactions on Pattern Analysis and Machine Intelligence 47 (11), pp. 10709–10730.
+
+External Links: Document
+
+Cited by: Table 5.
+
+Yan et al. (2025)
+X. Yan, S. Feng, J. Yuan, R. Xia, B. Wang, L. Bai, and B. Zhang
+
+SURVEYFORGE : on the outline heuristics, memory-driven generation, and multi-dimensional evaluation for automated survey writing.
+
+In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), W. Che, J. Nabende, E. Shutova, and M. T. Pilehvar (Eds.),
+
+Vienna, Austria, pp. 12444–12465.
+
+External Links: Link,
+Document,
+ISBN 979-8-89176-251-0
+
+Cited by: §H.3,
+§1,
+§2.
+
+Yang et al. (2026)
+Z. Yang, D. Ma, H. Li, Z. Wang, T. Huang, Z. Hu, C. Wang, Y. Zhang, X. Wu, K. Yu, and L. Chen
+
+DeepSurvey: enhancing analytical depth and citation reliability in automated survey generation.
+
+External Links: 2605.29522,
+Link
+
+Cited by: §H.3,
+§1,
+§2.
+
+Yu et al. (2025)
+G. Yu, G. Tan, H. Huang, Z. Zhang, P. Chen, R. Natella, Z. Zheng, and M. R. Lyu
+
+A survey on failure analysis and fault injection in ai systems.
+
+ACM Trans. Softw. Eng. Methodol. 35 (1).
+
+External Links: ISSN 1049-331X,
+Link,
+Document
+
+Cited by: Table 5.
+
+Zhang et al. (2025a)
+G. Zhang, L. Niu, J. Fang, K. Wang, L. Bai, and X. Wang
+
+Multi-agent architecture search via agentic supernet.
+
+External Links: 2502.04180,
+Link
+
+Cited by: Table 8,
+Table 14.
+
+Zhang et al. (2025b)
+J. Zhang, A. Maatouk, J. Chen, N. Bui, Q. Xie, L. Tassiulas, H. Xu, J. Shao, and R. Ying
+
+LitFM: a retrieval augmented structure-aware foundation model for citation graphs.
+
+In Proceedings of the 31st ACM SIGKDD Conference on Knowledge Discovery and Data Mining V.2,
+
+KDD ’25, New York, NY, USA, pp. 3728–3739.
+
+External Links: ISBN 9798400714542,
+Link,
+Document
+
+Cited by: §H.1,
+§1,
+§2.
+
+Zhang et al. (2025c)
+P. Zhang, W. Xu, Y. Liu, X. Qin, K. Niu, S. Cui, G. Shi, Z. Qin, X. Xu, F. Wang, Y. Meng, C. Dong, J. Dai, Q. Yang, Y. Sun, D. Gao, H. Gao, S. Han, and X. Song
+
+Intellicise wireless networks from semantic communications: a survey, research issues, and challenges.
+
+IEEE Communications Surveys & Tutorials 27 (3), pp. 2051–2084.
+
+External Links: Document
+
+Cited by: Table 5.
+
+Zhang (2025)
+W. Zhang
+
+A survey on multi-agent workflow automation: methods, taxonomies, and future directions.
+
+Note: PhD Qualifying Examination report,
+Department of Computer Science and Engineering,
+The Hong Kong University of Science and TechnologyQualifying examination held on December 19, 2025
+
+External Links: Link
+
+Cited by: Table 5,
+Table 8.
+
+Zhou et al. (2025)
+Z. Zhou, C. Li, X. Chen, S. Wang, Y. Chao, Z. Li, H. Wang, Q. Shi, Z. Tan, X. Han, X. Shi, Z. Liu, and M. Sun
+
+LLM $\times$ MapReduce: simplified long-sequence processing using large language models.
+
+In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), W. Che, J. Nabende, E. Shutova, and M. T. Pilehvar (Eds.),
+
+Vienna, Austria, pp. 27664–27678.
+
+External Links: Link,
+Document,
+ISBN 979-8-89176-251-0
+
+Cited by: §H.3,
+§1,
+§2.
+
+Zhu et al. (2025)
+K. Zhu, L. Liao, Y. Gu, L. Huang, X. Feng, and B. Qin
+
+Context-aware hierarchical taxonomy generation for scientific papers via LLM-guided multi-aspect clustering.
+
+In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing, C. Christodoulopoulos, T. Chakraborty, C. Rose, and V. Peng (Eds.),
+
+Suzhou, China, pp. 15616–15634.
+
+External Links: Link,
+Document,
+ISBN 979-8-89176-332-6
+
+Cited by: §H.2,
+§2.
+
+## Appendix A Evaluation Dataset and Baseline Configurations
+
+ID
+
+CCF Research Area
+
+Evaluation Topic and Source Survey
+
+RW Trees
+
+0
+
+Interdisciplinary, Comprehensive, and Emerging Areas
+
+Multi-Agent Workflow Automation (Zhang, 2025)
+
+25
+
+1
+
+Human-Computer Interaction and Ubiquitous Computing
+
+AI-Powered Video Accessibility for Blind and Low Vision Viewers (Xu, 2025)
+
+26
+
+2
+
+Artificial Intelligence
+
+Pose-Driven Dance Video Generation (Xue et al., 2025)
+
+22
+
+3
+
+Computer Graphics and Multimedia
+
+Learning-Based 3D Reconstruction Methodologies (Christodoulides et al., 2025)
+
+28
+
+4
+
+Theoretical Computer Science
+
+Threshold ECDSA Protocols (Sedghighadikolaei and Yavuz, 2025)
+
+20
+
+5
+
+Network and Information Security
+
+Risks and Countermeasures of Fine-Tuning Large Language Models (Wang et al., 2025a)
+
+22
+
+6
+
+Software Engineering, System Software, and Programming Languages
+
+Failure Modes in AI Service Layers (Yu et al., 2025)
+
+20
+
+7
+
+Databases, Data Mining, and Content Retrieval
+
+Learned Indexing for Multi-Dimensional Data Spaces (Al-Mamun et al., 2025)
+
+22
+
+8
+
+Computer Networks
+
+Semantic Feature Representation and Neural Semantic Coding (Zhang et al., 2025c)
+
+25
+
+9
+
+Computer Architecture, Parallel and Distributed Computing, and
+Storage Systems
+
+Geo-Distributed Cloud Task Scheduling for Higher Compute Utilization (Wu et al., 2025b)
+
+38
+
+Total
+248
+
+Table 5: 
+Evaluation topics, their source surveys, and the realized numbers of Related Work (RW) Trees.
+
+We constructed ten evaluation instances covering the ten research areas used in the China Computer Federation (CCF) venue classification (China Computer Federation, 2023) (Table 5).
+For each research area, we selected a human-written source survey and used either the complete survey or a focused section with sufficient coverage of the target topic.
+
+For instances based on a survey section, the LLM (GPT-5.5) received both the source-survey title and the selected section title; for instances based on the complete survey, it received only the survey title.
+Based on the given titles, the LLM generated (1) an evaluation topic title and (2) a focused scope definition describing the research problem, included directions, and exclusion boundaries.
+We manually reviewed the generated topic titles and scope definitions for consistency with the selected survey content.
+The resulting scope definitions were used consistently for paper selection, citation filtering, and scope verification throughout the experiments.
+
+We extracted the scientific papers cited in each selected survey unit, where the unit was either the complete survey or a selected section.
+We then resolved their bibliographic records, removed duplicate versions and non-paper references, and retained only papers that matched the generated scope definition, yielding 304 in-scope candidate papers.
+
+For each retained candidate paper, we identified its author-written Related Work discussion, resolved in-text citation markers against its bibliography, and filtered the resolved cited papers using the same topic-specific scope definition. The remaining citation contexts and cited papers were organized into a hierarchical RW Tree following the definition in Section 3.2.1.
+
+After topic-scope filtering and extraction validation, the final dataset contains 248 valid RW Trees.
+The resulting trees contain 3,937 citation-bearing leaf occurrences.
+Because the same cited paper may occur in multiple RW Trees, these occurrences correspond to 2,611 unique cited papers.
+
+## A.1 Baseline Configurations
+
+Setting. We distinguish controlled retrieval baselines from automatic survey-generation (ASG) systems run in their native settings. BM25 and Dense use the same candidate source within each Offline or Online setting and follow the same RQ1 evaluation protocol; their retrieval cutoffs are reported in Table 6.
+
+Method
+
+Candidate source
+
+Retrieval setting
+
+#Papers
+
+BM25–Offline
+
+Frozen corpus (1,064 papers)
+
+Top-50/topic
+
+500
+
+Dense–Offline
+
+Same frozen corpus
+
+Top-50/topic
+
+500
+
+BM25–Online
+
+Semantic Scholar candidate pools
+
+Top-200/topic
+
+1,995
+
+Dense–Online
+
+Semantic Scholar candidate pools
+
+Top-100/topic
+
+993
+
+SurveyGen
+
+Native references
+
+Native
+
+246
+
+SurveyForge
+
+Native references
+
+Native
+
+1,063
+
+AutoSurvey
+
+Native references
+
+Native
+
+2,063
+
+InsightRAG
+
+Citation traversal
+
+Paper budget 400
+
+1,879
+
+Table 6: Retrieval configurations for the RQ1 comparison. #Papers totals retrieved papers across the ten topics. BM25 and Dense share a candidate source within each Offline or Online setting, but use different Top- $k$ cutoffs Online. Dense retrieval uses BAAI/bge-base-en-v1.5 for ranking.
+
+Comparison scope. BM25 and Dense provide controlled retrieval comparisons. SurveyGen, SurveyForge, and AutoSurvey are compared using their native system outputs, not as budget-matched component baselines.
+
+## Appendix B Additional Retrieval Analyses
+
+## B.1 Scope-Reconstruction Ablation
+
+Table 7 reports the complete scope-reconstruction
+ablation results. Each variant removes one component while retaining the rest
+of the retrieval pipeline.
+
+Variant
+Coverage $\uparrow$ 
+Correctness $\uparrow$ 
+F1 $\uparrow$ 
+
+w/o Forward Expansion
+0.0871
+0.9507
+0.1595
+
+w/o Backward Expansion
+0.2210
+0.9755
+0.3603
+
+w/o Loop Closure & Densification
+0.3927
+0.9577
+0.5570
+
+InsightRAG (Full)
+0.4097
+0.9521
+0.5729
+
+Table 7: Ablation of scope-reconstruction components in InsightRAG. Bold indicates the best
+result in each column.
+
+## B.2 Seed Sensitivity
+
+Setting.
+
+For each of two topics, we asked an LLM to suggest two alternative in-scope seed papers based on the topic. We reran retrieval from the original and alternative seeds, keeping the topic definition, gold scope, and Q1 evaluation protocol fixed. Table 8 reports the results for each seed.
+
+Role
+
+Seed paper
+
+#Papers
+Coverage
+Correctness
+F1
+
+Multi-Agent Workflow Automation (Zhang, 2025)
+
+Original
+
+Multi-agent Architecture Search via Agentic Supernet (Zhang et al., 2025a)
+
+69
+0.6400
+0.8841
+0.7425
+
+Alternative
+
+FlowReasoner: Reinforcing Query-Level Meta-Agents (Gao et al., 2025)
+
+105
+0.7200
+0.9238
+0.8093
+
+Alternative
+
+EvoAgentX: An Automated Framework for Evolving Agentic Workflows (Wang et al., 2025b)
+
+122
+0.8400
+0.8361
+0.8380
+
+AI-Powered Video Accessibility for Blind and Low Vision Viewers (Xu, 2025)
+
+Original
+
+Making Short-Form Videos Accessible with Hierarchical Video Summaries (Van Daele et al., 2024)
+
+34
+0.6154
+0.9706
+0.7532
+
+Alternative
+
+AutoAD: Movie Description in Context (Han et al., 2023)
+
+46
+0.4615
+0.9783
+0.6272
+
+Alternative
+
+Branch Explorer: Leveraging Branching Narratives to Support Interactive 360∘ Video Viewing for Blind and Low Vision Users (Xu et al., 2025)
+
+62
+0.5769
+0.9516
+0.7183
+
+Table 8: Seed sensitivity of InsightRAG’s retrieval. Results cover two topics. #Papers counts evaluated retrieval candidates; Coverage, Correctness, and F1 follow the RQ1 definitions.
+
+Results.
+
+Correctness remains high across all six runs (0.8361–0.9783), but Coverage and F1 depend on the seed. For Multi-Agent Workflow Automation, FlowReasoner increases both Coverage (0.6400 to 0.7200) and Correctness (0.8841 to 0.9238) relative to the original seed, while EvoAgentX attains the highest Coverage (0.8400) at lower Correctness (0.8361). For Video Accessibility, Coverage and F1 do not increase monotonically with the number of retrieved papers. These results suggest that different seeds expose different reachable portions of the citation graph, rather than merely changing retrieval volume.
+
+## Appendix C Human Evaluation
+
+## C.1 Expert Audit of Retrieved Papers
+
+This experiment validates whether the LLM-based Correctness measure used in
+RQ1 remains reliable under expert judgment.
+
+Setting.
+
+The automatic measure could be overestimated if the LLM judge labels
+irrelevant papers as relevant. We therefore analyze the most uncertain portion
+of the reconstructed scope: papers retrieved by InsightRAG but absent
+from the human-curated scope. We sample ten papers for each of the ten topics,
+giving 100 papers in total. Two PhD researchers independently judge every paper
+against the corresponding topic definition. We report human-validated
+precision, false-discovery rate, a confidence interval, and extrapolated scope
+metrics in Table 9.
+
+Metric
+Evidence
+Value
+
+Validated extra precision
+ $90/100$ 
+0.9000
+
+False-discovery rate
+ $10/100$ 
+0.1000
+
+Precision 95% CI
+100 samples
+ $[0.8256,0.9448]$ 
+
+Projected precision
+Extrapolated
+0.9005
+
+Projected recall
+Extrapolated
+0.8915
+
+Projected F1
+Extrapolated
+0.8959
+
+Table 9: Expert validation of InsightRAG papers outside the gold
+scope.
+
+Results.
+
+Most candidate false positives are judged relevant by the PhD evaluators. This
+supports the reliability of the LLM-based Correctness measure and explains part
+of the apparent mismatch with the gold scope: some papers counted as extra are
+valid related work omitted from the human survey.
+
+## C.2 Method-Blinded Expert Comparison
+
+Setting. We compared InsightRAG and SurveyGen on two topics, Multi-Agent Workflow Automation and AI-Powered Video Accessibility for Blind and Low Vision Viewers. Three domain experts evaluated each topic (six in total). Given the topic scope, they saw both methods’ taxonomies and surveys labeled System A and System B without method names; presentation order was balanced across experts. The evaluation guidance covered conceptual coverage, non-redundancy, and hierarchy for taxonomies, and content coverage, topical relevance, and organization for surveys. Experts selected A, B, or similar for each artifact, followed by a semi-structured interview about organization, strengths and weaknesses, and potential research use.
+
+Results. InsightRAG’s taxonomy was preferred in 5/6 comparisons: 2/3 for Multi-Agent Workflow Automation and 3/3 for Video Accessibility. Its survey was preferred in all 6/6 comparisons, with 3/3 preferences on each topic.
+
+Interview findings. Experts often attributed InsightRAG’s advantage to topic-specific organization: its categories were more directly tied to the target problem and more often followed a problem-solving or technical progression, whereas SurveyGen was perceived as broader and more list-like. All six experts perceived a connection between a taxonomy and its resulting survey organization; one noted that this held for both systems. Experts also identified weaknesses in topical focus, coverage of important directions, technical specificity, and progression across sections. In particular, some subtopics remained parallel rather than progressively connected, and cross-cutting or future-oriented sections were not always well integrated with the preceding structure. Experts envisioned using the system when entering or organizing a research area, identifying research gaps, or positioning their own work.
+
+## C.3 Human Evaluation Protocol
+
+Participants and compensation.
+
+Participants in the retrieved-paper audit, expert comparison and interviews, and passage-based human audit were recruited online. All were PhD students with expertise related to the evaluation topics and were not authors of this paper. Each participant received USD 8 for approximately one hour of participation. Geographic information is not reported.
+
+Consent and reporting.
+
+Before participation, participants were informed of the research purpose and the use of their evaluation responses and interview feedback, and gave their consent. They were explicitly informed that participation was voluntary and that they could withdraw. We report aggregate judgments and anonymized interview findings.
+
+Materials and instructions.
+
+For the 100-paper retrieval audit, annotators received paper URLs and judged relevance against the corresponding topic definition. For the 24-pair citation audit, they were provided with the cited papers’ full texts to assess support for the claims. The expert-comparison interface presented the following task instructions and evaluation criteria.
+
+Compare System A and System B for one assigned research topic. Their identities are hidden.
+
+Taxonomy. Judge the conceptual organization only. Paper identifiers and method names have been removed.
+
+• 
+
+Coverage of the important conceptual areas in the stated topic scope.
+
+• 
+
+Distinct and non-redundant categories.
+
+• 
+
+Coherent parent-child organization and appropriate granularity.
+
+Which taxonomy better organizes the target research area overall?
+
+Survey. Judge the supplied survey text against the target scope. Citation faithfulness is evaluated separately.
+
+• 
+
+Coverage of important methods, findings, limitations, and representative work.
+
+• 
+
+Relevance to the stated topic scope, without substantial off-topic material.
+
+• 
+
+Clear organization, coherent synthesis, and useful comparisons across work.
+
+Which survey is better overall for the target research scope?
+
+The response options for each preference question were “A is better,” “Similar,” and “B is better.”
+
+## Appendix D Additional Taxonomy and Survey Results
+
+## D.1 Taxonomy Structural Diagnostics
+
+Node Ratio alone cannot show whether a granularity difference comes from more
+categories, excessive depth, or overly detailed leaves. We therefore report
+taxonomy size, depth, branching, and leaf statistics in
+Table 10.
+
+Method
+#Nodes
+Node Ratio
+Max Depth
+Avg. Branch.
+Leaf Ratio
+Small Leaf %
+Papers/Leaf
+
+Vanilla LLM
+30.20
+1.3464
+1.90
+2.0528
+0.7217
+87.69
+1.5533
+
+SurveyGen
+27.30
+1.1763
+2.00
+3.7833
+0.7885
+10.00
+7.6436
+
+SurveyForge
+29.80
+1.3092
+2.00
+4.9600
+0.8321
+1.60
+9.6703
+
+AutoSurvey
+52.10
+2.2906
+2.00
+6.4429
+0.8655
+4.44
+9.3235
+
+Deep Research
+7.70
+0.3482
+1.80
+2.1500
+0.8242
+36.17
+3.5950
+
+InsightRAG
+60.20
+2.2892
+2.40
+3.4767
+0.7351
+51.79
+3.7362
+
+Table 10: Structural statistics of the generated taxonomies. These diagnostic
+metrics describe granularity and do not share a single optimization direction.
+
+Table 10 shows that the higher Node Ratio of
+InsightRAG mainly comes from a moderately deeper hierarchy and a larger
+share of small, fine-grained leaves. Its branching factor and leaf ratio do not
+indicate an uncontrolled expansion of broad categories. The main issue is leaf
+fragmentation, which could be reduced by merging semantically similar
+fine-grained nodes.
+
+## D.2 Detailed LLM-Judge Results
+
+Table 11 provides the complete Coverage, Structure,
+Relevance, and average scores for each of the three judge models used in RQ3.1.
+
+GPT-5.2
+Gemini 3.1 Pro
+DeepSeek V4 Pro
+
+Method
+Cov.
+Str.
+Rel.
+Avg.
+Cov.
+Str.
+Rel.
+Avg.
+Cov.
+Str.
+Rel.
+Avg.
+
+Vanilla LLM
+4.45
+4.50
+4.50
+4.48
+5.00
+5.00
+5.00
+5.00
+4.50
+4.60
+4.90
+4.67
+
+SurveyGen
+3.70
+4.05
+3.50
+3.75
+3.75
+4.45
+3.70
+3.97
+3.70
+3.75
+3.75
+3.73
+
+SurveyForge
+3.15
+3.65
+3.10
+3.30
+4.55
+3.20
+4.10
+3.95
+3.25
+2.90
+3.00
+3.05
+
+AutoSurvey
+3.00
+3.85
+2.65
+3.17
+3.85
+4.65
+3.35
+3.95
+3.15
+3.40
+2.85
+3.13
+
+Deep Research
+4.00
+4.05
+4.35
+4.13
+4.90
+4.80
+5.00
+4.90
+4.35
+4.25
+4.85
+4.48
+
+InsightRAG
+4.35
+4.50
+4.40
+4.42
+5.00
+5.00
+5.00
+5.00
+4.50
+4.60
+4.90
+4.67
+
+Table 11: LLM-judged survey quality across three judge models. Cov., Str., and
+Rel. denote Coverage, Structure, and Relevance, respectively. Bold values
+indicate the best result in each column.
+
+## D.3 Passage-Based Citation Faithfulness Audit
+
+We evaluated two topics: Multi-Agent
+Workflow Automation and AI-Powered Video Accessibility for Blind and Low
+Vision Viewers. The six methods were Vanilla LLM, SurveyGen, SurveyForge,
+AutoSurvey, Deep Research, and InsightRAG. We sampled seven claim–citation pairs
+from each generated survey, yielding 84 pairs. The automatic judge was not shown
+method identities. For 74 pairs with a retrievable cited source, it read the
+extracted full text and returned page-marked evidence or the closest passage.
+The remaining ten pairs had unverifiable references and were labeled
+Unsupported. The judge model was
+Qwen-Plus. It internally distinguished fully supported, partially
+supported, and unsupported; for the reported binary comparison, Supported
+combines the first two labels. Thus, Supported here means at least partial
+passage support, not that every assertion in the claim is fully supported.
+
+Method
+Auto Supported
+Human Supported
+
+Vanilla LLM
+11/14 (78.6%)
+4/4 (100%)
+
+SurveyGen
+11/14 (78.6%)
+1/4 (25%)
+
+SurveyForge
+4/14 (28.6%)
+1/4 (25%)
+
+AutoSurvey
+2/14 (14.3%)
+1/4 (25%)
+
+Deep Research
+10/14 (71.4%)
+2/4 (50%)
+
+InsightRAG
+13/14 (92.9%)
+4/4 (100%)
+
+Table 12: Passage-based citation support of generated surveys. Auto scores use 14
+claim–citation pairs per method; human scores use four method-blinded pairs
+per method. Fully and partially supported automatic labels count as Supported;
+unverifiable references count as Unsupported.
+
+The human audit covers 24 pairs, two from each generated survey.
+InsightRAG and Vanilla LLM each have four human-supported pairs. Automatic and
+human binary judgments agree on 20/24 pairs (83.3%, $\kappa=0.655$ ); in all
+four disagreements the automatic judge is more lenient. Because this audit
+covers only two topics and a small number of pairs per method, it supplements
+rather than replaces the ten-topic citation-entry evaluation in the main text.
+The actual full-text judge prompt is given in
+§J.6.
+
+## Appendix E Metric Definitions and Evaluation Details
+
+This section collects the formal definitions and implementation details of all
+metrics used in Section 4. Let $\mathcal{T}$ denote the set
+of evaluation topics and $m$ a method.
+
+## E.1 Research-Scope Reconstruction Metrics
+
+For topic $t$ , let $G_{t}$ be the human-curated gold paper set, $R_{m,t}$ the
+papers retrieved by method $m$ , $J_{m,t}\subseteq R_{m,t}$ the retrieved papers
+successfully evaluated by the relevance judge, and
+ $\mathrm{Rel}_{m,t}\subseteq J_{m,t}$ those judged relevant. We compute
+topic-level Coverage and Correctness as
+
+ $\displaystyle\mathrm{Coverage}_{m,t}$ 
+ $\displaystyle=\frac{|R_{m,t}\cap G_{t}|}{|G_{t}|},$ 
+
+(2)
+
+ $\displaystyle\mathrm{Correctness}_{m,t}$ 
+ $\displaystyle=\frac{|\mathrm{Rel}_{m,t}|}{|J_{m,t}|}.$ 
+
+The reported scores average the corresponding topic-level values:
+
+ $\displaystyle\mathrm{Coverage}_{m}$ 
+ $\displaystyle=\frac{1}{|\mathcal{T}|}\sum_{t\in\mathcal{T}}\mathrm{Coverage}_{m,t},$ 
+
+(3)
+
+ $\displaystyle\mathrm{Correctness}_{m}$ 
+ $\displaystyle=\frac{1}{|\mathcal{T}|}\sum_{t\in\mathcal{T}}\mathrm{Correctness}_{m,t}.$ 
+
+Their harmonic mean gives
+
+ $\mathrm{F1}_{m}=\frac{2\,\mathrm{Coverage}_{m}\,\mathrm{Correctness}_{m}}{\mathrm{Coverage}_{m}+\mathrm{Correctness}_{m}}.$ 
+
+(4)
+
+Coverage therefore measures overlap with the human scope, whereas Correctness
+is relevance precision estimated by the LLM judge rather than gold-set
+precision.
+
+For the expert audit, validated extra-paper precision is the fraction of sampled
+papers judged relevant, and false-discovery rate is one minus this precision.
+Projected precision, recall, and F1 extrapolate the audited relevance rate to
+the complete set of papers retrieved outside the gold scope.
+
+## E.2 Taxonomy Evaluation Metrics
+
+Let $V_{G}$ and $V_{C}$ be the non-root nodes of the gold and generated taxonomies,
+and let $d(\cdot)$ denote node depth. Heading Soft Recall (HSR) matches every
+gold heading to its most similar generated heading and penalizes depth
+disagreement:
+
+ $\mathrm{HSR}=\frac{1}{|V_{G}|}\sum_{g\in V_{G}}\max_{c\in V_{C}}\mathrm{sim}(g,c)\,0.9^{|d(g)-d(c)|}.$ 
+
+(5)
+
+For the reported HSR and CEDS scores, $\mathrm{sim}(g,c)$ is the cosine
+similarity between embeddings of the gold and generated taxonomy node paths,
+clipped to $[0,1]$ . The root heading is excluded from each path; a node with
+no remaining path uses its own heading. The embedding model is
+Qwen3-Embedding-0.6B.
+Catalogue Edit Distance Similarity (CEDS) normalizes tree-edit distance by the
+combined number of nodes:
+
+ $\mathrm{CEDS}=1-\frac{\mathrm{TED}(T_{G},T_{C})}{|V_{G}|+|V_{C}|}.$ 
+
+(6)
+
+The tree-edit cost uses $1-\mathrm{sim}(g,c)$ to relabel matched nodes
+and counts nodes in inserted or deleted subtrees.
+Node Ratio is $|V_{C}|/|V_{G}|$ ; unlike the other metrics, it is descriptive, and a
+value closer to one indicates a taxonomy size closer to the human reference.
+
+For outline quality, the aggregate score averages Topic Uniqueness (TU),
+Structural Balance (SB), Hierarchical Clarity (HC), and Logical Organization
+(LO):
+
+ $\mathrm{OutlineAvg}=\frac{\mathrm{TU}+\mathrm{SB}+\mathrm{HC}+\mathrm{LO}}{4}.$ 
+
+(7)
+
+Let $\mathcal{R}$ be the concepts extracted from Related Work trees.
+For RW–Taxonomy Alignment, $\mathrm{sim}(r,v)$ is the cosine similarity
+between embeddings of an RW concept’s path (with nonredundant evidence text
+when available) and a taxonomy node’s path, using the same embedding model. We compute
+the two directional best-match scores
+
+ $\displaystyle R_{\mathrm{RW}}$ 
+ $\displaystyle=\frac{1}{|\mathcal{R}|}\sum_{r\in\mathcal{R}}\max_{v\in V_{C}}\mathrm{sim}(r,v),$ 
+
+(8)
+
+ $\displaystyle P_{\mathrm{RW}}$ 
+ $\displaystyle=\frac{1}{|V_{C}|}\sum_{v\in V_{C}}\max_{r\in\mathcal{R}}\mathrm{sim}(v,r),$ 
+
+and define RW–Taxonomy Alignment as their harmonic mean:
+
+ $\mathrm{RWTA}=\frac{2R_{\mathrm{RW}}P_{\mathrm{RW}}}{R_{\mathrm{RW}}+P_{\mathrm{RW}}}.$ 
+
+(9)
+
+HSR and CEDS compare the generated taxonomy with the human-survey reference hierarchy, assessing its correspondence with human-authored organization. RWTA instead measures alignment with organizational concepts extracted from author-written Related Work in the explored literature. Because this material also informs taxonomy construction, RWTA assesses evidence alignment rather than providing an independent human-reference comparison.
+Paper–Taxonomy Assignment Accuracy (PTA) is the number of paper assignments
+judged correct divided by the number of evaluated assignments.
+
+## E.3 Survey Evaluation Metrics
+
+Each LLM judge scores Coverage, Relevance, and Structure on a five-point scale.
+The score for one judge–topic evaluation is
+
+ $\displaystyle\mathrm{SurveyAvg}=\frac{1}{3}($ 
+ $\displaystyle\mathrm{Coverage}+\mathrm{Relevance}$ 
+
+(10)
+
+ $\displaystyle+\mathrm{Structure}).$ 
+
+For Semantic Similarity (SS), let $H$ and $G$ denote the chunks of the human and
+generated surveys. We compute best-match similarities in both directions:
+
+ $\displaystyle s_{\mathit{human}\rightarrow\mathit{gen}}$ 
+ $\displaystyle=\frac{1}{|H|}\sum_{h\in H}\max_{g\in G}\cos(h,g),$ 
+
+(11)
+
+ $\displaystyle s_{\mathit{gen}\rightarrow\mathit{human}}$ 
+ $\displaystyle=\frac{1}{|G|}\sum_{g\in G}\max_{h\in H}\cos(g,h),$ 
+
+ $\displaystyle\mathrm{SS}$ 
+ $\displaystyle=\frac{s_{\mathit{human}\rightarrow\mathit{gen}}+s_{\mathit{gen}\rightarrow\mathit{human}}}{2}.$ 
+
+For topic $t$ , let $K_{t}$ be the number of human key points and
+ $K^{\mathrm{cov}}_{m,t}$ the number covered by method $m$ . Key-Point Recall
+(KPR) is
+
+ $\mathrm{KPR}_{m,t}=100\times\frac{K^{\mathrm{cov}}_{m,t}}{K_{t}}.$ 
+
+(12)
+
+For citation evaluation, a claim is recalled when its complete citation group
+supports it. An individual citation is precise when it independently supports
+the claim, or when the complete group supports the claim and removing that
+citation makes the remaining group insufficient. Let $C_{\mathrm{sup}}$ and
+ $C_{\mathrm{all}}$ be the numbers of supported and evaluated claims, and let
+ $I_{\mathrm{nec}}$ and $I_{\mathrm{all}}$ be the numbers of necessary and total
+citation instances. Thus,
+
+ $\displaystyle\mathrm{CitRecall}$ 
+ $\displaystyle=\frac{C_{\mathrm{sup}}}{C_{\mathrm{all}}},$ 
+
+(13)
+
+ $\displaystyle\mathrm{CitPrecision}$ 
+ $\displaystyle=\frac{I_{\mathrm{nec}}}{I_{\mathrm{all}}}.$ 
+
+Finally, let $N_{\mathrm{match}}$ and $N_{\mathrm{ref}}$ be the numbers of
+matched and extracted reference entries. Verifiable Reference Rate (VRR) is
+
+ $\mathrm{VRR}=\frac{N_{\mathrm{match}}}{N_{\mathrm{ref}}}.$ 
+
+(14)
+
+The reported KPR, citation, and reference scores average the corresponding
+topic-level values. The #References column reports the total number of
+extracted reference entries rather than claim–citation pairs.
+
+## Appendix F Algorithmic and Implementation Details
+
+## F.1 Backbone Models, Retrieval Budgets, Runtime, and Token Usage
+
+Table 13 summarizes the backbone models, principal limits, and available token estimates for four main stages. The greedy taxonomy constructor is deterministic and makes no LLM calls in that step.
+
+Stage
+
+Model
+
+Main limits
+
+Estimated tokens per topic
+
+Insight-guided retrieval
+
+Qwen-Max
+
+Retrieval depth 4; paper budget 400
+
+1.4M–43.7M input; median 9.1M
+
+Greedy taxonomy construction
+
+Deterministic greedy
+
+Maximum taxonomy depth 4
+
+0 LLM tokens in this step
+
+Global taxonomy refinement
+
+Qwen-Max
+
+Maximum taxonomy depth 4
+
+4.7k–31.1k recorded input
+
+Evidence-bounded survey generation
+
+Qwen-Plus
+
+N/A
+
+14k–84k final-output proxy
+
+Table 13: Implementation settings and token estimates for InsightRAG. Input estimates and the final-output proxy have different accounting bases; these figures do not constitute a complete end-to-end token total.
+
+Across the ten evaluation topics, InsightRAG retrieved 1,879 papers in total (187.9 per topic on average). Survey generation took 5.0–28.2 minutes per topic (median 6.4 minutes); this is survey-generation time, not the runtime of the full retrieval-to-survey pipeline.
+
+## F.2 Insight-Guided Retrieval
+
+The pseudocode below makes explicit both exploration operators and their
+scheduling. The research request is converted into $d$ using the
+scope-structuring prompt (§I.1.1).
+Scope-Admission and Extract-RWT invoke the templates in
+§I.1.2 and §I.1.3.
+The schedule uses a forward-round bound $F_{\max}$ , a per-paper Forward
+candidate budget $K_{f}$ , a Backward depth bound $D_{\max}$ , and a global
+paper budget $B_{p}$ .
+For each of the ten main-study topics, we manually selected one representative, high-impact paper within the target scope as the initial seed. The pipeline resolves the supplied title against Semantic Scholar and verifies the paper’s fit with the scope before expansion. Table 14 lists the seeds.
+
+Topic ID
+
+Initial seed paper
+
+0
+
+Multi-agent Architecture Search via Agentic Supernet (Zhang et al., 2025a)
+
+1
+
+Making Short-Form Videos Accessible with Hierarchical Video Summaries (Van Daele et al., 2024)
+
+2
+
+Everybody Dance Now (Chan et al., 2019)
+
+3
+
+POCO: Point Convolution for Surface Reconstruction (Boulch and Marlet, 2022)
+
+4
+
+Fast Multiparty Threshold ECDSA with Fast Trustless Setup (Gennaro and Goldfeder, 2018)
+
+5
+
+Poisoning Language Models During Instruction Tuning (Wan et al., 2023)
+
+6
+
+Not What You've Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection (Greshake et al., 2023)
+
+7
+
+Learning Multi-dimensional Indexes (Nathan et al., 2020)
+
+8
+
+Deep Learning-Based Image Semantic Coding for Semantic Communications (Huang et al., 2021)
+
+9
+
+Energy-Aware Cloud Workflow Applications Scheduling With Geo-Distributed Data (Li et al., 2022)
+
+Table 14: Initial seed papers for the ten main-study topics. Topic IDs follow Table 5.
+
+⬇
+
+procedure FORWARD(p, d, Sa, Sf, Se, G, R)
+
+ C <- papers citing p, each paired with the
+
+ passage in which it discusses p
+
+ C <- remove clearly uninformative candidates from C
+
+ if the number of candidates in C exceeds Kf then
+
+ C <- prioritize C by citation impact and recency
+
+ C <- retain the first Kf candidates in C
+
+ end if
+
+ for each (q, passage) in C do
+
+ decision <- SCOPE-ADMISSION(q, d, passage)
+
+ if decision = ACCEPT then
+
+ if q not in Sa then
+
+ Sa <- Sa union {q}
+
+ R[q] <- EXTRACT-RWT(q, d)
+
+ end if
+
+ G <- ADD-EDGE(G, q, p, passage)
+
+ end if
+
+ end for
+
+ Se <- Se union {p}
+
+ Sf <- Sa minus Se
+
+ return Sa, Sf, Se, G, R
+
+end procedure
+
+⬇
+
+procedure RW-BACKWARD(p, d, Sa, Sf, Se, G, R, depth)
+
+ C <- leaf papers of R[p], each paired with
+
+ its author-written source passage
+
+ for each (q, passage) in C do
+
+ if the paper budget Bp is reached then break
+
+ decision <- SCOPE-ADMISSION(q, d, passage)
+
+ if decision = ACCEPT then
+
+ if q not in Sa then
+
+ Sa <- Sa union {q}
+
+ R[q] <- EXTRACT-RWT(q, d)
+
+ depth[q] <- depth[p] + 1
+
+ end if
+
+ G <- ADD-EDGE(G, p, q, passage)
+
+ end if
+
+ end for
+
+ Se <- Se union {p}
+
+ Sf <- Sa minus Se
+
+ return Sa, Sf, Se, G, R, depth
+
+end procedure
+
+⬇
+
+procedure SEED-RUN(d, seed)
+
+ decision <- SCOPE-ADMISSION(seed, d, no passage)
+
+ if decision = REJECT then
+
+ return empty set, empty graph, empty tree set
+
+ end if
+
+ Sa <- {seed}; Sf <- {seed}; Se <- empty set
+
+ G <- graph containing seed
+
+ R[seed] <- EXTRACT-RWT(seed, d)
+
+ for forward_step <- 1 to Fmax do
+
+ if Sf is empty then break
+
+ Fcurrent <- ORDER-BY-INFLUENCE(snapshot of Sf)
+
+ for each p in Fcurrent do
+
+ Sa, Sf, Se, G, R <-
+
+ FORWARD(p, d, Sa, Sf, Se, G, R)
+
+ end for
+
+ end for
+
+ Sf <- Sa
+
+ Se <- empty set
+
+ for each p in Sa do depth[p] <- 0
+
+ while the paper budget Bp is not reached do
+
+ Bcurrent <- {p in snapshot of Sf : depth[p] < Dmax}
+
+ if Bcurrent is empty then break
+
+ for each p in Bcurrent do
+
+ if the paper budget Bp is reached then break
+
+ Sa, Sf, Se, G, R, depth <-
+
+ RW-BACKWARD(p, d, Sa, Sf, Se, G, R, depth)
+
+ end for
+
+ end while
+
+ G <- LOOP-CLOSURE(G)
+
+ return Sa, G, R
+
+end procedure
+
+procedure INSIGHT-GUIDED-RETRIEVAL(request, p0)
+
+ d <- STRUCTURE-SCOPE(request)
+
+ P0, G0, R0 <- SEED-RUN(d, p0)
+
+ H <- papers in G0 that are cited at least once
+
+ and were not prior Forward seeds
+
+ H <- TOP-3-BY-IN-DEGREE(H)
+
+ subgraphs <- {G0}; trees <- {R0}
+
+ for each h in H do
+
+ Ph, Gh, Rh <- SEED-RUN(d, h)
+
+ subgraphs <- subgraphs union {Gh}
+
+ trees <- trees union {Rh}
+
+ end for
+
+ G <- MERGE-AND-LOOP-CLOSE(subgraphs)
+
+ P <- papers in G
+
+ return P, G, trees
+
+end procedure
+
+A seed initializes the search state only after passing
+Scope-Admission. Each Forward round takes a snapshot of the current
+frontier and applies the operator to every paper in that snapshot. Influence
+determines processing order only; it does not exclude any frontier paper.
+Each processed paper enters $S_{e}$ , admitted citing papers enter $S_{a}$ , and
+ $S_{f}$ is updated to $S_{a}\setminus S_{e}$ , forming the next round’s frontier.
+Forward terminates when $S_{f}$ is empty or $F_{\max}$ rounds have completed.
+Before Backward begins, $S_{f}$ is reset to $S_{a}$ and $S_{e}$ is cleared.
+Each Backward round similarly expands every eligible paper in a snapshot of
+the frontier, so newly admitted predecessors form the next recursive round.
+Backward terminates when no frontier paper remains below $D_{\max}$ or the
+paper budget $B_{p}$ is reached. Each Seed-Run ends with loop closure
+before the independently constructed subgraphs are merged.
+
+## F.3 Minimum-Conflict Taxonomy Construction
+
+The objective in Section 3.3 defines the
+ideal taxonomy–assignment pair. The implementation operationalizes this
+objective in three stages: it constructs a shared candidate concept space from
+citation contexts, recursively builds an evidence-supported greedy draft, and
+then resolves the remaining semantic and structural conflicts through global
+refinement. The LLM calls used in the last stage are reported in
+§I.2.
+
+⬇
+
+procedure BUILD-CANDIDATE-SPACE(P, G)
+
+ C <- empty set
+
+ w(c, p) <- 0 for every c and p
+
+ for each citation edge (p’, p) in E(G) do
+
+ passage <- author-written context on (p’, p)
+
+ phrases <- EXTRACT-CONCEPT-PHRASES(passage)
+
+ for each c in phrases do
+
+ C <- C union {c}
+
+ w(c, p) <- w(c, p) + 1
+
+ end for
+
+ end for
+
+ C, w <- MERGE-EQUIVALENT-CONCEPTS(C, w)
+
+ C, w <- FILTER-BY-EVIDENCE-SUPPORT(C, w)
+
+ delta <- ASSIGN-SEMANTIC-DIMENSIONS(C)
+
+ for each p in P without supported concept evidence do
+
+ C <- C union {c_bottom}
+
+ w(c_bottom, p) <- 0
+
+ end for
+
+ return C, w, delta
+
+end procedure
+
+Extract-Concept-Phrases removes citation markers and other
+non-semantic material before retaining phrases that describe the role or
+category of the cited paper. Semantically equivalent phrases are consolidated
+before evidence filtering, while conflicting assignments remain separate in
+the candidate space. Thus, a paper may retain positive support under multiple
+candidate concepts.
+
+⬇
+
+procedure BUILD-GREEDY-DRAFT(P, C, w, delta, Gamma)
+
+ create root r containing P
+
+ SPLIT(r, P, depth = 0)
+
+ T0 <- tree rooted at r
+
+ A0 <- assignments induced by the leaves of T0
+
+ return T0, A0
+
+end procedure
+
+procedure SPLIT(v, Pv, depth)
+
+ if depth reaches the bound in Gamma
+
+ or too few papers remain in Pv then return
+
+ Cv <- concepts supported by papers in Pv
+
+ Cv <- remove concepts with insufficient support
+
+ or violating Gamma
+
+ if Cv is empty then return
+
+ d_star <- dimension in delta with greatest total support
+
+ Cv <- {c in Cv : delta(c) = d_star}
+
+ H <- empty list; covered <- empty set
+
+ while the branching budget is not reached do
+
+ c_star <- candidate in Cv minus H with the largest
+
+ marginal coverage and evidence support
+
+ if no supported c_star remains then break
+
+ append c_star to H
+
+ covered <- covered union papers supported by c_star
+
+ end while
+
+ if H is empty then return
+
+ create one child of v for every concept in H
+
+ for each paper p in Pv do
+
+ assign p to the child with the highest
+
+ normalized support w(c,p) / sum_{h in H} w(h,p)
+
+ if p has insufficient support then
+
+ place p in a fallback child or defer its assignment
+
+ end if
+
+ end for
+
+ for each child u of v do
+
+ SPLIT(u, papers assigned to u, depth + 1)
+
+ end for
+
+end procedure
+
+Algorithm 5 applies the same split recursively. It terminates a
+branch when the depth bound is reached, too few papers remain, or no supported
+and constraint-compatible split is available. The result is the draft
+taxonomy–assignment pair $(T_{0},A_{0})$ . Appendix G
+formalizes the objective and establishes its NP-hardness.
+
+⬇
+
+procedure REFINE-AND-FINALIZE(d, P, T0, A0, {R_p})
+
+ Qc <- PROFILE-CONCEPTS(concepts in T0)
+
+ Qp <- PROFILE-PAPERS(P)
+
+ ER <- AGGREGATE-RW-TREE-EVIDENCE({R_p})
+
+ as recurring categories and parent-child relations
+
+ T <- GLOBAL-REFINE(d, T0, Qc, Qp, ER)
+
+ A <- REFINE-PAPER-ASSIGNMENTS(P, T, A0, Qp)
+
+ T, A <- VALIDATE-AND-REPAIR(T, A)
+
+ return T, A
+
+end procedure
+
+Global-Refine designs the final hierarchy from the evidence-grounded greedy draft $T_{0}$ , using aggregated RW Tree patterns as auxiliary structural evidence.
+Refine-Paper-Assignments
+takes $A_{0}$ as the default, revises only assignments invalidated by changes
+to the hierarchy, and maps every paper to exactly one leaf of the fixed
+taxonomy. The final validation checks assignment completeness and uniqueness
+and removes unsupported empty leaves.
+
+## Appendix G Complexity of Minimum-Conflict Taxonomy Construction
+
+This appendix restates the optimization problem of
+Section 3.3 in full, proves that it is
+NP-hard, and isolates the structural feature that causes the hardness.
+
+## G.1 Problem Restatement
+
+An instance of MCTC consists of a paper set $P$ , a candidate concept
+set $\mathcal{C}$ whose non-fallback concepts have passed global evidence
+filtering, and non-negative integer evidence weights $w(c,p)$ for
+ $(c,p)\in\mathcal{C}\times P$ . It also contains a dimension map
+ $\delta:\mathcal{C}\rightarrow\mathcal{D}$ , positive integer depth and
+branching bounds $B$ and $k$ , and a parsimony coefficient
+ $\lambda\geq 0$ . The root $r$ is not a candidate concept. The candidate set
+contains a fallback concept $c_{\bot}$ , with $w(c_{\bot},p)=0$ for every
+ $p\in P$ . It can be selected as a child of the root and receive any paper,
+guaranteeing that a feasible assignment remains available even when the paper
+has no supported candidate concept.
+
+A solution is represented by hierarchy-arc indicators
+ $x_{u,c}\in\{0,1\}$ for distinct
+ $u\in\{r\}\cup\mathcal{C}$ and $c\in\mathcal{C}$ , concept indicators
+ $y_{c}\in\{0,1\}$ , assignment indicators $a_{c,p}\in\{0,1\}$ , level values
+ $\ell_{c}$ , and dimension indicators $z_{u,d}\in\{0,1\}$ . For convenience,
+let $y_{r}=1$ and $\ell_{r}=0$ . Unless stated otherwise, the constraints below
+range over $u\in\{r\}\cup\mathcal{C}$ , $c,v\in\mathcal{C}$ ,
+ $p\in P$ , and $d\in\mathcal{D}$ , with hierarchy indicators defined only
+for distinct endpoints. These variables satisfy
+
+ $\displaystyle\textstyle\displaystyle\sum_{u\in(\{r\}\cup\mathcal{C})\setminus\{c\}}x_{u,c}=y_{c},$ 
+
+(15)
+
+ $\displaystyle x_{u,c}\leq y_{u},$ 
+
+ $\displaystyle x_{u,c}=1\Rightarrow\ell_{c}=\ell_{u}+1\leq B,$ 
+
+ $\displaystyle\textstyle\displaystyle\sum_{\begin{subarray}{c}c\in\mathcal{C}\\
+c\neq u\end{subarray}}x_{u,c}\leq k\,y_{u},$ 
+
+ $\displaystyle\textstyle\displaystyle\sum_{c\in\mathcal{C}}a_{c,p}=1,$ 
+
+ $\displaystyle a_{c,p}\leq y_{c},$ 
+
+ $\displaystyle a_{c,p}+x_{c,v}\leq 1,$ 
+
+ $\displaystyle x_{u,c}\leq z_{u,\delta(c)},$ 
+
+ $\displaystyle\textstyle\displaystyle\sum_{d\in\mathcal{D}}z_{u,d}\leq 1,$ 
+
+ $\displaystyle\textstyle\displaystyle\sum_{v\in\mathcal{C}\setminus\{c_{\bot}\}}x_{c_{\bot},v}=0,$ 
+
+The parent and level constraints give every selected concept exactly one
+parent and enforce a rooted acyclic hierarchy of depth at most $B$ . The
+branching constraint applies to every internal node, including the root. The
+assignment constraints make the assignment total and single-valued, while
+ $a_{c,p}+x_{c,v}\leq 1$ ensures that papers are assigned only to leaf
+concepts. Finally, the dimension constraints require the children of any
+parent to share one organizational dimension. Let $T$ denote the resulting
+tree and $\mathcal{C}(T)=\{c:y_{c}=1\}$ its selected concepts, and define
+ $A(p)=c$ whenever $a_{c,p}=1$ . Under these constraints, MCTC
+maximizes the following objective:
+
+ $\displaystyle\mathcal{J}(T,A)={}$ 
+ $\displaystyle\sum_{c\in\mathcal{C}(T)}\sum_{p\in P}w(c,p)+\sum_{p\in P}w\bigl(A(p),p\bigr)$ 
+
+(16)
+
+ $\displaystyle-\lambda\bigl|\mathcal{C}(T)\bigr|.$ 
+
+The first term rewards the selection of concepts with strong aggregate
+evidence, the second rewards evidence-supported leaf assignments, and the
+third discourages unnecessarily complex taxonomies.
+
+## G.2 NP-Hardness
+
+Theorem 1.
+
+The MCTC optimization problem is NP-hard. Hardness holds already for
+instances with $B=1$ , a single semantic dimension $|\mathcal{D}|=1$ ,
+ $\lambda=1$ , binary evidence weights, and
+ $\sum_{p\in P}w(c,p)=3$ for every non-fallback concept.
+
+Proof.
+
+We reduce from Exact Cover by 3-Sets (X3C)
+(Garey and Johnson, 1979). An X3C instance consists of a universe
+ $\mathcal{U}=\{e_{1},\dots,e_{3q}\}$ and a family
+ $\mathcal{S}=\{S_{1},\dots,S_{m}\}$ , where every $S_{j}$ contains exactly three
+elements. It asks whether there is a subfamily of exactly $q$ sets that
+partitions $\mathcal{U}$ .
+
+Construct an MCTC instance as follows. Create one paper $p_{i}$ for
+each element $e_{i}$ , one concept $c_{j}$ for each set $S_{j}$ , and the
+fallback concept $c_{\bot}$ . Define
+
+ $w(c_{j},p_{i})=\begin{cases}1,&e_{i}\in S_{j},\\
+0,&e_{i}\notin S_{j},\end{cases}\qquad w(c_{\bot},p_{i})=0.$ 
+
+Assign every concept the same dimension, and set
+ $B=1$ , $k=q$ , and $\lambda=1$ . We compare the optimum against the
+threshold $\theta=5q$ . The construction is polynomial in the size of the
+X3C instance.
+
+Suppose first that the X3C instance has an exact cover indexed by
+ $I\subseteq\{1,\dots,m\}$ , with $|I|=q$ . Select the concepts
+ $\{c_{j}:j\in I\}$ , attach them directly to the root, and do not select
+ $c_{\bot}$ . Because the selected sets partition $\mathcal{U}$ , every paper
+ $p_{i}$ can be assigned to the unique selected concept whose set contains
+ $e_{i}$ . The resulting taxonomy is feasible: it has depth one, exactly $q$ 
+root children, and a single organizational dimension. Each selected concept
+has support three, so the concept-support term is $3q$ ; every paper receives
+an assignment of weight one, so the assignment-support term is also $3q$ ;
+and the complexity penalty is $q$ . Therefore,
+
+ $\mathcal{J}(T,A)=3q+3q-q=5q=\theta.$ 
+
+Conversely, suppose a feasible MCTC solution satisfies
+ $\mathcal{J}(T,A)\geq 5q$ . Let $I=\{j:y_{c_{j}}=1\}$ , let $s=|I|$ , and
+let $b=y_{c_{\bot}}\in\{0,1\}$ . Since $B=1$ , every selected concept is a
+leaf attached directly to the root. The root branching bound gives
+ $s+b\leq q$ . Each ordinary concept has total support three, whereas the
+fallback has support zero, so the concept-support term equals $3s$ . The
+assignment-support term is at most $3s$ , because the $s$ selected ordinary
+concepts jointly provide positive evidence for at most $3s$ distinct papers.
+Consequently,
+
+ $\mathcal{J}(T,A)\leq 3s+3s-(s+b)=5s-b\leq 5q.$ 
+
+The assumed lower bound forces equality throughout. Thus $b=0$ , $s=q$ ,
+and the assignment-support term is $3q$ . Hence every one of the $3q$ 
+papers is assigned with weight one to a selected concept, so the corresponding
+ $q$ sets cover all elements of $\mathcal{U}$ . Since each selected set has
+size three, these $q$ sets contain exactly $3q$ element occurrences; a
+cover of the $3q$ -element universe is therefore possible only if they are
+pairwise disjoint. They form an exact cover.
+
+The X3C instance is therefore positive if and only if the constructed
+MCTC instance admits a solution of value at least $5q$ . An exact
+polynomial-time algorithm for MCTC would consequently decide
+X3C in polynomial time. Hence MCTC is NP-hard.
+∎
+
+Because the reduction uses a flat taxonomy, the hardness already arises from
+selecting a supported subset of concepts under the branching budget; it does
+not require a deep hierarchy.
+
+## Appendix H Extended Related Work
+
+## H.1 Citation-Aware Scholarly Retrieval and Relation Modeling
+
+Scientific literature retrieval has traditionally relied on lexical matching or embedding-based representations (Cohan et al., 2020). Although these approaches effectively capture content-level similarity, they provide limited support for modeling complex relations among papers, such as identifying corroborating or conflicting findings and tracing the development of a technique. Consequently, the resulting knowledge structure can remain fragmented (Shao et al., 2026). Existing scientific retrieval benchmarks also focus primarily on topical discovery: LitSearch (Ajith et al., 2024) and PASA (He et al., 2025) primarily evaluate the identification of papers relevant to a specified research topic, while STARK incorporates network structure but remains centered on structured multi-hop queries over predefined entities (Wu et al., 2024).
+
+To move beyond surface-level similarity, another line of work exploits citation-graph structure. Traditional citation analysis, including co-citation and main-path analysis, operates over paper-level citation structures, but does not explicitly encode the textual semantics of why one paper cites another (Wu et al., 2026).
+Modern scholarly infrastructures expose citation links, while some also provide citation contexts or influential-citation annotations (Wu et al., 2026).
+Building on these resources, structure-aware retrieval and RAG methods such as LitFM and CG-RAG use citation propagation and multi-hop retrieval to improve scientific question answering and synthesis (Zhang et al., 2025b; Hu et al., 2025a).
+
+In these retrieval systems, citation links primarily serve as graph-connectivity or relevance signals. Unless citation context is explicitly modeled, the link itself does not specify whether the citing author describes an extension, improvement, contrast, or background relation. A complementary line of work therefore examines the semantics of individual citations. SciCite classifies citation intent as background, method, or result comparison (Cohan et al., 2019), while Valenzuela et al. distinguish important from incidental citations (Valenzuela et al., 2015). These studies show that citations are not semantically interchangeable links. Their focus, however, is on characterizing citation instances rather than reconstructing a topic-specific literature scope from relations expressed across papers.
+
+Relatedly likewise recognizes Related Work sections as a resource for understanding a research area (Palani et al., 2023). It helps readers explore Related Work paragraphs across papers and develop topic outlines, making distributed author perspectives easier to inspect. Its contribution is to support readers in navigating and reconciling these perspectives; it does not itself integrate them into an automatically reconstructed literature scope, taxonomy, and survey. InsightRAG instead uses the passages surrounding citations as author-attributed relational evidence throughout these stages.
+
+## H.2 Scholarly Taxonomy Construction
+
+Organizing papers into a hierarchical taxonomy is also central to literature reviews. CHIME generates topical categories and assigns studies from a given paper set, with experts correcting category relations and paper assignments (Hsu et al., 2024). Its primary focus is organizing a supplied collection rather than discovering the literature scope to be organized. HiGTL combines paper text and citation-graph structure for hierarchical clustering, then verbalizes concepts at each level (Hu et al., 2025b). In this approach, citation links contribute graph connectivity, rather than the citing authors’ descriptions of what those links mean. Zhu et al. construct taxonomies through LLM-generated, multi-aspect paper representations and dynamic clustering, and introduce the TaxoBench-CS benchmark (Zhu et al., 2025). Their categories are derived from representations of paper content. Together, these methods construct useful hierarchies from paper content or citation-network structure, but do not explicitly use judgments expressed in author-written Related Work as evidence for discovering candidate concepts, weighing their support, and organizing papers. InsightRAG draws candidate concepts and support weights from citation contexts written by citing authors, linking taxonomy construction to the reconstructed literature scope.
+
+## H.3 Automatic Survey Generation
+
+With the rapid growth of scientific literature, automatic survey generation is becoming an increasingly important capability for both AI systems and human researchers. Mohammad et al. combined citation texts with multi-document summarization to generate technical surveys, showing that citation texts contain survey-worthy information not readily available from abstracts (Mohammad et al., 2009). Recent LLM-based approaches commonly formulate this task as a hierarchical retrieval–planning–writing pipeline: agents first retrieve papers relevant to a target topic, construct an outline, and then compose individual sections in parallel (Wang et al., 2024). AutoSurvey established the paradigm of combining semantic retrieval with parallel generation (Wang et al., 2024), which was subsequently extended by AutoSurvey2 (Wu et al., 2025a) and LLM $\times$ MapReduce (Zhou et al., 2025). Later studies improve different components of this pipeline. SurveyForge introduces memory-driven retrieval and heuristic planning learned from human-written outlines (Yan et al., 2025); SurveyX performs structured preprocessing with an AttributeTree (Liang et al., 2025); SurveyGen incorporates quality-aware feedback (Bao et al., 2025); and multi-agent systems explore collaborative generation through specialized agent roles (Go et al., 2026). To support evaluation across scientific fields, recent work has also introduced discipline-aware benchmarks (Guo et al., 2026).
+
+Despite these advances, most existing systems pass retrieved evidence to downstream generation modules as unstructured text. Reasoning about how concepts, methods, and research themes relate to one another is therefore deferred to the generation stage, requiring an LLM to organize long and heterogeneous evidence without an explicit conceptual or taxonomic structure (Pedinotti and Santus, 2026). Recent work has begun to move structural reasoning earlier in the pipeline. StructSurvey, for example, extracts entities, relations, and a lightweight taxonomy on demand from retrieved abstracts (Pedinotti and Santus, 2026), while DeepSurvey models cross-paper relations through full-text reading, clustering, and comparative analysis (Yang et al., 2026). Recovering structure this way, however, carries two limits. First, the relations are inferred rather than attributed: the model proposes them from whatever text it has read, and no source sentence is required to stand behind any particular relation, so an error in the extracted structure leaves nothing for a reader to check it against. Second, and more fundamentally, reading a paper yields only that paper’s own vantage point. A paper states its problem, its method, and its reading of the work it builds on, but how the field later positioned it—which subsequent work extended it, which contested it, which reframed the problem it addressed—is written by the authors who cited it. The evidence needed to place a paper within a global scope is therefore distributed across other papers, and no amount of careful reading of each retrieved paper in isolation will merge those vantage points into one. InsightRAG collects them instead: it follows citations in both directions, takes the relation from what the citing authors wrote, and aggregates these scattered judgments into a unified scaffold that supports both retrieval and generation.
+
+Taken together, the two limitations meet at the same point: a paper read on its own supplies only its own vantage point, and an untyped citation edge supplies only the fact of a link, whereas the passage an author wrote around that citation supplies the relation itself. InsightRAG builds on this observation. It does not treat citations merely as graph structures or similarity signals for retrieval, nor does it stop at extracting isolated pairwise relations between papers; it regards Related Work sections as distributed scholarly judgments already articulated by authors, and aggregates their curated citation paths and explicit relational statements into a cross-paper and temporal scaffold that jointly supports literature retrieval, taxonomy construction, and survey generation.
+
+## Appendix I Method Prompt Templates
+
+## I.1 Prompts for Insight-Guided Retrieval
+
+This subsection reports the three LLM templates used by retrieval. Runtime
+values are replaced by angle-bracketed fields. Forward and RW-guided Backward
+share the same scope-admission template; reseeding, loop closure, and graph
+merging are rule-based and therefore require no additional prompts.
+
+## I.1.1 Research-Scope Structuring
+
+This prompt converts the user’s request into the structured research scope
+ $d$ used by all subsequent admission decisions.
+
+System Prompt
+
+You are an expert research librarian and academic editor. You translate research requests into strict academic search configurations. Output only the structured fields requested by the user prompt.
+
+\iow_now:Ne¨˙\iow_now:Ne¨# Task\iow_now:Ne¨\iow_now:Ne¨Translate the following user research request into a\iow_now:Ne¨Strict Academic Search Configuration.\iow_now:Ne¨\iow_now:Ne¨# Instructions\iow_now:Ne¨\iow_now:Ne¨1. Refine Topic:\iow_now:Ne¨ Convert the request into standard academic terminology.\iow_now:Ne¨\iow_now:Ne¨2. Define Precisely:\iow_now:Ne¨ Write a one-sentence positive definition of the core\iow_now:Ne¨ concept. If the user already provides a clear definition,\iow_now:Ne¨ preserve it faithfully.\iow_now:Ne¨\iow_now:Ne¨3. Extract Constraints:\iow_now:Ne¨ Identify what the user explicitly or implicitly excludes.\iow_now:Ne¨ Preserve user-provided exclusion criteria.\iow_now:Ne¨\iow_now:Ne¨4. Infer Defaults:\iow_now:Ne¨ If target audience or perspective is unspecified, use\iow_now:Ne¨ sensible academic defaults.\iow_now:Ne¨\iow_now:Ne¨5. Year Range:\iow_now:Ne¨ Set year_range only when the user explicitly specifies\iow_now:Ne¨ a temporal range; otherwise return null.\iow_now:Ne¨\iow_now:Ne¨# User Query\iow_now:Ne¨\iow_now:Ne¨<USER_RESEARCH_REQUEST>\iow_now:Ne¨\iow_now:Ne¨# Required Structured Output\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "topic": "<REFINED_ACADEMIC_TOPIC>",\iow_now:Ne¨ "definitions": "<POSITIVE_SCOPE_DEFINITION>",\iow_now:Ne¨ "constraints": "<EXCLUSIONS_AND_BOUNDARIES>",\iow_now:Ne¨ "target_audience": "<TARGET_AUDIENCE>",\iow_now:Ne¨ "perspective": "<SURVEY_PERSPECTIVE>",\iow_now:Ne¨ "year_range": "<EXPLICIT_RANGE_OR_NULL>"\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.1.2 Scope Admission
+
+This prompt implements a binary scope-admission decision. For the initial seed,
+the citation context field is empty; Forward and Backward candidates receive
+the passage through which they were retrieved.
+
+System Prompt
+
+You are an extremely strict academic reviewer. Make a binary decision about whether a paper falls strictly within the exact scope of the given research topic. Return relevant=true only when the paper’s primary research scope matches the target scope; otherwise return relevant=false. Output only a valid JSON object.
+
+\iow_now:Ne¨˙\iow_now:Ne¨# Task\iow_now:Ne¨\iow_now:Ne¨Judge whether the following paper’s primary research scope\iow_now:Ne¨is identical to the research topic definition below.\iow_now:Ne¨The paper must directly study, advance, or evaluate the\iow_now:Ne¨exact problem defined, rather than being merely related,\iow_now:Ne¨applicable, upstream, or downstream.\iow_now:Ne¨\iow_now:Ne¨# Research Topic\iow_now:Ne¨\iow_now:Ne¨<RESEARCH_TOPIC>\iow_now:Ne¨\iow_now:Ne¨# Exact Topic Definition\iow_now:Ne¨\iow_now:Ne¨<STRUCTURED_RESEARCH_SCOPE>\iow_now:Ne¨\iow_now:Ne¨# Strict Judgment Rules\iow_now:Ne¨\iow_now:Ne¨Apply every rule. A violation of any exclusion rule yields NO.\iow_now:Ne¨\iow_now:Ne¨Mandatory scope alignment:\iow_now:Ne¨1. The paper’s primary research question or contribution\iow_now:Ne¨ must fall squarely within the exact scope.\iow_now:Ne¨2. The paper must explicitly position itself within the\iow_now:Ne¨ defined research area.\iow_now:Ne¨\iow_now:Ne¨Explicit exclusions:\iow_now:Ne¨3. An upstream component technology that could be used by\iow_now:Ne¨ the topic, but is not itself about the topic, yields NO.\iow_now:Ne¨4. A downstream application that uses the topic to solve a\iow_now:Ne¨ different problem, without advancing the topic, yields NO.\iow_now:Ne¨5. An adjacent or overlapping field addressing a different\iow_now:Ne¨ research question yields NO.\iow_now:Ne¨6. A general-purpose method, broad framework, survey, or\iow_now:Ne¨ toolkit not designed for the exact topic yields NO.\iow_now:Ne¨7. A tangential mention in related work, motivation, or\iow_now:Ne¨ future work yields NO.\iow_now:Ne¨\iow_now:Ne¨Use of citation context:\iow_now:Ne¨8. Citation context is supplementary evidence of the\iow_now:Ne¨ candidate’s role and contribution. It cannot by itself\iow_now:Ne¨ justify YES; the paper’s own content must confirm that\iow_now:Ne¨ its primary scope matches the topic.\iow_now:Ne¨\iow_now:Ne¨When to answer YES:\iow_now:Ne¨9. The core contribution directly advances the exact\iow_now:Ne¨ research problem.\iow_now:Ne¨10. The paper provides a dataset, benchmark, evaluation\iow_now:Ne¨ framework, or user study designed specifically for the\iow_now:Ne¨ exact topic.\iow_now:Ne¨11. The paper addresses a sub-problem explicitly included\iow_now:Ne¨ in the topic definition.\iow_now:Ne¨\iow_now:Ne¨Default:\iow_now:Ne¨12. If uncertain, answer NO. Answer YES only with high\iow_now:Ne¨ confidence that the paper’s primary scope matches the\iow_now:Ne¨ defined topic.\iow_now:Ne¨\iow_now:Ne¨# Citation Context\iow_now:Ne¨\iow_now:Ne¨<CITATION_OR_RELATED_WORK_PASSAGE>\iow_now:Ne¨\iow_now:Ne¨# Paper to Judge\iow_now:Ne¨\iow_now:Ne¨Title: <PAPER_TITLE>\iow_now:Ne¨\iow_now:Ne¨Paper Content:\iow_now:Ne¨<PAPER_CONTENT>\iow_now:Ne¨\iow_now:Ne¨# Required Output\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "relevant": true,\iow_now:Ne¨ "reason": "<ONE_SENTENCE_JUSTIFICATION>"\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.1.3 RW Tree Extraction
+
+This prompt extracts the local hierarchy and resolves its leaf citations
+against the paper’s reference list.
+
+System Prompt
+
+You are an expert researcher specializing in the target topic. Given the title, structured research scope, and full text of a paper, locate its Related Work or literature-review section and its reference list. Extract only citations discussed in Related Work, resolve each citation marker to the full paper title, and organize the retained papers into a fine-grained hierarchical RW Tree. Keep direct predecessors, competitors, and topic-specific components; discard generic background, neighboring tasks, and general surveys used only for context. Do not use generic category names such as Methods or Related Work, remove empty categories, and preserve the exact source sentence for every leaf citation. Return only the requested JSON object.
+
+\iow_now:Ne¨˙\iow_now:Ne¨{\iow_now:Ne¨ "paper_title": "<PAPER_TITLE>",\iow_now:Ne¨ "focus_topic": "<RESEARCH_TOPIC>",\iow_now:Ne¨ "research_scope": "<STRUCTURED_RESEARCH_SCOPE>",\iow_now:Ne¨ "full_paper_text": "<FULL_PAPER_TEXT>",\iow_now:Ne¨ "required_output": {\iow_now:Ne¨ "root_title": "<PAPER_TITLE>",\iow_now:Ne¨ "focus_topic": "<RESEARCH_TOPIC>",\iow_now:Ne¨ "should_expand": true,\iow_now:Ne¨ "relevant_categories": [\iow_now:Ne¨ {\iow_now:Ne¨ "category_name": "<FINE_GRAINED_CATEGORY>",\iow_now:Ne¨ "sub_categories": [\iow_now:Ne¨ {\iow_now:Ne¨ "category_name": "<FINE_GRAINED_SUBCATEGORY>",\iow_now:Ne¨ "leaves": [\iow_now:Ne¨ {\iow_now:Ne¨ "citation_id": "<IN_TEXT_CITATION_MARKER>",\iow_now:Ne¨ "title": "<RESOLVED_FULL_PAPER_TITLE>",\iow_now:Ne¨ "insight": "<TOPIC_SPECIFIC_CONTRIBUTION>",\iow_now:Ne¨ "source_context": "<EXACT_SOURCE_SENTENCE>"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ }\iow_now:Ne¨ ],\iow_now:Ne¨ "leaves": [\iow_now:Ne¨ {\iow_now:Ne¨ "citation_id": "<IN_TEXT_CITATION_MARKER>",\iow_now:Ne¨ "title": "<RESOLVED_FULL_PAPER_TITLE>",\iow_now:Ne¨ "insight": "<TOPIC_SPECIFIC_CONTRIBUTION>",\iow_now:Ne¨ "source_context": "<EXACT_SOURCE_SENTENCE>"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ }\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.2 Prompts for Minimum-Conflict Taxonomy Construction
+
+The greedy candidate-space and draft-construction stages are deterministic and
+use no LLM prompt. The following templates are used only for semantic
+profiling, late-stage global refinement, and conflict-aware paper assignment
+refinement. Each is sent as a single user message; the implementation does not
+add a separate system message. The experiments use the coarse profile setting
+shown below.
+
+## I.2.1 Concept Profile Generation
+
+This template compresses each draft concept into a short definition and three
+keywords for global refinement.
+
+\iow_now:Ne¨˙\iow_now:Ne¨Generate a semantic profile for the academic taxonomy\iow_now:Ne¨concept "<CONCEPT_NAME>".\iow_now:Ne¨\iow_now:Ne¨Return strict JSON:\iow_now:Ne¨{\iow_now:Ne¨ "definition": "a phrase of at most 15 words stating\iow_now:Ne¨ the core definition of the concept",\iow_now:Ne¨ "keywords": ["<KEYWORD_1>", "<KEYWORD_2>",\iow_now:Ne¨ "<KEYWORD_3>"]\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.2.2 Paper Profile Generation
+
+This template extracts the compact problem, method, and keywords used to
+reason about the paper during hierarchy refinement and assignment.
+
+\iow_now:Ne¨˙\iow_now:Ne¨Paper: <PAPER_TITLE>\iow_now:Ne¨Abstract: <PAPER_ABSTRACT>\iow_now:Ne¨\iow_now:Ne¨Extract the key information used to classify this paper\iow_now:Ne¨in a taxonomy. Return strict JSON:\iow_now:Ne¨{\iow_now:Ne¨ "problem": "a phrase of at most 10 words stating the\iow_now:Ne¨ core research problem",\iow_now:Ne¨ "method": "a phrase of at most 10 words stating the\iow_now:Ne¨ method or technical approach",\iow_now:Ne¨ "keywords": ["<KEYWORD_1>", "<KEYWORD_2>",\iow_now:Ne¨ "<KEYWORD_3>"]\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.2.3 Global Taxonomy Structural Refinement
+
+This template refines structure only, using the research scope, concept and paper profiles, the greedy draft taxonomy, and auxiliary evidence aggregated from RW Trees. It contains no paper assignment.
+
+\iow_now:Ne¨˙\iow_now:Ne¨## Task: Design a Fine-Grained Academic Taxonomy\iow_now:Ne¨\iow_now:Ne¨You are a senior researcher designing a comprehensive\iow_now:Ne¨taxonomy for a survey on "<TOPIC_NAME>". Your only task is\iow_now:Ne¨to design the taxonomy structure. Do not assign papers.\iow_now:Ne¨\iow_now:Ne¨### Research Topic\iow_now:Ne¨\iow_now:Ne¨<STRUCTURED_RESEARCH_SCOPE>\iow_now:Ne¨\iow_now:Ne¨### Core Concepts\iow_now:Ne¨\iow_now:Ne¨<CONCEPT_PROFILES>\iow_now:Ne¨\iow_now:Ne¨### Papers in Scope\iow_now:Ne¨\iow_now:Ne¨Each line has the following format:\iow_now:Ne¨Title | Keywords | Problem | Method\iow_now:Ne¨\iow_now:Ne¨<PAPER_PROFILES>\iow_now:Ne¨\iow_now:Ne¨### Baseline Taxonomy\iow_now:Ne¨\iow_now:Ne¨The following draft is provided for reference. You should\iow_now:Ne¨significantly improve upon it:\iow_now:Ne¨\iow_now:Ne¨<GREEDY_DRAFT_TAXONOMY>\iow_now:Ne¨\iow_now:Ne¨### Related Work Tree Evidence\iow_now:Ne¨\iow_now:Ne¨The following auxiliary evidence is aggregated from the\iow_now:Ne¨paper-level RW Trees. It captures how source papers organize\iow_now:Ne¨their related literature, but it is not ground truth.\iow_now:Ne¨\iow_now:Ne¨Top recurring categories:\iow_now:Ne¨<RW_TREE_CATEGORY_SUPPORT>\iow_now:Ne¨\iow_now:Ne¨Top recurring parent-child relations:\iow_now:Ne¨<RW_TREE_RELATION_SUPPORT>\iow_now:Ne¨\iow_now:Ne¨Compact per-paper RW Trees:\iow_now:Ne¨<COMPACT_RW_TREES>\iow_now:Ne¨\iow_now:Ne¨Use high-support RW Tree categories and parent-child\iow_now:Ne¨relations to shape the taxonomy when they are consistent\iow_now:Ne¨with the topic definition and paper profiles. A recurring\iow_now:Ne¨theme may be retained, merged into a semantically broader\iow_now:Ne¨branch, or excluded when it is clearly noisy or off-scope.\iow_now:Ne¨Do not copy isolated low-support terms verbatim.\iow_now:Ne¨\iow_now:Ne¨### Design Requirements\iow_now:Ne¨\iow_now:Ne¨1. Ground every branch in the research-scope definition.\iow_now:Ne¨2. Use 4-6 first-level categories aligned with core\iow_now:Ne¨ research dimensions.\iow_now:Ne¨3. Give each first-level category 4-7 subcategories;\iow_now:Ne¨ research-dense areas may use deeper subcategories up to\iow_now:Ne¨ depth <MAX_DEPTH>.\iow_now:Ne¨4. Target <TARGET_LEAF_COUNT> leaves, within the range\iow_now:Ne¨ <MIN_LEAF_COUNT>-<MAX_LEAF_COUNT>.\iow_now:Ne¨5. Make the categories mutually exclusive and collectively\iow_now:Ne¨ exhaustive.\iow_now:Ne¨6. Use specific, descriptive academic names of 3-6 words.\iow_now:Ne¨7. Avoid vague names such as Other, General,\iow_now:Ne¨ Miscellaneous, Advanced, or Emerging.\iow_now:Ne¨8. Make sibling categories distinct and non-synonymous.\iow_now:Ne¨9. Keep children as specializations of their parent.\iow_now:Ne¨10. Balance granularity so that papers can distribute\iow_now:Ne¨ naturally across the leaves.\iow_now:Ne¨\iow_now:Ne¨### Required Output\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "rationale": "two or three sentences explaining the\iow_now:Ne¨ design and refinement of the baseline",\iow_now:Ne¨ "taxonomy": {\iow_now:Ne¨ "concept": "<TOPIC_NAME>",\iow_now:Ne¨ "children": [\iow_now:Ne¨ {\iow_now:Ne¨ "concept": "<FIRST_LEVEL_CATEGORY>",\iow_now:Ne¨ "definition": "<ONE_SENTENCE_SCOPE>",\iow_now:Ne¨ "children": [\iow_now:Ne¨ {\iow_now:Ne¨ "concept": "<SUBCATEGORY>",\iow_now:Ne¨ "definition": "<ONE_SENTENCE_SCOPE>"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ }\iow_now:Ne¨}\iow_now:Ne¨\iow_now:Ne¨Return strict JSON containing structure and definitions\iow_now:Ne¨only. Do not include a papers field.
+
+User Prompt Template
+
+## I.2.4 Paper Assignment Refinement
+
+Once the refined structure is fixed, this template takes the draft assignment
+ $A_{0}$ as its default and revises only assignments invalidated by changes to
+the hierarchy. It returns a complete assignment so that every paper remains
+mapped to exactly one refined leaf.
+
+\iow_now:Ne¨˙\iow_now:Ne¨## Task: Refine Paper Assignments after Taxonomy Refinement\iow_now:Ne¨\iow_now:Ne¨### Refined Leaf Categories\iow_now:Ne¨\iow_now:Ne¨The leaf categories below use 0-based indices. Each line\iow_now:Ne¨contains the full category path and its definition.\iow_now:Ne¨\iow_now:Ne¨<INDEXED_LEAF_CATEGORIES>\iow_now:Ne¨\iow_now:Ne¨### Papers and Draft Assignments\iow_now:Ne¨\iow_now:Ne¨Each line has the format:\iow_now:Ne¨[8-character ID] Title | Keywords | Method |\iow_now:Ne¨Draft leaf path in A0\iow_now:Ne¨\iow_now:Ne¨<PAPER_BATCH_WITH_DRAFT_ASSIGNMENTS>\iow_now:Ne¨\iow_now:Ne¨### Rules\iow_now:Ne¨\iow_now:Ne¨1. Treat each paper’s draft assignment in A0 as the default.\iow_now:Ne¨2. Preserve the draft assignment when its leaf remains in\iow_now:Ne¨ the refined taxonomy, or when it has a clear semantic\iow_now:Ne¨ counterpart and the paper remains compatible with that\iow_now:Ne¨ leaf.\iow_now:Ne¨3. Reassign a paper only when its draft leaf has been\iow_now:Ne¨ removed, merged, split, or semantically changed so that\iow_now:Ne¨ the original assignment is no longer valid.\iow_now:Ne¨4. When reassignment is required, choose the most\iow_now:Ne¨ semantically relevant refined leaf using the paper title,\iow_now:Ne¨ keywords, method, full category path, and category\iow_now:Ne¨ definition.\iow_now:Ne¨5. Assign every paper to exactly one refined leaf category.\iow_now:Ne¨6. Do not modify the taxonomy structure.\iow_now:Ne¨\iow_now:Ne¨### Required Output\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "assignments": {\iow_now:Ne¨ "<PAPER_ID_1>": <LEAF_INDEX>,\iow_now:Ne¨ "<PAPER_ID_2>": <LEAF_INDEX>\iow_now:Ne¨ }\iow_now:Ne¨}\iow_now:Ne¨\iow_now:Ne¨Return strict JSON. Every paper ID in the batch must appear\iow_now:Ne¨exactly once in the assignments object. Preserve its draft\iow_now:Ne¨assignment unless refinement makes that assignment invalid.
+
+User Prompt Template
+
+## I.3 Prompts for Taxonomy-Guided Survey Generation
+
+Survey generation uses six single-message templates: two for local relation
+mining, one shared by leaf and internal writing units, and three for survey-level
+planning and completion. Runtime data is replaced below by angle-bracketed
+fields. RW Tree snippets may inform semantic relations but are explicitly
+non-citable unless the corresponding paper also appears in the unit’s allowed
+citation set.
+
+## I.3.1 Local Paper-Relation Mining
+
+This template is applied only to leaf units containing at least two papers.
+
+\iow_now:Ne¨˙\iow_now:Ne¨You are helping write an academic survey.\iow_now:Ne¨\iow_now:Ne¨## Task\iow_now:Ne¨\iow_now:Ne¨Find useful local paper relations inside the current\iow_now:Ne¨taxonomy concept.\iow_now:Ne¨\iow_now:Ne¨Use only the provided papers and evidence. You do not need\iow_now:Ne¨to connect every pair. Only papers listed in\iow_now:Ne¨allowed_citations are citable. RW Tree snippets are\iow_now:Ne¨semantic background only; papers mentioned inside them are\iow_now:Ne¨not citable unless they also appear in allowed_citations.\iow_now:Ne¨\iow_now:Ne¨## Decision Labels\iow_now:Ne¨\iow_now:Ne¨- direct_relation: explicit evidence exists, such as a\iow_now:Ne¨ direct citation, citation context, or shared RW Tree\iow_now:Ne¨ discussion.\iow_now:Ne¨- hidden_relation: no strong direct evidence exists, but\iow_now:Ne¨ the papers are meaningfully comparable, complementary,\iow_now:Ne¨ sequential, or methodologically different within the\iow_now:Ne¨ current concept.\iow_now:Ne¨- none: no useful writing relation exists. Do not output\iow_now:Ne¨ relations labeled none.\iow_now:Ne¨\iow_now:Ne¨## Writing Constraints\iow_now:Ne¨\iow_now:Ne¨- Be conservative when proposing hidden_relation.\iow_now:Ne¨- Do not claim superiority unless it is explicitly\iow_now:Ne¨ supported by the evidence.\iow_now:Ne¨- Produce a relation_sentence that can be used directly in\iow_now:Ne¨ a survey paragraph.\iow_now:Ne¨- Refer to papers using only numeric citation markers such\iow_now:Ne¨ as [12].\iow_now:Ne¨- Use only markers listed in allowed_citations.\iow_now:Ne¨- Do not cite paper titles inside square brackets.\iow_now:Ne¨- Do not mention external papers that appear only in RW\iow_now:Ne¨ Tree or source-context snippets.\iow_now:Ne¨- Return strict JSON only.\iow_now:Ne¨\iow_now:Ne¨## Required Output\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "paper_relations": [\iow_now:Ne¨ {\iow_now:Ne¨ "source_paper": "<PAPER_ID>",\iow_now:Ne¨ "target_paper": "<PAPER_ID>",\iow_now:Ne¨ "decision": "direct_relation | hidden_relation",\iow_now:Ne¨ "relation_mode": "comparison | progression |\iow_now:Ne¨ complementarity | contrast |\iow_now:Ne¨ shared_problem | other",\iow_now:Ne¨ "confidence": 0.0,\iow_now:Ne¨ "relation_sentence": "<SURVEY_READY_SENTENCE>",\iow_now:Ne¨ "evidence_summary": "<EVIDENCE_SUMMARY>"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨}\iow_now:Ne¨\iow_now:Ne¨## Local Input\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "concept": "<CONCEPT>",\iow_now:Ne¨ "taxonomy_path": "<TAXONOMY_PATH>",\iow_now:Ne¨ "concept_definition": "<CONCEPT_DEFINITION>",\iow_now:Ne¨ "allowed_citations": <ALLOWED_CITATIONS>,\iow_now:Ne¨ "papers": <LOCAL_PAPER_PROFILES>,\iow_now:Ne¨ "graph_evidence": <LOCAL_GRAPH_AND_RW_TREE_EVIDENCE>\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.3.2 Child-Concept Relation Mining
+
+This template is applied to internal units containing at least two direct
+children.
+
+\iow_now:Ne¨˙\iow_now:Ne¨You are helping write transitions inside an academic\iow_now:Ne¨survey section.\iow_now:Ne¨\iow_now:Ne¨## Task\iow_now:Ne¨\iow_now:Ne¨Find useful relations among the direct child concepts of\iow_now:Ne¨the current parent concept.\iow_now:Ne¨\iow_now:Ne¨Use only the provided child concepts, paper summaries, and\iow_now:Ne¨evidence. You do not need to connect every pair. Only\iow_now:Ne¨papers listed in allowed_citations are citable. Evidence\iow_now:Ne¨snippets are semantic background only; papers mentioned\iow_now:Ne¨there are not citable unless they appear in\iow_now:Ne¨allowed_citations.\iow_now:Ne¨\iow_now:Ne¨## Decision Labels\iow_now:Ne¨\iow_now:Ne¨- direct_relation: the child paper sets have explicit\iow_now:Ne¨ citation or citation-context evidence connecting them.\iow_now:Ne¨- hidden_relation: the child concepts are semantically\iow_now:Ne¨ useful to compare, contrast, order, or connect in\iow_now:Ne¨ writing.\iow_now:Ne¨- none: no useful writing relation exists. Do not output\iow_now:Ne¨ relations labeled none.\iow_now:Ne¨\iow_now:Ne¨## Writing Constraints\iow_now:Ne¨\iow_now:Ne¨- The relation_sentence should explain how the two child\iow_now:Ne¨ concepts relate inside the parent section.\iow_now:Ne¨- Do not force a relation when the children are merely\iow_now:Ne¨ siblings without a meaningful transition.\iow_now:Ne¨- Refer to representative papers only with numeric citation\iow_now:Ne¨ markers such as [12].\iow_now:Ne¨- Use only markers listed in allowed_citations.\iow_now:Ne¨- Do not cite paper titles inside square brackets.\iow_now:Ne¨- Do not mention external papers that appear only in\iow_now:Ne¨ evidence snippets.\iow_now:Ne¨- Return strict JSON only.\iow_now:Ne¨\iow_now:Ne¨## Required Output\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "child_concept_relations": [\iow_now:Ne¨ {\iow_now:Ne¨ "source_concept": "<CHILD_CONCEPT>",\iow_now:Ne¨ "target_concept": "<CHILD_CONCEPT>",\iow_now:Ne¨ "decision": "direct_relation | hidden_relation",\iow_now:Ne¨ "relation_mode": "comparison | progression |\iow_now:Ne¨ complementarity | contrast |\iow_now:Ne¨ parallel_dimensions | other",\iow_now:Ne¨ "direction": "source_to_target | target_to_source |\iow_now:Ne¨ none",\iow_now:Ne¨ "confidence": 0.0,\iow_now:Ne¨ "relation_sentence": "<SURVEY_READY_SENTENCE>",\iow_now:Ne¨ "evidence_summary": "<EVIDENCE_SUMMARY>"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨}\iow_now:Ne¨\iow_now:Ne¨## Local Input\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "parent_concept": "<PARENT_CONCEPT>",\iow_now:Ne¨ "taxonomy_path": "<TAXONOMY_PATH>",\iow_now:Ne¨ "allowed_citations": <ALLOWED_CITATIONS>,\iow_now:Ne¨ "children": <CHILD_CONCEPT_PROFILES>,\iow_now:Ne¨ "graph_evidence": <CROSS_CHILD_CITATION_EVIDENCE>\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.3.3 Writing-Unit Generation
+
+Leaf and internal units share this template and are distinguished by the
+unit_type field in the package.
+
+\iow_now:Ne¨˙\iow_now:Ne¨You are writing one subsection of an academic survey.\iow_now:Ne¨\iow_now:Ne¨## Goal\iow_now:Ne¨\iow_now:Ne¨Write a coherent survey subsection using the provided\iow_now:Ne¨taxonomy scope, papers, and relation sentences.\iow_now:Ne¨\iow_now:Ne¨## Rules\iow_now:Ne¨\iow_now:Ne¨- Use only papers listed in allowed_citations.\iow_now:Ne¨- Use only citation markers listed in allowed_citations.\iow_now:Ne¨- Do not invent citation numbers, paper titles,\iow_now:Ne¨ abbreviations, aliases, citations, or paper relations.\iow_now:Ne¨- If a paper appears only in an RW Tree, source context, or\iow_now:Ne¨ evidence snippet, treat it as non-citable background and\iow_now:Ne¨ do not mention it by name.\iow_now:Ne¨- Do not write a paper-by-paper annotated bibliography.\iow_now:Ne¨- For unit_type = section_overview, write a high-level\iow_now:Ne¨ overview of the child concepts using\iow_now:Ne¨ child_concept_relations; avoid detailed paper-by-paper\iow_now:Ne¨ synthesis.\iow_now:Ne¨- For unit_type = paper_subsection, synthesize the assigned\iow_now:Ne¨ papers using paper_relations.\iow_now:Ne¨- Organize the subsection around comparison, progression,\iow_now:Ne¨ complementarity, and contrast when supported by the\iow_now:Ne¨ supplied relation sentences.\iow_now:Ne¨- Phrase hidden relations conservatively.\iow_now:Ne¨- Cite papers only with numeric markers such as [12].\iow_now:Ne¨- Do not add a References section or the subsection title;\iow_now:Ne¨ the pipeline supplies both separately.\iow_now:Ne¨- If this is a section overview, write a concise bridge and\iow_now:Ne¨ do not summarize every paper.\iow_now:Ne¨- Return Markdown prose only, without JSON.\iow_now:Ne¨\iow_now:Ne¨## Writing Package\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "section_id": "<SECTION_ID>",\iow_now:Ne¨ "subsection_title": "<TITLE>",\iow_now:Ne¨ "taxonomy_path": "<TAXONOMY_PATH>",\iow_now:Ne¨ "subsection_scope": "<SCOPE>",\iow_now:Ne¨ "unit_type": "section_overview | paper_subsection",\iow_now:Ne¨ "allowed_citations": <ALLOWED_CITATIONS>,\iow_now:Ne¨ "overall_outline": <SURVEY_OUTLINE>,\iow_now:Ne¨ "previous_section": <PREVIOUS_SECTION>,\iow_now:Ne¨ "next_section": <NEXT_SECTION>,\iow_now:Ne¨ "papers": <LOCAL_PAPERS>,\iow_now:Ne¨ "paper_relations": <PAPER_RELATIONS>,\iow_now:Ne¨ "children": <CHILD_CONCEPTS>,\iow_now:Ne¨ "child_concept_relations": <CHILD_RELATIONS>\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.3.4 Survey-Level Planning
+
+This template plans the sections that surround the already-written taxonomy
+body; it does not rewrite that body.
+
+\iow_now:Ne¨˙\iow_now:Ne¨You are planning the global structure of a taxonomy-guided\iow_now:Ne¨academic survey.\iow_now:Ne¨\iow_now:Ne¨## Task\iow_now:Ne¨\iow_now:Ne¨Create a concise survey-level plan that wraps an\iow_now:Ne¨already-written taxonomy body. The taxonomy body must not\iow_now:Ne¨be rewritten. The taxonomy may change across runs, so use\iow_now:Ne¨the provided taxonomy dynamically.\iow_now:Ne¨\iow_now:Ne¨The final survey should contain:\iow_now:Ne¨- Title and Abstract;\iow_now:Ne¨- 1. Introduction;\iow_now:Ne¨- 2. Background and Scope;\iow_now:Ne¨- 3. Taxonomy Overview;\iow_now:Ne¨- the existing taxonomy body, using the dynamic section\iow_now:Ne¨ interval in survey_structure;\iow_now:Ne¨- Cross-Cutting Discussion;\iow_now:Ne¨- Open Challenges and Future Directions;\iow_now:Ne¨- Conclusion; and\iow_now:Ne¨- References.\iow_now:Ne¨\iow_now:Ne¨## Planning Constraints\iow_now:Ne¨\iow_now:Ne¨- Do not invent papers, citations, counts, or taxonomy\iow_now:Ne¨ dimensions.\iow_now:Ne¨- Use the existing taxonomy as the core body.\iow_now:Ne¨- Do not assume a fixed research area, fixed taxonomy\iow_now:Ne¨ section names, or a fixed number of top-level sections.\iow_now:Ne¨- Use only section_summaries to define taxonomy dimensions.\iow_now:Ne¨- When mentioning corpus size, use only corpus_stats.\iow_now:Ne¨- Do not claim first, largest, comprehensive, empirically\iow_now:Ne¨ grounded, or state-of-the-art unless explicitly supported\iow_now:Ne¨ by the input.\iow_now:Ne¨- Do not critique existing surveys unless they are\iow_now:Ne¨ explicitly provided as references.\iow_now:Ne¨- Focus on reader onboarding, cross-cutting synthesis, and\iow_now:Ne¨ conclusion.\iow_now:Ne¨- Return strict JSON only.\iow_now:Ne¨\iow_now:Ne¨## Required Output\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "survey_title": "<TITLE>",\iow_now:Ne¨ "survey_topic": "<TOPIC>",\iow_now:Ne¨ "central_thesis": "<CENTRAL_THESIS>",\iow_now:Ne¨ "reader_problem": "<READER_PROBLEM>",\iow_now:Ne¨ "scope": ["<IN_SCOPE_ITEM>"],\iow_now:Ne¨ "out_of_scope": ["<OUT_OF_SCOPE_ITEM>"],\iow_now:Ne¨ "main_contributions": ["<CONTRIBUTION>"],\iow_now:Ne¨ "background_terms": [\iow_now:Ne¨ {\iow_now:Ne¨ "term": "<TERM>",\iow_now:Ne¨ "plain_definition": "<DEFINITION>",\iow_now:Ne¨ "why_needed": "<WHY_NEEDED>"\iow_now:Ne¨ }\iow_now:Ne¨ ],\iow_now:Ne¨ "taxonomy_dimensions": [\iow_now:Ne¨ {\iow_now:Ne¨ "section_number": "<SECTION_NUMBER>",\iow_now:Ne¨ "title": "<DIMENSION_TITLE>",\iow_now:Ne¨ "core_question": "<CORE_QUESTION>",\iow_now:Ne¨ "coverage": "<COVERAGE>",\iow_now:Ne¨ "role_in_survey": "<ROLE>",\iow_now:Ne¨ "connection_to_next": "<CONNECTION>",\iow_now:Ne¨ "representative_citations": ["[1]", "[2]"]\iow_now:Ne¨ }\iow_now:Ne¨ ],\iow_now:Ne¨ "cross_cutting_themes": [\iow_now:Ne¨ {\iow_now:Ne¨ "title": "<THEME>",\iow_now:Ne¨ "description": "<DESCRIPTION>",\iow_now:Ne¨ "applies_to_sections": ["4", "6"],\iow_now:Ne¨ "supporting_citations": ["[1]", "[2]"]\iow_now:Ne¨ }\iow_now:Ne¨ ],\iow_now:Ne¨ "future_directions": [\iow_now:Ne¨ {\iow_now:Ne¨ "title": "<DIRECTION>",\iow_now:Ne¨ "problem": "<UNRESOLVED_PROBLEM>",\iow_now:Ne¨ "why_it_matters": "<IMPORTANCE>",\iow_now:Ne¨ "possible_direction": "<POSSIBLE_DIRECTION>",\iow_now:Ne¨ "supporting_citations": ["[1]", "[2]"]\iow_now:Ne¨ }\iow_now:Ne¨ ],\iow_now:Ne¨ "conclusion_message": "<CONCLUSION_MESSAGE>"\iow_now:Ne¨}\iow_now:Ne¨\iow_now:Ne¨## Input\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "corpus_stats": <CORPUS_STATISTICS>,\iow_now:Ne¨ "survey_structure": <DYNAMIC_SECTION_STRUCTURE>,\iow_now:Ne¨ "outline": <TAXONOMY_OUTLINE>,\iow_now:Ne¨ "section_summaries": <TOP_LEVEL_SECTION_SUMMARIES>,\iow_now:Ne¨ "references": <COMPACT_GLOBAL_REFERENCES>,\iow_now:Ne¨ "taxonomy_body": <ASSEMBLED_TAXONOMY_BODY>\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.3.5 Front-Matter Generation
+
+\iow_now:Ne¨˙\iow_now:Ne¨You are writing the front matter of a taxonomy-guided\iow_now:Ne¨academic survey.\iow_now:Ne¨\iow_now:Ne¨## Task\iow_now:Ne¨\iow_now:Ne¨Write only the title, abstract, introduction,\iow_now:Ne¨background/scope, and taxonomy overview. Do not write the\iow_now:Ne¨existing taxonomy body. Use the provided plan and taxonomy\iow_now:Ne¨dimensions dynamically.\iow_now:Ne¨\iow_now:Ne¨## Required Markdown Structure\iow_now:Ne¨\iow_now:Ne¨# <SURVEY_TITLE>\iow_now:Ne¨\iow_now:Ne¨## Abstract\iow_now:Ne¨\iow_now:Ne¨## 1. Introduction\iow_now:Ne¨\iow_now:Ne¨## 2. Background and Scope\iow_now:Ne¨\iow_now:Ne¨## 3. Taxonomy Overview\iow_now:Ne¨\iow_now:Ne¨## Writing Goals\iow_now:Ne¨\iow_now:Ne¨- Make the survey accessible to readers unfamiliar with\iow_now:Ne¨ the exact taxonomy.\iow_now:Ne¨- Explain the topic, reader problem, scope, and contribution\iow_now:Ne¨ using the supplied plan.\iow_now:Ne¨- Define the survey topic and four to six reusable terms in\iow_now:Ne¨ Background and Scope.\iow_now:Ne¨- Clarify included and excluded literature without\iow_now:Ne¨ enumerating every taxonomy dimension in that section.\iow_now:Ne¨- Explain the taxonomy organization and summarize each\iow_now:Ne¨ top-level dimension dynamically in Taxonomy Overview.\iow_now:Ne¨- A compact Markdown table may be used in the overview.\iow_now:Ne¨\iow_now:Ne¨## Citation Constraints\iow_now:Ne¨\iow_now:Ne¨- Use citations sparingly, with at most two citation\iow_now:Ne¨ clusters per paragraph.\iow_now:Ne¨- Use only numeric markers from the provided references.\iow_now:Ne¨- Do not invent citations or add a References section.\iow_now:Ne¨- Do not mention local files or paper identifiers.\iow_now:Ne¨- Use only corpus_stats when stating corpus size.\iow_now:Ne¨- Do not claim first, largest, comprehensive, empirically\iow_now:Ne¨ grounded, or state-of-the-art unless supported by the\iow_now:Ne¨ plan.\iow_now:Ne¨- Do not compare against existing surveys unless they are\iow_now:Ne¨ explicitly present in the references.\iow_now:Ne¨- Prefer conservative descriptions such as corpus-derived,\iow_now:Ne¨ taxonomy-guided, or based on the current corpus.\iow_now:Ne¨- Do not introduce dimensions absent from\iow_now:Ne¨ plan.taxonomy_dimensions.\iow_now:Ne¨- Return Markdown only, without meta commentary.\iow_now:Ne¨\iow_now:Ne¨## Input\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "corpus_stats": <CORPUS_STATISTICS>,\iow_now:Ne¨ "survey_structure": <DYNAMIC_SECTION_STRUCTURE>,\iow_now:Ne¨ "plan": <SURVEY_LEVEL_PLAN>,\iow_now:Ne¨ "outline": <TAXONOMY_OUTLINE>,\iow_now:Ne¨ "references": <COMPACT_GLOBAL_REFERENCES>\iow_now:Ne¨}
+
+User Prompt Template
+
+## I.3.6 Back-Matter Generation
+
+\iow_now:Ne¨˙\iow_now:Ne¨You are writing the back matter of a taxonomy-guided\iow_now:Ne¨academic survey.\iow_now:Ne¨\iow_now:Ne¨## Task\iow_now:Ne¨\iow_now:Ne¨Write only the discussion, open challenges, and conclusion\iow_now:Ne¨that follow an already-written taxonomy body. Do not\iow_now:Ne¨rewrite or repeat the taxonomy body. Use the supplied plan\iow_now:Ne¨and dynamic survey_structure.\iow_now:Ne¨\iow_now:Ne¨## Required Markdown Structure\iow_now:Ne¨\iow_now:Ne¨## <DISCUSSION_SECTION>. Cross-Cutting Discussion\iow_now:Ne¨\iow_now:Ne¨## <FUTURE_SECTION>. Open Challenges and Future Directions\iow_now:Ne¨### <FUTURE_SECTION>.1 <CHALLENGE_TITLE>\iow_now:Ne¨### <FUTURE_SECTION>.2 <CHALLENGE_TITLE>\iow_now:Ne¨\iow_now:Ne¨## <CONCLUSION_SECTION>. Conclusion\iow_now:Ne¨\iow_now:Ne¨## Writing Goals\iow_now:Ne¨\iow_now:Ne¨- Synthesize themes across taxonomy branches instead of\iow_now:Ne¨ summarizing each section again.\iow_now:Ne¨- Make the discussion reader-oriented and concrete.\iow_now:Ne¨- For future directions, state what remains unresolved, why\iow_now:Ne¨ current work is insufficient, and what could be done next.\iow_now:Ne¨- Write two to five future-direction subsections derived\iow_now:Ne¨ from plan.future_directions; do not invent unrelated\iow_now:Ne¨ challenges.\iow_now:Ne¨- Keep the conclusion short and introduce no new claims or\iow_now:Ne¨ papers.\iow_now:Ne¨\iow_now:Ne¨## Citation Constraints\iow_now:Ne¨\iow_now:Ne¨- Use citations sparingly, with at most two citation\iow_now:Ne¨ clusters per paragraph.\iow_now:Ne¨- Use only numeric markers from the provided references.\iow_now:Ne¨- Do not invent citations or add a References section.\iow_now:Ne¨- Do not mention local files or paper identifiers.\iow_now:Ne¨- Use only corpus_stats when stating corpus size.\iow_now:Ne¨- Do not claim first, largest, comprehensive, empirically\iow_now:Ne¨ grounded, or state-of-the-art unless supported by the\iow_now:Ne¨ plan.\iow_now:Ne¨- Prefer conservative descriptions such as corpus-derived,\iow_now:Ne¨ taxonomy-guided, or based on the current corpus.\iow_now:Ne¨- Do not introduce dimensions absent from\iow_now:Ne¨ plan.taxonomy_dimensions.\iow_now:Ne¨- Return Markdown only, without meta commentary.\iow_now:Ne¨\iow_now:Ne¨## Input\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "corpus_stats": <CORPUS_STATISTICS>,\iow_now:Ne¨ "survey_structure": <DYNAMIC_SECTION_STRUCTURE>,\iow_now:Ne¨ "plan": <SURVEY_LEVEL_PLAN>,\iow_now:Ne¨ "outline": <TAXONOMY_OUTLINE>,\iow_now:Ne¨ "references": <COMPACT_GLOBAL_REFERENCES>,\iow_now:Ne¨ "taxonomy_body": <RENUMBERED_TAXONOMY_BODY>\iow_now:Ne¨}
+
+User Prompt Template
+
+## Appendix J Evaluation Prompt Templates
+
+This section reports the complete templates used for LLM-based evaluation.
+Angle-bracketed fields are populated at runtime with the corresponding topic,
+paper, taxonomy, or survey content. Each prompt is presented as a breakable
+card within the standard two-column appendix layout.
+Method identifiers are retained for result aggregation but are not included in
+the judge-facing prompts.
+
+## J.1 Retrieved-Paper Relevance Judgment
+
+This prompt determines whether each retrieved paper is substantively relevant
+to the target research scope.
+
+System Prompt
+
+You are a strict evaluator for a survey-paper retrieval experiment. Your task is to decide whether a candidate research paper is substantively relevant to the target survey topic. Use only the topic prompt, paper title, and paper abstract. Do not reward superficial keyword overlap. Mark relevant=true only if the paper would reasonably belong in the scope of a survey on this topic. Do not think step by step. Return exactly one compact JSON object as the first and only output. Do not include markdown, explanations outside JSON, or hidden reasoning.
+
+\iow_now:Ne¨˙\iow_now:Ne¨{\iow_now:Ne¨ "topic_name": "<TOPIC_NAME>",\iow_now:Ne¨ "topic_prompt": "<TOPIC_SCOPE>",\iow_now:Ne¨ "paper_title": "<PAPER_TITLE>",\iow_now:Ne¨ "paper_abstract": "<PAPER_ABSTRACT>",\iow_now:Ne¨ "decision_instructions": [\iow_now:Ne¨ "Do not reason step by step. Answer immediately.",\iow_now:Ne¨ "Output exactly one JSON object and nothing else.",\iow_now:Ne¨ "Return relevant=true if this paper is substantively in scope for the topic.",\iow_now:Ne¨ "Return relevant=false if it is off-topic, too broad, only shares keywords, or lacks a clear connection.",\iow_now:Ne¨ "Use score from 0.0 to 1.0, where 1.0 means clearly in scope.",\iow_now:Ne¨ "Use confidence from 0.0 to 1.0.",\iow_now:Ne¨ "Keep reason under 20 words."\iow_now:Ne¨ ],\iow_now:Ne¨ "required_json_schema": {\iow_now:Ne¨ "relevant": "boolean",\iow_now:Ne¨ "score": "number between 0 and 1",\iow_now:Ne¨ "confidence": "number between 0 and 1",\iow_now:Ne¨ "reason": "short string"\iow_now:Ne¨ }\iow_now:Ne¨}
+
+User Prompt Template
+
+## J.2 Taxonomy Evaluation
+
+Taxonomy evaluation uses one prompt to assess the organization of the complete
+taxonomy and another to assess individual paper-to-taxonomy assignments.
+
+## J.2.1 Taxonomy Outline Quality Judgment
+
+System Prompt
+
+You are a strict evaluator for academic survey taxonomy quality. Return exactly one compact JSON object as the first and only output. Do not include chain-of-thought or markdown.
+
+\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "task": "Evaluate the organization quality of a generated academic survey taxonomy for taxonomy construction. This is not an evaluation of the final survey writing outline.",\iow_now:Ne¨ "topic_id": "<TOPIC_ID>",\iow_now:Ne¨ "topic_name": "<TOPIC_NAME>",\iow_now:Ne¨ "target_scope": {\iow_now:Ne¨ "source": "<TOPIC_PROMPT_SOURCE>",\iow_now:Ne¨ "input_prompt": "<TOPIC_SCOPE>"\iow_now:Ne¨ },\iow_now:Ne¨ "outline_includes_paper_counts": false,\iow_now:Ne¨ "scale": "0 to 5, where 0 is very poor and 5 is excellent.",\iow_now:Ne¨ "rubric": {\iow_now:Ne¨ "topic_uniqueness": "Sibling nodes should be distinct and non-overlapping. Penalize duplicate, near-duplicate, or mixed-scope technical categories. Do not give extra credit merely because a node is a generic survey section such as Foundations, Background, Applications, Future Work, or Open Challenges.",\iow_now:Ne¨ "structural_balance": "The taxonomy should have reasonable breadth and depth for the technical concept space. Penalize over-fragmented, overly flat, or lopsided trees, but do not require conventional survey-outline sections such as Foundations or Open Challenges.",\iow_now:Ne¨ "hierarchical_clarity": "Parent-child relations should be clear abstraction-to-specific relations. Penalize children that do not belong under their parent. Generic survey-writing sections are not automatically clearer than technical taxonomy categories.",\iow_now:Ne¨ "logical_organization": "The taxonomy should organize the field’s technical concepts coherently for taxonomy construction. Do not reward a generic survey narrative flow (e.g., foundations -> methods -> applications -> challenges) unless the supplied taxonomy nodes are specifically meaningful for the target scope."\iow_now:Ne¨ },\iow_now:Ne¨ "instructions": [\iow_now:Ne¨ "Use only the supplied target scope and taxonomy outline.",\iow_now:Ne¨ "Evaluate whether the taxonomy is well organized for this specific survey topic, not for a broader adjacent field.",\iow_now:Ne¨ "Judge taxonomy-construction quality, not final survey prose, writing quality, paper retrieval quality, or citation quality.",\iow_now:Ne¨ "A taxonomy may be high quality even if it does not include generic final-survey sections such as Foundations, Background, Applications, Future Work, or Open Challenges.",\iow_now:Ne¨ "Conversely, do not give high scores to a taxonomy only because it uses generic survey-outline sections; the categories must be technically specific and useful for the target scope.",\iow_now:Ne¨ "You must return all four rubric dimensions, even when a score is low.",\iow_now:Ne¨ "Give fine-grained two-decimal scores from 0.00 to 5.00 (e.g., 3.75, 4.20, 2.85); do not default to whole numbers or half points.",\iow_now:Ne¨ "Return JSON only.",\iow_now:Ne¨ "Return one top-level JSON object with exactly the required keys. Do not return only one dimension.",\iow_now:Ne¨ "Do not use a top-level ’reason’ key. Put short reasons inside each dimension object."\iow_now:Ne¨ ],\iow_now:Ne¨ "output_contract": "The response must contain topic_uniqueness, structural_balance, hierarchical_clarity, and logical_organization. The overall average is computed by the harness, so do not worry about reporting it.",\iow_now:Ne¨ "required_json_schema": {\iow_now:Ne¨ "topic_uniqueness": {\iow_now:Ne¨ "score": 0.00,\iow_now:Ne¨ "reason": "short phrase"\iow_now:Ne¨ },\iow_now:Ne¨ "structural_balance": {\iow_now:Ne¨ "score": 0.00,\iow_now:Ne¨ "reason": "short phrase"\iow_now:Ne¨ },\iow_now:Ne¨ "hierarchical_clarity": {\iow_now:Ne¨ "score": 0.00,\iow_now:Ne¨ "reason": "short phrase"\iow_now:Ne¨ },\iow_now:Ne¨ "logical_organization": {\iow_now:Ne¨ "score": 0.00,\iow_now:Ne¨ "reason": "short phrase"\iow_now:Ne¨ }\iow_now:Ne¨ },\iow_now:Ne¨ "taxonomy_outline": "<TAXONOMY_OUTLINE>"\iow_now:Ne¨}
+
+User Prompt Template
+
+## J.2.2 Paper-to-Taxonomy Assignment Judgment
+
+System Prompt
+
+You are a strict evaluator for paper-to-taxonomy assignment quality. Return exactly one compact JSON object as the first and only output. Do not include chain-of-thought or markdown.
+
+\iow_now:Ne¨˙\iow_now:Ne¨{\iow_now:Ne¨ "task": "Judge whether a paper is assigned to an appropriate taxonomy node.",\iow_now:Ne¨ "topic_id": "<TOPIC_ID>",\iow_now:Ne¨ "topic_name": "<TOPIC_NAME>",\iow_now:Ne¨ "target_scope": "<TOPIC_SCOPE>",\iow_now:Ne¨ "paper": {\iow_now:Ne¨ "title": "<PAPER_TITLE>",\iow_now:Ne¨ "abstract": "<PAPER_ABSTRACT>",\iow_now:Ne¨ "related_work_tree_summary": "<RELATED_WORK_TREE_SUMMARY>"\iow_now:Ne¨ },\iow_now:Ne¨ "assigned_taxonomy_node_path": "<ASSIGNED_NODE_PATH>",\iow_now:Ne¨ "sibling_taxonomy_nodes": [\iow_now:Ne¨ "<SIBLING_NODE_PATH_1>",\iow_now:Ne¨ "<SIBLING_NODE_PATH_2>"\iow_now:Ne¨ ],\iow_now:Ne¨ "rubric": {\iow_now:Ne¨ "correct_1": "The assigned node path is a substantively reasonable category for the paper’s main problem, method, application, or role in the related-work tree.",\iow_now:Ne¨ "correct_0": "The assigned node is off-topic, too broad to be meaningful when a better sibling exists, or describes a different method/application/threat/model than the paper."\iow_now:Ne¨ },\iow_now:Ne¨ "instructions": [\iow_now:Ne¨ "Use the topic scope, paper abstract, related-work tree summary, assigned node, and sibling nodes.",\iow_now:Ne¨ "Judge the assignment itself, not the writing quality of the taxonomy.",\iow_now:Ne¨ "Return correct=1 only when the node is a good taxonomy placement for this paper.",\iow_now:Ne¨ "Return correct=0 when the paper only has vague keyword overlap with the node.",\iow_now:Ne¨ "Give score from 0 to 5 where 5 is clearly correct and 0 is clearly incorrect.",\iow_now:Ne¨ "Return JSON only."\iow_now:Ne¨ ],\iow_now:Ne¨ "required_json_schema": {\iow_now:Ne¨ "correct": 0,\iow_now:Ne¨ "score": 0,\iow_now:Ne¨ "reason": "short phrase"\iow_now:Ne¨ }\iow_now:Ne¨}
+
+User Prompt Template
+
+## J.3 Survey Quality Evaluation
+
+System Prompt
+
+You are a neutral academic evaluator assessing an anonymized generated survey. Evaluate the supplied survey against the target topic definition using only evidence visible in the provided text. Consider strengths and limitations symmetrically. Do not infer which system produced the survey, and do not reward or penalize document length by itself. When inline citations and a reference list are supplied, evaluate citation practice that is directly observable in the document, but do not claim that a cited source exists or supports a claim without access to that source; source-level citation faithfulness is evaluated separately. Do not think step by step. Return exactly one compact JSON object as the first and only output.
+
+\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "prompt_version": "q3_balanced_v5_blinded_citation_aware",\iow_now:Ne¨ "task": "Score this generated survey paper for the target topic.",\iow_now:Ne¨ "score_scale": {\iow_now:Ne¨ "minimum": 1,\iow_now:Ne¨ "maximum": 5,\iow_now:Ne¨ "meaning": {\iow_now:Ne¨ "1": "poor or mostly unusable",\iow_now:Ne¨ "2": "weak with major gaps",\iow_now:Ne¨ "3": "acceptable but incomplete or uneven",\iow_now:Ne¨ "4": "strong with identifiable but non-fundamental limitations",\iow_now:Ne¨ "5": "excellent for the supplied scope, with no important content-quality limitation visible in the text"\iow_now:Ne¨ },\iow_now:Ne¨ "half_points_allowed": true\iow_now:Ne¨ },\iow_now:Ne¨ "score_calibration": {\iow_now:Ne¨ "5.0": "Excellent for the supplied scope, with no important visible content-quality limitation.",\iow_now:Ne¨ "4.0_to_4.5": "Strong survey with minor limitations, incomplete comparisons, or modest unevenness.",\iow_now:Ne¨ "3.0_to_3.5": "Acceptable but clearly incomplete, uneven, or partially off-scope.",\iow_now:Ne¨ "1.0_to_2.5": "Weak, substantially off-topic, structurally flawed, or mostly unusable."\iow_now:Ne¨ },\iow_now:Ne¨ "metrics": {\iow_now:Ne¨ "coverage": "How well the survey covers the major concepts and research directions that can reasonably be inferred from the supplied topic scope, with appropriate depth. Do not require datasets or benchmarks unless relevant.",\iow_now:Ne¨ "relevance": "How consistently the content contributes to understanding the target topic. Necessary background and useful cross-cutting discussion are relevant.",\iow_now:Ne¨ "structure": "How clearly the survey groups research directions, explains relationships and differences among them, and develops a coherent narrative through its taxonomy, hierarchy, transitions, and cross-cutting synthesis.",\iow_now:Ne¨ "avg": "Arithmetic mean of coverage, relevance, and structure."\iow_now:Ne¨ },\iow_now:Ne¨ "important_instructions": [\iow_now:Ne¨ "Judge the survey as a research survey, not as a retrieval list.",\iow_now:Ne¨ "Evaluate strengths and limitations symmetrically and ground both in concrete section headings or passages from the supplied survey.",\iow_now:Ne¨ "Do not reward or penalize length, citation count, or number of sections by itself.",\iow_now:Ne¨ "A strong survey should organize and synthesize research directions rather than merely enumerate papers, but detailed coverage is not a weakness when it remains coherent and useful.",\iow_now:Ne¨ "Allow necessary background and cross-cutting discussion when it helps explain the target topic; do not treat material as off-topic merely because it extends beyond the exact query wording.",\iow_now:Ne¨ "Consider datasets, benchmarks, evaluation protocols, limitations, or future directions only when they are substantively relevant to the target topic; their absence must not trigger an automatic score cap.",\iow_now:Ne¨ "Judge coverage only from the supplied topic scope and survey. Do not claim field-wide completeness or identify missing literature that cannot reasonably be inferred from the provided scope.",\iow_now:Ne¨ "Use the full 1-5 scale according to the rubric. Do not apply any score cap mechanically; scores must reflect the overall balance of demonstrated strengths and limitations.",\iow_now:Ne¨ "Separate topical breadth from redundancy: broad but well-organized coverage may score highly, while repeated content without additional synthesis may be penalized.",\iow_now:Ne¨ "Return JSON only.",\iow_now:Ne¨ "The full inline citations and reference list are included. Evaluate only observable citation practice: whether important scholarly claims are attributed, citations are integrated into the discussion, and citation markers and the reference list are internally usable and consistent.",\iow_now:Ne¨ "Do not infer that a citation is fabricated, unverifiable, or semantically unsupported solely from its title, year, style, or unfamiliarity. Full source-level support is evaluated in a separate citation-faithfulness audit.",\iow_now:Ne¨ "Citation observations are qualitative context and must not override the three content scores unless citation presentation directly impairs coverage, relevance, organization, or synthesis."\iow_now:Ne¨ ],\iow_now:Ne¨ "required_json_schema": {\iow_now:Ne¨ "coverage": "number from 1 to 5",\iow_now:Ne¨ "relevance": "number from 1 to 5",\iow_now:Ne¨ "structure": "number from 1 to 5",\iow_now:Ne¨ "avg": "number from 1 to 5",\iow_now:Ne¨ "strengths": "list of 1-3 concise strengths, each naming a concrete section or passage",\iow_now:Ne¨ "limitations": "list of 0-3 concise limitations, each naming a concrete section or passage",\iow_now:Ne¨ "citation_observations": "one concise sentence about observable citation practice, or ’Not assessed’ in content-only mode",\iow_now:Ne¨ "confidence": "one of: low, medium, high",\iow_now:Ne¨ "rationale": "a balanced explanation under 80 words"\iow_now:Ne¨ },\iow_now:Ne¨ "topic_id": "<TOPIC_ID>",\iow_now:Ne¨ "topic_name": "<TOPIC_NAME>",\iow_now:Ne¨ "topic_scope": "<TOPIC_SCOPE>",\iow_now:Ne¨ "survey_text": "<GENERATED_SURVEY_TEXT>"\iow_now:Ne¨}
+
+User Prompt Template
+
+## J.4 Key-Point Recall Evaluation
+
+Key-Point Recall is evaluated in two stages: extracting a fixed set of key
+points from the human-written survey and checking their presence in each
+generated survey.
+
+## J.4.1 Human-Survey Key-Point Extraction
+
+System Prompt
+
+You are a careful research-survey evaluator. Return exactly one compact JSON object as the first and only output. Do not include chain-of-thought.
+
+\iow_now:Ne¨˙\iow_now:Ne¨{\iow_now:Ne¨ "task": "Extract key points from a human-written academic survey.",\iow_now:Ne¨ "topic_id": "<TOPIC_ID>",\iow_now:Ne¨ "topic_name": "<TOPIC_NAME>",\iow_now:Ne¨ "definition": "A key point is a self-contained, survey-level scientific point: a major subtopic, method family, comparison axis, finding, dataset/evaluation theme, limitation, or future direction that a generated survey should cover.",\iow_now:Ne¨ "instructions": [\iow_now:Ne¨ "Extract key points from the human-written survey text only.",\iow_now:Ne¨ "Do not output paper titles as standalone key points.",\iow_now:Ne¨ "Prefer conceptual points that can be checked against another survey.",\iow_now:Ne¨ "Each key point must be one concise sentence.",\iow_now:Ne¨ "Avoid duplicates and overly narrow implementation details.",\iow_now:Ne¨ "Return exactly 10 key points, balanced across the survey."\iow_now:Ne¨ ],\iow_now:Ne¨ "required_json_schema": {\iow_now:Ne¨ "key_points": [\iow_now:Ne¨ {\iow_now:Ne¨ "id": "KP01",\iow_now:Ne¨ "key_point": "one self-contained sentence"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ },\iow_now:Ne¨ "human_survey_chunks": [\iow_now:Ne¨ {\iow_now:Ne¨ "chunk_id": 1,\iow_now:Ne¨ "text": "<HUMAN_SURVEY_CHUNK_1>"\iow_now:Ne¨ },\iow_now:Ne¨ {\iow_now:Ne¨ "chunk_id": 2,\iow_now:Ne¨ "text": "<HUMAN_SURVEY_CHUNK_2>"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨}
+
+User Prompt Template
+
+## J.4.2 Generated-Survey Key-Point Presence Check
+
+\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "task": "QA-style key point presence check.",\iow_now:Ne¨ "topic_id": "<TOPIC_ID>",\iow_now:Ne¨ "topic_name": "<TOPIC_NAME>",\iow_now:Ne¨ "chunk_index": "<CHUNK_INDEX>",\iow_now:Ne¨ "chunk_count": "<CHUNK_COUNT>",\iow_now:Ne¨ "question": "For each human-survey key point, decide whether the generated survey chunk explicitly or clearly semantically covers it.",\iow_now:Ne¨ "scoring_rule": "present=1 only if the generated survey covers the substance of the key point. present=0 if absent, only vaguely related, contradicted, or only mentioned as an unexplained keyword.",\iow_now:Ne¨ "required_json_schema": {\iow_now:Ne¨ "results": [\iow_now:Ne¨ {\iow_now:Ne¨ "id": "KP01",\iow_now:Ne¨ "present": 0,\iow_now:Ne¨ "evidence": "short supporting phrase, or empty if absent"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ },\iow_now:Ne¨ "key_points": [\iow_now:Ne¨ {\iow_now:Ne¨ "id": "KP01",\iow_now:Ne¨ "key_point": "<HUMAN_SURVEY_KEY_POINT>"\iow_now:Ne¨ }\iow_now:Ne¨ ],\iow_now:Ne¨ "generated_survey_chunk": "<GENERATED_SURVEY_CHUNK>"\iow_now:Ne¨}
+
+User Prompt Template
+
+## J.5 Citation Recall and Precision Evaluation
+
+This prompt jointly obtains the group-level judgments used for Citation Recall
+and the citation-level judgments used for Citation Precision.
+
+System Prompt
+
+You are a strict citation-faithfulness evaluator for academic survey text. Return exactly one compact JSON object as the first and only output. Do not include chain-of-thought.
+
+\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "task": "Q3-3 citation faithfulness evaluation.",\iow_now:Ne¨ "metric_definitions": {\iow_now:Ne¨ "citation_recall": "For each claim c_i, h(c_i, Ref_i)=1 iff the whole citation group Ref_i is sufficient to support the claim; otherwise 0.",\iow_now:Ne¨ "citation_precision": "For each citation r_ik in Ref_i, the citation is relevant/necessary iff it alone supports the claim, OR the full group supports the claim and removing r_ik makes the remaining citation group insufficient."\iow_now:Ne¨ },\iow_now:Ne¨ "judging_instructions": [\iow_now:Ne¨ "Judge conservatively from the claim text and the provided citation entries only.",\iow_now:Ne¨ "A citation entry is usually a title/URL/metadata string, not the full paper.",\iow_now:Ne¨ "Do not assume support that is not clearly implied by the citation entry.",\iow_now:Ne¨ "If a citation entry is missing or unresolved, treat it as not supporting unless another provided entry is sufficient.",\iow_now:Ne¨ "For one-citation groups, without_support must be 0 because no citation remains.",\iow_now:Ne¨ "Return binary 0/1 values only, with short evidence phrases."\iow_now:Ne¨ ],\iow_now:Ne¨ "required_json_schema": {\iow_now:Ne¨ "results": [\iow_now:Ne¨ {\iow_now:Ne¨ "claim_id": "C0001",\iow_now:Ne¨ "group_support": 0,\iow_now:Ne¨ "group_evidence": "short phrase",\iow_now:Ne¨ "citations": [\iow_now:Ne¨ {\iow_now:Ne¨ "ref_id": "1",\iow_now:Ne¨ "single_support": 0,\iow_now:Ne¨ "without_support": 0,\iow_now:Ne¨ "evidence": "short phrase"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ },\iow_now:Ne¨ "claims": [\iow_now:Ne¨ {\iow_now:Ne¨ "claim_id": "<CLAIM_ID>",\iow_now:Ne¨ "topic_name": "<TOPIC_NAME>",\iow_now:Ne¨ "claim": "<CLAIM_TEXT>",\iow_now:Ne¨ "citation_group": [\iow_now:Ne¨ {\iow_now:Ne¨ "ref_id": "<REFERENCE_ID>",\iow_now:Ne¨ "entry": "<REFERENCE_ENTRY>",\iow_now:Ne¨ "resolved": "<BOOLEAN>"\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨ }\iow_now:Ne¨ ]\iow_now:Ne¨}
+
+User Prompt Template
+
+## J.6 Passage-Based Citation Support Judgment
+
+The following is the full-text prompt used for the 74 pairs with
+retrievable cited sources in Appendix D.3. It has no
+method identifier. The judge returns three labels; the reported binary
+Supported rate combines fully and partially supported, while unverifiable
+references are marked Unsupported without a model call. The source text is
+supplied with page markers of the form [PAGE N].
+
+System Prompt
+
+You are a strict academic citation-faithfulness evaluator.
+You receive one survey claim and the complete page-marked text of one cited paper.
+Judge only whether that paper supports the claim. Return one JSON object only.
+Do not use outside knowledge. Identify the strongest source passage and its page.
+
+\iow_now:Ne¨\iow_now:Ne¨{\iow_now:Ne¨ "task": "Judge whether the cited paper supports this survey claim.",\iow_now:Ne¨ "definitions": {\iow_now:Ne¨ "fully_supported": "The paper supports every material assertion in the claim.",\iow_now:Ne¨ "partially_supported": "The paper supports only part of the claim or the claim overstates it.",\iow_now:Ne¨ "unsupported": "The paper does not support the claim or contradicts it."\iow_now:Ne¨ },\iow_now:Ne¨ "claim": "<CLAIM_TEXT>",\iow_now:Ne¨ "citation_label": "Citation A",\iow_now:Ne¨ "rules": [\iow_now:Ne¨ "Read the complete supplied paper text before deciding.",\iow_now:Ne¨ "Do not infer support from the title or outside knowledge.",\iow_now:Ne¨ "For fully_supported or partially_supported, give the strongest supporting passage and page.",\iow_now:Ne¨ "For unsupported, give the closest relevant passage and explain the gap.",\iow_now:Ne¨ "Copy passages as faithfully as possible from the supplied text."\iow_now:Ne¨ ],\iow_now:Ne¨ "required_json": {\iow_now:Ne¨ "label": "fully_supported | partially_supported | unsupported",\iow_now:Ne¨ "passage": "supporting or closest source passage",\iow_now:Ne¨ "page": 1,\iow_now:Ne¨ "unsupported_parts": ["unsupported portion, if any"],\iow_now:Ne¨ "reason": "brief justification",\iow_now:Ne¨ "confidence": "high | medium | low"\iow_now:Ne¨ },\iow_now:Ne¨ "cited_paper_full_text": "<CITED_PAPER_FULL_TEXT>"\iow_now:Ne¨}
+
+User Prompt Template

@@ -1,0 +1,1499 @@
+## BCT: Bayes-Consistent Tempering for
+
+Flow Language Models
+
+Daisuke ObaHiroki Furuta
+††thanks: Corresponding author. Email: daisuke.oba@nlp.comp.isct.ac.jp
+Affiliation: Institute of Science Tokyo
+
+Naoaki Okazaki
+
+Affiliation: Institute of Science Tokyo
+
+Affiliation: AIST
+
+Affiliation: NII LLMC
+
+Abstract
+
+Temperature scaling is typically applied as a post-hoc transformation of model probabilities. In posterior-induced flow language models, this creates two mismatches. First, posterior tempering implicitly changes both the endpoint distribution and the distribution of intermediate noisy states, while the denoiser remains trained on the original states. Second, the tempered posterior weights are combined with transport dynamics derived for the untempered flow. These mismatches are reflected empirically: lowering temperature improves GSM8K performance much less reliably in flow LMs than in discrete diffusion LMs. We introduce Bayes-Consistent Tempering (BCT), which makes temperature explicit in both the distributions and dynamics of the generative flow. Its learned realization trains the denoiser on tempered intermediate states and tempers the endpoint distribution using the corresponding tempered dynamics. We also derive training-free variants for conventionally trained checkpoints. Across hyperspherical flow LMs with two denoiser architectures and a von Mises–Fisher flow LM, BCT improves GSM8K generation across broad temperature ranges and achieves the strongest tempering performance. The gains also extend to Sudoku, demonstrating benefits on tightly constrained generation. At very low temperatures, the learned realization is also markedly more robust than the training-free variants, supporting temperature as a property of the generative flow across training and inference rather than a post-hoc probability adjustment. Code and model weights are available at:
+
+https://daioba.github.io/bct.
+
+Figure 1: 
+Conceptual overview of Bayes-Consistent Tempering (BCT).
+Posterior tempering implicitly changes both the endpoint distribution
+and the conditional bridge, while standard sampling retains the
+original conditional velocities and denoiser training states.
+BCT restores consistency between the bridge and sampling dynamics,
+and its learned realization additionally aligns training with
+the tempered bridge.
+
+## 1 Introduction
+
+Temperature scaling is one of the simplest controls for language generation (Ackley et al., 1985; Holtzman et al., 2020). In autoregressive models, dividing next-token logits by $T<1$ directly sharpens the distribution from which the next token is sampled. In many flow language models for discrete data, however, generation is driven by a denoising posterior: a model predicts the clean endpoint token from an intermediate noisy state, and this posterior induces the velocity that transports the state toward token embeddings (Stark et al., 2024; Lee et al., 2026; Deschenaux and Gulcehre, 2026). Applying temperature only to this posterior creates two mismatches. First, by Bayes’ rule, posterior tempering implicitly changes not only the endpoint distribution but also the conditional bridge—the time-indexed distribution of intermediate noisy states given each endpoint. The denoiser, however, is trained on states from the untempered bridge, so tempering changes the states encountered at inference without a corresponding change in training. Second, tempering changes the posterior weights over endpoints but leaves their conditional velocities unchanged, even though those velocities are designed for the original, untempered bridges. Thus, temperature changes the implied generative distribution without consistently changing how the model is trained or sampled.
+
+This issue is also visible empirically. On GSM8K (Cobbe et al., 2021), prior work reports that flow language models gain little from lowering the temperature, in contrast to discrete diffusion models such as MDLM (Sahoo et al., 2024) and Duo (Sahoo et al., 2025), whose accuracy improves substantially under low-temperature decoding (Deschenaux and Gulcehre, 2026). This discrepancy motivates us to ask whether temperature is being incorporated correctly into posterior-induced flows.
+
+We introduce Bayes-Consistent Tempering (BCT), which treats temperature as part of the generative flow rather than as a post-hoc transformation of the denoising posterior (Sec. 3).
+Its learned realization trains the denoiser on states from a tempered conditional bridge and, at inference, applies the Bayes correction needed to temper the endpoint distribution while preserving that tempered bridge, together with the dynamics induced by the same bridge. We call the training component Tempered-Flow Training (TFT) and the corresponding sampler BCT-L.
+
+We further investigate how much inference-time consistency can be recovered without retraining through two variants for existing checkpoints: BCT-P tempers both the endpoint distribution and bridge with matched dynamics, whereas BCT-E tempers only the endpoint distribution, retaining the original bridge and dynamics (Sec. 3.2).
+
+For posterior-induced flow language models, BCT is not merely a conceptual framework: applying it requires deriving the tempered bridge and its corresponding sampling dynamics, and these quantities are tractable in concrete models. For $\mathbb{S}$ -FLM (Deschenaux and Gulcehre, 2026), for example, the hyperspherical geometry lets us derive both explicitly. The same principle applies to SFCD (Chemseddine et al., 2026), which uses a von Mises–Fisher bridge with its own analytic tempering rule and corresponding dynamics. Thus, BCT is not specific to a particular denoiser architecture; its construction is determined by the bridge that defines the flow.
+
+Across hyperspherical flow LMs with two denoiser architectures (S-arch/DiT) (Deschenaux and Gulcehre, 2026) and a von Mises–Fisher flow LM (Chemseddine et al., 2026), BCT improves GSM8K over broad temperature ranges (Sec. 4).
+BCT-L is particularly robust at very low temperatures, outperforming the training-free variants and highlighting the benefit of temperature-aware training. Gains also extend to Sudoku (Ben-Hamu et al., 2025; Kim et al., 2026), where standard tempering does not benefit from lower temperatures, suggesting applicability to constrained generation.
+
+## 2 Preliminaries
+
+## 2.1 Posterior-induced flows
+
+We consider a single token position with finite vocabulary $\mathcal{V}$ and endpoint distribution $\pi(x)$ . Let ${\bm{z}}$ denote the continuous latent state and $t\in[0,1]$ run from noise to data. For each endpoint token $x$ , a conditional bridge $q_{t}({\bm{z}}\mid x)$ describes the distribution of intermediate states at time $t$ , starting from a token-independent source $p_{0}$ and converging toward its embedding ${\bm{e}}_{x}$ . All bridge densities are defined with respect to a fixed reference measure $\mu$ on the latent space. A corresponding conditional velocity $u_{t}({\bm{z}}\mid x)$ transports states so that their distribution follows $q_{t}(\cdot\mid x)$ over time; formally, $q_{t}$ and $u_{t}$ satisfy the continuity equation.
+
+Bayes’ rule gives the denoising posterior
+
+ $r_{t}(x\mid{\bm{z}})=\frac{\pi(x)\,q_{t}({\bm{z}}\mid x)}{\sum_{y\in\mathcal{V}}\pi(y)\,q_{t}({\bm{z}}\mid y)},$ 
+
+(1)
+
+and the generative velocity is its posterior-weighted average of the conditional velocities,
+
+ $u_{t}({\bm{z}})=\sum_{x\in\mathcal{V}}r_{t}(x\mid{\bm{z}})\,u_{t}({\bm{z}}\mid x).$ 
+
+(2)
+
+A denoiser $r^{\eta}_{t}(x\mid{\bm{z}})$ is trained to approximate $r_{t}$ and replaces it in Eq. (2) at generation time. We call flows constructed in this way posterior-induced flows.
+
+## 2.2 Standard tempering
+
+Writing $\beta=1/T$ , standard temperature scaling replaces the denoising posterior by
+
+ $r_{t}^{T}(x\mid{\bm{z}})\propto r_{t}(x\mid{\bm{z}})^{\beta},\qquad u_{t}^{T}({\bm{z}})=\sum_{x}r_{t}^{T}(x\mid{\bm{z}})\,u_{t}({\bm{z}}\mid x),$ 
+
+(3)
+
+thus changing the posterior weights while leaving the conditional velocities unchanged. In practice, this is implemented by dividing the denoiser logits by $T$ .
+
+Using Eq. (1),
+
+ $r_{t}(x\mid{\bm{z}})^{\beta}\propto\pi(x)^{\beta}q_{t}({\bm{z}}\mid x)^{\beta},$ 
+
+(4)
+
+so posterior tempering acts algebraically on both the endpoint factor and the bridge likelihood. Define
+
+ $\pi_{T}(x)\propto\pi(x)^{\beta},\qquad q_{t,T}({\bm{z}}\mid x)=\frac{q_{t}({\bm{z}}\mid x)^{\beta}}{Z_{t,T}(x)},\qquad Z_{t,T}(x)=\int q_{t}({\bm{z}}\mid x)^{\beta}\,d\mu({\bm{z}}).$ 
+
+(5)
+
+The posterior induced by $(\pi_{T},q_{t,T})$ differs from standard posterior tempering only by the token-dependent normalizer $Z_{t,T}(x)$ . Hence the two coincide whenever $Z_{t,T}(x)$ is independent of $x$ , as for the symmetric bridge families studied in this work.
+
+For clarity, we present all derivations for a single token position. For sequences, the same decomposition applies position-wise, with $\pi(x)$ replaced by the context-conditioned endpoint distribution induced by the remaining positions; see Appendix A.
+
+## 3 Bayes-Consistent Tempering
+
+Once an endpoint distribution and a conditional bridge are specified, the posterior weights and sampling dynamics should correspond to that same generative model. In particular, for the tempered pair $(\pi_{T},q_{t,T})$ , the sampler should use its denoising posterior, conditional velocities $u_{t,T}({\bm{z}}\mid x)$ that transport $q_{t,T}$ , and the source $q_{0,T}$ of that bridge.
+However, standard tempering does not generally satisfy this alignment: while its posterior corresponds to the tempered pair under the condition described in Section 2, it continues to use the conditional velocities $u_{t}({\bm{z}}\mid x)$ of the original bridge.
+
+In contrast, our proposal, Bayes-Consistent Tempering (BCT), treats the endpoint distribution, conditional bridge, and sampling dynamics as components of the same generative flow.
+We first develop its learned realization, which also aligns the distribution of states seen during training (Sec. 3.1), and then derive post-hoc variants for conventionally trained models (Sec. 3.2).
+
+## 3.1 Learned BCT
+
+The learned realization of BCT, BCT-L, aligns training with the tempered bridge used at inference.
+We first train the denoiser on intermediate states drawn from $q_{t,T}$ , rather than from the original bridge $q_{t}$ .
+Given a training distribution $p(T)$ over temperatures, Tempered-Flow Training (TFT) minimizes the usual denoising loss,
+
+ $\mathcal{L}(\eta)=\mathbb{E}_{T\sim p(T),\,t,\,x\sim\pi,\,{\bm{z}}\sim q_{t,T}(\cdot\mid x)}\left[-\log r^{\eta}_{t,T}(x\mid{\bm{z}})\right],$ 
+
+(6)
+
+where the denoiser is conditioned on $T$ .
+Since the endpoint token is still drawn from $\pi$ while its intermediate state is drawn from tempered bridge $q_{t,T}$ , the Bayes-optimal denoiser is
+
+ $r_{t,T}(x\mid{\bm{z}})=\frac{\pi(x)\,q_{t,T}({\bm{z}}\mid x)}{\sum_{y}\pi(y)\,q_{t,T}({\bm{z}}\mid y)}.$ 
+
+(7)
+
+Thus, TFT incorporates the tempered bridge into the learned posterior, but does not itself temper the endpoint distribution.
+
+At inference, BCT targets the pair $(\pi_{T},q_{t,T})$ .
+Its tempered posterior can be written directly in terms of the TFT posterior as
+
+ $r^{\mathrm{BCT\text{-}L}}_{t,T}(x\mid{\bm{z}})\propto r_{t,T}(x\mid{\bm{z}})^{\beta}q_{t,T}({\bm{z}}\mid x)^{1-\beta}.$ 
+
+(8)
+
+The second factor is the Bayes correction that tempers the endpoint while preserving the tempered bridge already represented by the denoiser. In practice, learned posteriors are approximate, so we allow the strength of this correction to be selected on held-out data:
+
+ $\ell^{\mathrm{BCT\text{-}L}}_{x}=\beta\,\ell^{\eta}_{x}+\lambda(1-\beta)\log q_{t,T}({\bm{z}}\mid x),\qquad 0\leq\lambda\leq 1,$ 
+
+(9)
+
+where one $\lambda$ is selected per trained model and shared across temperatures.
+
+Finally, BCT-L uses the tempered conditional velocity $u_{t,T}({\bm{z}}\mid x)$ that transports the corresponding tempered bridge $q_{t,T}$ :
+
+ $u^{\mathrm{BCT\text{-}L}}_{t,T}({\bm{z}})=\sum_{x}r^{\mathrm{BCT\text{-}L}}_{t,T}(x\mid{\bm{z}})\,u_{t,T}({\bm{z}}\mid x),$ 
+
+(10)
+
+with sampling initialized from the tempered source $q_{0,T}$ .
+The form of $u_{t,T}$ is model-dependent; we derive it for the flow constructions studied here in Sec. 3.3.
+Thus, TFT and BCT-L align the intermediate states seen during training, the endpoint distribution, and the sampling dynamics within the same generative flow.
+
+## 3.2 Post-hoc BCT Variants for Conventionally Trained Models
+
+We next ask how much of BCT can be recovered after a model has already been trained on the original bridge $q_{t}$ . We consider two complementary post-hoc variants—BCT-P and BCT-E.
+
+## Path tempering (BCT-P).
+
+BCT-P retains posterior tempering, which implicitly tempers both the endpoint distribution and the bridge, but replaces the original conditional dynamics with those of the tempered bridge. Its posterior is
+
+ $r^{\mathrm{BCT-P}}_{t,T}(x\mid{\bm{z}})\propto\frac{r_{t}(x\mid{\bm{z}})^{\beta}}{Z_{t,T}(x)},$ 
+
+(11)
+
+and the corresponding velocity is
+
+ $u^{\mathrm{BCT-P}}_{t,T}({\bm{z}})=\sum_{x}r^{\mathrm{BCT-P}}_{t,T}(x\mid{\bm{z}})\,u_{t,T}({\bm{z}}\mid x).$ 
+
+(12)
+
+When $Z_{t,T}(x)$ is independent of $x$ , BCT-P uses exactly the same posterior weights as standard tempering; the difference is that its conditional velocities are matched to the tempered bridge. Unlike BCT-L, however, its denoiser was trained only on states from the original bridge $q_{t}$ , leaving a train–inference mismatch in the intermediate states.
+
+## Endpoint tempering (BCT-E).
+
+BCT-E avoids tempering the bridge altogether.
+It keeps untempered bridge and conditional dynamics, and tempers only the endpoint distribution $\pi$ .
+By Bayes’ rule, its posterior can be written using the original denoiser as
+
+ $r^{\mathrm{BCT-E}}_{t,T}(x\mid{\bm{z}})\propto r_{t}(x\mid{\bm{z}})^{\beta}q_{t}({\bm{z}}\mid x)^{1-\beta},$ 
+
+(13)
+
+or, in logits,
+
+ $\ell^{\mathrm{E}}_{x}=\beta\,\ell_{x}+(1-\beta)\log q_{t}({\bm{z}}\mid x).$ 
+
+(14)
+
+These weights are combined with the original conditional velocities $u_{t}({\bm{z}}\mid x)$ .
+
+Both variants require no retraining.
+BCT-P restores consistency by matching the sampling dynamics to the tempered bridge,
+whereas BCT-E restores consistency by keeping the bridge and sampling dynamics untempered.
+
+## 3.3 Instantiations
+
+We instantiate BCT on two posterior-induced flow constructions with different conditional bridges.
+
+Hyperspherical flow.
+S-FLM (Deschenaux and Gulcehre, 2026) is based on hyperspherical flow, which places token embeddings and latents on the unit sphere and transports a uniform source toward each endpoint along geodesics. Let
+ $\theta_{x}({\bm{z}})=\arccos\langle{\bm{z}},{\bm{e}}_{x}\rangle$ and $a_{t}=1-\alpha_{t}$ denote the remaining fraction of the geodesic at time $t$ . Its conditional bridge has density
+
+ $q_{t}({\bm{z}}\mid x)\propto\frac{\sin^{d-2}(\theta_{x}/a_{t})}{\sin^{d-2}\theta_{x}}\;\mathbf{1}\{\theta_{x}<a_{t}\pi\},$ 
+
+(15)
+
+with respect to the spherical surface measure. This density gives the bridge likelihood needed by BCT-E and TFT. Rotational symmetry also makes $Z_{t,T}(x)$ independent of $x$ , so BCT-P uses the same posterior weights as standard tempering.
+
+The tempered bridge $q_{t,T}$ remains rotationally symmetric around ${\bm{e}}_{x}$ . Its corresponding conditional velocity therefore follows the same geodesic direction as the original S-FLM velocity, with a temperature-dependent change in speed,
+
+ $u_{t,T}({\bm{z}}\mid x)=w_{t,T}(\theta_{x})\,u_{t}({\bm{z}}\mid x),$ 
+
+(16)
+
+where $w_{t,T}$ is obtained from a one-dimensional continuity equation; we give its derivation in Appendix B.3. The same rotational symmetry reduces exact sampling from $q_{t,T}$ to a one-dimensional transformation of the polar angle, allowing TFT to draw training states directly from the tempered bridge (Appendix B.4).
+
+von Mises–Fisher flow.
+Chemseddine et al. (2026) use a von Mises–Fisher conditional bridge,
+
+ $q_{t}({\bm{z}}\mid x)\propto\exp\!\left(\kappa_{t}\langle{\bm{e}}_{x},{\bm{z}}\rangle\right).$ 
+
+(17)
+
+Tempering stays within the same family:
+
+ $q_{t,T}({\bm{z}}\mid x)\propto\exp\!\left(\frac{\kappa_{t}}{T}\langle{\bm{e}}_{x},{\bm{z}}\rangle\right),$ 
+
+(18)
+
+so BCT simply replaces $\kappa_{t}$ by $\kappa_{t}/T$ and uses the corresponding conditional dynamics (Appendix G). TFT likewise draws training states directly from the vMF distribution with concentration $\kappa_{t}/T$ . The normalizer is independent of $x$ , and BCT-P therefore again shares its posterior weights with standard tempering.
+
+For von Mises–Fisher flow, the tempered bridge evidence
+ $g_{t,T}(x,{\bm{z}})=(\kappa_{t}/T)\langle{\bm{e}}_{x},{\bm{z}}\rangle$ 
+is available analytically. For TFT, we therefore include this term explicitly in the denoiser logits,
+ $\ell^{\eta}_{x}=a_{\eta,x}+g_{t,T}(x,{\bm{z}})$ ,
+and learn only the remaining component $a_{\eta,x}$ . This is a parameterization of the same TFT posterior and BCT-L sampler, not a separate training method.
+
+## 4 Experiments
+
+## 4.1 Experimental Setup
+
+Main setting.
+Our main experiments evaluate BCT on GSM8K (Cobbe et al., 2021) with $\mathbb{S}$ -FLM (Deschenaux and Gulcehre, 2026).
+Following its setup, we adopt the TinyGSM protocol (Liu et al., 2023): for each of the 1319 test problems, the model generates a Python program, and the problem counts as solved if executing the program returns the reference answer.
+We use its released TinyGSM checkpoints for two denoiser backbones: S-arch, a Transformer whose intermediate activations lie on the hypersphere, and the standard Diffusion Transformer (Peebles and Xie, 2023, DiT;).
+We refer to either checkpoint as $\mathbb{S}$ -FLM and specify the backbone where relevant.
+The two backbones share the bridge, the posterior-induced velocity, and all samplers, so comparing them varies only the denoiser architecture.
+
+Additional settings.
+Two additional experiments test whether our conclusions generalize to other settings (Sections 4.4 and 4.5).
+First, we change the task while keeping the hyperspherical flow, using Sudoku-Hard (Kim et al., 2026; Ben-Hamu et al., 2025), which requires tightly constrained generation.
+Since no Sudoku checkpoint is released, we train a DiT-based $\mathbb{S}$ -FLM with its released training recipe (Appendix F).
+Second, we change the flow structure while keeping the task: we apply BCT to SFCD (Chemseddine et al., 2026), which uses a von Mises–Fisher bridge instead of the geodesic bridge of $\mathbb{S}$ -FLM, and evaluate its released TinyGSM checkpoint on the same GSM8K problems (Appendix G).
+Unless noted otherwise in their sections, both follow the protocol below.
+
+Samplers.
+All samplers use the exact posterior-induced velocity with 1024 function evaluations (NFE) and otherwise follow the released sampler; they differ only in the posterior weights and conditional velocities.
+We compare standard tempering Eq. (3), BCT-E Eq. (14), BCT-P Eq. (12), and BCT-L, which is described below.
+As a reference, we report the Top-1 velocity (Deschenaux and Gulcehre, 2026), which moves only toward the most likely token; it is invariant to temperature and is the $T\to 0$ limit of standard tempering.
+We evaluate $T\in\{1,0.8,0.6,0.5,0.4,0.3,0.2,0.1\}$ in all experiments.
+
+TFT and BCT-L.
+For each backbone, we continue training the released checkpoint with TFT Eq. (6) for 2,000 updates, 0.8% of its 250k pretraining updates, and refer to the resulting model as TFT.
+The temperature distribution $p(T)$ draws $T=1$ with probability 0.2, $T=0.1$ with probability 0.1, and otherwise $\beta\sim U(1.25,5)$ , so it covers every evaluated temperature.
+As a matched training control, Cont. continues training for the same 2,000 updates with the original recipe.
+All models are evaluated with EMA weights.
+ $\lambda$ in Eq. (9) is selected once per model on TinyGSM validation problems and shared across temperatures (Appendix C).
+
+0510152025300.10.20.30.40.50.60.70.80.91Temperature $T$ GSM8K accuracy (%)S-archTFT, BCT-LCont., BCT-PBCT-PCont., BCT-EBCT-ECont., standardStandard
+
+0510152025300.10.20.30.40.50.60.70.80.91Temperature $T$ GSM8K accuracy (%)DiT
+
+Figure 2: GSM8K accuracy against the sampling temperature on the two backbones (NFE $=1024$ ). Lines are the mean over three generation seeds and bands $\pm$ one sample standard deviation. Curves without a prefix use the released checkpoint; Cont. (dashed) is the matched continuation. At $T=1$ every BCT correction is the identity. Values in Table 1.
+
+Table 1: GSM8K accuracy (%), mean $\pm$ sample standard deviation over three generation seeds (1319 problems, NFE $=1024$ ).
+
+TFT
+Cont.
+ $\mathbb{S}$ -FLM
+
+ $T$ 
+BCT-L
+Standard
+BCT-E
+BCT-P
+Standard
+BCT-E
+BCT-P
+
+S-arch
+
+1
+12.6  $\pm$ 1.1
+12.0  $\pm$ 0.5
+12.0  $\pm$ 0.5
+12.0  $\pm$ 0.5
+12.5  $\pm$ 0.5
+12.5  $\pm$ 0.5
+12.5  $\pm$ 0.5
+
+0.8
+16.3  $\pm$ 0.2
+14.1  $\pm$ 0.5
+15.0  $\pm$ 0.5
+15.9  $\pm$ 0.2
+14.7  $\pm$ 0.7
+15.0  $\pm$ 1.1
+16.7  $\pm$ 0.2
+
+0.6
+20.4  $\pm$ 0.4
+15.3  $\pm$ 0.6
+16.5  $\pm$ 0.4
+20.2  $\pm$ 0.3
+15.6  $\pm$ 0.2
+16.9  $\pm$ 0.3
+19.7  $\pm$ 0.5
+
+0.5
+21.5  $\pm$ 0.3
+16.8  $\pm$ 0.2
+17.4  $\pm$ 0.4
+21.7  $\pm$ 0.6
+16.3  $\pm$ 0.5
+17.7  $\pm$ 0.3
+21.2  $\pm$ 0.6
+
+0.4
+23.0  $\pm$ 0.9
+17.3  $\pm$ 0.7
+18.3  $\pm$ 0.5
+23.2  $\pm$ 0.5
+17.1  $\pm$ 0.5
+18.0  $\pm$ 1.1
+22.9  $\pm$ 0.6
+
+0.3
+23.9  $\pm$ 1.0
+17.3  $\pm$ 0.6
+18.4  $\pm$ 0.2
+22.3  $\pm$ 0.6
+17.4  $\pm$ 0.6
+18.5  $\pm$ 0.6
+23.0  $\pm$ 0.5
+
+0.2
+25.1  $\pm$ 0.9
+17.5  $\pm$ 0.3
+18.7  $\pm$ 0.1
+16.6  $\pm$ 1.1
+17.6  $\pm$ 0.3
+18.3  $\pm$ 0.1
+18.3  $\pm$ 0.9
+
+0.1
+27.0  $\pm$ 1.0
+17.5  $\pm$ 0.5
+18.8  $\pm$ 0.1
+3.9  $\pm$ 0.5
+17.6  $\pm$ 0.5
+18.3  $\pm$ 0.1
+5.0  $\pm$ 0.4
+
+DiT
+
+1
+11.2  $\pm$ 1.3
+11.7  $\pm$ 1.2
+11.7  $\pm$ 1.2
+11.7  $\pm$ 1.2
+12.0  $\pm$ 1.0
+12.0  $\pm$ 1.0
+12.0  $\pm$ 1.0
+
+0.8
+16.2  $\pm$ 0.8
+14.3  $\pm$ 0.4
+15.2  $\pm$ 1.0
+17.0  $\pm$ 0.4
+14.0  $\pm$ 0.6
+14.8  $\pm$ 0.9
+17.3  $\pm$ 0.5
+
+0.6
+20.2  $\pm$ 0.5
+16.5  $\pm$ 0.1
+17.9  $\pm$ 0.4
+20.8  $\pm$ 0.6
+16.4  $\pm$ 0.1
+18.1  $\pm$ 0.6
+20.8  $\pm$ 0.9
+
+0.5
+22.0  $\pm$ 0.2
+16.6  $\pm$ 1.1
+18.9  $\pm$ 1.0
+23.9  $\pm$ 0.9
+16.9  $\pm$ 0.7
+18.9  $\pm$ 1.6
+23.8  $\pm$ 0.9
+
+0.4
+24.1  $\pm$ 0.3
+17.0  $\pm$ 0.6
+19.3  $\pm$ 0.3
+26.2  $\pm$ 0.6
+17.0  $\pm$ 0.9
+19.6  $\pm$ 1.1
+25.7  $\pm$ 0.7
+
+0.3
+25.2  $\pm$ 1.1
+17.8  $\pm$ 0.9
+19.7  $\pm$ 0.6
+26.7  $\pm$ 0.2
+17.2  $\pm$ 0.9
+19.4  $\pm$ 0.5
+26.7  $\pm$ 0.7
+
+0.2
+25.4  $\pm$ 0.5
+18.0  $\pm$ 0.7
+19.5  $\pm$ 0.7
+27.8  $\pm$ 0.6
+17.2  $\pm$ 0.8
+19.5  $\pm$ 0.8
+27.3  $\pm$ 0.6
+
+0.1
+26.0  $\pm$ 0.6
+17.3  $\pm$ 0.2
+19.4  $\pm$ 0.6
+17.0  $\pm$ 0.6
+17.2  $\pm$ 0.7
+19.2  $\pm$ 0.6
+16.7  $\pm$ 0.4
+
+## 4.2 Main Results
+
+Figure 2 and Table 1 show the results for the hyperspherical flow, whose bridge moves latents along geodesics on the sphere (Section 3.3), with both denoiser backbones.
+Since TFT continues a pretrained model rather than training from scratch, the fair baseline for BCT-L is Continual Training (Cont.), which receives the same additional update steps with the original recipe; the two differ only in whether temperature enters training.
+The continuation itself changes little: standard tempering on Cont. stays within one point of the released checkpoint at every temperature, and the training-free variants behave alike on the two checkpoints.
+
+BCT-L makes low-temperature decoding effective.
+With conventional training, lowering the temperature helps little: standard tempering stays at 17–18% for every $T\leq 0.4$ on both backbones, close to the Top-1 reference, its $T\to 0$ limit.
+BCT-L instead improves steadily as the temperature decreases, reaching $27.0\pm 1.0\%$ on S-arch and $26.0\pm 0.6\%$ on DiT at $T=0.1$ , and it is more accurate than standard tempering at every $T<1$ .
+
+Matching the dynamics at inference gives large gains at moderate temperatures.
+Without training, BCT-P already improves substantially on standard tempering, raising its best accuracy by about 6 points on S-arch and 10 points on DiT, and at moderate temperatures it is comparable to BCT-L, slightly ahead on DiT.
+
+Strong tempering requires training on the tempered bridge.
+Under strong tempering, however, BCT-P collapses and falls below standard tempering at $T=0.1$ on both backbones.
+This is consistent with its train–inference mismatch (Section 3.2): the latents follow the tempered bridge, on whose states the denoiser was not trained, and the mismatch grows as $T$ decreases.
+BCT-L, whose denoiser is trained on the tempered bridge, has no such mismatch and is the most accurate sampler at $T=0.1$ .
+The results at $T=0.1$ thus particularly highlight the importance of removing the mismatch between the intermediate states seen in training and those visited during sampling.
+
+Keeping the bridge is stable but gains less.
+BCT-E keeps the bridge on which the denoiser was trained and therefore does not degrade at low temperature, but it improves only modestly on standard tempering and stays below BCT-L at every $T<1$ , increasingly so as the temperature decreases.
+
+## 4.3 Gains Beyond Reduced Diversity
+
+1020304050600.20.40.60.81Temperature $T$ Pass@ $K$ (%)Pass@1TFT, BCT-LCont., standard
+
+0.20.40.60.81Temperature $T$ Pass@2
+
+0.20.40.60.81Temperature $T$ Pass@4
+
+0.20.40.60.81Temperature $T$ Pass@8
+
+Figure 3: Pass@ $K$ on GSM8K (S-arch, NFE $=1024$ ), estimated from eight generations per problem. Bands are 95% bootstrap intervals over problems; the panels share the vertical axis.
+
+Lowering the temperature concentrates the sampler, so the low-temperature gain of BCT-L could merely trade sample diversity for single-sample accuracy (Chen et al., 2021), which a less concentrated sampler would recover with more samples.
+We test this on S-arch by comparing BCT-L with standard tempering on Cont. in Pass@ $K$ for $K\in\{1,2,4,8\}$ , estimated from eight generations per problem with the unbiased estimator of Chen et al. (2021) (Figure 3; details in Appendix D).
+
+For every $T<1$ and $K\leq 8$ , BCT-L has the higher Pass@ $K$ , and the 95% paired bootstrap interval of the difference lies above zero.
+More samples raise Pass@ $K$ for both samplers, but not enough for standard tempering to catch up.
+The low-temperature gain of BCT-L is therefore not explained by reduced diversity alone.
+
+## 4.4 Beyond GSM8K: Sudoku-Hard
+
+363840424446480.10.20.30.40.50.60.70.80.91Temperature $T$ Exact solve rate (%)Cont., standardCont., BCT-ECont., BCT-PTFT, BCT-L
+
+Figure 4: Sudoku-Hard exact solve rate (NFE $=180$ ): mean and $\pm$ one sample standard deviation over three generation seeds; base-checkpoint results are in Table 5.
+
+Sudoku-Hard tests whether our conclusions carry over to tightly constrained generation, in which each puzzle has a single valid completion.
+Because no Sudoku checkpoint is released, we train the base model from scratch and obtain TFT by continuing it; as in Section 4.2, the fair baseline for BCT-L is therefore Cont. (Figure 4).
+Following the released configuration of $\mathbb{S}$ -FLM (Deschenaux and Gulcehre, 2026), we sample with 180 NFE.
+
+Lowering the temperature slightly hurts standard tempering, whereas BCT-L improves monotonically to 46.8%.
+The training-free variants also benefit from lower temperatures, and on this task BCT-P does not collapse; still, BCT-L is the most accurate at every $T\leq 0.6$ , with a margin that widens as $T$ decreases, and the base checkpoint shows the same pattern (Appendix F).
+
+## 4.5 Beyond the Geodesic Bridge: von Mises–Fisher Flows
+
+202530350.10.20.30.40.50.60.70.80.91Temperature $T$ GSM8K accuracy (%)TFT, BCT-LCont., BCT-PCont., BCT-ECont., standard
+
+Figure 5: GSM8K accuracy of BCT on the vMF flow LM (NFE $=1024$ ): mean and $\pm$ one sample standard deviation over five generation seeds. BCT-E falls below the plotted range for $T\leq 0.3$ ; more detailed results are in Table 7.
+
+We finally apply BCT to SFCD (Chemseddine et al., 2026), whose von Mises–Fisher bridge replaces the geodesic bridge of $\mathbb{S}$ -FLM (Section 3.3).
+We use its released TinyGSM checkpoint and sampler with NFE $=1024$ , and updates for TFT and Cont., and average over five generation seeds (Appendix G).
+Unlike $\mathbb{S}$ -FLM, this flow already benefits from standard tempering: lowering the temperature raises its accuracy by 9 points between $T=1$ and $T=0.3$ (Figure 5), suggesting that inconsistent tempering harms the vMF bridge less.
+We therefore ask whether consistent tempering still improves a model whose standard tempering is already effective.
+
+It does, mainly at moderate temperatures.
+BCT-L improves on standard tempering at every $T\in[0.2,0.6]$ and attains the highest accuracy among the evaluated samplers, $34.5\pm 0.5\%$ at $T=0.3$ , against $32.6\pm 0.6\%$ for standard tempering, a margin well beyond the seed standard deviations.
+
+Under strong tempering, the learned realization remains stable while the training-free variants fail.
+BCT-L declines at the lowest temperature, a trend absent on $\mathbb{S}$ -FLM, but only to the level of standard tempering (31.7% vs. 31.3% at $T=0.1$ ).
+Both training-free variants instead fall below it: BCT-P as on $\mathbb{S}$ -FLM (28.5%), and BCT-E, which is stable on $\mathbb{S}$ -FLM, collapses to essentially zero accuracy for $T\leq 0.2$ , likely because on this bridge its correction $-(\beta-1)\kappa_{t}\langle{\bm{e}}_{x},{\bm{z}}\rangle$ amplifies any mismatch between the learned logits and the analytic bridge term by $\beta$ and $\kappa_{t}$ .
+BCT-L is thus the only variant that never falls below standard tempering for $T<1$ : consistent tempering improves even a flow that already responds well to temperature, and training on the tempered bridge keeps it reliable under strong tempering.
+
+## 5 Related Work
+
+Posterior-induced flow language models.
+Non-autoregressive language models include discrete diffusion (Austin et al., 2021; Lou et al., 2024; Sahoo et al., 2024; Shi et al., 2024; Sahoo et al., 2025; Arriola et al., 2025; Nie et al., 2025) and continuous diffusion and flow models, which map tokens to continuous representations such as learned embeddings or one-hot vectors (Li et al., 2022; Dieleman et al., 2022; Gulrajani and Hashimoto, 2023; Lee et al., 2026; Hu et al., 2026).
+In many continuous models, a denoiser trained with cross-entropy predicts the clean token, and its posterior weights conditional velocities, drifts, or scores.
+Among spherical constructions (Davis et al., 2024; Jo and Hwang, 2025), $\mathbb{S}$ -FLM moves latents along geodesics of the hypersphere (Deschenaux and Gulcehre, 2026; Chen and Lipman, 2024), whereas SFCD uses von Mises–Fisher bridges (Chemseddine et al., 2026); we instantiate BCT for both.
+
+Temperature and consistency.
+In autoregressive models and discrete diffusion, temperature rescales the categorical distribution from which tokens are sampled (Ackley et al., 1985; Holtzman et al., 2020), and lowering it substantially improves discrete diffusion language models on GSM8K (Deschenaux and Gulcehre, 2026); we reproduce this in Appendix E.
+Continuous diffusion and flow models instead temper the score or the token posterior (Dieleman et al., 2022; Gulrajani and Hashimoto, 2023; Deschenaux and Gulcehre, 2026; Azangulov and Zhang, 2026), and for continuous data tempering is known not to commute with noising: the scaled score is not the score of the noised tempered distribution (Du et al., 2023).
+Work on this inconsistency targets other settings: Feynman–Kac correctors reweight and resample populations of particles along annealed marginals (Skreta et al., 2025; Hasan et al., 2026), Li et al. (2026) correct score scaling under Gaussian noising for flattening ( $T>1$ ), and temporal score rescaling controls a local temperature that leaves the mixture weights unchanged (Xu et al., 2026).
+None of them addresses flows induced by a token posterior over a finite vocabulary, where tempering the posterior implicitly changes the conditional bridge while leaving the conditional velocities untempered.
+BCT corrects this through the bridge itself, along a single sampling trajectory without particles, and extends the correction to training.
+
+Train–inference mismatch.
+Models evaluated on states that differ from those seen in training suffer from exposure bias, both in autoregressive models (Ranzato et al., 2016; Bengio et al., 2015) and in diffusion models, where it is reduced by perturbing training inputs or shifting sampling time steps (Ning et al., 2023; Li et al., 2024).
+There, the mismatch arises from the model’s own prediction errors.
+Under tempering, it is instead introduced by a known change of the bridge, so TFT can draw its training states exactly from the tempered bridge that the sampler follows.
+
+## 6 Conclusion
+
+We introduced Bayes-Consistent Tempering (BCT), which treats temperature as part of the generative flow rather than as a post-hoc transformation of the denoising posterior. BCT aligns the tempered endpoint distribution, intermediate-state distribution, training distribution, and sampling dynamics; its training-free variants recover parts of this consistency for conventionally trained checkpoints. Across hyperspherical flow LMs with two denoiser architectures and the von Mises–Fisher flow LM, BCT improves GSM8K generation over broad temperature ranges, while its learned realization remains robust under aggressive tempering where the post-hoc variants deteriorate. The gains also extend to Sudoku, suggesting that BCT’s benefits extend to tightly constrained generation. Overall, our results indicate that temperature in posterior-induced flow language models is better treated as part of the flow itself, across both training and inference.
+
+## Limitations and Discussion
+
+BCT applies to posterior-induced flows for which the tempered bridge and its corresponding sampling dynamics can be derived or approximated; the concrete derivations in this work cover the hyperspherical bridge of $\mathbb{S}$ -FLM and the von Mises–Fisher bridge of SFCD. Extending BCT to other bridge families is an important direction for future work.
+
+## Acknowledgments
+
+This research was conducted by AIST and Institute of Science Tokyo under FRONTia, a Japanese national program led by the Ministry of Economy, Trade and Industry of Japan (METI) and the New Energy and Industrial Technology Development Organization (NEDO), aimed at developing a domestic multimodal foundation model for AI robots and physical AI. This work was also supported in part by JSPS KAKENHI Grant Number 25H01137 and JST K Program Japan Grant Number JPMJKP24C3.
+
+## References
+
+Ackley et al. (1985)
+D. H. Ackley, G. E. Hinton, and T. J. Sejnowski
+
+A learning algorithm for Boltzmann machines.
+
+Cognitive Science 9 (1), pp. 147–169.
+
+Cited by: §1,
+§5.
+
+Arriola et al. (2025)
+M. Arriola, A. Gokaslan, J. T. Chiu, Z. Yang, Z. Qi, J. Han, S. S. Sahoo, and V. Kuleshov
+
+Block diffusion: interpolating between autoregressive and diffusion language models.
+
+In The Thirteenth International Conference on Learning Representations,
+
+Cited by: §5.
+
+Austin et al. (2021)
+J. Austin, D. D. Johnson, J. Ho, D. Tarlow, and R. van den Berg
+
+Structured denoising diffusion models in discrete state-spaces.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §5.
+
+Azangulov and Zhang (2026)
+I. Azangulov and L. Zhang
+
+Sampling from flow language models via marginal-conditioned bridges.
+
+arXiv preprint arXiv:2605.13681.
+
+Cited by: §5.
+
+Ben-Hamu et al. (2025)
+H. Ben-Hamu, I. Gat, D. Severo, N. Nolte, and B. Karrer
+
+Accelerated sampling from masked diffusion models via entropy bounded unmasking.
+
+External Links: 2505.24857,
+Link
+
+Cited by: §1,
+§4.1.
+
+Bengio et al. (2015)
+S. Bengio, O. Vinyals, N. Jaitly, and N. Shazeer
+
+Scheduled sampling for sequence prediction with recurrent neural networks.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §5.
+
+Chemseddine et al. (2026)
+J. Chemseddine, G. Kornhardt, and G. Steidl
+
+Spherical flows for sampling categorical data.
+
+arXiv preprint arXiv:2605.05629.
+
+Cited by: Appendix G,
+§1,
+§1,
+§3.3,
+§4.1,
+§4.5,
+§5.
+
+Chen et al. (2021)
+M. Chen, J. Tworek, H. Jun, Q. Yuan, H. P. D. O. Pinto, J. Kaplan, H. Edwards, Y. Burda, N. Joseph, G. Brockman, et al.
+
+Evaluating large language models trained on code.
+
+arXiv preprint arXiv:2107.03374.
+
+Cited by: Appendix D,
+§4.3.
+
+Chen and Lipman (2024)
+R. T. Q. Chen and Y. Lipman
+
+Flow matching on general geometries.
+
+In The Twelfth International Conference on Learning Representations,
+
+Cited by: §5.
+
+Cobbe et al. (2021)
+K. Cobbe, V. Kosaraju, M. Bavarian, M. Chen, H. Jun, L. Kaiser, M. Plappert, J. Tworek, J. Hilton, R. Nakano, et al.
+
+Training verifiers to solve math word problems.
+
+arXiv preprint arXiv:2110.14168.
+
+Cited by: §1,
+§4.1.
+
+Davis et al. (2024)
+O. Davis, S. Kessler, M. Petrache, İ. İ. Ceylan, M. Bronstein, and A. J. Bose
+
+Fisher flow matching for generative modeling over discrete data.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §5.
+
+Deschenaux and Gulcehre (2026)
+J. Deschenaux and C. Gulcehre
+
+Language modeling with hyperspherical flows.
+
+arXiv preprint arXiv:2605.11125.
+
+Cited by: Appendix E,
+Appendix E,
+Appendix F,
+§1,
+§1,
+§1,
+§1,
+§3.3,
+§4.1,
+§4.1,
+§4.4,
+§5,
+§5.
+
+Dieleman et al. (2022)
+S. Dieleman, L. Sartran, A. Roshannai, N. Savinov, Y. Ganin, P. H. Richemond, A. Doucet, R. Strudel, C. Dyer, C. Durkan, C. Hawthorne, R. Leblond, W. Grathwohl, and J. Adler
+
+Continuous diffusion for categorical data.
+
+arXiv preprint arXiv:2211.15089.
+
+Cited by: §5,
+§5.
+
+Du et al. (2023)
+Y. Du, C. Durkan, R. Strudel, J. B. Tenenbaum, S. Dieleman, R. Fergus, J. Sohl-Dickstein, A. Doucet, and W. Grathwohl
+
+Reduce, reuse, recycle: compositional generation with energy-based diffusion models and MCMC.
+
+In Proceedings of the 40th International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 202, pp. 8489–8510.
+
+Cited by: §5.
+
+Gulrajani and Hashimoto (2023)
+I. Gulrajani and T. B. Hashimoto
+
+Likelihood-based diffusion language models.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 36.
+
+Cited by: §5,
+§5.
+
+Hasan et al. (2026)
+M. Hasan, V. Ohanesian, A. Gazizov, Y. Bengio, A. Aspuru-Guzik, R. Bondesan, M. Skreta, and K. Neklyudov
+
+Discrete Feynman-Kac correctors.
+
+arXiv preprint arXiv:2601.10403.
+
+Cited by: §5.
+
+Holtzman et al. (2020)
+A. Holtzman, J. Buys, L. Du, M. Forbes, and Y. Choi
+
+The curious case of neural text degeneration.
+
+In International Conference on Learning Representations,
+
+Cited by: §1,
+§5.
+
+Hu et al. (2026)
+K. Hu, L. Qiu, Y. Lu, H. Zhao, T. Li, Y. Kim, J. Andreas, and K. He
+
+ELF: embedded language flows.
+
+arXiv preprint arXiv:2605.10938.
+
+Cited by: §5.
+
+Jo and Hwang (2025)
+J. Jo and S. J. Hwang
+
+Continuous diffusion model for language modeling.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §5.
+
+Kim et al. (2026)
+J. Kim, S. Kim, T. Lee, D. Z. Pan, H. Kim, S. Kakade, and S. Chen
+
+Fine-tuning masked diffusion for provable self-correction.
+
+In International Conference on Machine Learning,
+
+Cited by: §1,
+§4.1.
+
+Lee et al. (2026)
+C. Lee, J. Yoo, M. Agarwal, S. Shah, J. Huang, A. Raghunathan, S. Hong, N. M. Boffi, and J. Kim
+
+Flow map language models: one-step language modeling via continuous denoising.
+
+arXiv preprint arXiv:2602.16813.
+
+Cited by: §1,
+§5.
+
+Li et al. (2024)
+M. Li, T. Qu, R. Yao, W. Sun, and M. Moens
+
+Alleviating exposure bias in diffusion models through sampling with shifted time steps.
+
+In International Conference on Learning Representations,
+
+Cited by: §5.
+
+Li et al. (2026)
+P. Li, E. Aksan, A. Ichim, T. Beeler, and O. Sorkine-Hornung
+
+Diversify diffusion with temperature sampling and variance-corrective time shifting.
+
+arXiv preprint arXiv:2607.10853.
+
+Cited by: §5.
+
+Li et al. (2022)
+X. Li, J. Thickstun, I. Gulrajani, P. S. Liang, and T. B. Hashimoto
+
+Diffusion-lm improves controllable text generation.
+
+Advances in neural information processing systems 35, pp. 4328–4343.
+
+Cited by: §5.
+
+Liu et al. (2023)
+B. Liu, S. Bubeck, R. Eldan, J. Kulkarni, Y. Li, A. Nguyen, R. Ward, and Y. Zhang
+
+TinyGSM: achieving $>$ 80% on GSM8K with small language models.
+
+arXiv preprint arXiv:2312.09241.
+
+Cited by: §4.1.
+
+Lou et al. (2024)
+A. Lou, C. Meng, and S. Ermon
+
+Discrete diffusion modeling by estimating the ratios of the data distribution.
+
+In International Conference on Machine Learning,
+
+Cited by: §5.
+
+Nie et al. (2025)
+S. Nie, F. Zhu, Z. You, X. Zhang, J. Ou, J. Hu, J. Zhou, Y. Lin, J. Wen, and C. Li
+
+Large language diffusion models.
+
+arXiv preprint arXiv:2502.09992.
+
+Cited by: §5.
+
+Ning et al. (2023)
+M. Ning, E. Sangineto, A. Porrello, S. Calderara, and R. Cucchiara
+
+Input perturbation reduces exposure bias in diffusion models.
+
+In International Conference on Machine Learning,
+
+Cited by: §5.
+
+Peebles and Xie (2023)
+W. Peebles and S. Xie
+
+Scalable diffusion models with transformers.
+
+External Links: 2212.09748,
+Link
+
+Cited by: §4.1.
+
+Ranzato et al. (2016)
+M. Ranzato, S. Chopra, M. Auli, and W. Zaremba
+
+Sequence level training with recurrent neural networks.
+
+In International Conference on Learning Representations,
+
+Cited by: §5.
+
+Sahoo et al. (2024)
+S. Sahoo, M. Arriola, Y. Schiff, A. Gokaslan, E. Marroquin, J. Chiu, A. Rush, and V. Kuleshov
+
+Simple and effective masked diffusion language models.
+
+Advances in Neural Information Processing Systems 37, pp. 130136–130184.
+
+Cited by: Appendix E,
+§1,
+§5.
+
+Sahoo et al. (2025)
+S. S. Sahoo, J. Deschenaux, A. Gokaslan, G. Wang, J. T. Chiu, and V. Kuleshov
+
+The diffusion duality.
+
+In Forty-second International Conference on Machine Learning,
+
+External Links: Link
+
+Cited by: Appendix E,
+§1,
+§5.
+
+Shi et al. (2024)
+J. Shi, K. Han, Z. Wang, A. Doucet, and M. Titsias
+
+Simplified and generalized masked diffusion for discrete data.
+
+Advances in neural information processing systems 37, pp. 103131–103167.
+
+Cited by: §5.
+
+Skreta et al. (2025)
+M. Skreta, T. Akhound-Sadegh, V. Ohanesian, R. Bondesan, A. Aspuru-Guzik, A. Doucet, R. Brekelmans, A. Tong, and K. Neklyudov
+
+Feynman-Kac correctors in diffusion: annealing, guidance, and product of experts.
+
+In Proceedings of the 42nd International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 267, pp. 55906–55949.
+
+Cited by: §5.
+
+Stark et al. (2024)
+H. Stark, B. Jing, C. Wang, G. Corso, B. Berger, R. Barzilay, and T. Jaakkola
+
+Dirichlet flow matching with applications to dna sequence design.
+
+In Proceedings of the 41st International Conference on Machine Learning,
+
+pp. 46495–46513.
+
+Cited by: §1.
+
+Xu et al. (2026)
+Y. Xu, Y. Wu, S. Park, Z. Zhou, and S. Tulsiani
+
+Temporal score rescaling for temperature sampling in diffusion and flow models.
+
+In International Conference on Machine Learning,
+
+Cited by: §5.
+
+## Appendix A Sequences
+
+For a sequence $x=(x^{1},\dots,x^{L})$ with joint endpoint distribution $\pi(x)$ and a bridge that factorizes over positions, the posterior at position $l$ marginalizes the other positions:
+
+ $r_{t}(x^{l}\mid{\bm{z}})=\frac{q_{t}({\bm{z}}^{l}\mid x^{l})\,\tilde{\pi}_{t}(x^{l};{\bm{z}}^{-l})}{\sum_{y}q_{t}({\bm{z}}^{l}\mid y)\,\tilde{\pi}_{t}(y;{\bm{z}}^{-l})},\qquad\tilde{\pi}_{t}(x^{l};{\bm{z}}^{-l})=\sum_{x^{-l}}\pi(x)\prod_{j\neq l}q_{t}({\bm{z}}^{j}\mid x^{j}).$ 
+
+(19)
+
+This is Eq. (1) at position $l$ with $\pi$ replaced by the context-conditioned endpoint $\tilde{\pi}_{t}(\cdot\,;{\bm{z}}^{-l})$ , which does not depend on ${\bm{z}}^{l}$ .
+
+Every construction of Section 3 therefore applies position-wise and tempers $\tilde{\pi}_{t}$ ; under TFT, $\tilde{\pi}_{t}$ is formed with the tempered bridges $q_{t,T}$ at the other positions.
+For any fixed endpoint sequence (x), the product of the position-wise conditional bridges is transported by the concatenation of their corresponding conditional velocities, so the joint conditional continuity equation holds by the product rule.
+None of them tempers the joint endpoint: that would require the context factor $\sum_{x^{-l}}\pi(x)^{\beta}\prod_{j\neq l}q^{\prime}_{t}({\bm{z}}^{j}\mid x^{j})$ , with $q^{\prime}_{t}$ the bridge of the target pair, which in general is not proportional to the power of $\tilde{\pi}$ that every variant uses. Per-token temperature in autoregressive models has the same property.
+
+## Appendix B The hyperspherical bridge
+
+Throughout, $\theta=\theta_{x}({\bm{z}})$ is the polar angle about ${\bm{e}}_{x}$ , $\nu=d-2$ , $\sigma$ is the surface measure on $\mathbb{S}^{d-1}$ , and $a=a_{t}\in(0,1]$ , which equals $1$ at the source and decreases in $t$ ; the bridge depends on $t$ only through $a$ , and the results below hold for every $a\in(0,1]$ .
+
+## B.1 Bridge density
+
+ $\mathbb{S}$ -FLM draws ${\bm{z}}_{0}$ uniformly on $\mathbb{S}^{d-1}$ and sets ${\bm{z}}_{t}=\mathrm{SLERP}({\bm{z}}_{0},{\bm{e}}_{x};\alpha_{t})$ . About ${\bm{e}}_{x}$ , write ${\bm{z}}=\cos\theta\,{\bm{e}}_{x}+\sin\theta\,\bm{\xi}$ with $\bm{\xi}$ in the unit sphere $\mathbb{S}^{d-2}$ of the orthogonal complement of ${\bm{e}}_{x}$ . The surface measure factorizes as
+
+ $d\sigma({\bm{z}})=\sin^{\nu}\theta\;d\theta\;d\sigma_{d-2}(\bm{\xi}).$ 
+
+(20)
+
+Let $\omega=\theta_{x}({\bm{z}}_{0})$ . Then $\mathrm{SLERP}({\bm{z}}_{0},{\bm{e}}_{x};\alpha)=\bigl[\sin(a\omega)\,{\bm{z}}_{0}+\sin((1-a)\omega)\,{\bm{e}}_{x}\bigr]/\sin\omega$ , and substituting ${\bm{z}}_{0}=\cos\omega\,{\bm{e}}_{x}+\sin\omega\,\bm{\xi}$ gives ${\bm{z}}_{t}=\cos(a\omega)\,{\bm{e}}_{x}+\sin(a\omega)\,\bm{\xi}$ : SLERP keeps $\bm{\xi}$ and contracts the polar angle by the factor $a$ . For uniform ${\bm{z}}_{0}$ , $(\omega,\bm{\xi})$ has density $\sin^{\nu}\omega/|\mathbb{S}^{d-1}|$ with respect to $d\omega\,d\sigma_{d-2}(\bm{\xi})$ . The map $\omega\mapsto a\omega$ has Jacobian $a$ , and dividing by the factor $\sin^{\nu}\theta$ of Eq. (20) gives
+
+ $q_{t}({\bm{z}}\mid x)=\frac{\sin^{\nu}(\theta/a)}{a\,|\mathbb{S}^{d-1}|\,\sin^{\nu}\theta}\;\mathbf{1}\{\theta<a\pi\},$ 
+
+(21)
+
+which is Eq. (15).
+
+## B.2 Tempered bridge
+
+By Eq. (20), under $q_{t,T}(\cdot\mid x)\propto q_{t}(\cdot\mid x)^{\beta}$ the direction $\bm{\xi}$ is uniform on $\mathbb{S}^{d-2}$ and independent of the polar angle, whose marginal is
+
+ $m_{a,T}(\theta)=\frac{g_{a,T}(\theta)}{C_{a,T}},\qquad g_{a,T}(\theta)=\sin^{\nu\beta}\!\Bigl(\frac{\theta}{a}\Bigr)\,\sin^{\nu(1-\beta)}\theta,\qquad\theta\in(0,a\pi),$ 
+
+(22)
+
+with $C_{a,T}=\int_{0}^{a\pi}g_{a,T}$ . Rotations preserve $\sigma$ and map the bridges of different tokens onto one another, so $Z_{t,T}$ depends only on $(a,T,d)$ . Since $g_{a,T}$ behaves like $\theta^{\nu}$ as $\theta\to 0$ and like $(a\pi-\theta)^{\nu\beta}$ as $\theta\to a\pi$ ( $a<1$ ), $Z_{t,T}<\infty$ and $q_{t,T}$ is a valid density for every $T>0$ . Its support does not depend on $T$ . At $a=1$ , $g_{1,T}=\sin^{\nu}\theta$ for every $T$ , so the tempered source $q_{0,T}$ is the uniform source of $\mathbb{S}$ -FLM.
+
+## B.3 Tempered conditional velocity
+
+We write the polar dynamics as $d\theta/da=v_{a,T}(\theta)$ .
+
+Symmetry reduction.
+ $q_{t,T}(\cdot\mid x)$ is invariant under the orthogonal transformations fixing ${\bm{e}}_{x}$ , and we take its conditional velocity to be equivariant, $u(R{\bm{z}})=Ru({\bm{z}})$ for all such $R$ . The transformations fixing both ${\bm{e}}_{x}$ and ${\bm{z}}$ therefore fix $u({\bm{z}})$ , and for $d\geq 3$ the only tangent vectors at ${\bm{z}}$ they fix are multiples of $\mathbf{e}_{\theta}$ , the unit tangent pointing away from ${\bm{e}}_{x}$ along the geodesic. Equivariance under transformations that move $\bm{\xi}$ makes the magnitude a function of $\theta$ alone, so $u=\dot{\theta}\,\mathbf{e}_{\theta}$ .
+
+One-dimensional continuity equation.
+For a density $\rho$ with respect to $\sigma$ , $\nabla\cdot(\rho\,v\,\mathbf{e}_{\theta})=\sin^{-\nu}\theta\;\partial_{\theta}(\sin^{\nu}\theta\,\rho\,v)$ . Multiplying $\partial_{a}\rho+\nabla\cdot(\rho\,v\,\mathbf{e}_{\theta})=0$ by $|\mathbb{S}^{d-2}|\sin^{\nu}\theta$ , which turns $\rho$ into the polar marginal $m_{a,T}$ , gives
+
+ $\partial_{a}m_{a,T}(\theta)+\partial_{\theta}\bigl(m_{a,T}(\theta)\,v_{a,T}(\theta)\bigr)=0.$ 
+
+(23)
+
+With no flux through the pole ( $m\,v\to 0$ as $\theta\to 0$ ), integrating over $(0,\theta)$ gives the unique solution $v_{a,T}=-\partial_{a}M_{a,T}/m_{a,T}$ , where $M_{a,T}(\theta)=\int_{0}^{\theta}m_{a,T}$ .
+
+Closed form.
+From Eq. (22), $\partial_{a}g_{a,T}(\theta)=-(\nu\beta/a^{2})\,\theta\cot(\theta/a)\,g_{a,T}(\theta)$ . Since $g_{a,T}(a\pi)=0$ , differentiating $C_{a,T}$ produces no boundary term, and $\partial_{a}C_{a,T}=-(\nu\beta/a^{2})\,\bar{H}_{a,T}\,C_{a,T}$ with $\bar{H}_{a,T}=\mathbb{E}_{\theta\sim m_{a,T}}[\theta\cot(\theta/a)]$ . Hence
+
+ $v_{a,T}(\theta)=\frac{\nu\beta}{a^{2}}\,\frac{\int_{0}^{\theta}\bigl[\vartheta\cot(\vartheta/a)-\bar{H}_{a,T}\bigr]\,g_{a,T}(\vartheta)\,d\vartheta}{g_{a,T}(\theta)}.$ 
+
+(24)
+
+Velocity field.
+As $t$ increases, $da/dt=-\dot{\alpha}_{t}$ , so $\dot{\bm{z}}=-\dot{\alpha}_{t}\,v_{a,T}(\theta)\,\mathbf{e}_{\theta}$ . Since $\mathrm{Log}_{{\bm{z}}}({\bm{e}}_{x})=-\theta\,\mathbf{e}_{\theta}$ , this equals
+
+ $u_{t,T}({\bm{z}}\mid x)=w_{t,T}(\theta)\,u_{t}({\bm{z}}\mid x),\qquad w_{t,T}(\theta)=\frac{a_{t}\,v_{a_{t},T}(\theta)}{\theta},\qquad u_{t}({\bm{z}}\mid x)=\frac{\dot{\alpha}_{t}}{a_{t}}\,\mathrm{Log}_{{\bm{z}}}({\bm{e}}_{x}),$ 
+
+which is Eq. (16). At $T=1$ , integration by parts with $s=\theta/a$ gives $\int_{0}^{\pi}s\cos s\,\sin^{\nu-1}s\,ds=-\frac{1}{\nu}\int_{0}^{\pi}\sin^{\nu}s\,ds$ , hence $\bar{H}_{a,1}=-a/\nu$ , and $\frac{d}{d\theta}\bigl[\frac{\theta}{a}g_{a,1}(\theta)\bigr]=\frac{\nu}{a^{2}}\bigl[\theta\cot(\theta/a)-\bar{H}_{a,1}\bigr]g_{a,1}(\theta)$ . The integral in Eq. (24) thus equals $\frac{a}{\nu}\,\theta\,g_{a,1}(\theta)$ , so $v_{a,1}=\theta/a$ and $w_{t,1}\equiv 1$ : $u_{t}$ is the $\mathbb{S}$ -FLM conditional velocity, and the tempered construction reduces to it at $T=1$ .
+
+## B.4 Exact sampling of the tempered bridge
+
+Use the normalized angles $\psi=\omega/\pi$ and $\phi=\theta/(a\pi)$ in $(0,1)$ . Let $F_{\mathrm{src}}$ be the CDF of the density $\propto\sin^{\nu}(\pi\psi)$ , and let $F_{a,T}$ be the CDF of the density $\propto\sin^{\nu\beta}(\pi\phi)\sin^{\nu(1-\beta)}(a\pi\phi)$ , which is Eq. (22) in the variable $\phi$ . Define
+
+ $Q_{a,T}(\omega)=a\pi\,F_{a,T}^{-1}\bigl(F_{\mathrm{src}}(\omega/\pi)\bigr).$ 
+
+(25)
+
+Under both the source and the tempered bridge, $\bm{\xi}$ is uniform on $\mathbb{S}^{d-2}$ and independent of the polar angle. Hence ${\bm{z}}=\cos\theta\,{\bm{e}}_{x}+\sin\theta\,\bm{\xi}$ with $\theta=Q_{a,T}(\omega)$ is an exact sample of $q_{t,T}(\cdot\mid x)$ . At $\beta=1$ , $F_{a,1}=F_{\mathrm{src}}$ and $\theta=a\omega$ , which reproduces SLERP for the same ${\bm{z}}_{0}$ . Equivalently, ${\bm{z}}=\mathrm{SLERP}({\bm{z}}_{0},{\bm{e}}_{x};1-\theta/\omega)$ , a SLERP with a position-specific parameter. For TFT we build the target CDF for each $(a_{t},T)$ pair in the batch on a grid refined geometrically toward both ends of $[0,a_{t}\pi]$ and invert it at the drawn angles, with no interpolation table over $(a,T)$ .
+
+## Appendix C Held-out selection of $\lambda$ 
+
+Held-out set.
+The TinyGSM data used by $\mathbb{S}$ -FLM are split into a training part, which the TFT continuation reads, and a validation part of 118,216 problems, which it does not. From a random subset of 768 validation problems, we remove 111 prompts that also occur verbatim in the training part and 30 problems without a reliably recoverable reference answer (seven fall in both groups), leaving 634 problems, none of which matches a GSM8K test problem. The reference answer of each problem is the value returned by its TinyGSM reference program, and generated programs are graded as on GSM8K.
+
+Protocol.
+For each backbone, the sweep uses the TFT checkpoint, generation seed 1 and the GSM8K sampling protocol. Each $\lambda\in\{0,0.25,0.5,0.75,1\}$ is scored by its held-out accuracy averaged over $T\in\{0.4,0.2,0.1\}$ ; the maximizer, with ties broken toward the larger $\lambda$ , is used at every temperature. This selects $\lambda=0.5$ for S-arch and $\lambda=0.25$ for DiT (Figure 6, Table 2).
+
+25303540455000.250.50.751Correction strength $\lambda$ Held-out TinyGSM accuracy (%)S-arch $\lambda^{*}=0.5$ Mean over $T$ $T=0.1$ $T=0.2$ $T=0.4$ 
+
+25303540455000.250.50.751Correction strength $\lambda$ Held-out TinyGSM accuracy (%)DiT $\lambda^{*}=0.25$ 
+
+Figure 6: Held-out selection of $\lambda$ for BCT-L (634 held-out TinyGSM problems, TFT, seed 1). Thin lines: accuracy at each selection temperature; thick line: their mean, the selection score. The dotted line marks the selected $\lambda$ . $\lambda=0$ applies no Bayes correction and $\lambda=1$ the full correction. Values in Table 2.
+
+Table 2: Held-out $\lambda$ sweep: correct answers out of 634 at each selection temperature and the selection score (mean accuracy over the three temperatures, %); bold: selected value. The last column is a DiT TFT checkpoint after 500 updates, not used for selection.
+
+S-arch
+DiT
+DiT (500 upd.)
+
+ $\lambda$ 
+ $T{=}0.4$ 
+ $0.2$ 
+ $0.1$ 
+Score
+ $T{=}0.4$ 
+ $0.2$ 
+ $0.1$ 
+Score
+Score
+
+0
+279
+285
+282
+44.48
+271
+278
+287
+43.95
+42.27
+
+0.25
+279
+292
+290
+45.27
+278
+295
+316
+46.74
+48.74
+
+0.5
+283
+304
+303
+46.79
+281
+299
+295
+46.00
+48.32
+
+0.75
+284
+305
+295
+46.48
+282
+295
+257
+43.85
+45.79
+
+1
+286
+300
+289
+46.00
+279
+279
+181
+38.85
+43.22
+
+## Appendix D Pass@ $K$ on S-arch
+
+This appendix gives the setup and values behind Section 4.3.
+
+Setup.
+We compare Cont. with standard tempering and TFT with BCT-L ( $\lambda=0.5$ ) on S-arch, using the checkpoints, sampler, prompts and grader of Table 1 at the same eight temperatures. The sampler draws one generation per problem, so the eight generations per problem come from eight runs with generation seeds $1+10j$ , $j=0,\dots,7$ ; the first three are the seeds of Table 1 and reproduce its generations exactly. For a problem with $c$ correct generations out of $n=8$ , we use the unbiased estimator $1-\binom{n-c}{k}/\binom{n}{k}$ (Chen et al., 2021), averaged over the 1319 problems. Intervals are 95% percentile bootstrap intervals over problems (10,000 resamples), paired for differences.
+
+Table 3: Pass@ $K$ (%) of Figure 3: unbiased estimator over $n=8$ generations per problem (generation seeds $1,11,\dots,71$ ), S-arch, 1319 GSM8K problems. Pass@1 is the mean single-generation accuracy over the eight draws and agrees with the three-seed mean of Table 1 to within 0.6 points.
+
+Cont.
+TFT
+
+standard tempering
+BCT-L
+
+ $T$ 
+ $K=1$ 
+ $2$ 
+ $4$ 
+ $8$ 
+ $K=1$ 
+ $2$ 
+ $4$ 
+ $8$ 
+
+1
+12.3
+19.6
+28.3
+37.5
+12.7
+20.2
+29.0
+37.7
+
+0.8
+14.4
+22.5
+32.1
+42.0
+16.5
+25.1
+34.7
+44.5
+
+0.6
+15.8
+24.3
+34.1
+44.5
+20.2
+29.8
+40.3
+51.3
+
+0.5
+16.9
+25.8
+36.0
+46.8
+21.8
+31.3
+41.2
+51.1
+
+0.4
+17.4
+26.3
+36.7
+47.5
+23.3
+32.9
+42.8
+52.5
+
+0.3
+17.6
+26.7
+36.9
+47.3
+24.4
+33.7
+43.2
+52.5
+
+0.2
+17.7
+26.6
+36.6
+47.2
+25.3
+34.5
+43.4
+51.9
+
+0.1
+17.8
+26.8
+37.0
+47.5
+27.1
+35.7
+43.9
+51.1
+
+Differences.
+For every $T<1$ and $K\leq 8$ , the paired interval of the difference (BCT-L minus standard tempering) lies above zero. At $T=0.1$ the difference is 9.2 [8.1, 10.3] points at $K=1$ and 3.6 [1.4, 5.8] at $K=8$ . The number of problems solved by at least one of the eight generations is 693 and 674 for BCT-L at $T=0.3$ and $0.1$ , against 624 and 627 for standard tempering.
+
+## Appendix E Standard temperature scaling on discrete diffusion baselines
+
+We sweep the sampling temperature of the MDLM (Sahoo et al., 2024) and Duo (Sahoo et al., 2025) TinyGSM checkpoints released by Deschenaux and Gulcehre (2026), without any training or tuning. Both use the ancestral samplers of that release: at every step the denoiser logits are divided by $T$ before the softmax, and the tempered clean-token distribution enters the unchanged reverse transition (absorbing state for MDLM, uniform state for Duo). At $T=1$ this reproduces the released sampler exactly (1319 of 1319 identical programs for both models, checked with 32 steps). We use 1024 steps, generation seed 1 and the GSM8K evaluation of Section 4.1; the $\mathbb{S}$ -FLM values are the standard-tempering results at seed 1.
+
+05101520253035400.10.20.30.40.50.60.70.80.91Temperature $T$ GSM8K accuracy (%)DuoMDLMS-FLM (DiT)S-FLM (S-arch)
+
+Figure 7: Standard temperature scaling on the TinyGSM baselines released with $\mathbb{S}$ -FLM (NFE $=1024$ , seed 1). Gray: $\mathbb{S}$ -FLM (Section 4.2). Values in Table 4.
+
+Table 4: Accuracy (%) and correct answers out of 1319 for Figure 7. $\mathbb{S}$ -FLM uses the exact velocity.
+
+ $T$ 
+MDLM
+Duo
+ $\mathbb{S}$ -FLM (S-arch)
+ $\mathbb{S}$ -FLM (DiT)
+
+1
+15.0 (198)
+18.6 (245)
+13.0 (172)
+11.7 (154)
+
+0.8
+22.5 (297)
+23.0 (304)
+15.0 (198)
+13.9 (183)
+
+0.6
+28.5 (376)
+28.3 (373)
+15.8 (208)
+16.3 (215)
+
+0.5
+29.3 (386)
+29.5 (389)
+16.5 (218)
+17.3 (228)
+
+0.4
+30.2 (398)
+32.1 (423)
+17.5 (231)
+17.0 (224)
+
+0.3
+32.6 (430)
+34.0 (448)
+18.0 (238)
+16.9 (223)
+
+0.2
+33.7 (445)
+35.3 (465)
+18.0 (237)
+17.1 (226)
+
+0.1
+32.7 (431)
+36.2 (477)
+17.3 (228)
+16.9 (223)
+
+At $T=0.1$ , MDLM and Duo solve 32.7% and 36.2%, in line with the 33% and 36% reported by Deschenaux and Gulcehre (2026); at $T=1$ they solve 15.0% and 18.6%, against the reported 18.0% and 17.2%.
+
+## Appendix F Sudoku-Hard
+
+This appendix gives the setup and values behind Section 4.4.
+
+Task.
+We use the Sudoku-Hard task and puzzle generator of $\mathbb{S}$ -FLM (Deschenaux and Gulcehre, 2026) unchanged. Every puzzle has 30 clues and a unique solution (checked with a solution counter), and the 48,000 training and 2,000 test puzzles share no puzzle or solution. A sequence is the puzzle followed by its solution, each written as 81 digits with row separators (a vocabulary of 12 tokens). The puzzle is a fixed prefix during sampling, and a test puzzle counts as solved only if the generated solution equals the reference.
+
+Model and training.
+We train with the released Sudoku recipe of $\mathbb{S}$ -FLM unchanged: a DiT denoiser with 8 blocks and hidden size 512, the geodesic bridge with its truncated adaptive noise schedule, 20,000 updates with a batch of 256 puzzles on one GPU, AdamW with a constant learning rate of $3\times 10^{-4}$ after warmup, EMA decay 0.9999, and training seed 1. Our code reproduces the released code bit for bit on this recipe (weights, EMA weights and optimizer state after 1,200 updates). We call the result the base checkpoint. Cont. and TFT resume its complete training state for 2,000 updates; TFT uses the TFT setting of Section 4.1 with $T$ -conditioning. Each checkpoint is a single training run.
+
+Evaluation.
+All samplers use the released Sudoku sampler (180 NFE, exact velocity, argmax decoding, EMA weights, batches of 64 puzzles on one GPU) with generation seeds 1, 11 and 21; only the temperature and the BCT rule change between runs, and for a given seed all samplers start from the same noise. At $T=1$ the training-free samplers coincide up to floating-point differences, which change the number of solved puzzles by at most 2 per seed.
+
+Selection of $\lambda$ .
+We select $\lambda$ with the protocol of Appendix C on 2,000 new puzzles from the same generator with a different seed, disjoint from the training and test puzzles. Held-out accuracy increases with $\lambda$ at every selection temperature (Table 6), so $\lambda=1$ .
+
+Table 5: Sudoku-Hard exact solve rate (%), mean $\pm$ standard deviation over generation seeds 1, 11 and 21 (2,000 test puzzles, NFE $=180$ ). BCT-L uses the held-out $\lambda=1$ . The seed standard deviation is dominated by a shift shared by all samplers.
+
+Base checkpoint
+Cont.
+TFT
+
+ $T$ 
+Standard
+BCT-E
+BCT-P
+Standard
+BCT-E
+BCT-P
+BCT-L
+
+1
+42.9 $\pm$ 1.5
+42.9 $\pm$ 1.6
+42.9 $\pm$ 1.5
+41.7 $\pm$ 1.2
+41.7 $\pm$ 1.2
+41.7 $\pm$ 1.2
+41.7 $\pm$ 1.1
+
+0.8
+42.6 $\pm$ 1.6
+43.7 $\pm$ 1.4
+43.6 $\pm$ 1.0
+41.6 $\pm$ 1.2
+42.6 $\pm$ 1.2
+42.4 $\pm$ 1.0
+42.7 $\pm$ 0.7
+
+0.6
+42.3 $\pm$ 1.3
+44.1 $\pm$ 1.2
+44.2 $\pm$ 1.1
+41.4 $\pm$ 1.1
+43.1 $\pm$ 1.0
+42.7 $\pm$ 1.2
+44.3 $\pm$ 1.2
+
+0.5
+42.2 $\pm$ 1.3
+44.4 $\pm$ 1.3
+44.4 $\pm$ 1.2
+41.3 $\pm$ 1.0
+43.3 $\pm$ 1.2
+43.0 $\pm$ 0.8
+45.1 $\pm$ 1.3
+
+0.4
+42.1 $\pm$ 1.2
+44.8 $\pm$ 1.4
+44.8 $\pm$ 1.1
+41.2 $\pm$ 1.0
+43.5 $\pm$ 1.2
+43.2 $\pm$ 0.5
+45.6 $\pm$ 1.3
+
+0.3
+42.0 $\pm$ 1.2
+45.0 $\pm$ 1.4
+44.7 $\pm$ 0.9
+41.2 $\pm$ 1.0
+43.7 $\pm$ 1.2
+43.3 $\pm$ 0.5
+45.9 $\pm$ 1.1
+
+0.2
+41.9 $\pm$ 1.3
+45.2 $\pm$ 1.4
+44.8 $\pm$ 0.4
+41.2 $\pm$ 1.0
+44.0 $\pm$ 1.2
+43.6 $\pm$ 0.1
+46.4 $\pm$ 1.1
+
+0.1
+41.7 $\pm$ 1.3
+45.5 $\pm$ 1.4
+44.9 $\pm$ 0.4
+41.0 $\pm$ 1.0
+44.2 $\pm$ 1.4
+43.7 $\pm$ 0.5
+46.8 $\pm$ 1.2
+
+Table 6: Held-out selection of $\lambda$ for BCT-L on Sudoku-Hard: exact solve rate (%) of TFT on 2,000 held-out puzzles (generation seed 1, NFE $=180$ ). Mean: the selection score. Bold: selected. No test puzzle was used.
+
+ $\lambda$ 
+ $T=0.4$ 
+ $T=0.2$ 
+ $T=0.1$ 
+Mean
+
+0
+41.8
+40.8
+40.1
+40.9
+
+0.25
+42.8
+43.5
+43.3
+43.2
+
+0.5
+44.0
+44.5
+44.9
+44.5
+
+0.75
+44.9
+45.4
+46.9
+45.7
+
+1
+45.6
+46.3
+47.5
+46.5
+
+## Appendix G BCT for vMF flows
+
+This appendix gives the instantiation and setup of Section 4.5. SFCD (Chemseddine et al., 2026) keeps learned token embeddings on the unit sphere but uses the von Mises–Fisher bridge $q_{t}({\bm{z}}\mid x)=\mathrm{vMF}({\bm{e}}_{x},\kappa_{t})$ with increasing concentration and $\kappa_{0}=0$ . Its sampler integrates the posterior-induced velocity Eq. (2) on a time warp chosen by the release. We use the released TinyGSM checkpoint (250k updates) with its architecture, warp and sampler unchanged, and change only the velocity.
+
+Tempering the vMF bridge.
+The tempered bridge is $\mathrm{vMF}({\bm{e}}_{x},\kappa_{t}/T)$ Eq. (18), whose normalizer does not depend on $x$ , so BCT-P keeps the posterior weights of standard tempering. Because the vMF bridge is indexed by its concentration, the released conditional velocity has the form $u_{t}({\bm{z}}\mid x)=\dot{\kappa}_{t}\,V_{\kappa_{t}}({\bm{z}}\mid x)$ , where $V_{\kappa}(\cdot\mid x)$ transports $\mathrm{vMF}({\bm{e}}_{x},\kappa)$ as $\kappa$ increases. The tempered bridge is the same family at concentration $\kappa_{t}/T$ , so its conditional velocity is
+
+ $u_{t,T}({\bm{z}}\mid x)=\frac{\dot{\kappa}_{t}}{T}\,V_{\kappa_{t}/T}({\bm{z}}\mid x):$ 
+
+(26)
+
+the released velocity evaluated at concentration $\kappa_{t}/T$ , with the concentration advancing $1/T$ times as fast. BCT-P and BCT-L integrate this velocity on the warp grid of the release. BCT-E keeps the original bridge and dynamics and, since $\log q_{t}({\bm{z}}\mid x)=\kappa_{t}\langle{\bm{e}}_{x},{\bm{z}}\rangle$ up to a constant in $x$ , adds $(1-\beta)\,\kappa_{t}\langle{\bm{e}}_{x},{\bm{z}}\rangle$ to the tempered logits. At $T=1$ every variant reduces to the released sampler.
+
+TFT and BCT-L.
+TFT uses the parameterization of Section 3.3: the network outputs a remainder $a_{\theta}$ , the posterior is $\mathrm{softmax}(\bm{a}_{\theta}+\bm{g})$ with the analytic term $g_{x}=(\kappa_{t}/T)\langle{\bm{e}}_{x},{\bm{z}}\rangle$ , and training uses the cross-entropy of Eq. (6). The temperature enters the network through $\kappa_{t}/(T\kappa_{\max})$ . BCT-L Eq. (9) then takes the form $\ell_{x}=\beta\,a_{\theta,x}+[\beta+\lambda(1-\beta)]\,g_{x}$ .
+
+Continued training.
+Both continuations resume the released checkpoint for 20,000 updates: Cont. with the original recipe (with the warp frozen, as in TFT) and TFT with the temperature distribution of Section 4.1 and latents drawn from $q_{t,T}$ . Both are evaluated with an EMA accumulated over the continuation (decay 0.9999); the released checkpoint uses its released EMA weights. Each continuation is a single training run.
+
+Evaluation.
+We use the released SFCD evaluation of the 1319 GSM8K test problems (warp-aware ODE sampler, NFE $=1024$ , batches of 32, and its own answer checker) with generation seeds 42–46; every cell of Table 7 is complete over the five seeds. The separate $T=1$ runs of BCT-E on the released checkpoint reproduce standard tempering exactly.
+
+Selection of $\lambda$ .
+We select $\lambda$ with the protocol of Appendix C on 1024 TinyGSM validation problems that the continuation did not read and that share no problem with the GSM8K test set. The score increases with $\lambda$ (51.92, 53.19, 53.87, 54.07 and 54.39% for $\lambda=0,0.25,0.5,0.75,1$ ), so $\lambda=1$ .
+
+Table 7: BCT on SFCD: GSM8K accuracy (%), mean $\pm$ sample standard deviation over generation seeds 42–46 (1319 problems, NFE $=1024$ ). Released: the SFCD TinyGSM checkpoint with its released EMA weights. Cont. and TFT: 20,000 updates from it, evaluated with an adaptation-local EMA. BCT-L uses the held-out $\lambda=1$ . At $T=1$ every correction is the identity, so the three columns of a model coincide.
+
+Released
+Cont.
+TFT
+
+ $T$ 
+Standard
+BCT-E
+BCT-P
+Standard
+BCT-E
+BCT-P
+BCT-L
+
+1
+23.55 $\pm$ 0.79
+23.55 $\pm$ 0.79
+23.55 $\pm$ 0.79
+23.59 $\pm$ 0.71
+23.59 $\pm$ 0.71
+23.59 $\pm$ 0.71
+21.55 $\pm$ 0.86
+
+0.8
+27.79 $\pm$ 0.83
+29.19 $\pm$ 1.43
+29.39 $\pm$ 0.48
+27.99 $\pm$ 0.27
+29.80 $\pm$ 0.75
+29.28 $\pm$ 0.74
+28.19 $\pm$ 0.97
+
+0.6
+30.34 $\pm$ 0.63
+31.71 $\pm$ 0.64
+31.63 $\pm$ 0.77
+30.61 $\pm$ 0.77
+31.54 $\pm$ 0.78
+32.43 $\pm$ 0.45
+32.05 $\pm$ 0.47
+
+0.5
+30.80 $\pm$ 0.80
+31.40 $\pm$ 0.62
+32.36 $\pm$ 1.03
+31.80 $\pm$ 0.77
+31.21 $\pm$ 0.47
+33.28 $\pm$ 0.39
+33.54 $\pm$ 0.63
+
+0.4
+31.19 $\pm$ 0.99
+28.26 $\pm$ 0.52
+33.39 $\pm$ 0.90
+32.57 $\pm$ 0.83
+26.37 $\pm$ 0.32
+33.93 $\pm$ 0.58
+34.33 $\pm$ 0.97
+
+0.3
+31.75 $\pm$ 0.91
+15.30 $\pm$ 0.67
+33.63 $\pm$ 0.69
+32.62 $\pm$ 0.61
+2.93 $\pm$ 0.25
+33.54 $\pm$ 0.75
+34.47 $\pm$ 0.55
+
+0.2
+31.71 $\pm$ 0.40
+0.08 $\pm$ 0.11
+32.05 $\pm$ 0.67
+32.16 $\pm$ 0.40
+0.02 $\pm$ 0.03
+32.24 $\pm$ 0.28
+33.24 $\pm$ 1.12
+
+0.1
+30.99 $\pm$ 0.55
+0.00 $\pm$ 0.00
+26.63 $\pm$ 0.85
+31.25 $\pm$ 0.42
+0.00 $\pm$ 0.00
+28.49 $\pm$ 0.54
+31.68 $\pm$ 0.53

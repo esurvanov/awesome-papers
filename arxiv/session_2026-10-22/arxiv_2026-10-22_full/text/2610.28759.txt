@@ -1,0 +1,681 @@
+## GPU-Accelerated Construction of the Gabriel Graph:
+
+Parallelization Strategies and Applications to
+
+Large-Margin Classification
+
+and Graph-Based Clustering
+
+Diego Sanches Nere dos Santos
+
+Affiliation: Department of Computing and Systems, Institute of Exact and Applied Sciences, Federal University of Ouro Preto (UFOP), João Monlevade, MG, Brazil
+
+Luiz Carlos Bambirra Torres
+
+Affiliation: Department of Computing, Institute of Exact and Biological Sciences, Federal University of Ouro Preto (UFOP), Ouro Preto, MG, Brazil
+
+Abstract
+
+The Gabriel graph is a proximity graph widely used in computational geometry and geometric machine learning, underlying large-margin classifiers and, as we show in this work, density-aware clustering methods. Its construction, however, has cubic time complexity $O(N^{3})$ in the naive formulation, which severely limits its use on datasets beyond a few thousand samples. This paper presents a set of GPU parallelization strategies, implemented in CUDA, that make Gabriel graph construction practical at scale. We introduce (i) an implicit closed-form mapping from a linear thread index to the corresponding vertex pair $(i,j)$ , which removes the need for an explicit $O(N^{2})$ adjacency structure and lets every thread locate its pair in constant time and constant memory; (ii) a two-pass, bitmask-based, atomically-compacted edge-list construction that produces a dense edge array proportional only to the number of edges actually found; and (iii) a thread-coarsening strategy in which each thread evaluates several candidate pairs, trading launch and scheduling overhead against load balance. We evaluate these strategies on the acceleration of a Gabriel-graph-based large-margin classifier (NN-clas) and on a novel Gabriel-graph clustering algorithm that identifies connected components on a residual graph and performs GPU-parallel Union–Find with hierarchical edge-based merging. On 14 public benchmark datasets, the GPU implementation reduces Gabriel graph construction time by two to nearly four orders of magnitude relative to a sequential CPU baseline (up to $8484\times$ ), without loss of classification accuracy, and the proposed clustering method is statistically competitive with DBSCAN on the topological validity index Dunn while eliminating the need for an explicit density radius parameter.
+
+Keywords: Gabriel graph, GPU, CUDA, parallel computing, proximity graphs, large-margin classification, clustering, computational geometry.
+
+## 1 Introduction
+
+Proximity graphs occupy a central role in geometric approaches to machine learning: they turn a set of feature vectors into a combinatorial structure whose edges encode a notion of “closeness” that can be exploited for classification, clustering, dimensionality reduction, or anomaly detection. Among proximity graphs, the Gabriel graph, introduced by Gabriel and Sokal (1969) in the context of geographic variation analysis, is particularly attractive because it depends on nothing but pairwise Euclidean distances, requires no free parameters (unlike $k$ -nearest-neighbor or $\varepsilon$ -radius graphs), and is a subgraph of the Delaunay triangulation, which guarantees several useful connectivity and locality properties (Matula and Sokal, 1980).
+
+A vertex pair $(x_{i},x_{j})$ is connected by an edge in the Gabriel graph if and only if the open hypersphere having the segment $\overline{x_{i}x_{j}}$ as diameter contains no other point of the dataset. This purely geometric criterion has made the Gabriel graph a popular structural backbone for large-margin classifiers (Garcia et al., 2015; Arias-Garcia and others, 2024; Hanriot et al., 2024), where edges connecting samples of different classes – the support edges – approximate the decision margin between classes without solving any optimization problem.
+
+The price of this elegance is computational: verifying the empty-hypersphere condition for every candidate pair against every other point costs $O(N^{3})$ in the number of samples $N$ , since there are $O(N^{2})$ candidate pairs and each check is itself $O(N)$ . This cost quickly becomes the dominant bottleneck of any Gabriel-graph-based pipeline once $N$ grows into the thousands, which is precisely the regime in which real-time or large-scale applications – medical diagnosis, network intrusion detection, industrial monitoring – would most benefit from these classifiers.
+
+Because the empty-hypersphere test for a pair $(i,j)$ is completely independent of the test for any other pair $(k,l)$ , Gabriel graph construction is an embarrassingly parallel problem, and is therefore a natural candidate for acceleration on Graphics Processing Units (GPUs), whose Single-Instruction-Multiple-Threads (SIMT) architecture is designed precisely to exploit this kind of massive, independent, data-parallel work (Owens et al., 2008; Nickolls et al., 2008).
+
+## Contributions.
+
+This paper isolates and details the GPU parallelization of Gabriel graph construction – the computational core shared by every Gabriel-graph-based algorithm – and studies it as a problem in its own right. Concretely, we contribute:
+
+1. 
+
+A closed-form, $O(1)$ -time and $O(1)$ -memory mapping from a one-dimensional CUDA thread index $k$ to the pair of vertex indices $(i,j)$ that it must evaluate, which avoids materializing an $O(N^{2})$ index table (Section 4);
+
+2. 
+
+A two-pass, bitmask-based edge construction scheme that uses atomic operations to compact the sparse set of valid Gabriel edges into a dense array proportional to the true edge count, keeping GPU memory usage close to $O(|E|)$ rather than $O(N^{2})$ (Section 4.3);
+
+3. 
+
+An empirical study of thread coarsening – assigning multiple candidate pairs to each thread – showing that the best coarsening factor is dataset-dependent: it reduces execution time on one dataset but not on another (Section 4.4);
+
+4. 
+
+Two downstream applications that validate the approach: an accelerated re-implementation of the NN-clas large-margin classifier (Arias-Garcia and others, 2024), and a new GPU-native clustering algorithm that uses connected components of a distance-filtered Gabriel graph, with an automatic elbow-based cut and a GPU parallel Union–Find with hierarchical merging (Section 5);
+
+5. 
+
+An experimental evaluation on 14 public datasets (synthetic and real), reporting speedups of up to $8484\times$ over a sequential CPU baseline and a statistical comparison of the resulting clustering quality against $K$ -means and DBSCAN (Section 6).
+
+The remainder of the paper is organized as follows. Section 2 reviews related work. Section 3 introduces the Gabriel graph and the relevant CUDA/SIMT background. Section 4 presents the parallelization strategies in detail. Section 5 describes the two applications used to validate the approach. Section 6 reports the experimental results, Section 7 discusses limitations, and Section 8 concludes with directions for future work.
+
+## 2 Related Work
+
+## Gabriel-graph-based classification.
+
+Gabriel and Sokal (1969) originally proposed the Gabriel graph for geographic variation analysis; Matula and Sokal (1980) later characterized its geometric properties. In machine learning, the graph has been used to build hyperparameter-free, geometry-driven large-margin classifiers: edges connecting samples of opposite classes (support edges) delineate the separating margin without an explicit optimization procedure. Garcia et al. (2015) studied the effect of label noise on such classifiers and proposed a quality-based filtering step, which we reuse as a pre-processing stage. Arias-Garcia and others (2024) proposed a hardware (FPGA) implementation of a Gabriel-graph classifier to reduce its computational cost, confirming that acceleration of this family of methods is an open and relevant problem, while Hanriot et al. (2024) extended Gabriel-graph classifiers to the multiclass setting and connected them to neural architectures, and The GGClassification Contributors (2020) provide a reference software implementation. None of these works targets general-purpose GPU acceleration of the underlying graph construction, which is the focus of the present paper.
+
+## GPU-accelerated machine learning.
+
+The suitability of GPUs for data-parallel machine learning workloads is well documented (Owens et al., 2008; Eon and others, 2021; Zhang and others, 2023; Çolhak and others, 2025). Çolhak and others (2025) benchmark GPU versus CPU execution of machine learning libraries and report substantial throughput gains; Zhang and others (2023) present a GPU framework that couples neural simulation and AI at scale. These works motivate GPU acceleration in general but do not address the specific combinatorial structure of proximity-graph construction.
+
+## Thread granularity and coarsening.
+
+Magni et al. (2014) show that automatically tuning the amount of work assigned to each GPU thread – thread coarsening – is essential, because a naive one-thread-per-element mapping can be dominated by scheduling overhead. We adopt this principle for Gabriel graph construction and quantify its effect empirically in Section 6.
+
+## Graph-based clustering.
+
+Clustering by connected components of a proximity graph is a classical idea (Cormen et al., 2001; Jain, 2010); the difficulty lies in choosing which edges to keep. We adopt an elbow-based automatic threshold (Thorndike, 1953) on the sorted Gabriel edge weights, following the general taxonomy of internal cluster validity indices surveyed by Ezugwu and others (2022), which we use throughout for quantitative evaluation.
+
+## 3 The Gabriel Graph
+
+## 3.1 Definition and Basic Properties
+
+Let $S=\{x_{i}\}_{i=1}^{N}\subset\mathbb{R}^{n}$ be a finite point set. The Gabriel graph of $S$ is the undirected graph $G=(V,E)$ with $V=\{1,\dots,N\}$ (one vertex per sample) and
+
+Definition 1 (Gabriel edge).
+
+An edge $(i,j)\in E$ exists if and only if no other point $x_{k}\in S$ , $k\neq i,j$ , lies strictly inside the open hypersphere having $\overline{x_{i}x_{j}}$ as diameter. Equivalently,
+
+ $\|x_{i}-x_{j}\|^{2}\;\leq\;\|x_{i}-x_{k}\|^{2}+\|x_{j}-x_{k}\|^{2},\qquad\forall\,x_{k}\in S\setminus\{x_{i},x_{j}\}.$ 
+
+(1)
+
+Figure 1 illustrates the construction: for the highlighted pair, the dashed circle (the two-dimensional analogue of the empty hypersphere) contains no other data point, so the edge is admitted. In a labeled binary classification setting $S=\{(x_{i},y_{i})\}$ with $y_{i}\in\{-1,+1\}$ , we call support edges the subset $E_{S}\subseteq E$ of edges whose endpoints have different labels; under mild assumptions on class overlap, $E_{S}$ localizes the decision boundary between classes (Gabriel and Sokal, 1969; Arias-Garcia and others, 2024).
+
+Figure 1: A Gabriel graph built on a synthetic two-class point set. Grey edges connect same-class neighbors; red edges are support edges joining points of different classes. The dashed circle illustrates the empty-hypersphere test of Eq. (1) for one admitted edge: no other point falls inside it.
+
+Property 1 (Complexity).
+
+Checking Eq. (1) for a single candidate pair costs $O(N)$ (one pass over all other points). Since there are $\binom{N}{2}=O(N^{2})$ candidate pairs, the naive construction costs $O(N^{3})$ in time. The graph itself is sparse: it is known to be a subgraph of the Delaunay triangulation, so $|E|=O(N)$ in the planar case and generally $|E|\ll N^{2}$ in higher dimensions for non-adversarial data.
+
+The gap between the $O(N^{3})$ construction cost and the $O(N)$ – $O(N^{2})$ size of the resulting graph is precisely what motivates a parallel, memory-conscious construction strategy: work is heavily redundant across candidate pairs (each requiring an independent scan of $N-2$ points) but the eventual output is small and sparse.
+
+## 3.2 The SIMT Execution Model
+
+CUDA organizes computation into a grid of thread blocks; each block contains threads grouped into warps of 32 threads that execute the same instruction stream in lock-step (Single Instruction, Multiple Threads, SIMT) (NVIDIA Corporation, 2025). Performance is maximized when threads within a warp follow the same control-flow path (avoiding warp divergence) and when global memory accesses are coalesced. Concurrent writes to shared memory locations are protected with atomic operations (e.g., atomicAdd, atomicOr, atomicMin), which guarantee indivisible read-modify-write semantics at the cost of potential serialization when many threads contend for the same address (NVIDIA Corporation, 2025).
+
+Gabriel graph construction maps naturally onto this model: each candidate pair $(i,j)$ can, in principle, be assigned to an independent thread, with no data dependency between threads other than read-only access to the (immutable) point set. The remainder of this paper addresses how to organize that mapping efficiently.
+
+## 4 Parallel Construction Strategies
+
+## 4.1 Naive Parallelization and the Indexing Problem
+
+A direct GPU translation of Gabriel graph construction launches one thread per candidate pair $(i,j)$ , $i<j$ , and has each thread evaluate Eq. (1). The number of candidate pairs is
+
+ $T=\binom{N}{2}=\frac{N(N-1)}{2}.$ 
+
+(2)
+
+The immediate difficulty is indexing: CUDA launches a one-dimensional (or low-dimensional) grid of threads, each receiving a linear global index $k\in[0,T-1]$ ; the thread must recover the pair $(i,j)$ that $k$ represents. Materializing a lookup table of size $T=O(N^{2})$ defeats the purpose of an efficient implementation, since it alone can exceed available GPU global memory for large $N$ (e.g., $N=30{,}000$ already gives $T\approx 4.5\times 10^{8}$ pairs).
+
+## 4.2 Implicit Index Mapping $k\mapsto(i,j)$ 
+
+We derive a closed-form inverse of the standard row-major enumeration of the strict upper triangle of the $N\times N$ pair matrix,
+
+ $(0,1),(0,2),\dots,(0,N-1),\;(1,2),(1,3),\dots,(1,N-1),\;\dots,\;(N-2,N-1),$ 
+
+so that every thread can compute its own $(i,j)$ in constant time and constant memory, using only $N$ and its own index $k$ .
+
+Row $i$ contains $L_{i}=N-i-1$ valid pairs. The number of pairs enumerated strictly before row $i$ is
+
+ $P(i)=\sum_{r=0}^{i-1}(N-r-1)=\frac{N(N-1)}{2}-\frac{(N-i)(N-i-1)}{2}.$ 
+
+(3)
+
+Index $k$ belongs to the (unique) row $i$ satisfying $P(i)\leq k<P(i+1)$ . Solving this quadratic inequality for $i$ in closed form gives
+
+ $i=N-2-\left\lfloor\frac{\sqrt{-8k+4N(N-1)-7}}{2}-0.5\right\rfloor.$ 
+
+(4)
+
+The column index then follows directly from the offset within row $i$ :
+
+ $j=k-\left(\frac{N(N-1)}{2}-\frac{(N-i)(N-i-1)}{2}\right)+i+1.$ 
+
+(5)
+
+Equations (4)–(5) let every thread invert its linear index $k$ into a vertex pair $(i,j)$ using a handful of arithmetic operations and one square root – no auxiliary memory, and no per-thread branching that would introduce warp divergence.
+
+Example 1.
+
+For $N=5$ , $T=10$ and the enumeration is
+
+ $\begin{array}[]{c|ccccc}&0&1&2&3&4\\
+\hline\cr 0&-&(0,1)_{0}&(0,2)_{1}&(0,3)_{2}&(0,4)_{3}\\
+1&&-&(1,2)_{4}&(1,3)_{5}&(1,4)_{6}\\
+2&&&-&(2,3)_{7}&(2,4)_{8}\\
+3&&&&-&(3,4)_{9}\\
+4&&&&&-\end{array}$ 
+
+For $k=5$ , Eq. (4) gives $i=3-\lfloor\sqrt{33}/2-0.5\rfloor=3-\lfloor 2.37\rfloor=1$ , then $P(1)=4$ and Eq. (5) gives $j=1+1+(5-4)=3$ , correctly recovering the pair $(1,3)$ .
+
+To guard against 64-bit overflow when $N$ is large, all index arithmetic (grid sizing, $T$ , and the intermediate terms of Eqs. (4)–(5)) is carried out using 64-bit integer/floating-point types.
+
+## 4.3 Two-Pass Construction with Bitmask Compaction
+
+Even without materializing an index table, naively allocating one flag per candidate pair still costs $O(N^{2})$ memory if a full byte (or worse, a 32-bit int) is used per flag. We instead use a two-pass, bitmask-compacted scheme:
+
+1. 
+
+Pass 1 – Marking. Each thread evaluates Eq. (1) for its pair $(i,j)$ (recovered via Eqs. (4)–(5)). If the pair satisfies the Gabriel condition, the thread sets a single bit in a global bitmask using atomicOr, reducing flag storage by a factor of 32 relative to one int per pair, and increments a global counter with atomicAdd to determine the exact number of valid edges.
+
+2. 
+
+Intermediate allocation. The host reads the counter and allocates exactly the memory required for the dense edge list (and, if needed, the associated edge weights).
+
+3. 
+
+Pass 2 – Compaction. Threads re-scan the bitmask; for every set bit, an atomic increment on a write-cursor determines that edge’s position in the dense output array, which is then populated.
+
+This scheme keeps peak GPU memory proportional to the number of candidate pairs only during the (cheap, bit-packed) marking pass, and proportional to $|E|$ thereafter – the true asymptotic footprint of the graph. All device vectors are managed through the Thrust library (thrust::device_vector), and intermediate buffers are explicitly released (shrink_to_fit) as soon as they are no longer needed, which is important because subsequent stages (noise filtering, classification, or clustering) may need to allocate further structures on the same device.
+
+## 4.4 Thread Coarsening
+
+Mapping exactly one candidate pair to one thread maximizes available parallelism but also maximizes the number of threads that must be created, scheduled and retired, which introduces overhead that is not always amortized by useful work – especially for the many pairs, per warp, that fail the Gabriel test early. We therefore evaluate thread coarsening (Magni et al., 2014): each thread is assigned a contiguous block of $c$ candidate pairs (indices $k,k+1,\dots,k+c-1$ under the mapping of Eqs. (4)–(5)), amortizing per-thread overhead and improving data locality, at the cost of a coarser and potentially less balanced distribution of work across the device. Figure 2 sketches the expected trade-off: execution time can fall as $c$ grows (overhead amortization dominates), reach a minimum, and rise again as load imbalance across threads dominates. Section 6.3 measures whether this holds in practice.
+
+Figure 2: Schematic illustration of the thread-coarsening trade-off in Gabriel graph construction: very fine granularity is dominated by kernel-launch and scheduling overhead, while very coarse granularity is dominated by load imbalance across threads. An intermediate “sweet spot” minimizes total execution time; measurements on two datasets, where the optimum turns out to be dataset-dependent, are reported in Section 6.3.
+
+## 4.5 Summary of the Construction Pipeline
+
+Algorithm 1 summarizes the full GPU construction pipeline combining implicit indexing, coarsening and two-pass compaction.
+
+Algorithm 1 GPU Gabriel graph construction with coarsening $c$ 
+
+ 1:
+
+ point set $\{x_{i}\}_{i=1}^{N}$ on device, coarsening factor $c$ 
+
+ 2:
+
+ dense edge list $E$ 
+
+ 3:
+
+ $T\leftarrow N(N-1)/2$ $\triangleright$ Eq. (2), 64-bit
+
+ 4:
+
+ allocate bitmask $B$ of $\lceil T/32\rceil$ words; zero-initialize; allocate counter $\gamma\leftarrow 0$ 
+
+ 5:
+
+ for each thread $t$ in parallel do $\triangleright$ Pass 1: marking
+
+ 6:
+
+   for $k=t\cdot c$ to $\min((t+1)c,T)-1$ do
+
+ 7:
+
+     $(i,j)\leftarrow$ invert $k$ via Eqs. (4)–(5)
+
+ 8:
+
+    if Eq. (1) holds for $(i,j)$ then
+
+ 9:
+
+      atomicOr $(B[k/32],1\ll(k\bmod 32))$ 
+
+ 10:
+
+      atomicAdd $(\gamma,1)$ 
+
+ 11:
+
+    end if
+
+ 12:
+
+   end for
+
+ 13:
+
+ end for
+
+ 14:
+
+ allocate dense array $E$ of size $\gamma$ on host readback of $\gamma$ ; reset write-cursor $w\leftarrow 0$ 
+
+ 15:
+
+ for each thread $t$ in parallel do $\triangleright$ Pass 2: compaction
+
+ 16:
+
+   for $k=t\cdot c$ to $\min((t+1)c,T)-1$ do
+
+ 17:
+
+    if bit $k$ of $B$ is set then
+
+ 18:
+
+       $p\leftarrow$ atomicAdd $(w,1)$ 
+
+ 19:
+
+       $(i,j)\leftarrow$ invert $k$ ;   $E[p]\leftarrow(i,j)$ 
+
+ 20:
+
+    end if
+
+ 21:
+
+   end for
+
+ 22:
+
+ end for
+
+ 23:
+
+ return $E$ 
+
+## 5 Applications
+
+To validate the parallelization strategies of Section 4, we apply them to two Gabriel-graph-based algorithms: an existing large-margin classifier and a new clustering method.
+
+## 5.1 Accelerating a Gabriel-Graph Large-Margin Classifier
+
+NN-clas (Arias-Garcia and others, 2024) is a large-margin classifier that (i) builds the Gabriel graph of the labeled training set; (ii) applies a quality-based filtering step (Garcia et al., 2015) that removes noisy vertices whose neighborhood quality $q(x_{i})=|\hat{G}r(x_{i})|/|Gr(x_{i})|$ falls below the class-wise average threshold; (iii) rebuilds the Gabriel graph on the filtered vertex set and extracts the support edges $E_{S}$ ; and (iv) classifies a new sample $x$ by a 1-nearest-neighbor rule restricted to the endpoints of $E_{S}$ (the “border vertices”), rather than the full training set. Because both graph-construction passes (steps i and iii) dominate the algorithm’s cost, they are the ones accelerated with the pipeline of Section 4; filtering and border-vertex classification remain comparatively cheap, embarrassingly-parallel, per-vertex operations executed on the GPU without further modification.
+
+## 5.2 A Gabriel-Graph Clustering Algorithm
+
+Building on the intuition that short Gabriel edges reflect strong local connectivity while long edges tend to bridge distinct clusters, we propose a clustering algorithm that runs entirely on the GPU, avoiding host–device transfers once the graph has been built. It proceeds in four stages:
+
+1. 
+
+Automatic threshold via the elbow heuristic. Edge weights (Euclidean distances) are sorted (thrust::sort). Treating the sorted weights as a curve, a straight line is drawn between its first and last point, and a parallel kernel computes, for every point, its perpendicular distance to that line; the point of maximum distance is taken as the “elbow” and defines the cut threshold $T_{\text{corte}}$ (Thorndike, 1953).
+
+2. 
+
+Residual graph. Edges with weight $w\leq T_{\text{corte}}+\varepsilon$ are kept via GPU stream compaction (thrust::copy_if with zipped iterators); longer edges are dropped from the initial connectivity structure but retained in memory for the merging stage.
+
+3. 
+
+Parallel Union–Find. Connected components of the residual graph are computed with a GPU parallel Union–Find: a hook kernel processes residual edges in parallel and merges trees using atomicMin on the parent labels (the higher-ID root becomes a child of the lower-ID root, resolving write conflicts deterministically), followed by a path-compression kernel that flattens every label to point directly at its root. The two kernels alternate until no label changes.
+
+4. 
+
+Hierarchical merge (optional). If the number of connected components exceeds a user-specified target $K$ , the algorithm repeatedly (a) finds, via a parallel reduction over all original Gabriel edges (including those dropped in step 2), the minimum-weight edge that still connects two distinct components, and (b) relabels every point of the absorbed component to the surviving label, until exactly $K$ components remain or no inter-component edge exists.
+
+This design keeps the entire clustering pipeline – from graph construction to final labels – resident on the GPU, and requires no density radius or minimum-points parameter (unlike DBSCAN); when a target $K$ is not supplied, the algorithm reports the number of clusters implied by the elbow-selected threshold.
+
+## 6 Experimental Results
+
+## 6.1 Setup
+
+Two hardware configurations were used. For the sequential-versus-parallel classifier comparison: an AMD Ryzen 3 2200G CPU, an NVIDIA RTX 4070 Ti GPU (12 GB VRAM, 7680 CUDA cores), 16 GB RAM, Linux Mint 21.3, nvcc 11.5, G++-9, C++17. For the clustering validation, in order to test a more demanding hardware configuration: an AMD Ryzen 9 7900 (12 cores, 24 threads) CPU, an NVIDIA RTX 5070 Ti GPU (16 GB VRAM), 64 GB RAM, Ubuntu 24.04.3 LTS, nvcc 13.0. All timings isolate kernel and algorithmic execution time; host–device transfer overhead is not the focus of this study, since our goal is to characterize the relative acceleration and efficiency of the parallel kernels themselves.
+
+## 6.2 Sequential vs. Parallel Graph-Based Classification
+
+Table 1 reports execution time, speedup, accuracy, and F1-score for NN-clas on 14 public datasets (sizes 72–1372 samples, 3–60 features), comparing a sequential CPU baseline against the GPU pipeline of Section 4 (one candidate pair per thread, i.e., coarsening factor $c=1$ ). Figure 3 visualizes the same data on a logarithmic scale.
+
+Table 1: Execution time, speedup, accuracy and F1-score: sequential vs. GPU-parallel Gabriel-graph classifier.
+
+Dataset
+ $N$ 
+Feat.
+Seq. (s)
+Par. (s)
+Speedup
+Acc.
+F1
+
+Australian
+690
+14
+10.3789
+0.0026
+ $3933.8\times$ 
+0.8487
+0.8250
+
+BankNote
+1372
+4
+15.1423
+0.0022
+ $6882.5\times$ 
+0.9978
+0.9970
+
+Breast Cancer
+683
+9
+4.4336
+0.0019
+ $2333.8\times$ 
+0.9648
+0.9730
+
+BreastHess
+133
+30
+0.4752
+0.0009
+ $558.6\times$ 
+0.7879
+0.8510
+
+Bupa
+345
+6
+0.5933
+0.0008
+ $742.1\times$ 
+0.5916
+0.5360
+
+Climate
+540
+18
+23.4760
+0.0064
+ $3665.6\times$ 
+0.8870
+0.9380
+
+Diabetes
+768
+8
+5.5789
+0.0021
+ $2656.6\times$ 
+0.7474
+0.7980
+
+German
+1000
+24
+93.3308
+0.0110
+ $\mathbf{8484.6\times}$ 
+0.7120
+0.7780
+
+Golub
+72
+50
+0.1709
+0.0007
+ $237.4\times$ 
+0.7732
+0.8280
+
+Haberman
+306
+3
+0.3409
+0.0006
+ $532.6\times$ 
+0.6431
+0.7520
+
+Heart
+270
+13
+1.1135
+0.0010
+ $1080.1\times$ 
+0.8222
+0.8360
+
+ILPD
+579
+10
+2.3315
+0.0012
+ $1942.6\times$ 
+0.6028
+0.6960
+
+Parkinsons
+195
+22
+0.5699
+0.0008
+ $759.9\times$ 
+0.8045
+0.8740
+
+Sonar
+208
+60
+3.4717
+0.0014
+ $2548.3\times$ 
+0.7355
+0.6870
+
+Figure 3: Execution time of Gabriel-graph-based classification, sequential (CPU) vs. GPU-parallel construction, log scale. Speedups range from $237\times$ (Golub, $N=72$ ) to $8484\times$ (German, $N=1000$ ).
+
+Speedup tends to grow with problem size, from $237\times$ on the smallest dataset (Golub, $N=72$ , dominated by kernel-launch and host–device overhead) to $8484\times$ on German ( $N=1000$ , 24 features), the highest in the table. Accuracy and F1-score of the parallel implementation match the sequential baseline in every case (differences are within numerical noise), confirming that the atomic-based compaction and bitmask marking introduce no correctness loss. In absolute terms, execution time drops from the range of seconds – in one case, over 90 seconds – to low milliseconds, which is the difference between an offline-only method and one usable in near-real-time pipelines.
+
+## 6.3 Effect of Thread Coarsening
+
+We swept the coarsening factor $c$ (pairs per thread, in powers of two) on two larger public datasets: Diabetes ( $N\approx 100{,}000$ clinical records; $c\in\{1,2,4,\dots,65536\}$ ) and Internet Firewall Data ( $N\approx 65{,}000$ network-traffic records, from the UCI Machine Learning Repository; $c\in\{1,2,4,\dots,1024\}$ ). The two datasets behave differently.
+
+On Diabetes, the trade-off sketched in Figure 2 appears clearly. Execution time decreases from $c=1$ to a minimum at roughly $128$ – $512$ pairs per thread, about $15\%$ below the $c=1$ time, consistent with the amortization of per-thread creation and scheduling overhead over more comparisons. Beyond that optimum the time increases again, exceeds the $c=1$ time for $c\gtrsim 8192$ , and is largest at $c=65536$ , roughly $35\%$ above $c=1$ . This is the pattern expected when coarser blocks are unevenly sized in useful work, so that some streaming multiprocessors finish early and idle while others are still processing their (larger, or Gabriel-condition-heavy) blocks.
+
+On Internet Firewall Data, in contrast, execution time increases with $c$ over the whole range tested: the best configuration is $c=1$ , and $c=1024$ is roughly $40\%$ slower. The run-to-run variability is large relative to the differences between neighboring values of $c$ , so only the overall trend should be read from this curve. We did not investigate the cause; plausible factors are the dimensionality of the data and the density of Gabriel edges (i.e., how often the early-exit condition in Eq. (1) triggers), which change the per-pair cost and its variance across threads.
+
+These measurements agree with the general thread-coarsening principle of Magni et al. (2014) that the best granularity depends on the workload: for Gabriel graph construction, one pair per thread is not always optimal (Diabetes), but neither is a large per-thread batch, and coarsening can also bring no benefit at all (Firewall). We therefore recommend tuning $c$ empirically per dataset rather than fixing it a priori. The speedups in Table 1 use $c=1$ and therefore do not include any gain from coarsening.
+
+## 6.4 Clustering Quality
+
+We evaluated the Gabriel-graph clustering algorithm of Section 5.2 against $K$ -means and DBSCAN on 14 datasets (7 synthetic 2-D sets with non-convex structure – e.g., Spiral, Fullmoon, Halfkernel – and 7 real UCI datasets with 214–30,000 samples and up to 57 features), using five internal validity indices: Silhouette, Davies–Bouldin, Calinski–Harabasz, Dunn, and Xie–Beni (Ezugwu and others, 2022). Two regimes were tested: an automatic regime, in which the elbow-selected threshold alone determines the number of clusters, and a $K$ -optimized regime, in which the hierarchical merge stage forces convergence to the ground-truth number of classes.
+
+Across both regimes, a consistent pattern emerges. On variance-based indices that are biased toward convex, equal-radius clusters (Silhouette, Calinski–Harabasz), $K$ -means is statistically superior, as expected given its explicit minimization of within-cluster variance. On the Dunn index, which rewards true topological separation and is sensitive to non-convex structure, the proposed method is statistically indistinguishable from DBSCAN (average rank $1.69$ vs. $1.73$ in the $K$ -optimized regime, both significantly better than $K$ -means under a Friedman test with Nemenyi and Bonferroni–Dunn post-hoc analysis at $\alpha=0.05$ ) while requiring no density-radius hyperparameter. The hierarchical merge stage materially improves the method’s behavior on cohesion-oriented metrics: on Silhouette and Davies–Bouldin, the $K$ -optimized variant becomes statistically indistinguishable from $K$ -means (Bonferroni–Dunn critical difference $\mathrm{CD}=0.8472$ ), correcting the over-fragmentation observed under the purely automatic regime. These results indicate that a Gabriel-graph clustering method, made computationally tractable by the GPU construction pipeline of Section 4, is a viable density-aware alternative to DBSCAN for non-convex cluster shapes, at negligible additional hyperparameter cost.
+
+## 7 Discussion and Limitations
+
+The results support two related claims. First, the $O(N^{3})$ cost that has historically limited Gabriel-graph methods to small or medium datasets is not an intrinsic obstacle but an artifact of sequential execution: because the empty-hypersphere test is independent across candidate pairs, a GPU implementation combining implicit pair indexing and bitmask-compacted two-pass construction reduces execution time by two to nearly four orders of magnitude with no loss of downstream accuracy (Table 1, measured with $c=1$ ); thread coarsening can reduce it further on some datasets, but not on all. Second, once construction is fast, the Gabriel graph becomes a practical building block not only for classification (as in NN-clas) but also for density-aware clustering, where it is competitive with DBSCAN on the Dunn index while avoiding an explicit density-radius parameter.
+
+Several limitations should be noted. The reported speedups compare a single-threaded CPU baseline to a single-GPU implementation on hardware with a substantial theoretical performance gap between host and device, which the community’s convention (and our stated intent to isolate parallel-kernel efficiency) accepts but which should be kept in mind when transferring absolute speedup numbers to other hardware pairings; a multi-threaded CPU baseline (e.g., OpenMP) would narrow the reported gap while leaving the qualitative conclusions unchanged. The clustering method’s hierarchical merge stage relies on a global minimum-weight-edge search per merge step, which, while GPU-parallel, adds sequential dependency across merge iterations and could itself be a target for further optimization (e.g., a parallel priority structure). Finally, the largest datasets used for the coarsening study ( $N\approx 10^{5}$ ) already produce several billion candidate pairs ( $T\approx 5\times 10^{9}$ for $N=10^{5}$ ); scaling further, into the range where the bitmask itself exceeds single-GPU memory, would require a multi-GPU or out-of-core extension of the pipeline described here.
+
+## 8 Conclusion
+
+We presented a set of GPU parallelization strategies for constructing the Gabriel graph – implicit constant-time pair indexing, two-pass bitmask-compacted edge construction, and thread coarsening – and showed that, applied to a Gabriel-graph large-margin classifier, they reduce execution time by up to $8484\times$ relative to a sequential CPU baseline across 14 public datasets, without any loss of classification accuracy. Because the same accelerated construction is reusable across tasks, we further proposed a new GPU-native clustering algorithm that filters the Gabriel graph by an automatically detected elbow threshold, extracts connected components via a parallel Union–Find, and optionally merges components hierarchically to reach a target cluster count; this method is statistically competitive with DBSCAN on the Dunn cluster-validity index while requiring no density-radius hyperparameter. Taken together, these results indicate that GPU acceleration removes the main practical obstacle – cubic-time construction – that has historically confined Gabriel-graph methods to small datasets, opening them up to time-sensitive, large-scale applications such as real-time medical diagnosis and network intrusion detection.
+
+Future work includes multi-GPU and out-of-core extensions for datasets whose candidate-pair bitmask exceeds single-device memory, energy-efficiency characterization of the proposed kernels, alternative automatic cut-selection criteria beyond the elbow heuristic (e.g., statistically motivated thresholds), and a systematic comparison against multi-threaded CPU baselines to isolate the contribution of GPU parallelism from that of parallelism in general.
+
+## Acknowledgments
+
+This work is derived from an undergraduate thesis conducted in the Department of Computing and Systems, Federal University of Ouro Preto (UFOP), Brazil.
+
+## References
+
+Arias-Garcia et al. (2024)
+J. Arias-Garcia et al.
+
+Improved design for hardware implementation of graph-based large margin classifiers for embedded edge computing.
+
+IEEE Transactions on Neural Networks and Learning Systems 35 (1), pp. 1320–1329.
+
+Cited by: item 4,
+§1,
+§2,
+§3.1,
+§5.1.
+
+Çolhak et al. (2025)
+F. Çolhak et al.
+
+Accelerating IoV intrusion detection: benchmarking GPU-accelerated vs CPU-based ML libraries.
+
+arXiv preprint arXiv:2504.01905.
+
+External Links: Link
+
+Cited by: §2.
+
+Cormen et al. (2001)
+T. H. Cormen, C. E. Leiserson, R. L. Rivest, and C. Stein
+
+Introduction to algorithms.
+
+2nd edition, MIT Press.
+
+Cited by: §2.
+
+Eon et al. (2021)
+W. Eon et al.
+
+Deep learning with GPUs.
+
+In Advances in Computers, S. Kim and G. C. Deka (Eds.),
+
+Vol. 122, pp. 167–215.
+
+Cited by: §2.
+
+Ezugwu et al. (2022)
+A. E. Ezugwu et al.
+
+A comprehensive survey of clustering algorithms: state-of-the-art machine learning applications, taxonomy, challenges, and future research prospects.
+
+Engineering Applications of Artificial Intelligence 110, pp. 104743.
+
+Cited by: §2,
+§6.4.
+
+Gabriel and Sokal (1969)
+K. R. Gabriel and R. R. Sokal
+
+A new statistical approach to geographic variation analysis.
+
+Systematic Zoology 18 (3), pp. 259–278.
+
+External Links: Document
+
+Cited by: §1,
+§2,
+§3.1.
+
+Garcia et al. (2015)
+L. P. F. Garcia, A. C. P. L. F. de Carvalho, and A. C. Lorena
+
+Effect of label noise in the complexity of classification problems.
+
+Neurocomputing 160, pp. 108–119.
+
+External Links: Document
+
+Cited by: §1,
+§2,
+§5.1.
+
+Hanriot et al. (2024)
+V. M. Hanriot, L. C. B. Torres, and A. P. Braga
+
+Multiclass graph-based large margin classifiers: unified approach for support vectors and neural networks.
+
+IEEE Transactions on Neural Networks and Learning Systems.
+
+External Links: Document
+
+Cited by: §1,
+§2.
+
+Jain (2010)
+A. K. Jain
+
+Data clustering: 50 years beyond $K$ -means.
+
+Pattern Recognition Letters 31 (8), pp. 651–666.
+
+Cited by: §2.
+
+Magni et al. (2014)
+A. Magni, C. Dubach, and M. O’Boyle
+
+Automatic optimization of thread-coarsening for graphics processors.
+
+In Proceedings of the 23rd International Conference on Parallel Architectures and Compilation Techniques (PACT),
+
+pp. 455–466.
+
+Cited by: §2,
+§4.4,
+§6.3.
+
+Matula and Sokal (1980)
+D. W. Matula and R. R. Sokal
+
+Properties of Gabriel graphs relevant to geographic variation research and the clustering of points in the plane.
+
+Geographical Analysis 12 (3), pp. 205–222.
+
+External Links: Document
+
+Cited by: §1,
+§2.
+
+Nickolls et al. (2008)
+J. Nickolls, I. Buck, M. Garland, and K. Skadron
+
+Scalable parallel programming with CUDA.
+
+In ACM SIGGRAPH 2008 Classes,
+
+External Links: Document
+
+Cited by: §1.
+
+NVIDIA Corporation (2025)
+NVIDIA Corporation
+
+CUDA C++ programming guide.
+
+Note: Version 13.0. https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+
+Cited by: §3.2.
+
+Owens et al. (2008)
+J. D. Owens, M. Houston, D. Luebke, S. Green, J. E. Stone, and J. C. Phillips
+
+GPU computing.
+
+Proceedings of the IEEE 96 (5), pp. 879–899.
+
+Cited by: §1,
+§2.
+
+The GGClassification Contributors (2020)
+The GGClassification Contributors
+
+GGClassification: Gabriel graph based large-margin classifiers.
+
+Note: R package. https://rdrr.io/cran/GGClassification/
+
+Cited by: §2.
+
+Thorndike (1953)
+R. L. Thorndike
+
+Who belongs in the family?.
+
+Psychometrika 18 (4), pp. 267–276.
+
+Cited by: §2,
+item 1.
+
+Zhang et al. (2023)
+Y. Zhang et al.
+
+A GPU-based computational framework that bridges neuron simulation and artificial intelligence.
+
+Nature Communications 14, pp. 5798.
+
+Cited by: §2.

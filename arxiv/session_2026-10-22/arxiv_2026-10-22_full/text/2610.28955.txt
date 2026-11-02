@@ -1,0 +1,968 @@
+## SLoSa: Small, Low-Power, and Safe Foundation Models for Robotic Task Planning
+
+Weizhe Xu
+
+Email: wxu3@nd.edu
+
+Jialiang Fan
+
+Email: jfan5@nd.edu
+
+Essien Taylor
+
+Affiliation: University of Notre Dame  Northwestern University
+
+Email: zwang58@nd.edu
+
+Zijun Wang
+
+Email: fkong@nd.edu
+
+Russell Joseph
+
+Affiliation: University of Notre Dame  Northwestern University
+
+Email: etaylor@u.northwestern.edu
+
+Fanxin Kong
+
+Email: rjoseph@northwestern.edu
+
+Abstract
+
+Safe robotic task planning requires planners that can reliably achieve task goals while satisfying safety constraints.
+Classical planners search over explicit symbolic task representations and can
+provide formal guarantees with respect to encoded safety constraints, but require rigid input formats.
+Their computational cost also increases rapidly with the search space.
+In contrast, large language models (LLMs) offer flexible task interfaces and strong generalization capabilities, but they are large, power-hungry, and pre-trained with little robot-specific safety data and knowledge.
+Thus, they can be difficult to deploy locally on robotic systems with limited resources.
+To address these limitations, we present SLoSa, a neuro-symbolic compression and fine-tuning framework for training foundation-model-based robotic task planners with Small size, Low power demand, and Safety awareness.
+The framework first constructs a safety-aware dataset using classical planners, an advanced teacher LLM, and formal verifiers, followed by two training stages: supervised fine-tuning and reinforcement learning (RL) fine-tuning guided by a verification-based reward machine to enforce safety alignment.
+We evaluate SLoSa across four Planning Domain Definition Language (PDDL) domains, two household simulation environments, local edge platforms, and a desktop robotic arm.
+Across the PDDL tasks, verifier-guided post-training raises the success rate of compact 4B–14B planners to 70.5–76.0%, while INT4 deployment on a Jetson Orin requires 17.85–26.41 W of average power.
+Results in household simulators and on the physical robot further demonstrate the applicability of SLoSa across diverse robotic task settings.
+
+## I Introduction
+
+Robotic task planning converts a high-level goal into an executable sequence of actions [1].
+In safety-critical settings, reaching the goal is not enough: every intermediate state must also satisfy requirements such as ordering, mutual exclusion, and resource constraints [2, 3].
+A plan that eventually places an object correctly can still be unacceptable if it enters a restricted region, manipulates a fragile object in the wrong order, or violates a required inspection step.
+We therefore study safety-constrained task planning: generating plans that are executable and goal-reaching while satisfying explicit trajectory-level constraints.
+
+Classical planners offer a principled solution when a correct symbolic task specification is available.
+Systems such as Fast Downward and OPTIC search over states defined by action preconditions and effects [4, 5]; PDDL3 expresses trajectory constraints, and tools such as VAL check a candidate plan against the formal specification [6, 7].
+This formal structure provides an auditable safety criterion, but it comes with two practical costs.
+First, tasks in complicated environments can induce exponentially growing search spaces as the number of objects and planning horizon increase, making symbolic search difficult to scale [8].
+Second, users must provide rigid symbolic inputs and carefully engineered domain specifications.
+Imitation and reinforcement learning can amortize planning into compact policies [9, 10, 11, 12].
+However, learned policies are commonly tied to particular task distributions, and their outputs do not inherit a formal guarantee without an explicit specification and verifier.
+
+LLM planners offer a complementary strength: they can interpret high-level
+task descriptions and directly generate candidate action
+sequences [13, 14].
+Recent systems ground language into symbolic specifications or integrate LLMs
+with planners and formal verifiers [15, 16, 17].
+An inference-time verifier can reject an invalid plan
+and prompt the model to revise it [18, 19].
+However, this process leaves the base planner unchanged, so repeated failures
+increase token usage, latency, and computation.
+Moreover, general-purpose LLMs can be too large for memory- and power-limited
+robot computers.
+These limitations motivate a planner that combines safety-aware plan
+generation, compact local inference, and flexible task interfaces.
+
+We introduce SLoSa, a neuro-symbolic post-training framework for this combination.
+Rather than keeping the verifier only in the inference loop, SLoSa uses formal feedback to change the compact planner itself.
+First, SLoSa constructs behavior-changing safety-aware training data by retaining planning instances in which the supplied constraint rejects the baseline plan while a verified alternative remains feasible.
+Second, compression-aware supervised fine-tuning (SFT) adapts compact, quantized LLMs using the verified plans.
+Third, verifier-guided Group Relative Policy Optimization (GRPO) refines the planner with a reward hierarchy that separates unparseable outputs, precondition violations, safety violations, goal failures, and successful plans.
+At inference, SLoSa combines local plan generation with verifier feedback to enforce the supplied safety constraints while reducing the tokens spent on iterative repair.
+
+We evaluate SLoSa using three compact open-source LLM backbones across four PDDL domains that cover manipulation, transportation, object transfer, and tool use, together with separately trained planners for safety-adapted VirtualHome and ALFWorld to evaluate the applicability of the same post-training pipeline beyond PDDL-based planning.
+The results show consistent improvements from safety-aware post-training
+across model sizes, task domains, and input representations.
+We further evaluate local inference on an NVIDIA RTX 4080 and a Jetson Orin,
+and demonstrate the complete vision-grounded planning pipeline on a desktop
+6-degree-of-freedom (6-DoF) robotic arm.
+Our contributions are summarized as follows:
+
+• 
+
+We introduce SLoSa, a neuro-symbolic post-training framework that
+improves compact LLM planners through behavior-changing safety-aware data
+construction, compression-aware supervised fine-tuning, and
+verifier-guided GRPO.
+
+• 
+
+We construct safety-constrained evaluation tasks spanning four PDDL planning domains and two adapted household simulation benchmarks, with formally verified plans and task-specific trajectory constraints.
+
+• 
+
+We conduct extensive experiments across multiple model sizes, task
+domains, and input representations, showing consistent improvements from
+safety-aware post-training. We further validate local edge deployment,
+verifier-guided inference, and physical robotic-arm execution.
+
+## II Related Work
+
+Classical, learned, and neuro-symbolic task planning.
+Classical planners search over explicit task representations and can validate a plan against its goals and constraints [4, 5, 6, 7].
+Their explicit semantics make failures interpretable, but formal specification construction is labor-intensive, and tasks in complicated environments can induce exponentially growing search spaces as the number of objects and the planning horizon increase [8].
+Imitation learning and reinforcement learning instead learn policies or search guidance from demonstrations and interaction [9, 10, 11, 12].
+But they are generally optimized for a specific training distribution.
+SLoSa adopts this general direction but uses symbolic planners and validators primarily as sources of training supervision, while a compact neural model generates the initial plan at deployment.
+
+LLM planning with formal grounding and runtime assurance.
+LLMs have been used to generate actions, select skills, and translate natural-language requests into planning specifications [13, 14].
+LIMP grounds open-ended robot instructions into symbolic representations from which verifiable behaviors can be synthesized [15], while
+[16, 17] translate language into syntactically valid temporal logic for downstream motion planning.
+Other systems retain a verifier in the inference loop: ISR-LLM translates natural-language tasks into PDDL and iteratively refines long-horizon plans, while the Safety Chip enforces LTL constraints around an LLM-driven agent [18, 19].
+These approaches provide important assurance at the interface between language and execution, but a weak base planner can still require repeated generation and verification.
+SLoSa instead uses formal validation during post-training to improve the first-pass plan quality of the compact planner itself.
+At deployment, the resulting planner can still be paired with an ISR-style verifier and repair loop, retaining formal guarantees for validator-accepted plans while reducing regeneration tokens.
+
+Safety post-training and compact deployment.
+Quantization and parameter-efficient fine-tuning reduce the memory and adaptation cost of LLMs [20, 21, 22, 23], but compression alone does not optimize satisfaction of task-level safety constraints.
+SafeGen-LLM uses verified PDDL supervision to improve safety generalization across properties, domains, and input formats [24].
+SLoSa studies a complementary question: whether verifier knowledge can be transferred into small, low-power LLM planners that improve safe plan generation with lower memory use and less dependence on repeated repair.
+
+## III Preliminaries
+
+Safety-constrained robotic task planning.
+We consider a high-level robotic planning problem
+ $P=(S,A,s_{0},G,C)$ ,
+where $S$ is the symbolic state space, $A$ is the action set, $s_{0}$ is the
+initial state, $G$ is the goal, and $C$ is the set of safety constraints.
+Each action $a\in A$ has preconditions $\mathrm{Pre}(a)$ and effects
+ $\mathrm{Eff}(a)$ , and represents a high-level robot skill such as pick,
+move, or place.
+
+A plan is a finite action sequence $\tau=[a_{1},\ldots,a_{T}]$ .
+A plan is executable, denoted by $\mathrm{Exec}(\tau)$ , if
+ $s_{i-1}\models\mathrm{Pre}(a_{i})$ for all $i=1,\ldots,T$ .
+If $\mathrm{Exec}(\tau)$ holds, applying the action effects induces a complete
+trajectory
+ $\rho(\tau)=(s_{0},s_{1},\ldots,s_{T})$ .
+For an executable plan, goal achievement and safety are defined as
+ $\mathrm{Goal}(\tau)\iff s_{T}\models G,\mathrm{Safe}(\tau)\iff\rho(\tau)\models C.$ 
+
+PDDL3 constraints and plan verification.
+We represent symbolic planning problems using PDDL and encode hard safety
+requirements as PDDL3 trajectory constraints.
+A PDDL3 domain defines predicates and actions, whereas a problem specifies
+objects, the initial state, the goal, and trajectory constraints.
+
+Given a generated output, the verifier applies its checks in a fixed order,
+and the first failed check determines the outcome.
+An output that cannot be parsed or contains undefined actions or objects is a
+format error.
+A parsed plan that violates an action precondition is a
+precondition violation.
+Only after obtaining a complete executable trajectory does the verifier
+evaluate $C$ ; an executable plan that violates $C$ is a
+safety violation.
+A safe and executable plan is a goal failure if it does not reach $G$ ,
+and a success otherwise.
+This ordered procedure assigns exactly one category to every output and is
+used for training data filtering, reward design, and evaluation.
+
+SLoSa objective.
+SLoSa stands for Small size, Low power demand, and Safety awareness.
+Here, safety awareness means compliance with the formal task specification defined above, while low-power operation is an empirical deployment objective rather than an assumed property.
+The goal of SLoSa robotic task planning is to train a compact LLM planner that generates safety-compliant plans with low deployment and inference cost.
+
+## IV SLoSa
+
+SLoSa is a neuro-symbolic compression and fine-tuning framework for safety-constrained robotic task planning.
+It trains compact, quantized LLM planners using formally verified supervision and reward signals.
+As shown in Figure 1, SLoSa has three stages.
+First, it constructs safety-aware training data using classical planners, teacher models, and formal validators.
+Only plans that pass formal validation are used as positive training targets.
+Second, it applies SFT to compact and quantized LLMs using verified plans.
+The model takes PDDL, structured text, or natural language as input and outputs a grounded action sequence.
+Third, it applies verifier-guided GRPO, where formal verification gives error categories and classical planning gives progress signals for dense reward design.
+Together, these stages use symbolic planning and verification to guide neural model compression and fine-tuning, so the final planner is easier to deploy and more likely to generate safety-compliant plans.
+
+Fig. 1: 
+Overview of SLoSa.
+Classical planners, teacher models, and a formal verifier construct safety-aware data.
+Student LLMs are trained by SFT and then refined by GRPO with verifier-based rewards.
+
+## IV-A Safety-Aware Training Data Construction
+
+The first stage of SLoSa constructs behavior-changing, safety-constrained
+training instances for SFT and GRPO.
+We use four robotics-inspired PDDL domains: Blocksworld, Ferry, Grippers, and
+Spanner, covering manipulation, transportation, object transfer, and tool use.
+
+For each base problem $P_{0}$ , a classical planner generates a baseline plan
+ $\tau_{0}$ , which is verified as executable and goal reaching.
+We then introduce a domain-grounded PDDL3 constraint $c$ to obtain a
+constrained problem $P_{c}$ .
+The constraint is derived from the domain semantics and the actions and objects
+appearing in the task, following one of the four patterns summarized in
+Table I.
+For example, in Spanner, an ordering constraint requiring nut1
+to be tightened before nut2 is encoded as
+(sometime-before (tightened nut2) (tightened nut1)).
+A plan that tightens both nuts in the reverse order may still reach the
+task goal, but violates the inserted trajectory constraint.
+
+TABLE I: Safety patterns used to construct behavior-changing constraints.
+
+Pattern
+
+PDDL3 construct
+
+Robotic interpretation
+
+Ordering safety
+
+sometime-before
+
+A required event must precede another event.
+
+Staging safety
+
+sometime, sometime-before
+
+The robot must pass through a safe intermediate state.
+
+Resource restriction
+
+always, not
+
+Unsafe, reserved, or faulty resources cannot be used.
+
+Mandatory inspection
+
+sometime
+
+The robot must visit a checkpoint or complete an inspection.
+
+A planner then solves $P_{c}$ to obtain an alternative plan $\tau_{c}$ .
+Let $V(P,\tau)$ denote the verifier outcome for plan $\tau$ under problem $P$ .
+We retain an instance only if 
+ $V(P_{0},\tau_{0})=V(P_{c},\tau_{c})=\mathrm{success}$ 
+and
+ $V(P_{c},\tau_{0})=\mathrm{safety\ violation}$ .
+Thus, the added constraint invalidates the baseline plan while preserving a
+verified alternative, ensuring that the constraint changes the required
+planning behavior rather than acting as a decorative condition.
+We therefore refer to the retained instances as behavior-changing.
+This definition is relative to the selected baseline plan $\tau_{0}$ and does
+not imply that the formal specification captures every real-world hazard.
+
+We assign each constrained problem a difficulty level solely according to the length of its verified plan, denoted by $d(P_{c})=\operatorname{bin}(|\tau_{c}|)$ .
+The Easy, Medium, and Hard levels therefore differ only in planning-horizon length.
+
+This measure represents the effective planning horizon under the safety
+constraint rather than difficulty inferred from problem-size parameters.
+
+Each constrained problem $P_{c}$ is converted into task prompts using PDDL or template-generated natural language.
+The prompt is paired with the verified constrained plan $\tau_{c}$ as a positive
+SFT example and is used without a target plan during GRPO.
+For 20% of the constrained problems, a teacher model (GPT-5.4-mini) generates additional
+candidate plans to increase demonstration diversity.
+These plans are retained only if they receive a success label from the same
+formal verifier.
+
+Across the dataset, we use three input formats: PDDL, structured natural language, and narrative natural language.
+Each constrained problem contributes one PDDL prompt and one natural-language prompt rendered in either structured or narrative form.
+These representations preserve the same underlying symbolic problem while exposing the planner to different task interfaces.
+
+## IV-B Compression-Aware Supervised Fine-Tuning
+
+The safety-aware dataset provides verified plans, but the pretrained compact models do not know the required planning format, action semantics, or safety-constrained behavior.
+We therefore use SFT as the first training stage.
+The goal is to give the compact planner a strong initialization before GRPO, so that it can generate parseable and executable plans that are close to the verified constrained plans.
+
+Given a positive training set
+ $\mathcal{D}_{+}=\{(x_{i},\tau_{i})\}_{i=1}^{N}$ ,
+where $x_{i}$ is a task prompt constructed from a constrained planning problem
+and $\tau_{i}$ is its verifier-accepted plan, we minimize
+
+ $\mathcal{L}_{\text{SFT}}(\theta)=-\frac{1}{N}\sum_{i=1}^{N}\log p_{\theta}(\tau_{i}\mid x_{i}).$ 
+
+The target final output is always a grounded action sequence, with one action per line.
+SFT uses only verifier-accepted plans as positive targets.
+To support the SLoSa objective, we fine-tune compact LLMs with quantization and parameter-efficient adapters.
+The base model is loaded in low precision, and only the adapter parameters are trained.
+
+## IV-C Verifier-Guided GRPO
+
+SFT learns from verified target plans but does not directly learn from the
+model’s own failures.
+We therefore refine the SFT model using GRPO, with the formal verifier serving
+as a programmatic reward function.
+This avoids training a separate reward model or critic.
+
+For each prompt group $g$ , the current policy samples $K$ candidate plans
+ $\{\tau_{g,1},\ldots,\tau_{g,K}\}$ .
+The verifier assigns each candidate one of the five mutually exclusive
+outcomes defined in Section III and computes a scalar
+reward $r_{g,i}=r(x_{g},\tau_{g,i})$ .
+
+Verifier-guided reward.
+Format errors receive a fixed reward of $-1$ , while successful plans receive
+ $1$ .
+For precondition violations, safety violations, and goal failures, we define
+negative reward intervals $I_{c}=[\ell_{c},h_{c}]$ satisfying
+
+ $\displaystyle-1<\ell_{\mathrm{pre}}\leq h_{\mathrm{pre}}<\ell_{\mathrm{safe}}\leq h_{\mathrm{safe}}<\ell_{\mathrm{goal}}\leq h_{\mathrm{goal}}<0.$ 
+
+We order the reward intervals according to the verification pipeline and failure severity.
+A precondition violation cannot produce a complete execution trace, while, among executable plans, a safety violation is treated as more severe than a safe plan that fails only to reach the goal.
+
+Planner-based progress distinguishes candidates within the same failure
+category.
+For each evaluation state, we construct a residual planning problem by replacing the original initial state with the evaluation state while retaining the same action model and goal.
+A classical planner configured for shortest-plan search then solves the residual problem.
+For a precondition violation, the evaluation state is the state before the failed action.
+For a safety violation, it is the first state at which the violation is detected, or the terminal state for constraints evaluated over the complete trajectory.
+For a goal failure, it is the terminal state.
+We define $d_{\mathrm{init}}$ as the length of the shortest plan from the
+original initial state to the goal and $d_{\mathrm{res}}$ as the length of the
+shortest plan from the evaluation state to the goal:
+
+ $\phi_{\mathrm{dist}}=\frac{d_{\mathrm{init}}-d_{\mathrm{res}}}{d_{\mathrm{init}}+d_{\mathrm{res}}+\epsilon}.$ 
+
+A larger $\phi_{\mathrm{dist}}$ indicates greater progress toward the goal.
+If the classical planner cannot solve the residual problem within the time
+limit, we assign the lowest progress value.
+
+For a failure in category
+ $c\in\{\mathrm{pre},\mathrm{safe},\mathrm{goal}\}$ , the reward is
+
+ $r(x,\tau)=\ell_{c}+(h_{c}-\ell_{c})\frac{\phi_{\mathrm{dist}}+1}{2}.$ 
+
+The verifier determines the reward interval, while the classical-planner
+distance orders candidates only within that interval.
+We omit a plan-length term from successful plans because the objective is to
+increase validator acceptance rather than optimize plan cost.
+
+Active-group GRPO updates.
+For each prompt group $g$ , GRPO computes the normalized advantages
+
+ $A_{i}=\frac{r(x,\tau_{i})-\operatorname{mean}_{j}r(x,\tau_{j})}{\operatorname{std}_{j}r(x,\tau_{j})+\epsilon}.$ 
+
+If all rewards are identical, the group provides no relative preference signal
+and is marked inactive.
+Inactive groups are excluded from both the policy and KL terms.
+If a nominal step contains no active group, its optimizer and learning-rate
+scheduler updates are skipped, while the step counter and data cursor continue
+to advance.
+No additional candidates are sampled, preserving the data order and generation
+budget.
+
+Difficulty curriculum.
+GRPO uses the difficulty levels defined during data construction from the
+lengths of the verified constrained plans.
+Early training emphasizes problems with shorter plans, after which the
+proportion of medium and hard problems gradually increases.
+This curriculum allows the policy to first learn relative preferences over
+shorter planning horizons before training on longer ones.
+
+## V Experiments
+
+To evaluate the effectiveness and versatility of SLoSa across diverse robotic planning settings, we consider PDDL planning domains, household simulation benchmarks, and a real-world robotic arm.
+We further measure local deployment cost and conduct ablation studies of the
+safety-aware post-training pipeline.
+
+## V-A Experimental Setup
+
+PDDL tasks.
+We evaluate SLoSa on four robotics-inspired domains: Blocksworld, Ferry, Grippers, and Spanner.
+For each domain, we generate 250 constrained planning problems, each represented by one PDDL prompt and one natural-language prompt rendered in either structured or narrative form, yielding 500 prompt instances per domain.
+Across all domains, the SFT and GRPO sets each contain 1,000 prompts derived from disjoint sets of 500 underlying planning problems.
+Validation and test splits are also disjoint at the underlying problem level to avoid cross-format leakage.
+
+Models, training, and decoding.
+We study Qwen3-4B11
+ 1
+
+ unsloth/Qwen3-4B-unsloth-bnb-4bit,
+Llama-8B22
+ 2
+
+ unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit,
+and Qwen3-14B33
+ 3
+
+ unsloth/Qwen3-14B-unsloth-bnb-4bit.
+All models are loaded with 4-bit quantization and adapted using LoRA with rank
+32, scaling factor 64, and dropout 0.05.
+SFT uses a learning rate of $2\times 10^{-4}$ and an effective batch size of 8.
+GRPO uses fused AdamW with a learning rate of $1\times 10^{-5}$ , $\beta_{1}=0.9$ , $\beta_{2}=0.999$ , $\epsilon=10^{-8}$ , no weight decay, and a maximum gradient norm of 1.0.
+The learning rate decays linearly over 500 effective optimizer updates without warmup.
+Each nominal step contains four prompt groups, with $K=4$ candidate plans sampled per prompt at temperature 0.9 and a KL coefficient of 0.02.
+GRPO follows a three-stage easy-to-hard curriculum with Easy/Medium/Hard sampling ratios of $6/3/1$ , $1/6/3$ , and $1/3/6$ , over 125, 250, and 125 steps, respectively.
+Checkpoints are saved every 125 steps, and the checkpoint with the highest validation success is selected for evaluation.
+For verifier-guided rewards, we use
+ $I_{\mathrm{pre}}=[-0.9,-0.7]$ ,
+ $I_{\mathrm{safe}}=[-0.6,-0.4]$ , and
+ $I_{\mathrm{goal}}=[-0.3,-0.1]$ ;
+format errors and successful plans receive fixed rewards of $-1$ and $1$ , respectively.
+
+At evaluation, all models use greedy decoding without intermediate
+chain-of-thought output.
+Qwen3 thinking mode is disabled during both training and evaluation.
+The PT, SFT, and GRPO models share the same test split and output format.
+
+Household benchmarks.
+To test whether SLoSa applies beyond PDDL, we additionally use fully observed,
+non-interactive adaptations of VirtualHome [25] and
+ALFWorld [26]. For each benchmark, we construct a
+separate safety-aware training and test set.
+We match the dataset size and difficulty distribution to the PDDL setup.
+We then independently train the Qwen3-4B SFT and GRPO checkpoints from the same pretrained initialization.
+Each model must emit a complete plan without intermediate environment feedback
+or replanning. ALFWorld-FO-Safe exposes the complete symbolic state and is not
+the standard partially observed, interactive ALFWorld protocol.
+
+Metrics and reporting.
+We use the verifier-defined success rate as the primary metric and report the
+mutually exclusive failure outcomes for diagnosis.
+For deployment, end-to-end latency includes generation and parsing, whereas throughput measures decoding only.
+
+## V-B Planning Performance
+
+Table II reports the results on the current 200-instance PDDL evaluation.
+PT denotes the original pretrained compact backbone before SLoSa post-training. Because these models have not yet been adapted to the task-specific action vocabulary and strict output format, their failures are dominated by formatting or grounding errors. In contrast, the larger directly prompted LLMs more often produce parseable outputs, although many of their plans still fail the verifier.
+SFT produces the largest change from PT: success rises from 0% to 59.0–67%.
+GRPO then improves success to 70.5%, 74.0%, and 76.0% for the 4B, 8B, and 14B models, respectively.
+These consistent gains across model families and scales demonstrate that SLoSa
+improves the safety-constrained planning capability of compact LLMs.
+Directly prompted GPT-5.6 Sol and Claude Sonnet 5 achieve 26.5% and 31.0% success, respectively, showing that model scale alone does not replace safety-aware post-training on these formally constrained tasks.
+
+TABLE II: PDDL planning outcomes across post-training stages. Values are percentages over the current 200-instance test set; outcome columns are mutually exclusive. GPT and Claude models are evaluated by direct prompting, whereas the compact models are shown across their available post-training stages.
+
+Model
+Stage
+Success $\uparrow$ 
+Goal fail $\downarrow$ 
+Safety violation $\downarrow$ 
+Precondition violation $\downarrow$ 
+Format error $\downarrow$ 
+
+GPT-5.6 Sol
+Direct
+26.5
+0.0
+0.5
+73.0
+0.0
+
+Claude Sonnet 5
+Direct
+31.0
+3.5
+0.0
+55.5
+10.0
+
+Qwen3-4B
+PT
+0.0
+1.5
+0.0
+0.0
+98.5
+
+SFT
+59.0
+1.5
+0.5
+36.5
+2.5
+
+GRPO
+70.5
+1.5
+0.5
+25.0
+2.5
+
+Llama-8B
+PT
+0.0
+5.0
+0.0
+70.0
+25.0
+
+SFT
+62.0
+5.5
+1.0
+30.5
+1.0
+
+GRPO
+74.0
+7.5
+0.0
+18.0
+0.5
+
+Qwen3-14B
+PT
+0.0
+0.5
+0.0
+0.0
+99.5
+
+SFT
+67.0
+2.5
+0.0
+30.5
+0.0
+
+GRPO
+76.0
+1.5
+0.0
+22.0
+0.5
+
+Figure 2 provides a domain- and input-level breakdown of the Qwen3-4B results.
+The outcome distributions show that the benefits of post-training are consistent across the four PDDL domains, although Blocksworld remains the most challenging.
+The GRPO-refined model also achieves comparable performance across PDDL, structured natural language, and narrative natural language inputs, indicating robustness to different task representations.
+
+Fig. 2: Domain and input-format analysis of Qwen3-4B.
+Panel (a) compares the GRPO-refined model across PDDL, structured natural language (SNL), and narrative natural language (NNL) inputs.
+Panel (b) shows the distribution of outcomes for PT, SFT, and GRPO in each domain.
+
+## V-C Contribution of Safety-Aware Post-Training
+
+We isolate the contribution of safety-aware SFT data using Qwen3-4B.
+All variants use equally sized positive-only datasets and receive no
+contrastive negative examples.
+U-SFT uses unconstrained positive plans.
+OC-SFT uses constraint-compliant plans from a balanced mixture: in 50% of
+the problems, the constraint does not alter the nominal solution, while the
+remaining 50% are behavior-changing.
+BC-SFT uses only behavior-changing instances in which the constraint
+invalidates the nominal plan while preserving a verified alternative.
+All variants are trained using SFT alone, allowing the comparison to isolate
+the effect of safety-aware data composition without confounding from GRPO.
+
+We distinguish task completion from safety compliance using three metrics.
+Success requires a well-formed, executable, goal-reaching, and
+constraint-compliant plan.
+Goal reach counts well-formed and executable plans that reach the
+goal, regardless of constraint compliance.
+Conditional safety violation is the fraction of goal-reach outputs
+that violate at least one supplied safety constraint.
+
+TABLE III: Positive-only safety-aware data ablation on Qwen3-4B.
+Brackets report bootstrap 95% confidence intervals for success.
+
+Data
+
+Success
+(95% CI) $\uparrow$ 
+
+Goal
+reach $\uparrow$ 
+
+Cond. safety
+violation $\downarrow$ 
+
+U-SFT
+3.5% [1.7, 7.0]
+17.5%
+80.0%
+
+OC-SFT
+53.0% [46.1, 59.8]
+56.0%
+5.4%
+
+BC-SFT
+59.0% [52.1, 65.6]
+59.5%
+0.8%
+
+Constraint-aware supervision substantially improves success over U-SFT.
+Using behavior-changing instances further reduces unsafe goal-reaching plans,
+showing that the proposed data filtering teaches the model to change its
+planning behavior in response to safety constraints rather than merely imitate
+goal-reaching solutions.
+
+## V-D Applicability Across Planning Benchmarks
+
+We apply the same post-training pipeline separately to VirtualHome-Safe and ALFWorld-FO-Safe.
+Each row in Table IV uses a Qwen3-4B planner trained on benchmark-specific data; the comparison therefore tests whether SLoSa remains effective beyond PDDL domains.
+
+TABLE IV: Success (%) of separately trained Qwen3-4B planners on two
+household benchmarks. SFT and GRPO use benchmark-specific training data;
+each checkpoint generates one complete plan without intermediate feedback.
+
+Benchmark
+PT
+SFT
+GRPO
+
+VirtualHome-Safe
+0.0%
+74.5%
+80.5%
+
+ALFWorld-FO-Safe
+0.0%
+76.0%
+85.0%
+
+Across both benchmarks, SFT substantially improves planning success over the pre-trained model, while verifier-guided GRPO provides a further gain.
+These consistent trends show that the proposed post-training pipeline remains effective across planning benchmarks with different task representations and execution environments.
+
+Figure 3 presents representative
+safety-constrained problems constructed in VirtualHome-Safe and
+ALFWorld-FO-Safe.
+For each problem, the upper row shows the original baseline plan, which
+completes the task but violates the added safety constraint, whereas the lower
+row shows a safety-satisfying plan for the same task.
+The examples illustrate how the introduced constraints change the required
+planning behavior in both simulation environments.
+
+(a) VirtualHome-Safe
+
+(b) ALFWorld-FO-Safe
+
+Fig. 3: Representative safety-constrained planning problems in two embodied
+simulators.
+In each panel, the upper sequence shows the original baseline plan, which
+completes the task but violates the added safety constraint, whereas the lower
+sequence shows a safety-satisfying plan for the same task.
+The red box highlights the critical steps that cause the constraint violation.
+In panel (a), the task is to place the salmon in the refrigerator, with the
+refrigerator required to be opened before the salmon is picked up.
+In panel (b), the task is to place the clock and laptop on the table, with the
+laptop required to be placed before the clock.
+The examples assess high-level symbolic safety compliance rather than physical collision safety.
+
+## V-E Edge Deployment and Repair Cost
+
+We evaluate INT4 local inference on an NVIDIA RTX 4080 (16GB) and a NVIDIA Jetson AGX Orin Developer Kit (64GB)
+using batch size one and a single concurrent request.
+Each model is evaluated on the same 100 PDDL prompts over three runs, following
+20 warmup queries.
+Table V shows that all three compact planners fit and
+run locally on both devices.
+On the Jetson Orin, the models require 3.89–11.50 GB of peak memory and
+achieve 3.55–5.01 tokens/s while drawing 17.85–26.41 W on average.
+Llama-8B provides the lowest latency and highest throughput, whereas Qwen3-4B
+has the lowest memory, power, and energy requirements.
+These results demonstrate that SLoSa planners can be deployed entirely on
+resource-constrained edge hardware without cloud inference.
+
+TABLE V: INT4 local-inference efficiency on an RTX 4080 and a Jetson Orin.
+Latency includes generation and parsing, whereas throughput
+measures generation only.
+Energy per accepted plan divides the measured inference energy, including inter-request overhead, by the number of plans.
+Model loading, warmup, and validation energy are excluded.
+
+Hardware
+Model
+P50 (s)
+P90 (s)
+Tok./s
+Peak mem. (GB)
+Avg. power (W)
+Energy/ plan (J)
+
+RTX 4080
+Qwen3-4B
+6.65
+8.66
+11.73
+3.80
+71.16
+464.75
+
+Llama-8B
+6.01
+7.77
+13.19
+5.91
+88.14
+516.70
+
+Qwen3-14B
+8.03
+11.11
+9.77
+11.22
+122.90
+983.78
+
+Jetson Orin
+Qwen3-4B
+18.28
+23.53
+4.30
+3.89
+17.85
+316.33
+
+Llama-8B
+15.88
+20.01
+5.01
+6.06
+23.14
+355.18
+
+Qwen3-14B
+22.00
+30.04
+3.55
+11.50
+26.41
+581.14
+
+Figure 4 compares runtime scaling on 41 Blocksworld instances with 10–50 blocks.
+Fast Downward and OPTIC exhibit increasingly variable runtimes as the problem size grows, with many larger instances reaching the 300-s timeout.
+Some larger instances are solved faster because search difficulty depends on the specific initial and goal configurations, rather than only on the number of blocks.
+In contrast, GPT-5.6 Sol maintains comparatively stable generation time across the evaluated range.
+This comparison motivates combining efficient LLM-based plan generation with
+symbolic planning and formal verification, as pursued by SLoSa.
+
+Fig. 4: Runtime scalability on 41 Blocksworld instances with 10–50 blocks.
+Fast Downward and OPTIC show highly variable search times, while GPT-5.6 Sol
+maintains comparatively stable generation time.
+Markers distinguish valid plans from invalid/no-plan outcomes, and the dashed
+line denotes the 300-s timeout.
+
+We then insert the three Llama-8B checkpoints into
+SafePilot [3], which uses verifier feedback to repair
+rejected plans for at most three rounds.
+SafePilot improves final success while ensuring that only plans passing all
+verifier checks are accepted.
+Table VI further shows that SLoSa reduces the cost of this
+verification-guided repair: stronger post-training requires fewer iterations
+to obtain a verifier-accepted plan and consequently reduces token usage.
+
+TABLE VI: Verification-guided inference with SafePilot over the 200-instance
+test set and at most three rounds. Improvement is measured relative to first-pass
+success before repair. The iteration count includes the initial generation.
+
+Model
+Final succ. $\uparrow$ 
+Gain $\uparrow$ 
+Avg. iter. $\downarrow$ 
+Avg. tokens $\downarrow$ 
+
+PT
+0.5%
++0.5 pp
+2.995
+5185.81
+
+SFT
+68.0%
++6.0 pp
+1.735
+2179.52
+
+GRPO
+77.5%
++3.5 pp
+1.500
+1782.87
+
+## V-F Desktop Robot-Arm Demonstration
+
+The physical experiment implements Blocksworld using a desktop 6-DoF robotic
+arm and a third-person camera.
+Each task is specified by an image of the initial block configuration, an image
+of the desired goal configuration, and a natural-language description of the
+safety constraints.
+A vision-language model grounds these inputs into a safety-constrained PDDL3
+problem by extracting the objects, initial state, goal predicates, and safety constraints.
+Qwen3-4B SFT or GRPO then generates a high-level plan from the resulting symbolic specification.
+
+Before execution, we apply a SafePilot-style verifier-in-the-loop procedure.
+The formal verifier checks each candidate plan against the problem.
+If the plan is rejected, the verification feedback is returned to the planner
+for revision; only a verifier-accepted plan is passed to the robotic-arm
+controller, where symbolic actions are mapped to predefined manipulation
+skills.
+This workflow prevents invalid high-level action sequences from being sent
+directly to the robot, thereby reducing the risk of unsafe motions and damage.
+
+We evaluate each planner on 30 Blocksworld trials.
+Table VII reports verifier acceptance and physical
+completion separately.
+Verifier-rejected plans are never executed, while low-level failures denote cases in which a verifier-accepted plan cannot be completed because limited execution precision causes block-stacking failure or the resulting stack exceeds the robot arm’s reachable workspace.
+This experiment demonstrates the practical feasibility of deploying SLoSa as part of a complete high-level planning and verification pipeline in a real-world robotic environment.
+
+TABLE VII: Blocksworld results on the desktop robotic arm.
+Each planner is evaluated on 30 planning trials; only verifier-accepted
+plans are executed on the robot.
+
+Metric
+SFT
+Full GRPO
+
+Verifier-accepted plans (/30)
+17
+19
+
+Verifier-rejected plans (/30)
+13
+11
+
+Successful executions (/30)
+13
+14
+
+Low-level failures (/30)
+4
+5
+
+Fig. 5: Representative Blocksworld execution with the desktop robotic arm.
+From left to right: the initial state, a failed physical outcome caused by
+block-placement error, and a successful goal state.
+The physical failure results from limited manipulation precision rather
+than a violation of the encoded symbolic constraints.
+
+## VI Discussion and Limitations
+
+SLoSa uses symbolic planning and formal verification as sources of training feedback rather than as restrictions on the deployment interface.
+The resulting planners accept formal language, structured natural-language, and narrative natural-language inputs.
+By transferring formal planning feedback into compact LLMs while preserving flexible task interfaces, SLoSa addresses the gap identified in the
+Introduction: safety-aware planning, compact local inference, and flexible task
+inputs within a single framework.
+
+SLoSa focuses on high-level task planning.
+Its safety supervision is derived from symbolic action models and formal
+verifier outcomes, and the reported safety performance measures compliance
+with the corresponding high-level constraints.
+The evaluation does not cover perception errors, motion-level failures, or
+unmodeled physical risks.
+Long-horizon domains such as Blocksworld also remain challenging, and the
+desktop-arm evaluation uses one workcell and fixed low-level skills.
+Future work will study richer robotic tasks and tighter integration with
+perception, motion planning, and runtime safety mechanisms.
+
+## VII Conclusion
+
+We introduced SLoSa, a neuro-symbolic post-training framework for compact,
+safety-constrained robotic task planning.
+By using classical planners, a teacher LLM, and formal verifiers for training
+supervision, SLoSa improves executable, goal-reaching, and safety-compliant
+plan generation across model sizes, domains, and input formats.
+Results on household benchmarks, SafePilot integration, and local deployment
+further demonstrate applicability beyond PDDL and reduced inference overhead.
+Overall, SLoSa provides a practical way to combine flexible LLM-based plan generation with symbolic planning and formal verification.
+
+## References
+
+[1]
+
+H. Guo, F. Wu, Y. Qin, R. Li, K. Li, and K. Li, “Recent trends in task and motion planning for robotics: A survey,” ACM Computing Surveys, vol. 55, no. 13s, pp. 1–36, 2023.
+
+[2]
+
+S. K. Jha, S. Jha, P. Lincoln, N. D. Bastian, A. Velasquez, R. Ewetz, and S. Neema, “Neuro symbolic reasoning for planning: Counterexample guided inductive synthesis using large language models and satisfiability solving,” arXiv preprint arXiv:2309.16436, 2023.
+
+[3]
+
+W. Xu, M. Liu, S. Drager, M. Adderson, and F. Kong, “Assuring llm-enabled cyber-physical systems,” in ACM/IEEE International Conference on Cyber-Physical Systems. ACM/IEEE, 2024.
+
+[4]
+
+M. Helmert, “The fast downward planning system,” Journal of Artificial Intelligence Research, vol. 26, pp. 191–246, 2006.
+
+[5]
+
+J. Benton, A. Coles, and A. Coles, “Temporal planning with preferences and time-dependent continuous costs,” in Proceedings of the international conference on automated planning and scheduling, vol. 22, 2012, pp. 2–10.
+
+[6]
+
+A. Gerevini and D. Long, “Plan constraints and preferences in pddl3,” Technical Report 2005-08-07, Department of Electronics for Automation …, Tech. Rep., 2005.
+
+[7]
+
+R. Howey, D. Long, and M. Fox, “Val: Automatic plan validation, continuous effects and mixed initiative planning using pddl,” in 16th IEEE international conference on tools with artificial intelligence. IEEE, 2004, pp. 294–301.
+
+[8]
+
+M. Kwon, Y. Kim, and Y. J. Kim, “Fast and accurate task planning using neuro-symbolic language models and multi-level goal decomposition,” in 2025 IEEE International Conference on Robotics and Automation (ICRA). IEEE, 2025, pp. 16 195–16 201.
+
+[9]
+
+S. Choudhury, M. Bhardwaj, S. Arora, A. Kapoor, G. Ranade, S. Scherer, and D. Dey, “Data-driven planning via imitation learning,” The International Journal of Robotics Research, vol. 37, no. 13-14, pp. 1632–1672, 2018.
+
+[10]
+
+A. Mandlekar, C. R. Garrett, D. Xu, and D. Fox, “Human-in-the-loop task and motion planning for imitation learning,” in Conference on Robot Learning. PMLR, 2023, pp. 3030–3060.
+
+[11]
+
+K. Acharya, W. Raza, C. Dourado, A. Velasquez, and H. H. Song, “Neurosymbolic reinforcement learning and planning: A survey,” IEEE Transactions on Artificial Intelligence, vol. 5, no. 5, pp. 1939–1953, 2023.
+
+[12]
+
+Y. Jiang, F. Yang, S. Zhang, and P. Stone, “Task-motion planning with reinforcement learning for adaptable mobile service robots,” in 2019 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS). IEEE, 2019, pp. 7529–7534.
+
+[13]
+
+P. Jansen, “Visually-grounded planning without vision: Language models infer detailed plans from high-level instructions,” in Findings of the association for computational linguistics: Emnlp 2020, 2020, pp. 4412–4417.
+
+[14]
+
+A. Brohan, N. Brown, J. Carbajal, Y. Chebotar, X. Chen, K. Choromanski, T. Ding, D. Driess, A. Dubey, C. Finn et al., “Rt-2: Vision-language-action models transfer web knowledge to robotic control,” arXiv preprint arXiv:2307.15818, 2023.
+
+[15]
+
+B. Quartey, E. Rosen, S. Tellex, and G. Konidaris, “Verifiably following complex robot instructions with foundation models,” in 2025 IEEE International Conference on Robotics and Automation (ICRA). IEEE, 2025, pp. 1–8.
+
+[16]
+
+B. Rabiei, M. K. AR, Z. Dai, S. L. Pilla, Q. Dong, and N. Atanasov, “Ltlcodegen: Code generation of syntactically correct temporal logic for robot task planning,” in 2025 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS). IEEE, 2025, pp. 19 240–19 247.
+
+[17]
+
+Y. Wu, Z. Xiong, Y. Hu, S. S. Iyengar, N. Jiang, A. Bera, L. Tan, and S. Jagannathan, “Selp: Generating safe and efficient task plans for robot agents with large language models,” in 2025 IEEE International Conference on Robotics and Automation (ICRA). IEEE, 2025, pp. 2599–2605.
+
+[18]
+
+Z. Zhou, J. Song, K. Yao, Z. Shu, and L. Ma, “Isr-llm: Iterative self-refined large language model for long-horizon sequential task planning,” in 2024 IEEE International Conference on Robotics and Automation (ICRA). IEEE, 2024, pp. 2081–2088.
+
+[19]
+
+Z. Yang, S. S. Raman, A. Shah, and S. Tellex, “Plug in the safety chip: Enforcing constraints for llm-driven robot agents,” in 2024 IEEE International Conference on Robotics and Automation (ICRA). IEEE, 2024, pp. 14 435–14 442.
+
+[20]
+
+X. Zhu, J. Li, Y. Liu, C. Ma, and W. Wang, “A survey on model compression for large language models,” Transactions of the Association for Computational Linguistics, vol. 12, pp. 1556–1577, 2024.
+
+[21]
+
+K. Egashira, M. Vero, R. Staab, J. He, and M. Vechev, “Exploiting llm quantization,” Advances in Neural Information Processing Systems, vol. 37, pp. 41 709–41 732, 2024.
+
+[22]
+
+A. Chavan, Z. Liu, D. Gupta, E. Xing, and Z. Shen, “One-for-all: Generalized lora for parameter-efficient fine-tuning,” arXiv preprint arXiv:2306.07967, 2023.
+
+[23]
+
+Y. Li, Y. Yu, C. Liang, N. Karampatziakis, P. He, W. Chen, and T. Zhao, “Loftq: Lora-fine-tuning-aware quantization for large language models,” in International Conference on Learning Representations, vol. 2024, 2024, pp. 13 409–13 424.
+
+[24]
+
+J. Fan, W. Xu, M. Liu, O. Sokolsky, I. Lee, and F. Kong, “Safegen-llm: Enhancing safety generalization in task planning for robotic systems,” arXiv preprint arXiv:2602.24235, 2026.
+
+[25]
+
+X. Puig, K. Ra, M. Boben, J. Li, T. Wang, S. Fidler, and A. Torralba, “Virtualhome: Simulating household activities via programs,” in 2018 IEEE/cvf conference on computer vision and pattern recognition. IEEE, 2018, pp. 8494–8502.
+
+[26]
+
+M. Shridhar, X. Yuan, M.-A. Côté, Y. Bisk, A. Trischler, and M. Hausknecht, “Alfworld: Aligning text and embodied environments for interactive learning,” arXiv preprint arXiv:2010.03768, 2020.

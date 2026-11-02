@@ -1,0 +1,3798 @@
+## Robustness of Internal Signals for Hallucination Detection in Vision-Language Models
+
+Allison Chen
+
+Email: allisonchen@princeton.edu
+
+William Yang
+
+Email: williamyang@princeton.edu
+
+Salma Abdel Magid
+
+Email: sabdelmagid@princeton.edu
+
+Jonathan Williams
+
+Email: jw4199@princeton.edu
+
+Olga Russakovsky
+
+Email: olgarus@princeton.edu
+
+Esin Tureci
+
+Email: esin.tureci@princeton.edu
+
+Department of Computer Science
+
+Affiliation: Princeton University, Princeton, NJ 08544
+
+Abstract
+
+When given an image and a text prompt, vision-language models (VLMs) can produce seemingly sophisticated text responses.
+However, they are also prone to hallucinate objects in their output, which can have detrimental consequences in safety-critical applications.
+To detect these hallucinations, certain methods interestingly leverage internal signals from the VLM as it generates the text response; potentially, these methods use the same signals that led to a hallucination to detect it.
+We conduct an in-depth analysis to understand the robustness of these detection methods.
+First, we show that a naive baseline of a generated word’s token position in the VLM text response achieves competitive performance.
+Further, we reveal how some detection methods rely on token position and use this heuristic as a shortcut.
+Second, we explore detection methods’ sensitivity to language and vision modalities.
+Our experiments suggest that strong detection performance is often driven by detecting language-based hallucinations, and when methods rely on token position, they tend to be less visually grounded and exhibit reduced robustness when hallucinations occur earlier in a text response.
+Lastly, we demonstrate that different detection methods can carry complementary signals; when ensembling methods together, adding weaker methods to an ensemble of higher performing ones still offers performance improvements.
+Altogether, while there may be useful internal VLM signals to detect hallucinations, our investigation reveals important limitations of the current methods that try to leverage them.
+
+## 1 Introduction
+
+While vision-language models (VLMs) are increasingly used for a wide variety of visual understanding tasks [14, 41], they are known to hallucinate,
+generating plausible sounding text responses that are incorrect or inconsistent with the given image [38, 12].
+These hallucinations are especially problematic when VLMs are deployed in high-stakes contexts (e.g., healthcare, law, or autonomous driving) [49, 75, 64, 48], spurring the need for solutions that can detect hallucinations.
+
+While there are many approaches for detecting hallucinations including using external evaluators [31, 19, 52, 65] or sampling uncertainty estimates [35, 86, 15], a more computationally lightweight approach is to leverage signals from the VLM as it generates text [53, 29, 28, 55, 23].
+These methods may be preferred for real-time applications because unlike the others, they do not require additional memory or computation beyond the VLM’s forward pass.
+However, since these methods appear to be using the same signals that lead to hallucinations in the first place, it is important to understand their robustness beyond what standard evaluations reveal.
+
+In this work, we aim to understand whether internal signal-based detection methods use reliable cues that enable robust generalization or simply depend on surface-level heuristics.
+Our work goes one step beyond the standard evaluation paradigm of reporting metrics (e.g., AUROC or AUPRC) on large datasets [17, 53, 52, 18] to understand the underlying mechanisms of these methods.
+To provide a comprehensive analysis, we study both “white box” methods that leverage internal signals [53, 29, 28, 55], such as representation embeddings or attention matrices, alongside “black box” methods that rely solely on output logits [90, 45, 12].
+Specifically, our analyses center on the original setting the methods were designed for: detecting object hallucinations in image-captioning tasks.
+
+Concretely, our work primarily reveals that the token position of a word in the VLM-generated caption can play a surprising role in detection methods leveraging internal VLM signals.
+We first introduce a token position heuristic as a competitive hallucination detector (§ 4.1) and show that many white box methods rely on token position for detection to varying degrees (§ 4.2).
+Second, we explore how detection methods leverage different modalities (i.e., language and vision).
+We find that white box methods perform well by detecting language-based hallucinations (§ 5.1), but highly token position-dependent methods can be independent of visual signals, suggesting they may make predictions agnostic to the image (§ 5.2).
+We then demonstrate the brittleness of token position-dependent methods by showing a concrete setting where token position-dependent methods are not reliable detectors (§ 5.3) and performance drops to near random chance.
+Lastly, to encourage future work improving these methods, we use progressive ensembles to demonstrate that black box detection methods can provide complementary signals to higher performing white box methods, contributing a relative $7.6\%$ increase in an ensemble’s AUPRC performance (§ 6).
+This suggests that one possible avenue for future work to overcome token position biases may be to combine signals from multiple methods.
+Altogether, our work reveals insights regarding the robustness of hallucination detection methods leveraging a VLM’s internal signals beyond standard benchmarks.
+We hope this work encourages further in-depth analyses and careful development of error detection tools to ensure high robustness before being deployed.
+
+## 2 Related Work
+
+## 2.1 Hallucinations in Vision Language Models
+
+Broadly, a VLM is said to hallucinate when it generates text that is inaccurate or inconsistent with a provided image [38, 12, 28, 90, 20].
+Initial VLM hallucination works primarily focused on object hallucinations where objects are not in the image but mentioned in the caption [57, 29, 43, 53].
+More recent works have expanded to include a variety of hallucinations, such as attributes, relations between objects [90, 84, 89, 70, 77], or broadly, any type of inaccuracy [55, 52, 71].
+
+To further study hallucinations, it is common to develop novel benchmarks, expanding the scope of evaluation settings.
+For example, some works evaluate different visual tasks such as image captioning [57, 30, 24, 71, 54, 6] or visual question-answering [20, 7, 66, 21, 67, 25].
+Others focus on evaluating VLM hallucinations in different response types, such as open-ended [15, 66, 57, 42], binary or multiple choice questions [20, 18, 33], and even conversational dialogue [51, 7].
+In this work, we focus on object hallucinations in image captioning settings because it provides the clearest ground-truth labels and aligns with prior work on the detection methods we study.
+
+## 2.2 Detecting Hallucinations in VLMs
+
+While both detecting and mitigating hallucinations is important, we focus on detection methods because hallucinations are unlikely to be mitigated altogether, given the statistical nature of VLMs [4].
+We elaborate on prior works in detecting hallucinations here and describe mitigation works in § E.
+
+In our work, we focus on methods that detect hallucinations using the VLM’s signals as it generates text.
+These detection methods are advantageous for practical applications because they do not require external evaluators, training, or multiple passes of the VLM; in short, they are computationally lightweight.
+They compute hallucination scores for every generated text token and can be grouped into two categories: “black box” and “white box” [12].
+Black box methods rely on the VLM’s text or logit (i.e., pre-softmax) outputs [90, 45] while white box methods require internal image and/or text representations [55, 28, 53] or attention patterns [29, 23].
+While black box methods do not require access to model internals, white box methods tend to perform better, presumably due to their access to richer signals.
+
+Beyond these single-pass internal signal-based methods, others tend to require external evaluators or multiple passes.
+For example, external evaluators can detect hallucinations in captions directly [31, 19, 84, 30, 9, 71, 76, 69] or compare the consistency of responses across multiple text generations [35, 15, 84]. Some require fine-tuning large vision or language models [52, 21, 17, 78, 8] or training a lightweight classifier on VLM signals [65, 87, 1, 47].
+Methods requiring multiple passes include contrastive decoding [32, 74, 88] which requires two forward passes to calculate logit differences between the original and modified inputs and semantic entropy which computes scores based on multiple sampling trajectories [35, 86, 15].
+We exclude these methods from our analysis because they do not solely rely on a VLM’s internal signals as it generates the caption.
+
+Developing practical and effective hallucination detection methods requires a comprehensive understanding of their behavior, but the predominant evaluation paradigm can only offer limited insight.
+Works tend to report standard detection performance metrics (e.g., AUROC, AUPRC) over a large dataset [53, 28, 29, 86, 65, 52, 35] where white box methods are presented as a clear forerunner over black box [53, 28, 29, 23].
+However, this setup does not consider what signals may drive white box methods’ performance.
+Our work aims to provide a more holistic and thorough understanding regarding how white box detection methods work; we reveal novel insights that standard evaluations conceal, such as dependencies on token position heuristics.
+
+## 3 Experimental Setup
+
+In this section, we first describe the seven hallucination detection methods we study: two are black box, relying only on the caption-generating VLM’s output logits, and the remaining five are white box, accessing the model’s internal signals.
+Then, we provide an overview of our experimental setting, namely the framework, metrics, and VLMs analyzed.
+
+## 3.1 Hallucination Detection Methods
+
+All the selected detection methods can output a hallucination score for every text token generated by the VLM.
+We directionally align methods such that higher scores correspond to higher likelihood of hallucination, compute scores for multi-token objects by using the first token [29, 53], and only evaluate the first occurrence of a word in the caption [53, 55].
+Here we describe each method at a high level; for details and mathematical formulations, see § A.1 or the original works.
+
+Black box methods. The two black box methods we evaluate are Negative Log Likelihood (NLL) [90] and Entropy (Ent) [45].
+NLL is the negative log likelihood of a generated token and Ent is the entropy of the token’s generation output probability distribution.
+
+White box methods. The five white box methods are Internal Confidence (IC) [28], Contextual Lens (CL) [55], Global-Local Similarity (GLSim) [53], Summed Visual Attention Ratio (SVAR) [29], and Prelim Attention Score (PAS) [23].
+IC [28] is based on how well the generated object can be predicted from just the image patch representations with Logit Lens [50].
+CL [55] identifies hallucinations using cosine similarity between the image patches and a generated text token’s representations.
+GLSim also leverages cosine similarity between representations, but computes a weighted average
+of a generated token’s “global” similarity with the last prompt token and “local” similarity with image patches.
+Lastly, SVAR and PAS leverage attention patterns; SVAR sums the attention from a generated token to the image patches and PAS sums attention from a generated token to previously generated caption tokens.
+
+## 3.2 Framework, Metrics, and Models
+
+We evaluate methods on their ability to detect object hallucinations in image captioning tasks.
+This is to reproduce prior methods and fairly compare them in the settings they were developed in [53, 29, 28, 12, 3].
+To do so, we use the CHAIR framework [57].
+Given a caption and an image with object-level annotations, CHAIR uses string-based text matching to determine what objects in the caption are hallucinated.
+While this framework is widely used, it has limitations such as being context-independent (further described in § B.1).
+To avoid known systematic noise in our main results, we filter out objects that were consistently flagged incorrectly (i.e., “orange” mis-flagged as an object when it frequently refers to the color).
+However, we show that our results are robust to CHAIR labeling noise in § D.6 and § D.5.
+Our analyses report threshold-less metrics of AUROC (Area Under the Receiver Operating Characteristic Curve) and AUPRC (Area Under the Precision-Recall Curve) which is particularly informative under large class imbalances, as with hallucinations.
+While these are similar metrics to standard evaluation settings, our analyses importantly differs by revealing previously inaccessible properties about the analyzed detection methods.
+
+Our primary analysis is conducted on $5,000$ randomly selected images from the MSCOCO 2014 validation set [36], following prior work [28, 29, 53, 23].
+We expand existing works [29, 28, 53, 23] by conducting our analyses over six diverse open-source VLMs: LLaVA-1.5-7B [39], LLaVA-1.5-13B [39], InstructBLIP-7B [13], Qwen3VL-8B-Instruct [2], InternVL2-8B [10], and Gemma-4-E4B-it [62].
+See § A.2 for further setup and hyperparameter details.
+In our main paper, we primarily report results with LLaVA-1.5-13B; results for other VLMs can be found in § C.
+To demonstrate the robustness of our results, we additionally conduct generalization experiments in § D, such as with newer VLMs (Qwen3.5-9B [56] and InternVL3.5-8B [73]), and on a second dataset, Objects365 [59].
+
+## 4 The Role of Token Position in Hallucination Detection
+
+In uncovering the driving signals behind internal signal-based detection methods, we reveal three key observations regarding the role of an object’s token position in a VLM’s caption.
+First, we find that token position, derived separately from the content of both the reference image and generated caption, serves as a surprisingly competitive baseline.
+Second, we observe that many top-performing white box methods exhibit a strong correlation with token position, calling into question whether they rely on this positional cue.
+Lastly, we demonstrate that in fact a number of white box methods depend on token position shortcuts, suggesting they may not leverage reliable internal signals or grounded visual reasoning.
+We further present how these results are generalizable across datasets, prompts, seeds, and labeling noise in (§ D).
+
+## 4.1 Token Position is a Surprisingly Strong Baseline
+
+Previous work revealed that hallucinations by VLMs are more likely to occur in later token positions [90, 34, 60, 16, 40, 70], which we also show in § C.1.
+One potential explanation is that VLMs begin to rely on the generated objects earlier in the caption to infer the existence of other, but incorrect, objects.
+To quantify how strongly this positional bias correlates with hallucination likelihood, we first establish a baseline detection method using token position alone.
+Concretely, for each object of interest, this heuristic is defined as the object’s first token position, beginning at the caption start.
+
+Figure 1: CL, GLSim, SVAR, and PAS are highly correlated with token position and each other.
+
+Surprisingly, we find that token position yields evaluation scores on par with state of the art white box methods, and normalizing by the caption length can push these metrics even higher, especially for LLaVA VLMs (Table 1).
+These results suggest that standardizing this “blind” baseline is crucial for calibrating the true difficulty of detecting hallucinations for a particular VLM.
+It can reveal whether a benchmark success requires deep internal signals or merely aligns with a positional bias.
+As a result, these findings urges caution when interpreting reported metrics that exclude this naive baseline.
+
+Table 1: Token position achieves evaluation scores on par with white box detection methods, despite being agnostic to the image and caption content.
+Across many VLMs, the token position heuristic achieves comparable AUROC (top) and AUPRC (bottom) to established detection methods, even achieving best or second best performance for certain VLMs.
+Token position is an object’s first token position in the caption, and normalized token position divides by the caption’s length.
+
+Metric
+Model
+
+Black Box
+White Box
+Heuristic
+
+Random
+NLL
+Entropy
+IC
+CL
+GLSim
+SVAR
+PAS
+Token Pos.
+
+Token Pos.
+
+(norm.)
+
+AUROC
+LLaVA-1.5-13B
+50.0
+72.2
+73.6
+74.8
+82.3
+82.8
+81.4
+83.4
+83.2
+84.6
+
+LLaVA-1.5-7B
+72.4
+73.4
+78.6
+79.3
+83.5
+81.1
+84.0
+83.4
+84.7
+
+InstructBLIP-7B
+81.1
+82.5
+88.1
+86.7
+86.3
+88.7
+89.1
+88.5
+88.7
+
+Qwen3VL-8B
+66.5
+68.5
+69.1
+67.4
+64.7
+79.3
+77.1
+73.9
+74.2
+
+InternVL2-8B
+64.3
+65.8
+77.1
+69.6
+79.2
+81.0
+78.8
+77.0
+77.8
+
+Gemma-4-E4B-it
+
+65.4
+67.3
+69.8
+53.9
+80.2
+76.2
+74.9
+72.2
+72.7
+
+Average
+50.0
+70.3
+71.9
+76.2
+73.2
+79.5
+81.3
+81.2
+79.7
+80.5
+
+AUPRC
+LLaVA-1.5-13B
+22.8
+44.7
+45.1
+50.4
+53.6
+54.4
+49.3
+51.4
+50.9
+56.3
+
+LLaVA-1.5-7B
+25.1
+47.2
+46.4
+57.5
+55.5
+60.7
+51.9
+56.5
+54.7
+59.8
+
+InstructBLIP-7B
+26.2
+61.0
+62.1
+73.1
+64.1
+64.9
+68.7
+69.3
+66.3
+67.9
+
+Qwen3VL-8B
+20.8
+35.7
+38.9
+38.2
+33.3
+30.4
+50.5
+44.0
+37.2
+39.1
+
+InternVL2-8B
+18.3
+30.4
+31.2
+43.5
+34.6
+44.9
+48.1
+39.8
+37.0
+41.2
+
+Gemma-4-E4B-it
+15.1
+27.0
+29.7
+25.6
+19.2
+40.5
+33.7
+31.1
+27.2
+29.7
+
+Average
+21.4
+41.0
+42.2
+48.1
+43.4
+49.3
+50.4
+48.7
+45.5
+49.0
+
+Next we investigate the performance trends of detection methods and the token position heuristic by computing the correlation of object-wise hallucination scores.
+As demonstrated in Fig. 1, four of the white box methods (CL, GLSim, SVAR, and PAS) exhibit high correlation with token position ( $\rho\geq 0.70$ , all $p<0.001$ ) and with one another ( $\rho\geq 0.69$ , all $p<0.001$ ), but not with IC or black box methods ( $\rho\leq 0.43$ , all $p<0.001$ ) (see § C.2 for additional results with other VLMs and qualitative examples).
+The high correlation of many white box methods with token position raises the question: are these methods simply using token position as a shortcut?
+
+## 4.2 Reliance of Detection Methods on Token Position
+
+To investigate the degree to which detection methods rely on token position as shortcut signal, we conduct a pair of interventions on the generated captions.
+The interventions aim to isolate the effect of an object’s token position on a detection method’s score while controlling for semantic influences.
+In the first intervention, for each object in a caption, we modify its token position by removing all complete sentences preceding it, recompute hallucination scores, and calculate the difference in scores from the original.
+This intervention effectively reduces the object’s token position; however, it also removes the semantic content of the preceding sentences.
+To control for this potential confound, we perform a similar intervention but replace the sentences with image-agnostic but task-relevant text and re-compute the difference in hallucination scores from the original.
+In short, both interventions remove or reduce semantic information but only the former changes token position significantly.
+If a detection method relies on token position, it will behave similarly to a token position heuristic in these interventions: hallucination scores decrease when the preceding text is removed and only change negligibly when it is replaced with uninformative text.
+See § C.3 for replacement sentences and further details.
+
+White Box Methods. We find that the white box methods that highly correlate with token position also depend on it, especially attention-based SVAR and PAS.
+As shown in Fig. 2, when preceding sentences of the caption are removed, white box scores decrease, resembling the change in token position score.
+This holds for all white box methods evaluated except IC, as expected since it leverages only image representations and is agnostic to text representations.
+For other white box methods, after accounting for the effect of preceding semantic information (i.e., the change in score with the replacement intervention), token position accounts for approximately 20%, 67%, 93% and 98% of CL, GLSim, SVAR, and PAS’s decrease in scores respectively.
+These results suggest that most white box methods rely on token position cues to some degree, revealing robustness limitations that current evaluation settings conceal.
+Conducting this analysis with other VLMs in § C.3 shows similar trends for white box methods, especially attention-based methods SVAR and PAS.
+We further demonstrate robustness of these results across newer VLMs, datasets, prompts, and context-aware labeling in § D.
+
+Black Box Methods.
+We observe that token position has an inverse effect on black box methods: when an object’s token position decreases, black box methods either do not change or score it as more likely to be hallucinated.
+While Ent seems to be more sensitive to information than token position, roughly 46%
+of NLL’s increase in mean hallucination score can be attributed to token position alone.
+We hypothesize the inverse effect can be attributed to sensitivity to training objectives like perplexity that measure how well a token “fits” the preceding context
+(see § C.3 for more details).
+Although black box methods do not seem to rely on token position like white box methods, these results suggest they still exhibit some sensitivity to language-based cues.
+
+Figure 2: Our experiments can reveal when white box methods (CL, GLSim, SVAR, PAS) demonstrate a reliance on token position.
+These four methods resemble behavior of the token position heuristic, especially attention-based methods: SVAR and PAS.
+On the other hand, black box methods tend to behave in the opposite direction.
+We only examine objects in sentence 5+ of the caption to ensure sufficiently long preceding context.
+Scores are normalized by mean and standard deviation to be on the same scale.
+Error bars represent 95% confidence intervals. 
+
+## 5 Token Position-dependent Methods are not Robust Predictors
+
+Having established how certain white box detection methods highly rely on a token position shortcut,
+we explore how this reliance is reflected in a method’s visual grounding abilities and robustness to varying object hallucination patterns.
+First, we analyze how the hallucination modality source affects detection performance and find that white box methods’ competitive advantage arises from detecting language-prior induced hallucinations (§ 5.1).
+Next, we explore the extent to which white box methods are grounded in image signals (§ 5.2).
+We find that highly token position-dependent methods exhibit minimal grounding in image-based signals, suggesting they may depend on this heuristic in lieu of visual signals.
+Lastly, we demonstrate that token position is not a robust signal by presenting an example prompt setting that can lead token position-dependent methods to perform near random chance (§ 5.3).
+
+## 5.1 White Box Methods’ Competitive Advantage is from Language-based Hallucinations
+
+First, we aim to explore the degree to which the performance of white and black box methods are dependent on the source modality of the hallucination (i.e., language-based or not).
+We hypothesize that white box methods gain their competitive advantage over black box methods from detecting language-based hallucinations but not necessarily other hallucinations (e.g., an object is misrepresented in the image embeddings).
+We could see this behavior whether white box methods leverage rich visual signals or rely on language patterns like token position heuristics.
+Visually grounded methods could fail on non-language hallucinations because corrupted image signals would mislead detection methods.
+On the other hand, language heuristics would simply fail to detect hallucinations that do not arise from language generation or modeling patterns.
+
+To explore this hypothesis, we partition hallucinations into whether they are language-based or not and compare performance between white and black box methods on each partition separately.
+Following prior work, we determine which partition a hallucinated object belongs to by feeding the generated caption with a blank gray image into the VLM and examining whether the new predicted token for each hallucinated object is the same or not [85, 88, 16, 80].
+If the hallucination persists even when there is no image, the hallucination goes in the language-based partition because it is not dependent on the image and likely arises from language factors [85, 88, 16, 80].
+Otherwise, the hallucination cannot be strictly isolated to language sources.
+The other partition contains hallucinations sensitive to the image, and it primarily encompasses hallucinations from visual deficiencies (e.g., ambiguous visual representations or misalignment between vision and language [38, 12]).
+While the image-sensitive partition may contain some language hallucinations that are also influenced by the image, any performance differences between the partitions is likely to be driven by the introduction of vision-based errors.
+For further elaboration, see § C.4.
+
+As shown in Fig. 3, white box methods consistently outperform black box methods on language-based hallucinations but not on image-sensitive hallucinations.
+Specifically, on language-based hallucinations, all white box methods outperform black box methods by at least $+0.12$ and up to $+0.24$ on AUPRC.
+Interestingly, we also observe that token position can outperform black box methods, suggesting that detecting some language-based hallucinations may not always require access to image representations.
+On the other hand, on image-sensitive hallucinations, black box methods perform comparably to white box methods, outperforming some white box methods by up to $+0.12$ in AUPRC and even matching the performance of the best white box detection method.
+We observe similar trends across VLMs, as demonstrated in § C.4.
+These results suggest that white box methods are leveraging a signal that black box methods do not in order to detect language-based hallucinations.
+In the next section, we explore the extent to which this signal is visually grounded.
+
+Figure 3: The competitive advantage of white box methods stems from detecting language-based hallucinations.
+White box methods outperform black box methods on language-based hallucinations (left) but not on image-sensitive hallucinations (right).
+We report AUPRC as it is more sensitive than AUROC to performance on hallucinations.
+Black box methods are NLL and Ent, token position is in gray for reference, and horizontal dashed lines represent the random baseline, i.e., hallucination rate. 
+
+## 5.2 Token Position-dependent Methods Lack Visual Grounding
+
+One possible explanation for white box methods achieving strong performance on language-based hallucinations is that they appropriately leverage visual signals.
+This could enable them to cross validate the presence of an object in the image.
+However, given the reliance on token position shortcuts of some white box methods, it is unclear whether this is the case.
+
+We set out to examine the degree to which white box methods are grounded in image signals; to do so, we use the blank image replacement setup from § 5.1.
+This time, we evaluate each method’s detection performance with the original image compared to a blank one of the same size.
+Importantly, the captions and ground truth labels are derived from the original image to ensure consistency across the two settings.
+If a detection method is faithfully relying on image-based signals, then with the blank image, it should score all objects as likely to be hallucinated and performance should approach random chance (i.e., the hallucination rate).
+On the other hand, if a method ignores image-based signals, its performance would remain high when given a blank image.
+
+We observe in Fig. 4 that the detection methods that are dependent on token position tend to exhibit very little grounding in image-based signals, suggesting these methods are not visually grounded.
+Specifically, methods that are more dependent on token position (SVAR, PAS) retain the most performance in the blank image setting, whereas black box methods (NLL, Ent) and IC drop to or below random chance.
+Methods based on text and image similarity (CL, GLSim) fall somewhere in between.
+Without the image, NLL, Ent, and IC are no longer able to complete this hallucination detection task, suggesting these methods are responsive to changes in the image and to some extent, are desirably visually grounded.
+Similarly, CL and GLSim performance drops to just above random chance, suggesting a degree of visual grounding.
+On the other hand, the minimal change in SVAR and PAS’s performance suggests that these attention-based methods can depend on token position heuristics in lieu of image-based signals.
+In summary, white box methods that are less dependent on token position seem to leverage visual signals more than token position-dependent methods.
+While results generally hold for other VLMs (§ C.5), we observe few exceptions that suggest that depending on the VLM, some methods can be sensitive to both token position and visual signals simultaneously.
+The lack of visual grounding suggests that token position-dependent methods may not be robust predictors, which we further explore in the next section.
+
+Figure 4: Detection methods that depend on token position (i.e., SVAR, PAS for LLaVA-1.5-13B) exhibit less visual grounding than other detection methods.
+We compare detection method performance in AUPRC when using the original image (solid) compared to replacing the image with a blank gray image but retaining the original caption (hatched).
+A greater drop suggests greater grounding in visual signals, while negligible drops indicate little to no grounding in the image.
+
+## 5.3 Object Biases Lead Token Position to be an Unreliable Predictor
+
+If reliance on token position heuristics instead of visual signals leads to non-robust detectors, this raises a natural question: why can these methods still perform well across a variety of captioning settings, as in § D?
+One hypothesis is that their success arises in part from a correlation between object salience and a VLM’s generation order.
+When asked to describe an image, VLMs may be more likely to mention larger and more visually salient objects earlier.
+Meanwhile smaller, less salient objects are mentioned later, and because they are more difficult to recognize, they are more prone to hallucination.
+This induces a token-position signal that can serve as a reliable shortcut under standard captioning settings across datasets, generation seeds, and variations of the prompt (§ D).
+
+However, VLMs are general-purpose models rather than dedicated image captioners, and the generated object ordering may vary substantially across downstream applications.
+We therefore test whether token position remains reliable when this ordering is altered by prompting the VLM to identify the least obvious, smallest, or hardest-to-see objects first, as may be useful in applications such as assistive visual description [22, 79].
+Concretely, we prompt the VLM to “Describe the least obvious, smallest, or hardest-to-see elements of the image first. Then describe the most prominent objects.”
+To attribute changes in performance to token position alone, we primarily evaluate over the subset of objects that appear in the captions in both the original and prompting small objects first settings.
+See § C.6 for further details.
+
+Our results in Fig. 5 show that hallucinations can occur much earlier in the caption with the alteration.
+As a result, the token position heuristic performs no better than black box methods at detecting hallucinations.
+Further, we see how attention-based methods that depend on token position (SVAR, PAS) drop in relative performance as well, now falling behind representation-based methods of IC, CL, and GLSim.
+While the same prompt may induce this effect to varying degrees for different VLMs (see § C.6),
+it is conceivable that there are other prompts, applications, and tasks would similarly render token position-dependent methods less usable, such as multiple choice or short answer VQA [33, 20, 18].
+Taken together, in contrast with standard evaluation settings that suggest attention-based methods like SVAR and PAS to be strong contenders for detecting hallucinations from VLM-generated captions, our analyses suggest that they can be more likely to depend on unreliable token position heuristics that may not generalize beyond the standard captioning settings.
+
+Figure 5: Token position and position-dependent methods (e.g., SVAR, PAS) are not always reliable hallucination detectors.
+Left: While hallucinated objects tend to appear later in the caption for typical settings (light blue), prompting for small objects first can lead VLMs to hallucinate earlier in the caption (dark blue).
+Right: When LLaVA-1.5-13B is asked to describe small objects first, SVAR and PAS perform near random chance.
+To ensure fair comparisons, we plot AUPRC over the objects shared in captions from prompting for small objects first (bars) and in the original setting (dashed lines) for a given image. 
+
+## 6 Evidence of Complementary Signals Beyond Token Position
+
+So far, we have revealed limitations of certain hallucination detection methods leveraging internal signals, leaving open the question of how to improve these methods beyond token position.
+To begin answering this question, we observe in Fig. 1 that while certain methods exhibit high correlation with token position, others do not.
+This leads us to hypothesize that methods may carry complementary signals to be leveraged.
+We test this hypothesis by building progressive ensembles, starting with token position, adding groups of detection methods, and observing performance gains with each addition.
+
+Concretely, to explore whether the methods capture complementary or overlapping signal, we first partition them based on correlation with (Fig. 1) and dependence on (Fig. 2) token position.
+Then we train logistic-regression classifiers, progressively adding one group at a time.
+Detection methods are partitioned into four groups: (1) white box methods that are highly correlated with and dependent on token position (SVAR, PAS), (2) white box methods that are moderately correlated and dependent on token position (CL, GLSim), (3) the last white box method that is weakly correlated and independent of token position (IC), and (4) black box methods (NLL, Ent) which are weakly correlated with token position and most white box methods.
+For each ensemble, we train logistic regression classifiers using the scores from the included hallucination detection methods on 5,000 randomly selected images from MSCOCO training split.
+We primarily report each progressive ensemble’s performance on 5,000 validation images using AUPRC as this metric considers class imbalances, and we additionally include AUROC in Fig. 6.
+For additional details, results on additional VLMs, and further experiments on signal complementarity, see § C.7-§ C.8.
+
+We observe that for LLaVA-1.5-13B, while SVAR and PAS do not contribute informative signal above token position, the remaining white box methods can contribute additional predictive power, and black box methods can further offer complementary non-redundant information.
+This can be seen by the monotonic structure in Fig. 6.
+Specifically, adding CL and GLSim on top of SVAR, PAS, and token position raises AUPRC from $0.53$ to $0.61$ ( $+0.08$ ).
+This gain suggests CL and GLSim can offer complementary signals to improve performance beyond what token position and token position-dependent methods can offer.
+Next, incorporating IC further pushes AUPRC to $0.66$ ( $+0.05$ ) over the other four white box methods, indicating that the Logit-Lens-based [50] signal can supply discriminative information not captured by the embedding similarity (GLSim, CL) or attention-based (SVAR, PAS) methods.
+Lastly, adding black box methods (NLL, Ent) further yields an additional improvement of $+0.05$ to reach AUPRC of $0.71$ , notable since these scores are computed without internal model access.
+
+Overall, the combined ensemble performs the best, implying that methods can contribute unique discriminative power to the combined detector.
+On top of token position alone, using all methods results in AUPRC of $0.71$ ( $+0.20$ above token position alone) and AUROC of $0.89$ ( $+0.06$ ), suggesting that developing a hallucination detection method that leverages multiple types of detection methods can outperform any existing method alone.
+We further include results with other VLMs in § C.7, which demonstrate that while the full ensemble consistently performs best, the degree of complementarity between each group of methods may vary per VLM.
+Taken together, these results reveal that different methods can carry non-redundant but complementary signals, suggesting that future detection methods could improve performance and reliability by combining different mechanisms from different methods.
+
+Figure 6: Detection methods can contain complementary signals to one another.
+We cumulatively build logistic-regression ensembles on top of token position adding methods in order of decreasing correlation and dependence with token position: (1) +SVAR, PAS; (2) +CL, GLSim; (3) +IC; and (4) black box methods +NLL, Ent.
+Except for ( +SVAR, PAS), each additional group of detection methods improves the ensemble’s performance, suggesting the groups carry non-overlapping signal to one another.
+Error bars are $95\%$ confidence intervals computed via percentile bootstrap of validation predictions. 
+
+## 7 Conclusion
+
+In this work, we conduct an in-depth analysis to understand the robustness of hallucination detection methods that leverage internal signals as a VLM generates text.
+We reveal insights inaccessible through typical benchmarks, and in light of our findings, we recommend three practical suggestions for researchers and practitioners working with VLM hallucination detection.
+
+Standardize a “blind” positional baseline. We demonstrate that token position is a competitive detection baseline in standard evaluation settings (§ 4.1), and that certain white box methods exhibit some degree of dependency on token position (§ 4.2).
+Consequently, we advocate for all new detection methods to be compared to a token position baseline: simply the position of the word’s first token in the generated caption.
+By standardizing this baseline, we obtain a better assessment on the progress of hallucination detection that cannot be explained away by a simple heuristic based on the structure of the generated output.
+
+Don’t forget the “V” in VLM.
+In revealing the practical limitations of detection methods, we find that white box methods’ competitive advantage tends to be from detecting language-based hallucinations (§ 5.1), and when methods rely on token position, they tend to not be visually grounded (§ 5.2).
+Consequently, they can exhibit biases towards an object’s position in the caption (§ 5.3).
+Hallucination detection methods must exhibit visual grounding which in its simplest form, can be operationalized as sensitivity to the image.
+Without it, they can fail beyond the standard image captioning evaluation.
+We advocate for researchers to validate and quantify their method’s image sensitivity to ensure it uses the image rather than heuristic cues.
+Without this validation, we risk a “vision-blind” research trajectory where detecting hallucinations reflects detecting artifacts of the evaluation setting rather than building a more robust detection that generalizes across many real-world situations.
+
+Leverage strengths of different methods.
+Current evaluations of hallucination detection methods encourage discounting methods that achieve lower performance, such as black box methods.
+However, our ensemble experiments demonstrate that despite this weakness, black box methods can carry complementary signals to white box methods (§ 6).
+In other words, black box methods can detect certain hallucinations that white box methods do not.
+To further improve hallucination detection, we encourage future work to explore how to leverage these complementary strengths.
+
+## Acknowledgments and Disclosure of Funding
+
+We would like to thank all those who provided thoughtful feedback and discussion, especially members of the Princeton Visual AI Lab and the anonymous reviewers.
+We gratefully acknowledge support from the NSF Graduate Research Fellowship Program (A.C., J.W.), Princeton University President’s Fellows (J.W.), Princeton Presidential Postdoctoral Fellowship (S.A.) and from Solidigm AI SW.
+
+## References
+
+[1]
+O. Azachi, K. Eliyahu, E. E. Ani, R. Himelstein, R. Reichart, Y. Pinter, and N. Calderon (2025)
+
+Leveraging NTPs for Efficient Hallucination Detection in VLMs.
+
+ arXiv.
+
+Note: arXiv:2509.20379 [cs.CV]
+
+External Links: Link,
+Document
+
+Cited by: §2.2.
+
+[2]
+S. Bai, Y. Cai, R. Chen, K. Chen, X. Chen, Z. Cheng, L. Deng, W. Ding, C. Gao, C. Ge, W. Ge, Z. Guo, Q. Huang, J. Huang, F. Huang, B. Hui, S. Jiang, Z. Li, M. Li, M. Li, K. Li, Z. Lin, J. Lin, X. Liu, J. Liu, C. Liu, Y. Liu, D. Liu, S. Liu, D. Lu, R. Luo, C. Lv, R. Men, L. Meng, X. Ren, X. Ren, S. Song, Y. Sun, J. Tang, J. Tu, J. Wan, P. Wang, P. Wang, Q. Wang, Y. Wang, T. Xie, Y. Xu, H. Xu, J. Xu, Z. Yang, M. Yang, J. Yang, A. Yang, B. Yu, F. Zhang, H. Zhang, X. Zhang, B. Zheng, H. Zhong, J. Zhou, F. Zhou, J. Zhou, Y. Zhu, and K. Zhu (2025)
+
+Qwen3-VL Technical Report.
+
+ arXiv (en).
+
+Note: Version Number: 2
+
+External Links: Link,
+Document
+
+Cited by: §3.2.
+
+[3]
+Z. Bai, P. Wang, T. Xiao, T. He, Z. Han, Z. Zhang, and M. Z. Shou (2025)
+
+Hallucination of Multimodal Large Language Models: A Survey.
+
+ arXiv.
+
+Note: arXiv:2404.18930 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §3.2.
+
+[4]
+S. Banerjee, A. Agarwal, and S. Singla (2025)
+
+LLMs Will Always Hallucinate, and We Need to Live with This.
+
+In Intelligent Systems and Applications, K. Arai (Ed.),
+
+Cham, pp. 624–648 (en).
+
+External Links: ISBN 978-3-031-99965-9,
+Document
+
+Cited by: Appendix E,
+§2.2.
+
+[5]
+F. Barbero, C. Perivolaropoulos, M. Bronstein, P. Velicˇkovic, and R. Pascanu (2025)
+
+Why do LLMs attend to the first token?.
+
+(en).
+
+Cited by: §C.3.2.
+
+[6]
+A. Ben-Kish, M. Yanuka, M. Alper, R. Giryes, and H. Averbuch-Elor (2024)
+
+Mitigating Open-Vocabulary Caption Hallucinations.
+
+In Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing, Y. Al-Onaizan, M. Bansal, and Y. Chen (Eds.),
+
+Miami, Florida, USA, pp. 22680–22698.
+
+External Links: Link,
+Document
+
+Cited by: §B.1,
+§2.1.
+
+[7]
+Q. Cao, J. Cheng, X. Liang, and L. Lin (2024)
+
+VisDiaHalBench: A Visual Dialogue Benchmark For Diagnosing Hallucination in Large Vision-Language Models.
+
+In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), L. Ku, A. Martins, and V. Srikumar (Eds.),
+
+Bangkok, Thailand, pp. 12161–12176.
+
+External Links: Link,
+Document
+
+Cited by: §2.1.
+
+[8]
+J. Chen, D. Yang, T. Wu, Y. Jiang, X. Hou, M. Li, S. Wang, D. Xiao, K. Li, and L. Zhang (2026)
+
+Detecting and Evaluating Medical Hallucinations in Large Vision Language Models.
+
+ arXiv.
+
+Note: arXiv:2406.10185 [cs.CV]
+
+External Links: Link,
+Document
+
+Cited by: §2.2.
+
+[9]
+X. Chen, C. Wang, Y. Xue, N. Zhang, X. Yang, Q. Li, Y. Shen, L. Liang, J. Gu, and H. Chen (2024)
+
+Unified Hallucination Detection for Multimodal Large Language Models.
+
+ arXiv.
+
+Note: arXiv:2402.03190 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+§2.2.
+
+[10]
+Z. Chen, W. Wang, H. Tian, S. Ye, Z. Gao, E. Cui, W. Tong, K. Hu, J. Luo, Z. Ma, J. Ma, J. Wang, X. Dong, H. Yan, H. Guo, C. He, B. Shi, Z. Jin, C. Xu, B. Wang, X. Wei, W. Li, W. Zhang, B. Zhang, P. Cai, L. Wen, X. Yan, M. Dou, L. Lu, X. Zhu, T. Lu, D. Lin, Y. Qiao, J. Dai, and W. Wang (2024)
+
+How far are we to GPT-4V? Closing the gap to commercial multimodal models with open-source suites.
+
+Science China Information Sciences 67 (12), pp. 220101 (en).
+
+External Links: ISSN 1869-1919,
+Link,
+Document
+
+Cited by: §3.2.
+
+[11]
+Z. Chen, J. Wu, W. Wang, W. Su, G. Chen, S. Xing, M. Zhong, Q. Zhang, X. Zhu, L. Lu, B. Li, P. Luo, T. Lu, Y. Qiao, and J. Dai (2024)
+
+InternVL: Scaling up Vision Foundation Models and Aligning for Generic Visual-Linguistic Tasks.
+
+ arXiv.
+
+Note: arXiv:2312.14238 [cs]
+
+External Links: Link,
+Document
+
+Cited by: Appendix E.
+
+[12]
+Z. Chen, Y. Min, J. Zhang, B. Yan, J. Wang, X. Wang, and S. Shan (2026)
+
+A Survey of Multimodal Hallucination Evaluation and Detection.
+
+ arXiv.
+
+Note: arXiv:2507.19024 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §C.4,
+§1,
+§1,
+§2.1,
+§2.2,
+§3.2,
+§5.1.
+
+[13]
+W. Dai, J. Li, D. Li, A. M. H. Tiong, J. Zhao, W. Wang, B. Li, P. Fung, and S. Hoi
+
+InstructBLIP: Towards General-purpose Vision-Language Models with Instruction Tuning.
+
+(en).
+
+Cited by: §3.2.
+
+[14]
+D. Driess, F. Xia, M. S. M. Sajjadi, C. Lynch, A. Chowdhery, B. Ichter, A. Wahid, J. Tompson, Q. Vuong, T. Yu, W. Huang, Y. Chebotar, P. Sermanet, D. Duckworth, S. Levine, V. Vanhoucke, K. Hausman, M. Toussaint, K. Greff, A. Zeng, I. Mordatch, and P. Florence (2023)
+
+PaLM-E: an embodied multimodal language model.
+
+In Proceedings of the 40th International Conference on Machine Learning,
+
+ICML’23, Vol. 202, Honolulu, Hawaii, USA, pp. 8469–8488.
+
+Cited by: §1.
+
+[15]
+S. Farquhar, J. Kossen, L. Kuhn, and Y. Gal (2024)
+
+Detecting hallucinations in large language models using semantic entropy.
+
+Nature 630 (8017), pp. 625–630 (en).
+
+External Links: ISSN 1476-4687,
+Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+§1,
+§2.1,
+§2.2.
+
+[16]
+A. Favero, L. Zancato, M. Trager, S. Choudhary, P. Perera, A. Achille, A. Swaminathan, and S. Soatto (2024)
+
+Multi-Modal Hallucination Control by Visual Information Grounding.
+
+In 2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR),
+
+Seattle, WA, USA, pp. 14303–14312 (en).
+
+External Links: ISBN 979-8-3503-5300-6,
+Link,
+Document
+
+Cited by: §C.1,
+§C.4,
+§C.5,
+Appendix E,
+§4.1,
+§5.1.
+
+[17]
+L. Fieback, J. Spiegelberg, and H. Gottschalk (2025)
+
+MetaToken: Detecting Hallucination in Image Descriptions by Meta Classification.
+
+ arXiv.
+
+Note: arXiv:2405.19186 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §A.1,
+§1,
+§2.2.
+
+[18]
+C. Fu, P. Chen, Y. Shen, Y. Qin, M. Zhang, X. Lin, J. Yang, X. Zheng, K. Li, X. Sun, Y. Wu, R. Ji, C. Shan, and R. He
+
+MME: A Comprehensive Evaluation Benchmark for Multimodal Large Language Models.
+
+(en).
+
+Cited by: §1,
+§2.1,
+§5.3.
+
+[19]
+Y. Ge, X. Zeng, J. S. Huffman, T. Lin, M. Liu, and Y. Cui (2024)
+
+Visual Fact Checker: Enabling High-Fidelity Detailed Caption Generation.
+
+pp. 14033–14042 (en).
+
+External Links: Link
+
+Cited by: §A.1,
+§B.2,
+§1,
+§2.2.
+
+[20]
+T. Guan, F. Liu, X. Wu, R. Xian, Z. Li, X. Liu, X. Wang, L. Chen, F. Huang, Y. Yacoob, D. Manocha, and T. Zhou (2024)
+
+Hallusionbench: An Advanced Diagnostic Suite for Entangled Language Hallucination and Visual Illusion in Large Vision-Language Models.
+
+In 2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR),
+
+Seattle, WA, USA, pp. 14375–14385 (en).
+
+External Links: ISBN 979-8-3503-5300-6,
+Link,
+Document
+
+Cited by: §2.1,
+§2.1,
+§5.3.
+
+[21]
+A. Gunjal, J. Yin, and E. Bas (2024)
+
+Detecting and Preventing Hallucinations in Large Vision Language Models.
+
+ arXiv.
+
+Note: arXiv:2308.06394 [cs]
+
+External Links: Link,
+Document
+
+Cited by: Appendix E,
+§2.1,
+§2.2.
+
+[22]
+D. Gurari, Q. Li, A. J. Stangl, A. Guo, C. Lin, K. Grauman, J. Luo, and J. P. Bigham (2018)
+
+VizWiz Grand Challenge: Answering Visual Questions from Blind People.
+
+In 2018 IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+
+pp. 3608–3617.
+
+Note: ISSN: 2575-7075
+
+External Links: ISSN 2575-7075,
+Link,
+Document
+
+Cited by: §5.3.
+
+[23]
+N. Hoang-Xuan, M. Vu, M. T. Thai, and M. Bhattarai (2025)
+
+PAS : Prelim Attention Score for Detecting Object Hallucinations in Large Vision–Language Models.
+
+ arXiv.
+
+Note: arXiv:2511.11502 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §A.1.2,
+§1,
+§2.2,
+§2.2,
+§3.1,
+§3.2.
+
+[24]
+Q. Huang, X. Dong, P. Zhang, B. Wang, C. He, J. Wang, D. Lin, W. Zhang, and N. Yu (2024)
+
+OPERA: Alleviating Hallucination in Multi-Modal Large Language Models via Over-Trust Penalty and Retrospection-Allocation.
+
+In 2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR),
+
+Seattle, WA, USA, pp. 13418–13427 (en).
+
+External Links: ISBN 979-8-3503-5300-6,
+Link,
+Document
+
+Cited by: Appendix E,
+§2.1.
+
+[25]
+W. Huang, H. Liu, M. Guo, and N. Gong (2024)
+
+Visual Hallucinations of Multi-modal Large Language Models.
+
+In Findings of the Association for Computational Linguistics: ACL 2024, L. Ku, A. Martins, and V. Srikumar (Eds.),
+
+Bangkok, Thailand, pp. 9614–9631.
+
+External Links: Link,
+Document
+
+Cited by: §2.1.
+
+[26]
+J. Jain, J. Yang, and H. Shi (2024)
+
+VCoder: Versatile Vision Encoders for Multimodal Large Language Models.
+
+pp. 27992–28002 (en).
+
+External Links: Link
+
+Cited by: Appendix E.
+
+[27]
+B. Jiang, Y. Xie, Z. Hao, X. Wang, T. Mallick, W. J. Su, C. J. Taylor, and D. Roth (2024)
+
+A Peek into Token Bias: Large Language Models Are Not Yet Genuine Reasoners.
+
+In Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing, Y. Al-Onaizan, M. Bansal, and Y. Chen (Eds.),
+
+Miami, Florida, USA, pp. 4722–4756.
+
+External Links: Link,
+Document
+
+Cited by: §C.3.2.
+
+[28]
+N. Jiang, A. Kachinthaya, S. Petryk, and Y. Gandelsman (2025)
+
+Interpreting and Editing Vision-Language Representations to Mitigate Hallucinations.
+
+ arXiv.
+
+Note: arXiv:2410.02762 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §A.1.2,
+§A.2,
+§1,
+§1,
+§2.1,
+§2.2,
+§2.2,
+§3.1,
+§3.2,
+§3.2.
+
+[29]
+Z. Jiang, J. Chen, B. Zhu, T. Luo, Y. Shen, and X. Yang (2025)
+
+Devils in Middle Layers of Large Vision-Language Models: Interpreting, Detecting and Mitigating Object Hallucinations via Attention Lens.
+
+Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pp. 25004–25014 (en).
+
+External Links: Link
+
+Cited by: §A.1.1,
+§A.1.1,
+§A.1.2,
+§A.2,
+§A.2,
+§A.2,
+§1,
+§1,
+§2.1,
+§2.2,
+§2.2,
+§3.1,
+§3.1,
+§3.2,
+§3.2.
+
+[30]
+L. Jing, R. Li, Y. Chen, and X. Du (2024)
+
+FaithScore: Fine-grained Evaluations of Hallucinations in Large Vision-Language Models.
+
+In Findings of the Association for Computational Linguistics: EMNLP 2024, Y. Al-Onaizan, M. Bansal, and Y. Chen (Eds.),
+
+Miami, Florida, USA, pp. 5042–5063.
+
+External Links: Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+§2.1,
+§2.2.
+
+[31]
+P. Kaul, Z. Li, H. Yang, Y. Dukler, A. Swaminathan, C. J. Taylor, and S. Soatto (2024)
+
+THRONE: An Object-Based Hallucination Benchmark for the Free-Form Generations of Large Vision-Language Models.
+
+In 2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR),
+
+Seattle, WA, USA, pp. 27218–27228 (en).
+
+External Links: ISBN 979-8-3503-5300-6,
+Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+§1,
+§2.2.
+
+[32]
+S. Leng, H. Zhang, G. Chen, X. Li, S. Lu, C. Miao, and L. Bing (2024)
+
+Mitigating Object Hallucinations in Large Vision-Language Models through Visual Contrastive Decoding.
+
+In 2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR),
+
+Seattle, WA, USA, pp. 13872–13882 (en).
+
+External Links: ISBN 979-8-3503-5300-6,
+Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+Appendix E,
+§2.2.
+
+[33]
+Y. Li, Y. Du, K. Zhou, J. Wang, X. Zhao, and J. Wen (2023)
+
+Evaluating Object Hallucination in Large Vision-Language Models.
+
+In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing, H. Bouamor, J. Pino, and K. Bali (Eds.),
+
+Singapore, pp. 292–305.
+
+External Links: Link,
+Document
+
+Cited by: §B.1,
+§2.1,
+§5.3.
+
+[34]
+Z. Li, H. Shi, Y. Gao, D. Liu, Z. Wang, Y. Chen, T. Liu, L. Zhao, H. Wang, and D. N. Metaxas (2025)
+
+The Hidden Life of Tokens: Reducing Hallucination of Large Vision-Language Models Via Visual Information Steering.
+
+In Proceedings of the 42nd International Conference on Machine Learning,
+
+pp. 35799–35819 (en).
+
+External Links: ISSN 2640-3498,
+Link
+
+Cited by: §C.1,
+§4.1.
+
+[35]
+Z. Liao, S. Hu, K. Zou, H. Fu, L. Zhen, and Y. Xia (2026)
+
+Vision-Amplified Semantic Entropy for Hallucination Detection in Medical Visual Question Answering.
+
+In Medical Image Computing and Computer Assisted Intervention – MICCAI 2025, J. C. Gee, D. C. Alexander, J. Hong, J. E. Iglesias, C. H. Sudre, A. Venkataraman, P. Golland, J. H. Kim, and J. Park (Eds.),
+
+Cham, pp. 669–679 (en).
+
+External Links: ISBN 978-3-032-04971-1,
+Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+§1,
+§2.2,
+§2.2.
+
+[36]
+T. Lin, M. Maire, S. Belongie, J. Hays, P. Perona, D. Ramanan, P. Dollár, and C. L. Zitnick (2014)
+
+Microsoft COCO: Common Objects in Context.
+
+In Computer Vision – ECCV 2014, D. Fleet, T. Pajdla, B. Schiele, and T. Tuytelaars (Eds.),
+
+Cham, pp. 740–755 (en).
+
+External Links: ISBN 978-3-319-10602-1,
+Document
+
+Cited by: §A.2,
+§A.2,
+§B.2,
+§C.7,
+§C.7,
+§3.2.
+
+[37]
+F. Liu, K. Lin, L. Li, J. Wang, Y. Yacoob, and L. Wang (2024)
+
+Mitigating Hallucination in Large Multi-Modal Models via Robust Instruction Tuning.
+
+(en).
+
+Cited by: Appendix E.
+
+[38]
+H. Liu, W. Xue, Y. Chen, D. Chen, X. Zhao, K. Wang, L. Hou, R. Li, and W. Peng (2024)
+
+A Survey on Hallucination in Large Vision-Language Models.
+
+ arXiv.
+
+Note: arXiv:2402.00253 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §C.4,
+§1,
+§2.1,
+§5.1.
+
+[39]
+H. Liu, C. Li, Y. Li, and Y. J. Lee (2024)
+
+Improved Baselines with Visual Instruction Tuning.
+
+In 2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR),
+
+pp. 26286–26296.
+
+Note: ISSN: 2575-7075
+
+External Links: ISSN 2575-7075,
+Link,
+Document
+
+Cited by: §3.2.
+
+[40]
+S. Liu, X. Wen, Z. Lan, A. Wang, and J. Su (2026)
+
+Countering the Over-Reliance Trap: Mitigating Object Hallucination for LVLMs via a Self-Validation Framework.
+
+(en).
+
+External Links: Link
+
+Cited by: §4.1.
+
+[41]
+Y. Liu, H. Duan, Y. Zhang, B. Li, S. Zhang, W. Zhao, Y. Yuan, J. Wang, C. He, Z. Liu, K. Chen, and D. Lin (2025)
+
+MMBench: Is Your Multi-modal Model an All-Around Player?.
+
+In Computer Vision – ECCV 2024, A. Leonardis, E. Ricci, S. Roth, O. Russakovsky, T. Sattler, and G. Varol (Eds.),
+
+Cham, pp. 216–233 (en).
+
+External Links: ISBN 978-3-031-72658-3,
+Document
+
+Cited by: §1.
+
+[42]
+Z. Liu, H. Liu, Y. Hu, Z. Shao, and N. Z. Gong (2024)
+
+Automatically Generating Visual Hallucination Test Cases for Multimodal Large Language Models.
+
+ arXiv.
+
+Note: arXiv:2410.11242 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §2.1.
+
+[43]
+H. Lovenia, W. Dai, S. Cahyawijaya, Z. Ji, and P. Fung (2024)
+
+Negative Object Presence Evaluation (NOPE) to Measure Object Hallucination in Vision-Language Models.
+
+In Proceedings of the 3rd Workshop on Advances in Language and Vision Research (ALVR), J. Gu, T. (. Fu, D. Hudson, A. Celikyilmaz, and W. Wang (Eds.),
+
+Bangkok, Thailand, pp. 37–58.
+
+External Links: Link,
+Document
+
+Cited by: §2.1.
+
+[44]
+X. Lyu, B. Chen, L. Gao, J. Song, and H. T. Shen
+
+Alleviating Hallucinations in Large Vision-Language Models through Hallucination-Induced Optimization.
+
+(en).
+
+Cited by: Appendix E.
+
+[45]
+A. Malinin and M. Gales (2021)
+
+Uncertainty Estimation in Autoregressive Structured Prediction.
+
+ arXiv.
+
+Note: arXiv:2002.07650 [stat]
+
+External Links: Link,
+Document
+
+Cited by: §1,
+§2.2,
+§3.1.
+
+[46]
+N. McKenna, T. Li, L. Cheng, M. Hosseini, M. Johnson, and M. Steedman (2023)
+
+Sources of Hallucination by Large Language Models on Inference Tasks.
+
+In Findings of the Association for Computational Linguistics: EMNLP 2023, H. Bouamor, J. Pino, and K. Bali (Eds.),
+
+Singapore, pp. 2758–2774.
+
+External Links: Link,
+Document
+
+Cited by: §C.1.
+
+[47]
+S. Nath, A. Basu, S. Dasgupta, and S. Das (2025)
+
+HalluShift++: Bridging Language and Vision through Internal Representation Shifts for Hierarchical Hallucinations in MLLMs.
+
+ arXiv.
+
+Note: arXiv:2512.07687 [cs.CL]
+
+External Links: Link,
+Document
+
+Cited by: §2.2.
+
+[48]
+V. Nath, W. Li, D. Yang, A. Myronenko, M. Zheng, Y. Lu, Z. Liu, H. Yin, Y. M. Law, Y. Tang, P. Guo, C. Zhao, Z. Xu, Y. He, S. Harmon, B. Simon, G. Heinrich, S. Aylward, M. Edgar, M. Zephyr, P. Molchanov, B. Turkbey, H. Roth, and D. Xu (2025)
+
+VILA-M3: Enhancing Vision-Language Models with Medical Expert Knowledge.
+
+pp. 14788–14798 (en).
+
+External Links: Link
+
+Cited by: §1.
+
+[49]
+Z. A. Nazi and W. Peng (2024)
+
+Large Language Models in Healthcare and Medical Domain: A Review.
+
+Informatics 11 (3), pp. 57 (en).
+
+External Links: ISSN 2227-9709,
+Link,
+Document
+
+Cited by: §1.
+
+[50]
+nostalgebraist (2020)
+
+Interpreting GPT: the logit lens — LessWrong.
+
+External Links: Link
+
+Cited by: §A.1.2,
+§A.1.2,
+§3.1,
+§6.
+
+[51]
+D. Park, Z. Qian, G. Han, and S. Lim (2024)
+
+Mitigating Dialogue Hallucination for Large Vision Language Models via Adversarial Instruction Tuning.
+
+ arXiv.
+
+Note: arXiv:2403.10492 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §2.1.
+
+[52]
+E. Park, M. Kim, and G. Kim (2025)
+
+HalLoc: Token-level Localization of Hallucinations for Vision Language Models.
+
+(en).
+
+External Links: Link
+
+Cited by: §A.1,
+§1,
+§1,
+§2.1,
+§2.2,
+§2.2.
+
+[53]
+S. Park and S. Li (2025)
+
+GLSim: Detecting Object Hallucinations in LVLMs via Global-Local Similarity.
+
+ arXiv.
+
+Note: arXiv:2508.19972 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §A.1.1,
+§A.1.1,
+§A.1.2,
+§A.2,
+§A.2,
+§A.2,
+§D.4,
+§1,
+§1,
+§2.1,
+§2.2,
+§2.2,
+§3.1,
+§3.1,
+§3.2,
+§3.2.
+
+[54]
+S. Petryk, D. M. Chan, A. Kachinthaya, H. Zou, J. Canny, J. E. Gonzalez, and T. Darrell (2024)
+
+ALOHa: A New Measure for Hallucination in Captioning Models.
+
+ arXiv.
+
+Note: arXiv:2404.02904 [cs]
+version: 1
+
+External Links: Link,
+Document
+
+Cited by: §2.1.
+
+[55]
+A. Phukan, Divyansh, H. K. Morj, Vaishnavi, A. Saxena, and K. Goswami (2025)
+
+Beyond Logit Lens: Contextual Embeddings for Robust Hallucination Detection & Grounding in VLMs.
+
+In Proceedings of the 2025 Conference of the Nations of the Americas Chapter of the Association for Computational Linguistics: Human Language Technologies (Volume 1: Long Papers), L. Chiruzzo, A. Ritter, and L. Wang (Eds.),
+
+Albuquerque, New Mexico, pp. 9661–9675.
+
+External Links: ISBN 979-8-89176-189-6,
+Link,
+Document
+
+Cited by: §A.1.2,
+§1,
+§1,
+§2.1,
+§2.2,
+§3.1,
+§3.1.
+
+[56]
+Qwen Team (2026)
+
+Qwen3.5: Towards Native Multimodal Agents.
+
+External Links: Link
+
+Cited by: §3.2.
+
+[57]
+A. Rohrbach, L. A. Hendricks, K. Burns, T. Darrell, and K. Saenko (2018)
+
+Object Hallucination in Image Captioning.
+
+In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing,
+
+Brussels, Belgium, pp. 4035–4045 (en).
+
+External Links: Link,
+Document
+
+Cited by: §B.1,
+§C.2,
+§2.1,
+§2.1,
+§3.2.
+
+[58]
+H. Seo, D. U. Kang, H. Cho, J. Lee, and S. Y. Chun (2025)
+
+On Epistemic Uncertainty of Visual Tokens for Object Hallucinations in Large Vision-Language Models.
+
+ arXiv.
+
+Note: arXiv:2510.09008 [cs]
+
+External Links: Link,
+Document
+
+Cited by: Appendix E.
+
+[59]
+S. Shao, Z. Li, T. Zhang, C. Peng, G. Yu, X. Zhang, J. Li, and J. Sun (2019)
+
+Objects365: A Large-Scale, High-Quality Dataset for Object Detection.
+
+In 2019 IEEE/CVF International Conference on Computer Vision (ICCV),
+
+pp. 8429–8438.
+
+Note: ISSN: 2380-7504
+
+External Links: ISSN 2380-7504,
+Link,
+Document
+
+Cited by: §B.2,
+§D.2,
+§3.2.
+
+[60]
+Y. Sun, K. Atarashi, K. Takeuchi, and H. Kashima (2025)
+
+Exploring Causes and Mitigation of Hallucinations in Large Vision Language Models.
+
+ arXiv.
+
+Note: arXiv:2502.16842 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §C.1,
+§4.1.
+
+[61]
+G. Team, R. Anil, S. Borgeaud, J. Alayrac, J. Yu, R. Soricut, J. Schalkwyk, A. M. Dai, A. Hauth, K. Millican, D. Silver, M. Johnson, I. Antonoglou, J. Schrittwieser, A. Glaese, J. Chen, E. Pitler, T. Lillicrap, A. Lazaridou, O. Firat, J. Molloy, M. Isard, P. R. Barham, T. Hennigan, B. Lee, F. Viola, M. Reynolds, Y. Xu, R. Doherty, E. Collins, C. Meyer, E. Rutherford, E. Moreira, K. Ayoub, M. Goel, J. Krawczyk, C. Du, E. Chi, H. Cheng, E. Ni, P. Shah, P. Kane, B. Chan, M. Faruqui, A. Severyn, H. Lin, Y. Li, Y. Cheng, A. Ittycheriah, M. Mahdieh, M. Chen, P. Sun, D. Tran, S. Bagri, B. Lakshminarayanan, J. Liu, A. Orban, F. Güra, H. Zhou, X. Song, A. Boffy, H. Ganapathy, S. Zheng, H. Choe, Á. Weisz, T. Zhu, Y. Lu, S. Gopal, J. Kahn, M. Kula, J. Pitman, R. Shah, E. Taropa, M. A. Merey, M. Baeuml, Z. Chen, L. E. Shafey, Y. Zhang, O. Sercinoglu, G. Tucker, E. Piqueras, M. Krikun, I. Barr, N. Savinov, I. Danihelka, B. Roelofs, A. White, A. Andreassen, T. v. Glehn, L. Yagati, M. Kazemi, L. Gonzalez, M. Khalman, J. Sygnowski, A. Frechette, C. Smith, L. Culp, L. Proleev, Y. Luan, X. Chen, J. Lottes, N. Schucher, F. Lebron, A. Rrustemi, N. Clay, P. Crone, T. Kocisky, J. Zhao, B. Perz, D. Yu, H. Howard, A. Bloniarz, J. W. Rae, H. Lu, L. Sifre, M. Maggioni, F. Alcober, D. Garrette, M. Barnes, S. Thakoor, J. Austin, G. Barth-Maron, W. Wong, R. Joshi, R. Chaabouni, D. Fatiha, A. Ahuja, G. S. Tomar, E. Senter, M. Chadwick, I. Kornakov, N. Attaluri, I. Iturrate, R. Liu, Y. Li, S. Cogan, J. Chen, C. Jia, C. Gu, Q. Zhang, J. Grimstad, A. J. Hartman, X. Garcia, T. S. Pillai, J. Devlin, M. Laskin, D. d. L. Casas, D. Valter, C. Tao, L. Blanco, A. P. Badia, D. Reitter, M. Chen, J. Brennan, C. Rivera, S. Brin, S. Iqbal, G. Surita, J. Labanowski, A. Rao, S. Winkler, E. Parisotto, Y. Gu, K. Olszewska, R. Addanki, A. Miech, A. Louis, D. Teplyashin, G. Brown, E. Catt, J. Balaguer, J. Xiang, P. Wang, Z. Ashwood, A. Briukhov, A. Webson, S. Ganapathy, S. Sanghavi, A. Kannan, M. Chang, A. Stjerngren, J. Djolonga, Y. Sun, A. Bapna, M. Aitchison, P. Pejman, H. Michalewski, T. Yu, C. Wang, J. Love, J. Ahn, D. Bloxwich, K. Han, P. Humphreys, T. Sellam, J. Bradbury, V. Godbole, S. Samangooei, B. Damoc, A. Kaskasoli, S. M. R. Arnold, V. Vasudevan, S. Agrawal, J. Riesa, D. Lepikhin, R. Tanburn, S. Srinivasan, H. Lim, S. Hodkinson, P. Shyam, J. Ferret, S. Hand, A. Garg, T. L. Paine, J. Li, Y. Li, M. Giang, A. Neitz, Z. Abbas, S. York, M. Reid, E. Cole, A. Chowdhery, D. Das, D. Rogozińska, V. Nikolaev, P. Sprechmann, Z. Nado, L. Zilka, F. Prost, L. He, M. Monteiro, G. Mishra, C. Welty, J. Newlan, D. Jia, M. Allamanis, C. H. Hu, R. d. Liedekerke, J. Gilmer, C. Saroufim, S. Rijhwani, S. Hou, D. Shrivastava, A. Baddepudi, A. Goldin, A. Ozturel, A. Cassirer, Y. Xu, D. Sohn, D. Sachan, R. K. Amplayo, C. Swanson, D. Petrova, S. Narayan, A. Guez, S. Brahma, J. Landon, M. Patel, R. Zhao, K. Villela, L. Wang, W. Jia, M. Rahtz, M. Giménez, L. Yeung, J. Keeling, P. Georgiev, D. Mincu, B. Wu, S. Haykal, R. Saputro, K. Vodrahalli, J. Qin, Z. Cankara, A. Sharma, N. Fernando, W. Hawkins, B. Neyshabur, S. Kim, A. Hutter, P. Agrawal, A. Castro-Ros, G. v. d. Driessche, T. Wang, F. Yang, S. Chang, P. Komarek, R. McIlroy, M. Lučić, G. Zhang, W. Farhan, M. Sharman, P. Natsev, P. Michel, Y. Bansal, S. Qiao, K. Cao, S. Shakeri, C. Butterfield, J. Chung, P. K. Rubenstein, S. Agrawal, A. Mensch, K. Soparkar, K. Lenc, T. Chung, A. Pope, L. Maggiore, J. Kay, P. Jhakra, S. Wang, J. Maynez, M. Phuong, T. Tobin, A. Tacchetti, M. Trebacz, K. Robinson, Y. Katariya, S. Riedel, P. Bailey, K. Xiao, N. Ghelani, L. Aroyo, A. Slone, N. Houlsby, X. Xiong, Z. Yang, E. Gribovskaya, J. Adler, M. Wirth, L. Lee, M. Li, T. Kagohara, J. Pavagadhi, S. Bridgers, A. Bortsova, S. Ghemawat, Z. Ahmed, T. Liu, R. Powell, V. Bolina, M. Iinuma, P. Zablotskaia, J. Besley, D. Chung, T. Dozat, R. Comanescu, X. Si, J. Greer, G. Su, M. Polacek, R. L. Kaufman, S. Tokumine, H. Hu, E. Buchatskaya, Y. Miao, M. Elhawaty, A. Siddhant, N. Tomasev, J. Xing, C. Greer, H. Miller, S. Ashraf, A. Roy, Z. Zhang, A. Ma, A. Filos, M. Besta, R. Blevins, T. Klimenko, C. Yeh, S. Changpinyo, J. Mu, O. Chang, M. Pajarskas, C. Muir, V. Cohen, C. L. Lan, K. Haridasan, A. Marathe, S. Hansen, S. Douglas, R. Samuel, M. Wang, S. Austin, C. Lan, J. Jiang, J. Chiu, J. A. Lorenzo, L. L. Sjösund, S. Cevey, Z. Gleicher, T. Avrahami, A. Boral, H. Srinivasan, V. Selo, R. May, K. Aisopos, L. Hussenot, L. B. Soares, K. Baumli, M. B. Chang, A. Recasens, B. Caine, A. Pritzel, F. Pavetic, F. Pardo, A. Gergely, J. Frye, V. Ramasesh, D. Horgan, K. Badola, N. Kassner, S. Roy, E. Dyer, V. C. Campos, A. Tomala, Y. Tang, D. E. Badawy, E. White, B. Mustafa, O. Lang, A. Jindal, S. Vikram, Z. Gong, S. Caelles, R. Hemsley, G. Thornton, F. Feng, W. Stokowiec, C. Zheng, P. Thacker, Ç. Ünlü, Z. Zhang, M. Saleh, J. Svensson, M. Bileschi, P. Patil, A. Anand, R. Ring, K. Tsihlas, A. Vezer, M. Selvi, T. Shevlane, M. Rodriguez, T. Kwiatkowski, S. Daruki, K. Rong, A. Dafoe, N. FitzGerald, K. Gu-Lemberg, M. Khan, L. A. Hendricks, M. Pellat, V. Feinberg, J. Cobon-Kerr, T. Sainath, M. Rauh, S. H. Hashemi, R. Ives, Y. Hasson, E. Noland, Y. Cao, N. Byrd, L. Hou, Q. Wang, T. Sottiaux, M. Paganini, J. Lespiau, A. Moufarek, S. Hassan, K. Shivakumar, J. v. Amersfoort, A. Mandhane, P. Joshi, A. Goyal, M. Tung, A. Brock, H. Sheahan, V. Misra, C. Li, N. Rakićević, M. Dehghani, F. Liu, S. Mittal, J. Oh, S. Noury, E. Sezener, F. Huot, M. Lamm, N. D. Cao, C. Chen, S. Mudgal, R. Stella, K. Brooks, G. Vasudevan, C. Liu, M. Chain, N. Melinkeri, A. Cohen, V. Wang, K. Seymore, S. Zubkov, R. Goel, S. Yue, S. Krishnakumaran, B. Albert, N. Hurley, M. Sano, A. Mohananey, J. Joughin, E. Filonov, T. Kępa, Y. Eldawy, J. Lim, R. Rishi, S. Badiezadegan, T. Bos, J. Chang, S. Jain, S. G. S. Padmanabhan, S. Puttagunta, K. Krishna, L. Baker, N. Kalb, V. Bedapudi, A. Kurzrok, S. Lei, A. Yu, O. Litvin, X. Zhou, Z. Wu, S. Sobell, A. Siciliano, A. Papir, R. Neale, J. Bragagnolo, T. Toor, T. Chen, V. Anklin, F. Wang, R. Feng, M. Gholami, K. Ling, L. Liu, J. Walter, H. Moghaddam, A. Kishore, J. Adamek, T. Mercado, J. Mallinson, S. Wandekar, S. Cagle, E. Ofek, G. Garrido, C. Lombriser, M. Mukha, B. Sun, H. R. Mohammad, J. Matak, Y. Qian, V. Peswani, P. Janus, Q. Yuan, L. Schelin, O. David, A. Garg, Y. He, O. Duzhyi, A. Älgmyr, T. Lottaz, Q. Li, V. Yadav, L. Xu, A. Chinien, R. Shivanna, A. Chuklin, J. Li, C. Spadine, T. Wolfe, K. Mohamed, S. Das, Z. Dai, K. He, D. v. Dincklage, S. Upadhyay, A. Maurya, L. Chi, S. Krause, K. Salama, P. G. Rabinovitch, P. K. R. M, A. Selvan, M. Dektiarev, G. Ghiasi, E. Guven, H. Gupta, B. Liu, D. Sharma, I. H. Shtacher, S. Paul, O. Akerlund, F. Aubet, T. Huang, C. Zhu, E. Zhu, E. Teixeira, M. Fritze, F. Bertolini, L. Marinescu, M. Bölle, D. Paulus, K. Gupta, T. Latkar, M. Chang, J. Sanders, R. Wilson, X. Wu, Y. Tan, L. N. Thiet, T. Doshi, S. Lall, S. Mishra, W. Chen, T. Luong, S. Benjamin, J. Lee, E. Andrejczuk, D. Rabiej, V. Ranjan, K. Styrc, P. Yin, J. Simon, M. R. Harriott, M. Bansal, A. Robsky, G. Bacon, D. Greene, D. Mirylenka, C. Zhou, O. Sarvana, A. Goyal, S. Andermatt, P. Siegler, B. Horn, A. Israel, F. Pongetti, C. ". Chen, M. Selvatici, P. Silva, K. Wang, J. Tolins, K. Guu, R. Yogev, X. Cai, A. Agostini, M. Shah, H. Nguyen, N. Ó. Donnaile, S. Pereira, L. Friso, A. Stambler, A. Kurzrok, C. Kuang, Y. Romanikhin, M. Geller, Z. J. Yan, K. Jang, C. Lee, W. Fica, E. Malmi, Q. Tan, D. Banica, D. Balle, R. Pham, Y. Huang, D. Avram, H. Shi, J. Singh, C. Hidey, N. Ahuja, P. Saxena, D. Dooley, S. P. Potharaju, E. O’Neill, A. Gokulchandran, R. Foley, K. Zhao, M. Dusenberry, Y. Liu, P. Mehta, R. Kotikalapudi, C. Safranek-Shrader, A. Goodman, J. Kessinger, E. Globen, P. Kolhar, C. Gorgolewski, A. Ibrahim, Y. Song, A. Eichenbaum, T. Brovelli, S. Potluri, P. Lahoti, C. Baetu, A. Ghorbani, C. Chen, A. Crawford, S. Pal, M. Sridhar, P. Gurita, A. Mujika, I. Petrovski, P. Cedoz, C. Li, S. Chen, N. D. Santo, S. Goyal, J. Punjabi, K. Kappaganthu, C. Kwak, P. LV, S. Velury, H. Choudhury, J. Hall, P. Shah, R. Figueira, M. Thomas, M. Lu, T. Zhou, C. Kumar, T. Jurdi, S. Chikkerur, Y. Ma, A. Yu, S. Kwak, V. Ähdel, S. Rajayogam, T. Choma, F. Liu, A. Barua, C. Ji, J. H. Park, V. Hellendoorn, A. Bailey, T. Bilal, H. Zhou, M. Khatir, C. Sutton, W. Rzadkowski, F. Macintosh, R. Vij, K. Shagin, P. Medina, C. Liang, J. Zhou, P. Shah, Y. Bi, A. Dankovics, S. Banga, S. Lehmann, M. Bredesen, Z. Lin, J. E. Hoffmann, J. Lai, R. Chung, K. Yang, N. Balani, A. Bražinskas, A. Sozanschi, M. Hayes, H. F. Alcalde, P. Makarov, W. Chen, A. Stella, L. Snijders, M. Mandl, A. Kärrman, P. Nowak, X. Wu, A. Dyck, K. Vaidyanathan, R. R, J. Mallet, M. Rudominer, E. Johnston, S. Mittal, A. Udathu, J. Christensen, V. Verma, Z. Irving, A. Santucci, G. Elsayed, E. Davoodi, M. Georgiev, I. Tenney, N. Hua, G. Cideron, E. Leurent, M. Alnahlawi, I. Georgescu, N. Wei, I. Zheng, D. Scandinaro, H. Jiang, J. Snoek, M. Sundararajan, X. Wang, Z. Ontiveros, I. Karo, J. Cole, V. Rajashekhar, L. Tumeh, E. Ben-David, R. Jain, J. Uesato, R. Datta, O. Bunyan, S. Wu, J. Zhang, P. Stanczyk, Y. Zhang, D. Steiner, S. Naskar, M. Azzam, M. Johnson, A. Paszke, C. Chiu, J. S. Elias, A. Mohiuddin, F. Muhammad, J. Miao, A. Lee, N. Vieillard, J. Park, J. Zhang, J. Stanway, D. Garmon, A. Karmarkar, Z. Dong, J. Lee, A. Kumar, L. Zhou, J. Evens, W. Isaac, G. Irving, E. Loper, M. Fink, I. Arkatkar, N. Chen, I. Shafran, I. Petrychenko, Z. Chen, J. Jia, A. Levskaya, Z. Zhu, P. Grabowski, Y. Mao, A. Magni, K. Yao, J. Snaider, N. Casagrande, E. Palmer, P. Suganthan, A. Castaño, I. Giannoumis, W. Kim, M. Rybiński, A. Sreevatsa, J. Prendki, D. Soergel, A. Goedeckemeyer, W. Gierke, M. Jafari, M. Gaba, J. Wiesner, D. G. Wright, Y. Wei, H. Vashisht, Y. Kulizhskaya, J. Hoover, M. Le, L. Li, C. Iwuanyanwu, L. Liu, K. Ramirez, A. Khorlin, A. Cui, T. LIN, M. Wu, R. Aguilar, K. Pallo, A. Chakladar, G. Perng, E. A. Abellan, M. Zhang, I. Dasgupta, N. Kushman, I. Penchev, A. Repina, X. Wu, T. v. d. Weide, P. Ponnapalli, C. Kaplan, J. Simsa, S. Li, O. Dousse, F. Yang, J. Piper, N. Ie, R. Pasumarthi, N. Lintz, A. Vijayakumar, D. Andor, P. Valenzuela, M. Lui, C. Paduraru, D. Peng, K. Lee, S. Zhang, S. Greene, D. D. Nguyen, P. Kurylowicz, C. Hardin, L. Dixon, L. Janzer, K. Choo, Z. Feng, B. Zhang, A. Singhal, D. Du, D. McKinnon, N. Antropova, T. Bolukbasi, O. Keller, D. Reid, D. Finchelstein, M. A. Raad, R. Crocker, P. Hawkins, R. Dadashi, C. Gaffney, K. Franko, A. Bulanova, R. Leblond, S. Chung, H. Askham, L. C. Cobo, K. Xu, F. Fischer, J. Xu, C. Sorokin, C. Alberti, C. Lin, C. Evans, A. Dimitriev, H. Forbes, D. Banarse, Z. Tung, M. Omernick, C. Bishop, R. Sterneck, R. Jain, J. Xia, E. Amid, F. Piccinno, X. Wang, P. Banzal, D. J. Mankowitz, A. Polozov, V. Krakovna, S. Brown, M. Bateni, D. Duan, V. Firoiu, M. Thotakuri, T. Natan, M. Geist, S. t. Girgin, H. Li, J. Ye, O. Roval, R. Tojo, M. Kwong, J. Lee-Thorp, C. Yew, D. Sinopalnikov, S. Ramos, J. Mellor, A. Sharma, K. Wu, D. Miller, N. Sonnerat, D. Vnukov, R. Greig, J. Beattie, E. Caveness, L. Bai, J. Eisenschlos, A. Korchemniy, T. Tsai, M. Jasarevic, W. Kong, P. Dao, Z. Zheng, F. Liu, F. Yang, R. Zhu, T. H. Teh, J. Sanmiya, E. Gladchenko, N. Trdin, D. Toyama, E. Rosen, S. Tavakkol, L. Xue, C. Elkind, O. Woodman, J. Carpenter, G. Papamakarios, R. Kemp, S. Kafle, T. Grunina, R. Sinha, A. Talbert, D. Wu, D. Owusu-Afriyie, C. Du, C. Thornton, J. Pont-Tuset, P. Narayana, J. Li, S. Fatehi, J. Wieting, O. Ajmeri, B. Uria, Y. Ko, L. Knight, A. Héliou, N. Niu, S. Gu, C. Pang, Y. Li, N. Levine, A. Stolovich, R. Santamaria-Fernandez, S. Goenka, W. Yustalim, R. Strudel, A. Elqursh, C. Deck, H. Lee, Z. Li, K. Levin, R. Hoffmann, D. Holtmann-Rice, O. Bachem, S. Arora, C. Koh, S. H. Yeganeh, S. Põder, M. Tariq, Y. Sun, L. Ionita, M. Seyedhosseini, P. Tafti, Z. Liu, A. Gulati, J. Liu, X. Ye, B. Chrzaszcz, L. Wang, N. Sethi, T. Li, B. Brown, S. Singh, W. Fan, A. Parisi, J. Stanton, V. Koverkathu, C. A. Choquette-Choo, Y. Li, T. J. Lu, A. Ittycheriah, P. Shroff, M. Varadarajan, S. Bahargam, R. Willoughby, D. Gaddy, G. Desjardins, M. Cornero, B. Robenek, B. Mittal, B. Albrecht, A. Shenoy, F. Moiseev, H. Jacobsson, A. Ghaffarkhah, M. Rivière, A. Walton, C. Crepy, A. Parrish, Z. Zhou, C. Farabet, C. Radebaugh, P. Srinivasan, C. v. d. Salm, A. Fidjeland, S. Scellato, E. Latorre-Chimoto, H. Klimczak-Plucińska, D. Bridson, D. d. Cesare, T. Hudson, P. Mendolicchio, L. Walker, A. Morris, M. Mauger, A. Guseynov, A. Reid, S. Odoom, L. Loher, V. Cotruta, M. Yenugula, D. Grewe, A. Petrushkina, T. Duerig, A. Sanchez, S. Yadlowsky, A. Shen, A. Globerson, L. Webb, S. Dua, D. Li, S. Bhupatiraju, D. Hurt, H. Qureshi, A. Agarwal, T. Shani, M. Eyal, A. Khare, S. R. Belle, L. Wang, C. Tekur, M. S. Kale, J. Wei, R. Sang, B. Saeta, T. Liechty, Y. Sun, Y. Zhao, S. Lee, P. Nayak, D. Fritz, M. R. Vuyyuru, J. Aslanides, N. Vyas, M. Wicke, X. Ma, E. Eltyshev, N. Martin, H. Cate, J. Manyika, K. Amiri, Y. Kim, X. Xiong, K. Kang, F. Luisier, N. Tripuraneni, D. Madras, M. Guo, A. Waters, O. Wang, J. Ainslie, J. Baldridge, H. Zhang, G. Pruthi, J. Bauer, F. Yang, R. Mansour, J. Gelman, Y. Xu, G. Polovets, J. Liu, H. Cai, W. Chen, X. Sheng, E. Xue, S. Ozair, C. Angermueller, X. Li, A. Sinha, W. Wang, J. Wiesinger, E. Koukoumidis, Y. Tian, A. Iyer, M. Gurumurthy, M. Goldenson, P. Shah, M. K. Blake, H. Yu, A. Urbanowicz, J. Palomaki, C. Fernando, K. Durden, H. Mehta, N. Momchev, E. Rahimtoroghi, M. Georgaki, A. Raul, S. Ruder, M. Redshaw, J. Lee, D. Zhou, K. Jalan, D. Li, B. Hechtman, P. Schuh, M. Nasr, K. Milan, V. Mikulik, J. Franco, T. Green, N. Nguyen, J. Kelley, A. Mahendru, A. Hu, J. Howland, B. Vargas, J. Hui, K. Bansal, V. Rao, R. Ghiya, E. Wang, K. Ye, J. M. Sarr, M. M. Preston, M. Elish, S. Li, A. Kaku, J. Gupta, I. Pasupat, D. Juan, M. Someswar, T. M, X. Chen, A. Amini, A. Fabrikant, E. Chu, X. Dong, A. Muthal, S. Buthpitiya, S. Jauhari, N. Hua, U. Khandelwal, A. Hitron, J. Ren, L. Rinaldi, S. Drath, A. Dabush, N. Jiang, H. Godhia, U. Sachs, A. Chen, Y. Fan, H. Taitelbaum, H. Noga, Z. Dai, J. Wang, C. Liang, J. Hamer, C. Ferng, C. Elkind, A. Atias, P. Lee, V. Listík, M. Carlen, J. v. d. Kerkhof, M. Pikus, K. Zaher, P. Müller, S. Zykova, R. Stefanec, V. Gatsko, C. Hirnschall, A. Sethi, X. F. Xu, C. Ahuja, B. Tsai, A. Stefanoiu, B. Feng, K. Dhandhania, M. Katyal, A. Gupta, A. Parulekar, D. Pitta, J. Zhao, V. Bhatia, Y. Bhavnani, O. Alhadlaq, X. Li, P. Danenberg, D. Tu, A. Pine, V. Filippova, A. Ghosh, B. Limonchik, B. Urala, C. K. Lanka, D. Clive, Y. Sun, E. Li, H. Wu, K. Hongtongsak, I. Li, K. Thakkar, K. Omarov, K. Majmundar, M. Alverson, M. Kucharski, M. Patel, M. Jain, M. Zabelin, P. Pelagatti, R. Kohli, S. Kumar, J. Kim, S. Sankar, V. Shah, L. Ramachandruni, X. Zeng, B. Bariach, L. Weidinger, T. Vu, A. Andreev, A. He, K. Hui, S. Kashem, A. Subramanya, S. Hsiao, D. Hassabis, K. Kavukcuoglu, A. Sadovsky, Q. Le, T. Strohman, Y. Wu, S. Petrov, J. Dean, and O. Vinyals (2025)
+
+Gemini: A Family of Highly Capable Multimodal Models.
+
+ arXiv.
+
+Note: arXiv:2312.11805 [cs.CL]
+
+External Links: Link,
+Document
+
+Cited by: §C.3.1.
+
+[62]
+G. Team, S. E. Abd, V. Aggarwal, R. Algayres, A. Andreev, O. Bachem, I. Ballantyne, C. Brick, V. Cărbune, M. Casbon, M. Chaturvedi, A. Chawla, V. Cotruta, A. Coucke, P. Culliton, R. Dadashi, L. Dixon, M. Elhawaty, U. Evci, C. Farabet, J. Ferret, F. Galgani, S. Girgin, J. Grill, M. Grootendorst, J. Guo, C. Hardin, Y. He, S. M. Hernandez, O. Homburger, L. Hussenot, J. Ji, A. Joulin, A. Kamath, P. Kassraie, O. Lacombe, P. Lahoti, G. Liu, G. Martins, L. Martins, T. Matejovicova, R. Merhej, N. Momchev, S. Mondal, R. Mullins, S. R. Panyam, S. Pathak, S. Perrin, A. S. Pinto, E. Pot, A. Pouget, A. Ramé, S. Ramos, D. Reid, D. Rim, M. Rivière, K. Roth, L. Rouillard, O. Sanseviero, P. G. Sessa, S. Settle, D. Sinopalnikov, S. Smoot, P. Stanczyk, A. Steiner, L. Stewart, I. Tolstikhin, M. Tschannen, A. Tsitsulin, N. Vieillard, R. Wu, P. Xu, H. Yang, E. Yvinec, B. Zhang, L. Zhang, J. Zou, N. Aagnes, A. Abdelhamed, J. Adamek, S. Agrawal, S. Agrawal, I. Alabdulmohsin, J. B. Alayrac, U. Alon, C. Amarnath, A. Anand, C. Anastasiou, S. Ariafar, F. Aubet, K. Axiotis, F. Barbero, J. Barral, A. Bendebury, U. Bergmann, S. Bileschi, K. Black, M. Blondel, S. Borgeaud, A. Bražinskas, R. Burnell, R. Busa-Fekete, M. Cai, D. Calandriello, G. Cameron, C. Caucheteux, R. Chaabouni, G. Chadha, J. Chan, B. J. Chen, J. Chen, L. Chen, X. Chen, D. Cheng, T. Chien, N. Chinaev, Y. Chou, Z. Chu, B. Coleman, P. Consul, S. Conway-Rahman, S. Crowell, D. Cutler, V. Dani, S. Daruki, A. Das, D. Deutsch, N. Dikkala, L. Ding, Q. Ding, S. Dodhia, K. Donhauser, T. Doshi, A. Dragan, A. Druinsky, S. Dua, Z. Egyed, D. Eisenbud, D. Eppens, C. Fan, B. Fatemi, Y. Fathullah, V. Feinberg, M. Ferev, S. Flennerhag, T. Fujimoto, J. G. Oliveira, I. Galatzer-Levy, J. Gante, S. Geisler, S. Ghosal, A. M. Girgis, T. v. Glehn, A. Go, A. Gokhale, A. Grills, Y. Gu, M. Gupta, P. Gupta, G. Guruganesh, R. Hadsell, H. Harkous, J. Harlalka, D. Hassabis, A. Hauth, J. Heyward, A. Hosseini, C. Hsia, I. Hsu, X. Huang, Y. Huang, K. Hui, A. Hutter, T. I, F. Iliopoulos, A. Jain, G. Jawahar, Z. Ji, Q. Jin, M. Johnson, K. Joshi, A. Kandoor, W. Kang, K. Kavukcuoglu, M. Kazemi, K. Kenealy, A. Khalifa, P. Kirk, I. Korotkov, S. Kothawade, V. Kovalev, N. Kovelamudi, A. Kraft, R. Kumar, V. Kumar, H. Kuppam, J. Lannin, C. Lee, S. Lee, D. Lepikhin, A. Levkovitch, D. Li, Q. Li, V. Liévin, E. Lin, Z. Lin, C. Liu, T. Liu, T. Liu, X. Liu, I. Lobov, M. Lunayach, M. Ma, G. Madan, A. Maksai, E. Malmi, M. Matuszak, D. McDuff, G. Menghani, M. Mikuła, D. Mirylenka, K. Misiunas, V. Misra, A. Mitran, K. Mohamed, M. Mukha, E. Noland, J. O’Donnell, B. O’Donoghue, K. Olszewska, B. Orlando, W. Pan, R. Panigrahy, U. Parekh, N. Perez-Nieves, C. Park, E. Paskie, L. Peng, B. Petrini, S. Petrov, J. Pfeiffer, B. Piot, M. Plomecka, S. Poder, O. Ponce, A. Pramanik, D. Racz, A. Rajan, M. Ramanovich, A. Rao, M. Ritter, V. Rodrigues, E. Rosen, M. Rybiński, N. Sachdeva, M. E. Sander, R. Sathyanarayana, S. Savla, S. Schmidgall, T. Schuster, G. Scrivener, B. Seguin, A. Sellergren, A. Severyn, I. Shafran, D. Shah, B. Shahriari, Y. Shangguan, A. Shenoy, P. Shenoy, R. Shivanna, P. Sho, L. Spangher, W. Stokowiec, T. Strother, Y. Su, Y. Sun, M. Sundararajan, A. Tacchetti, M. H. Taege, P. Tafti, J. Tarbouriech, C. Tekur, S. Thakoor, R. Thapa, M. Traverse, L. Treven, T. Tu, C. T. Tung, Ç. Ünlü, P. Veličković, M. P. Venkat, S. G. Venkatesh, V. Venkiteswaran, F. Visin, A. Vitvitskyi, K. Vodrahalli, W. Wang, X. Wang, T. Warkentin, J. Wassenberg, J. Wieting, C. Wu, L. Xiao, H. Xu, Y. Xu, F. Xue, A. Yadav, J. Yan, A. Yang, L. Yang, M. Yang, Z. Ying, J. H. Yoo, M. Zadimoghaddam, S. Zafar, F. Zhang, J. Zhang, J. Zhang, X. Zhang, C. Zhao, D. Zhou, and C. Zou (2026)
+
+Gemma 4 Technical Report.
+
+ arXiv.
+
+Note: arXiv:2607.02770 [cs.CL]
+
+External Links: Link,
+Document
+
+Cited by: §3.2.
+
+[63]
+T. V. Team (2023)
+
+Vicuna: An Open-Source Chatbot Impressing GPT-4 with 90%* ChatGPT Quality - LMSYS Blog.
+
+(en).
+
+External Links: Link
+
+Cited by: Figure 7.
+
+[64]
+X. Tian, J. Gu, B. Li, Y. Liu, Y. Wang, Z. Zhao, K. Zhan, P. Jia, X. Lang, and H. Zhao
+
+DriveVLM: The Convergence of Autonomous Driving and Large Vision-Language Models.
+
+(en).
+
+Cited by: §1.
+
+[65]
+C. Tong, Q. Zhang, C. Li, L. Jiang, and Y. Liu (2026)
+
+FaithSCAN: Model-Driven Single-Pass Hallucination Detection for Faithful Visual Question Answering.
+
+ arXiv.
+
+Note: arXiv:2601.00269 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §1,
+§2.2,
+§2.2.
+
+[66]
+Y. Tu, R. Hu, and J. Sang (2025)
+
+ODE: Open-Set Evaluation of Hallucinations in Multimodal Large Language Models.
+
+ arXiv.
+
+Note: arXiv:2409.09318 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §2.1.
+
+[67]
+A. Villa, J. Léon, A. Soto, and B. Ghanem (2025)
+
+Behind the Magic, MERLIM: Multi-modal Evaluation Benchmark for Large Image-Language Models.
+
+pp. 492–502 (en).
+
+External Links: Link
+
+Cited by: §2.1.
+
+[68]
+A. Vo, K. Nguyen, M. R. Taesiri, V. T. Dang, A. T. Nguyen, and D. Kim (2026)
+
+Vision Language Models are Biased.
+
+ arXiv.
+
+Note: arXiv:2505.23941 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §C.1.
+
+[69]
+Y. Wada, K. Matsuda, K. Sugiura, and G. Neubig (2026)
+
+ZINA: Multimodal Fine-grained Hallucination Detection and Editing.
+
+ arXiv.
+
+Note: arXiv:2506.13130 [cs.CV]
+
+External Links: Link,
+Document
+
+Cited by: §2.2.
+
+[70]
+J. Wang, Y. Wang, G. Xu, J. Zhang, Y. Gu, H. Jia, J. Wang, H. Xu, M. Yan, J. Zhang, and J. Sang (2024)
+
+AMBER: An LLM-free Multi-dimensional Benchmark for MLLMs Hallucination Evaluation.
+
+ arXiv.
+
+Note: arXiv:2311.07397 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §2.1,
+§4.1.
+
+[71]
+J. Wang, Y. Zhou, G. Xu, P. Shi, C. Zhao, H. Xu, Q. Ye, M. Yan, J. Zhang, J. Zhu, J. Sang, and H. Tang (2023)
+
+Evaluation and Analysis of Hallucination in Large Vision-Language Models.
+
+ arXiv.
+
+Note: arXiv:2308.15126 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §2.1,
+§2.1,
+§2.2.
+
+[72]
+W. Wang, X. Li, Z. Wang, Y. Pang, J. Zhang, P. Li, Q. Zhang, and L. Gao
+
+Diving into Mitigating Hallucinations from a Vision Perspective for Large Vision-Language Models.
+
+(en).
+
+Cited by: Appendix E.
+
+[73]
+W. Wang, Z. Gao, L. Gu, H. Pu, L. Cui, X. Wei, Z. Liu, L. Jing, S. Ye, J. Shao, Z. Wang, Z. Chen, H. Zhang, G. Yang, H. Wang, Q. Wei, J. Yin, W. Li, E. Cui, G. Chen, Z. Ding, C. Tian, Z. Wu, J. Xie, Z. Li, B. Yang, Y. Duan, X. Wang, Z. Hou, H. Hao, T. Zhang, S. Li, X. Zhao, H. Duan, N. Deng, B. Fu, Y. He, Y. Wang, C. He, B. Shi, J. He, Y. Xiong, H. Lv, L. Wu, W. Shao, K. Zhang, H. Deng, B. Qi, J. Ge, Q. Guo, W. Zhang, S. Zhang, M. Cao, J. Lin, K. Tang, J. Gao, H. Huang, Y. Gu, C. Lyu, H. Tang, R. Wang, H. Lv, W. Ouyang, L. Wang, M. Dou, X. Zhu, T. Lu, D. Lin, J. Dai, W. Su, B. Zhou, K. Chen, Y. Qiao, W. Wang, and G. Luo (2025)
+
+InternVL3.5: Advancing Open-Source Multimodal Models in Versatility, Reasoning, and Efficiency.
+
+ arXiv.
+
+Note: arXiv:2508.18265 [cs.CV]
+
+External Links: Link,
+Document
+
+Cited by: §3.2.
+
+[74]
+X. Wang, J. Pan, L. Ding, and C. Biemann (2024)
+
+Mitigating Hallucinations in Large Vision-Language Models with Instruction Contrastive Decoding.
+
+ arXiv.
+
+Note: arXiv:2403.18715 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+Appendix E,
+§2.2.
+
+[75]
+H. Westermann and J. Savelka (2024)
+
+Analyzing Images of Legal Documents: Toward Multi-Modal LLMs for Access to Justice.
+
+ arXiv.
+
+Note: arXiv:2412.15260 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §1.
+
+[76]
+J. Wu, Q. Liu, D. Wang, J. Zhang, S. Wu, L. Wang, and T. Tan (2024)
+
+Logical Closed Loop: Uncovering Object Hallucinations in Large Vision-Language Models.
+
+In Findings of the Association for Computational Linguistics: ACL 2024, L. Ku, A. Martins, and V. Srikumar (Eds.),
+
+Bangkok, Thailand, pp. 6944–6962.
+
+External Links: Link,
+Document
+
+Cited by: §2.2.
+
+[77]
+M. Wu, J. Ji, O. Huang, J. Li, Y. Wu, X. Sun, and R. Ji (2024)
+
+Evaluating and Analyzing Relationship Hallucinations in Large Vision-Language Models.
+
+In Proceedings of the 41st International Conference on Machine Learning,
+
+pp. 53553–53570 (en).
+
+External Links: ISSN 2640-3498,
+Link
+
+Cited by: §2.1.
+
+[78]
+W. Xiao, Z. Huang, L. Gan, W. He, H. Li, Z. Yu, F. Shu, H. Jiang, and L. Zhu (2025)
+
+Detecting and Mitigating Hallucination in Large Vision Language Models via Fine-Grained AI Feedback.
+
+ arXiv.
+
+Note: arXiv:2404.14233 [cs.CV]
+
+External Links: Link,
+Document
+
+Cited by: §2.2.
+
+[79]
+J. Xie, R. Yu, H. Zhang, S. M. Billah, S. Lee, and J. M. Carroll (2025)
+
+Beyond Visual Perception: Insights from Smartphone Interaction of Visually Impaired Users with Large Multimodal Models.
+
+In Proceedings of the 2025 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’25, New York, NY, USA, pp. 1–17.
+
+External Links: ISBN 979-8-4007-1394-1,
+Link,
+Document
+
+Cited by: §5.3.
+
+[80]
+Y. Xie, G. Li, X. Xu, and M. Kan (2024)
+
+V-DPO: Mitigating Hallucination in Large Vision Language Models via Vision-Guided Direct Preference Optimization.
+
+In Findings of the Association for Computational Linguistics: EMNLP 2024, Y. Al-Onaizan, M. Bansal, and Y. Chen (Eds.),
+
+Miami, Florida, USA, pp. 13258–13273.
+
+External Links: Link,
+Document
+
+Cited by: §C.4,
+§C.5,
+§5.1.
+
+[81]
+T. Yang, Z. Li, J. Cao, and C. Xu (2024)
+
+Understanding and Mitigating Hallucination in Large Vision-Language Models via Modular Attribution and Intervention.
+
+(en).
+
+External Links: Link
+
+Cited by: Appendix E.
+
+[82]
+S. Yin, C. Fu, S. Zhao, T. Xu, H. Wang, D. Sui, Y. Shen, K. Li, X. Sun, and E. Chen (2024)
+
+Woodpecker: hallucination correction for multimodal large language models.
+
+Science China Information Sciences 67 (12), pp. 220105 (en).
+
+External Links: ISSN 1674-733X, 1869-1919,
+Link,
+Document
+
+Cited by: Appendix E.
+
+[83]
+H. You, H. Zhang, Z. Gan, X. Du, B. Zhang, Z. Wang, L. Cao, S. Chang, and Y. Yang (2024)
+
+Ferret: Refer and Ground Anything Anywhere at Any Granularity.
+
+(en).
+
+Cited by: Appendix E.
+
+[84]
+Q. Yu, J. Li, L. Wei, L. Pang, W. Ye, B. Qin, S. Tang, Q. Tian, and Y. Zhuang (2024)
+
+HalluciDoctor: Mitigating Hallucinatory Toxicity in Visual Instruction Data.
+
+In 2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR),
+
+Seattle, WA, USA, pp. 12944–12953 (en).
+
+External Links: ISBN 979-8-3503-5300-6,
+Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+§2.1,
+§2.2.
+
+[85]
+R. Zhang, D. Jiang, Y. Zhang, H. Lin, Z. Guo, P. Qiu, A. Zhou, P. Lu, K. Chang, Y. Qiao, P. Gao, and H. Li (2025)
+
+MATHVERSE: Does Your Multi-modal LLM Truly See the Diagrams in Visual Math Problems?.
+
+In Computer Vision – ECCV 2024, A. Leonardis, E. Ricci, S. Roth, O. Russakovsky, T. Sattler, and G. Varol (Eds.),
+
+Cham, pp. 169–186 (en).
+
+External Links: ISBN 978-3-031-73242-3,
+Document
+
+Cited by: §C.4,
+§C.5,
+§5.1.
+
+[86]
+R. Zhang, H. Zhang, and Z. Zheng (2024)
+
+VL-Uncertainty: Detecting Hallucination in Large Vision-Language Model via Uncertainty Estimation.
+
+ arXiv.
+
+Note: arXiv:2411.11919 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+§1,
+§2.2,
+§2.2.
+
+[87]
+Y. Zhang, R. Xie, X. Sun, Y. Huang, J. Chen, Z. Kang, D. Wang, and Y. Wang (2025)
+
+DHCP: Detecting Hallucinations by Cross-modal Attention Pattern in Large Vision-Language Models.
+
+In Proceedings of the 33rd ACM International Conference on Multimedia,
+
+MM ’25, New York, NY, USA, pp. 3555–3564.
+
+External Links: ISBN 979-8-4007-2035-2,
+Link,
+Document
+
+Cited by: §2.2.
+
+[88]
+J. Zhao, F. Zhang, X. Sun, and C. Feng (2025)
+
+Mitigate Language Priors in Large Vision-Language Models by Cross-Images Contrastive Decoding.
+
+ arXiv.
+
+Note: arXiv:2505.10634 [cs]
+version: 2
+
+External Links: Link,
+Document
+
+Cited by: §A.1,
+§B.2,
+§C.4,
+§C.5,
+§2.2,
+§5.1.
+
+[89]
+K. Zheng, J. Chen, Y. Yan, X. Zou, H. Zhou, and X. Hu (2025)
+
+Reefknot: A Comprehensive Benchmark for Relation Hallucination Evaluation, Analysis and Mitigation in Multimodal Large Language Models.
+
+In Findings of the Association for Computational Linguistics: ACL 2025, W. Che, J. Nabende, E. Shutova, and M. T. Pilehvar (Eds.),
+
+Vienna, Austria, pp. 6193–6212.
+
+External Links: ISBN 979-8-89176-256-5,
+Link,
+Document
+
+Cited by: §2.1.
+
+[90]
+Y. Zhou, C. Cui, J. Yoon, L. Zhang, Z. Deng, C. Finn, M. Bansal, and H. Yao (2024)
+
+Analyzing and Mitigating Object Hallucination in Large Vision-Language Models.
+
+ arXiv.
+
+Note: arXiv:2310.00754 [cs]
+
+External Links: Link,
+Document
+
+Cited by: §C.1,
+Appendix E,
+§1,
+§2.1,
+§2.2,
+§3.1,
+§4.1.
+
+Robustness of Internal Signals for Hallucination Detection in Vision-Language Models
+
+Appendix
+
+## Appendix A Implementation details
+
+This section covers details regarding the hallucination detection methods analyzed and token position baseline (§ A.1), and details on experimental setup and implementation (e.g., hyperparameters) (§ A.2).
+
+## A.1 Hallucination detection method details
+
+In this section we provide greater detail and mathematical formulations of the hallucination detection problem in general (§ A.1.1) and of each hallucination detection method (§ A.1.2).
+
+First, the detection method must rely on signals from the VLM generating the caption, either internal representations like embeddings or attention (white box) or external logits or probabilities (black box).
+This excludes methods that detect hallucinations using auxiliary models, such as LLMs or lightweight classifiers [31, 19, 84, 30, 9, 52, 17].
+Second, we selected detection methods that could output a token-wise hallucination score with a single pass, excluding methods based on contrastive decoding [32, 74, 88] or that require multiple passes [35, 86, 15].
+
+## A.1.1 Mathematical formulation of hallucination detection methods.
+
+Let $x$ denote the input image and instruction prompt “Describe this image in detail” and $f_{\theta}$ the VLM.
+ $f_{\theta}$ consists of a vision encoder $f_{\phi}$ that represents the image using $N$ image embeddings, language model decoder $f_{\pi}$ that consists of $L$ transformer layers, and a projector $\Phi$ that projects image embeddings into the language space.
+
+Given the inputs $x$ , $f_{\theta}$ then generates a token sequence of length $T$ , $y=(y_{1},\dots,y_{T})$ autoregressively with the conditional distribution $p_{\theta}(y_{t}\mid x,y_{<t})$ .
+Let $\mathcal{M}=\{m_{1},\dots,m_{7}\}$ denote the set of methods, where some are black box, accessing only output probabilities or logits $p_{\theta}(\cdot\mid x,y_{<t})$ , and others which are white box, additionally leveraging internal model signals.
+Each detection method $m\in\mathcal{M}$ assigns a per-token hallucination score as $f_{\theta}$ generates each token autoregressively:
+
+ $s_{m}(y_{t};x,y_{<t})\in\mathbb{R},$ 
+
+For a multi-token object $o=(y_{a},\dots,y_{b})$ , we define the per-object score using the first token, following prior work [29, 53]:
+
+ $s_{m}(o)=s_{m}(y_{a};x,y_{<a}).$ 
+
+We do not modify the original methods, except to directionally align scores such that higher always corresponds to a higher likelihood of hallucination.
+Following prior work, we always consider the first token of each object [29, 53].
+Additionally, if an object is mentioned multiple times in the caption, we only compute the hallucination scores for the first time it is mentioned.
+This is to have one hallucination score for each object mentioned and the first instance is when the object would be likely to have higher hallucination scores.
+
+## A.1.2 Equations of specific methods.
+
+IC [28] computes scores based on how likely the object can be predicted from the image representations. Concretely, it applies Logit Lens [50] on all $N$ image embeddings $I$ from all $L$ LLM layers and takes the maximum value for the generated token, indexed by $o$ :
+
+ $s_{ic}=1-\mathrm{max}_{\begin{subarray}{c}1\leq l\leq L\\
+1\leq i\leq N\end{subarray}}\{\mathrm{softmax}(\mathrm{LogitLens}(I_{li}))_{o}\}$ 
+
+CL [55] identifies hallucinations based on similarity between image and text representations. Specifically, CL computes the maximum cosine similarity between the generated token’s text embedding $t$ from all $N$ image embeddings $I$ , crossing between layers:
+
+ $s_{cl}=1-\mathrm{max}_{\begin{subarray}{c}1\leq l\leq L\\
+1\leq i\leq N\end{subarray}}\{\mathrm{CosineSim}(I_{li},t_{l})\}$ 
+
+GLSim [53] also leverages cosine similarity between representations, but computes a weighted average of “local” similarity between the token’s text embedding $t$ with $k$ image embeddings $I_{1:k}$ and a “global” similarity between the token’s embedding with the last token embedding of the prompt, $r$ . Layers for embeddings $l$ and $l^{\prime}$ are hyperparameters, along with the weight term $w$ and number of image patches $k$ . See [53] for original formulations.
+
+Here we describe further details about GLSim that were omitted in the main text for brevity.
+
+Recall that GLSim, or Global-Local Similarity computes a weighted average of two similarity terms, and is defined as:
+
+ $s_{glsim}=1-\left(w\cdot\mathrm{GlobalSim}(r_{l},t_{l^{\prime}})+(1-w)\cdot\mathrm{LocalSim}(I_{l,1:k},t_{l^{\prime}})\right)$ 
+
+where $r$ is the last token of the prompt embedding, $t$ is the embedding of the object token $o$ , and $I$ represents image patch embeddings. $w$ , $k$ , $l$ , and $l^{\prime}$ are hyperparameters.
+More concretely, $\mathrm{GlobalSim}=\mathrm{CosineSim}(r_{l},t_{l^{\prime}})$ .
+Local similarity first requires selecting the top- $k$ image patches by applying Logit Lens [50] on all $N$ image patches, and selecting the $k$ that output the highest probability for the current object token $o$ . Mathematically, the top- $k$ image embeddings at layer $l$ are
+
+ $I_{l,1:k}=\mathrm{TopK_{I\in\textbf{I}}}(\mathrm{softmax}(\mathrm{LogitLens}(I))_{o})$ 
+
+Once the top- $k$ image patches are selected, the local similarity is defined as:
+
+ $\mathrm{LocalSim}=\frac{1}{k}\sum_{I_{l}\in I_{l,1:k}}\mathrm{CosineSim}(I_{l},t_{l^{\prime}})$ 
+
+SVAR [29] leverages attention instead of representation embeddings like the previous methods. Specifically, it sums the attention from the generated token to all image patches, aggregating across layers $l_{s}$ to $l_{e}$ and averaging across $H$ heads.
+By default, SVAR uses layers 5 to 18, but we conduct hyperparameter searches for each VLM.
+Because this sum is unbounded, we direction-align SVAR by multiplying it by $-1$ .
+
+ $s_{svar}=-1*\frac{1}{H}\sum_{l=l_{s}}^{l_{e}}\sum_{h=1}^{H}\sum_{i=1}^{N}A_{t}^{(l,h)}(t,I_{i})$ 
+
+PAS [23] also leverages attention, like SVAR, but sums attention from the generated token to previously generated caption tokens.
+The intuition is that if there is more attention distributed to caption tokens, less is distributed to the image which is more likely to occur with hallucinations.
+By default, PAS uses attention from the first layer and averages across $H$ attention heads, but we conduct a hyperparameter search for layer selection.
+In the equation below, $m$ is the number of prompt tokens, $t$ is the current token’s index, and $j$ represents indices of all prior tokens in the caption.
+
+ $s_{pas}=\frac{1}{H}\sum_{h=1}^{H}\sum_{j=m+1}^{t-1}A_{t}^{(0,h)}(t,j)$ 
+
+## A.1.3 Token position baseline
+
+The token position baseline uses the position of the first token of a word in the caption, beginning at the start of the caption, i.e., ignoring the image and prompt instructions tokenization.
+Most of the VLMs consistently allocate the same number of tokens per image because they resize them, but Qwen3VL-8B-Instruct does not. We also tested if accounting for the image’s token count with Qwen resulted in a better token position baseline, but it did not.
+
+## A.2 Reproducibility details, word-matching, & hyperparameters
+
+In this section, we provide more details regarding reproducibility of results including experimental settings, our word-matching algorithm, and hyperparameters we used. Code is publicly available at https://github.com/princetonvisualai/hallucination-detection-robustness
+
+Setup. Following prior work [53, 28, 29], we randomly select 5,000 images from the MSCOCO 2014 validation set to evaluate the detection methods. Concretely, we selected these with seed=0.
+For all VLMs, we set the following generation hyperparameters: sampling=False, temp=0, max_new_tokens=512, and num_beams=1.
+We additionally fixed all seed=0 for deterministic outputs and reproducibility.
+All experiments were conducted in internal compute clusters with either 1 RTX3090 GPU with 24GB of RAM or 1 L40 GPU with 48 GB of RAM for larger VLMs (e.g., Qwen3VL-8B-Instruct or LLaVA-1.5-13B).
+All experiments were allocated 8 CPUs and while most experiments took 3-4 GPU-hours, no experiment exceeded 48 GPU-hours. Qwen3VL-8B-Instruct tended to take the longest because its captions are the longest.
+Total compute time is estimated to be roughly 120 GPU-hours. This does not include preliminary and exploratory experiments that did not make it into the final draft, which we estimate to be roughly 72 GPU hours.
+
+Our setup in determining which token and word instances to use were based on prior work [53, 29]. When a word spans multiple tokens, we always use the hallucination scores for the first token [53, 29], and when a word appears multiple times in the caption, we also use the first occurrence, as in Park and Li [53].
+This assumes that applications of hallucination detection will be more interested in catching hallucinations of objects, not necessarily instances of objects. Thus, we focus on whether a method can detect whether an object is hallucinated to begin with by using the first instance.
+
+We selected the six VLMs in order to have a diversity of architectures and methods.
+For example, LLaVA-1.5-7B, LLaVA-1.5-13B, and InstructBLIP-Vicuna-7B all use Vicuna as an LLM backbone while Qwen3VL-8B-Instruct and InternVL2-8B do not.
+Qwen3VL-8B-Instruct performs adaptive image sizing while other VLMs use fixed image sizes.
+InstructBLIP-Vicuna-7B considers the instruction prompt when computing the image representations and InternVL2-8B uses a pre-trained language model as a vision-language adaptor such that the image representations are shaped by language before they enter the LLM backbone.
+Other VLMs, however, do not consider language in the visual representation and use lightweight adaptors.
+
+MSCOCO [36] was accessed via https://cocodataset.org/#download, and we use the 2014 splits.
+For robustness experiments, data for Objects365 was accessed via OpenDataLab at https://opendatalab.com/OpenDataLab/Objects365_v1.
+All VLMs were accessed via HuggingFace at the following URLs:
+
+• 
+
+LLaVA-1.5-7B: https://huggingface.co/llava-hf/llava-1.5-7b-hf
+
+• 
+
+LLaVA-1.5-13B: https://huggingface.co/llava-hf/llava-1.5-13b-hf
+
+• 
+
+InstructBLIP-Vicuna-7B: https://huggingface.co/Salesforce/instructblip-vicuna-7b
+
+• 
+
+Qwen3VL-8B-Instruct: https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct
+
+• 
+
+InternVL2-8B: https://huggingface.co/OpenGVLab/InternVL2-8B
+
+• 
+
+Gemma-4-E4B-it: https://huggingface.co/google/gemma-4-E4B-it
+
+Word-Matching. In this work we meticulously developed a robust word-matching system to account for edge cases when identifying which tokens corresponded to which word.
+While prior work [53, 29] simply obtained the first instance that the desired token appeared in the output, we found that there were edge cases where this would give a false match.
+For example, if the word was “table,” depending on the tokenizer, if the word “tablecloth” appeared before “table” in the sentence, this would be the word that was returned, resulting in a false match.
+To mitigate this, we included additional checks to ensure the word was a standalone word, such as ensuring that the word was preceded and followed by a space or punctuation, accounting for plural forms.
+
+Another difficulty was if a tokenizer does not detokenize with spaces, such that sometimes two words when placed next to each other appear like a potential object. For example “a calm man” becomes “acalman” and the object “man” becomes a false match.
+To mitigate this issue, we perform checks on the preceding and following words in the original and decoded captions, if applicable, and if it is a false match, we skip this instance and check the next occurrence of the word.
+
+While this level of granularity in word matching may not have a large effect in these evaluation settings, if these methods are to be deployed in real-world settings, greater care must be taken to ensure proper token matching. Even with our additional checks, we do observe there are bound to be cases that are not caught.
+
+Addressing CHAIR’s context-insensitivity. One of the limitations of CHAIR is that it uses text-based string matching and thus is insensitive to the context. For example, if a VLM generates the word “orange” to describe the color, CHAIR will flag this as the object orange being mentioned.
+To exclude this systematic issue from our results, we omit the word “orange” from all evaluations presented in the main text.
+However, we addit
+
+Hyperparameter Selection.
+For methods with hyperparameters (GLSim, SVAR, CL, and PAS) we aim to stay as faithful as possible to the original work.
+If a VLM was reported in the original paper (LLaVA-1.5-7B and LLaVA-1.5-13B), we use the reported hyperparameters.
+If not, we start with the hyperparameters reported for LLaVA-1.5-7B or LLaVA-1.5-13B and then conduct a hyperparameter search by evaluating over $500$ samples from the 2014 training split of MSCOCO [36].
+We choose the hyperparameter configuration that jointly maximizes AUROC and AUPRC on the $500$ samples.
+If there is a tie, we prioritize maximizing AUPRC, as it is a better metric for unbalanced classes.
+We report the hyperparameters for MSCOCO in Table 2 and for Objects365 in Table 3.
+
+GLSim has four hyperparameters: the weight parameter $w$ , the number of image patches $k$ , the layer of the image and prompt embeddings $l$ , and the layer of the object token embedding $l^{\prime}$ .
+SVAR has two hyperparameters: the start ( $s$ ) and end ( $e$ ) layers that attention is extracted from.
+CL and PAS each have one hyperparameter: the layer ( $l$ ) at which we extract representations or attention patterns.
+
+Table 2: Hyperparameter values for GLSim, SVAR, CL, and PAS on all VLMs with MSCOCO. VLMs under the horizontal line are different versions of evaluated VLMs
+
+GLSim
+SVAR
+CL
+PAS
+
+VLM
+ $w$ 
+ $k$ 
+ $l$ 
+ $l^{\prime}$ 
+ $s$ 
+ $e$ 
+ $l$ 
+ $l$ 
+
+LLaVA-1.5-7B
+0.6
+32
+32
+31
+5
+18
+30
+0
+
+LLaVA-1.5-13B
+0.6
+32
+40
+38
+5
+18
+25
+0
+
+InstructBLIP-Vicuna-7B
+0.8
+4
+32
+32
+1
+7
+30
+0
+
+Qwen3VL-8B-Instruct
+0.3
+8
+35
+35
+2
+21
+20
+14
+
+InternVL2-8B
+0.8
+8
+23
+32
+1
+10
+10
+9
+
+Gemma-4-E4B-it
+0.7
+16
+42
+33
+1
+20
+10
+9
+
+InternVL3.5-8B
+0.7
+8
+33
+36
+1
+18
+15
+35
+
+Qwen3.5-9B
+0.7
+32
+31
+31
+2
+5
+15
+2
+
+Table 3: Hyperparameter values for GLSim, SVAR, CL, and PAS on all VLMs with Objects365. NA indicates using the maximum across all layers yields best results.
+
+GLSim
+SVAR
+CL
+PAS
+
+VLM
+ $w$ 
+ $k$ 
+ $l$ 
+ $l^{\prime}$ 
+ $s$ 
+ $e$ 
+ $l$ 
+ $l$ 
+
+LLaVA-1.5-7B
+0.6
+32
+32
+31
+5
+10
+NA
+0
+
+LLaVA-1.5-13B
+0.5
+8
+37
+40
+5
+18
+25
+0
+
+InstructBLIP-Vicuna-7B
+0.7
+8
+32
+32
+1
+15
+20
+0
+
+Qwen3VL-8B-Instruct
+0.1
+8
+35
+35
+10
+35
+30
+34
+
+InternVL2-8B
+0.6
+8
+20
+32
+5
+18
+NA
+9
+
+Gemma-4-E4B-it
+0.1
+8
+42
+30
+1
+20
+10
+9
+
+## Appendix B Limitations
+
+In this section, we non-exhaustively elaborate on limitations of the CHAIR evaluation setting (§ B.1) and of the limited scope of our analyses (§ B.2).
+
+## B.1 Limitations of CHAIR evaluation
+
+Although CHAIR [57] is commonly used for labeling hallucinations, we acknowledge that it has limitations, as other evaluation settings try to address [6, 33].
+Namely, the limitations come from the method using direct string matching to label objects and their synonyms without considering the context which recent work aims to mitigate [6].
+For example, if there is an image of an empty park and the caption consists of a hypothetical phrase such as “this park looks like a great place for people to enjoy a sunny afternoon,” CHAIR would identify “people” as a hallucination.
+However, in the full context of the caption, the model is not actually hallucinating.
+CHAIR faces similar limitations for other phrases such as “the shirt says ‘cat in the house”’.
+Further, with CHAIR, it is not possible to distinguish between multiple instances of the same object class. For example, if an image contains one person on the left, but a caption says “there is one person on the left and one person on the right,” this is a hallucination that CHAIR is unable to detect.
+
+Lastly, CHAIR cannot differentiate between different parts of speech, such as when the word “orange” appears as the fruit or the color because it does not take into account contextual cues.
+Because of this, we noticed that some VLMs, primarily Qwen3VL-8B-Instruct and InternVL2-8B, frequently hallucinated the word “orange,” but manual investigation demonstrated that these instances were from references to the color rather than the object.
+Because CHAIR mislabels these as hallucinations, we omitted all instances of the word “orange” from all analyses. However, as we show in § D.6, the results with and without the object “orange” do not lead to different conclusions.
+
+## B.2 Limited scope of analyses
+
+While our analyses present interesting findings, we acknowledge a few limitations here, such as only considering object hallucinations, a subset of hallucination detection methods.
+First, our analyses were limited to detecting object hallucinations in image captioning settings and do not consider attribute or relational hallucinations nor various settings like multiple choice question-answering or dialogues.
+Second, in order to operate in a well-constrained environment, we only considered hallucination detection methods that were training-free and calculated hallucination scores based on a single pass of the VLM’s generation.
+However, there are many other types of hallucination detection methods such as those that require multiple passes [32, 74, 88, 35, 86, 15], or that utilize auxiliary detector models [31, 19, 84, 30, 9].
+Third, while we tested on a variety of VLMs with different language model backbones, we were limited to smaller open-source models due to computational constraints.
+These may exhibit different hallucination rates than frontier models.
+Lastly, while we report results on two independently curated datasets, MSCOCO [36] and Objects365[59], these datasets may not be fully representative of the real-world.
+
+Future work should consider expanding upon these limitations, considering a wider variety of hallucination types, VLM response settings, a broader suite of hallucination detection methods, and various VLMs, and additional datasets.
+It is important to conduct experiments in a variety of settings to evaluate whether the findings hold in diverse conditions or not.
+
+## B.3 Potential impacts
+
+Potential positive impacts of our work include motivating future work to contribute analyses of different aspects of hallucination detection methods, more thorough evaluation of hallucination detection methods, and responsible deployment of hallucination detection tools.
+While the positive potential impacts outweigh the negative, potential negative impacts could include overconfidence in particular detection methods and developing user-facing applications before robustly analyzing the methods.
+However, because our work is aimed to encourage researchers and developers to take more care when evaluating hallucination detection methods, we do not foresee large negative societal impact.
+
+## Appendix C Experimental details & additional results
+
+In this section, we go through each analysis in the order presented in the main paper and elaborate on experimental details and present results from other VLMs not reported in the main paper. Because figures tend to be quite large, we place them at the end of this section (§ C).
+
+## C.1 Token position distribution of real vs. hallucinated objects
+
+This is more of a preliminary analysis to demonstrate that for all VLMs, later token positions are more likely to be hallucinations. This observation has been alluded to or demonstrated in much of prior work as well [68, 46, 90, 34, 60, 16].
+For this analysis, we simply partition the objects into real and hallucinated and plot the distribution of token position. Results can be found in Fig. 7.
+
+## C.2 Correlation analysis between detection methods and token position
+
+Here we supply additional figures and graphs to demonstrate the correlation between hallucination score and token position.
+
+In Fig. 8- 11, we present qualitative examples of the correlations in captions generated by LLaVA-1.5-13B.
+As demonstrated by the examples, SVAR, GLSim, and to a certain degree CL tend to score objects later in the caption as more likely to be hallucinated, even if the same object was deemed as less likely to be hallucinated earlier in the caption.
+While our analyses only evaluates the first occurrence of each word in a caption, we visualize all instances to show how a word’s hallucination score can change depending on its location in the caption.
+Bolded text indicates the object is a hallucination according to CHAIR [57]. Green indicates the detection method scored this word as a low probability of hallucination while red indicates a higher probability of hallucination.
+
+Further, in Fig. 12, we show correlation matrices for all VLMs, including LLaVA-1.5-13B again for reference.
+We computed pairwise Spearman’s rank correlation between the object-wise scores for all methods and the object’s token position.
+We chose Spearman’s over Pearson’s because the former does not assume linear relationships between the methods.
+
+As shown in the figure, the correlations between SVAR and token position and between black box methods remain consistent across different VLM architectures.
+However, for other pairwise correlations, especially with white box methods, we observe variation across different VLMs, which we provide some potential explanations for here.
+For InstructBLIP-Vicuna-7B and InternVL2-8B, the correlations between IC and other white box methods are higher than for the other four VLMs.
+We hypothesize this is due to the influence of language in shaping the image representations before they enter the LLM backbone.
+In other VLMs, the image representation is less affected by text, especially since the image is always before the instruction text, which could lead IC to perform more differently in these cases.
+We also note that Gemma-4-E4B-it exhibits very low correlation between CL and GLSim, which is surprising, given the similarity of the methods’ underlying computations.
+All correlations were statistically significant ( $p<0.001$ ) even when accounting for multiple comparisons.
+
+## C.3 Reliance of detection on token position
+
+## C.3.1 Experimental details
+
+To replace sentences with image-agnostic but task-relevant text, we generated a pool of sentences with varying lengths using Gemini [61] with the following prompt: “I need to replace sentences one at a time in image captions generated by a vision-language model, such as Qwen. I am replacing sentences with image-agnostic text, starting at the beginning of the caption. I need a variety of sentences that are different lengths, ranging from 10-50 tokens when using the llava-1.5-7b tokenizer. Starting at 10 tokens long and increasing by 5 tokens until you reach 50 tokens, give me a sentence that could replace a sentence in an image caption.”
+
+Then we manually inspected them and checked the token lengths according to the different tokenizers. Specifically, we removed phrases that seemed to describe staged images and made small edits to adjust incorrect token lengths. Below are the pool of sentences followed by the number of tokens (using LLaVA-1.5-7B tokenizer) and the number of words.
+
+• 
+
+The overall composition of the image is quite balanced. (11, 9)
+
+• 
+
+Objects are arranged throughout the scene in a specific way, naturally or deliberately. (17, 13)
+
+• 
+
+Lighting plays a crucial role in defining the textures and colors that are visible across the entire frame. (22, 18)
+
+• 
+
+The perspective captured here offers a unique viewpoint that emphasizes the important relationship between the foreground elements and the background details. (25, 21)
+
+• 
+
+It is important to consider how the spatial distribution of these items contributes to the narrative being told by the visual information presented within this specific context. (30, 27)
+
+• 
+
+The way the light interacts with various surfaces creates a subtle range of highlights and soft shadows that defines the physical presence of everything within the area without highlighting one specific subject. (38, 32)
+
+• 
+
+Various elements across the entire area seem to fall into a pattern, where the distribution of shapes and colors allows the gaze to wander freely through the space without any single point dominating the overall visual experience. (43, 37)
+
+• 
+
+The overall atmosphere of this particular setting is characterized by a blend of various textures and shapes that come together to form a cohesive view, providing a sense of depth and perspective that defines the entire area being observed here. (47, 40)
+
+When replacing preceding sentences, we replaced one sentence at a time by computing the token length of the sentence and replacing it with the one from the pool that was closest in token length.
+We acknowledge this is not perfect as it could result in sentences being repeated, but we selected to do this for simplicity yet maintaining readability.
+Additionally, it is arguable that there is still some information in these sentences and that to completely remove information, one should fill it with spaces or other filler text.
+We decided to use the sentence-wise replacement in order for the caption to still resemble natural language.
+However, this experiment could be done in future work.
+
+Other than being solely dependent on token position (i.e., scores decrease significantly in the remove intervention but do not change in the replace intervention), we could observe a few other behaviors.
+In some cases, the detection method could be dependent on both token position and semantic content.
+If this is the case, then its score may fluctuate in the replace intervention but we would still expect the hallucination scores to decrease when text is removed compared to when text is replaced.
+However, in these latter cases, we cannot make as precise claims about the degree of dependency on only token position.
+In other cases, detection methods could be modeling the congruity of the object in preceding context, as we hypothesize is the case with NLL and Ent.
+
+## C.3.2 Results for reliance on token position for all VLMs
+
+In Fig. 13, we show how hallucination scores change for all detection methods and VLMs reported in Table 1.
+The trends described in the main paper still reliably hold.
+Black box methods increase hallucination scores (i.e., judging objects to be more likely hallucinated) while white box methods, especially attention-based SVAR and PAS are more likely to decrease scores or remain the same.
+
+We observe for newer VLMs (i.e., Qwen3VL-8B-Instruct, InternVL2-8B, and Gemma-4-E4B-it), there is reduced direct token position dependence across white box methods, demonstrated by the relative size of the bars in the “remove” setting to be more comparable between white box methods and token position.
+This suggests that internal signals in newer models may be more robust to this heuristic.
+It additionally suggests that a single detection method can be leveraging different types of signals depending on the VLM; in other words, two VLMs’ representations or attention patterns can carry different signals which would shape the detection methods’ performance.
+
+For other VLMs, we observe that either most of CL and GLSim’s change in score in the remove intervention is accounted for by the replace experiment or there is very little change for CL.
+This suggests that for some VLMs, CLmay be more sensitive to prior context, not just token position, and for others it is insensitive to either.
+We further observe that the behavior of attention-based methods (SVAR and PAS) also remains consistent across VLMs, suggesting these methods are consistently dependent on token position and less so on context.
+
+In § 4.2, we briefly mention a hypothesis of the mechanisms causing black box method scores to increase when removing or replacing preceding context.
+We elaborate further here, and this also applies to our interpretation of PAS with some of the VLMs.
+One possible explanation for the behavior observed with black box methods is that these methods are highly sensitive to how well the current token belongs (or doesn’t belong) with the preceding context, i.e., the perplexity of the current token.
+Thus, when the preceding context is gone (in the removal case) or devoid of meaningful information (in the replacement case), naturally, the perplexity of the current token is high, the likelihood is low, and the black box methods score it as more likely to be hallucinated.
+
+On the other hand CL, GLSim, and SVAR white box methods may also be sensitive to language model biases, such as sensitivity to position [27, 5].
+If this language-biased sensitivity outweighs other factors, then these methods would behave more similarly to token position, as SVAR clearly does.
+
+## C.4 Language vs. image-sensitive partitioning
+
+Here we provide further elaboration on the language vs. image-sensitive hallucination partitioning, as there may be concern of its sensitivity to out of distribution images.
+To summarize, we partition hallucinations by feeding the generated caption with a blank gray image into the VLM and examining whether the new predicted token is the same object or not [85, 88, 16, 80].
+We used a gray image as it more closely represents the mean pixel values compared to a black or white image.
+If the predicted token is still the hallucinated object when the image is blank, it belongs to the language-based partition.
+This is because the VLM still hallucinates the object, even when there is no image [85, 88, 16, 80].
+Otherwise, the hallucination likely arises from image-sensitive sources which would be primarily attributed to visual deficiencies, which can include ambiguous visual representations or misalignment between vision and language, based on prior work [38, 12].
+We note that prior work tended to remove the image, but in our settings this is infeasible because the detection methods require an image representation.
+
+Let us examine each partition (language vs. vision) separately.
+The language partition includes hallucinated objects that are still hallucinated when given a blank image.
+We believe the objects that fall into this partition are safe from out of distribution effects; if they are still hallucinated even with an extremely out of distribution image, then the VLM is most likely not referring to the image to generate this word.
+
+So, if the partition function is sensitive to out of distribution images, then likely these would fall into the “image-sensitive” partition.
+This partition then would contain hallucinations from vision sources as well as out of distribution effects.
+Nevertheless, our main claim is on the language-based hallucination partition, and not this second partition. Therefore such contamination does not affect our claim that the advantage of white box methods over black box methods is apparent only in the first partition, which is language-based hallucinations.
+While this partition would include vision-based as well as other sources of hallucinations, we hypothesize that a cleaner partition function would only highlight the performance differences since more language-based hallucinations would be appropriately partitioned.
+
+Results for all VLMs reported in the main paper can be found in Fig. 14.
+Here we see white box methods consistently outperform black box methods in language-based hallucinations but perform on par—or even underperform—black box methods on image-sensitive hallucinations.
+This trend is consistent across VLMs.
+For example, while black box methods outperform all white box methods on image-sensitive hallucinations for Qwen3VL-8B-Instruct and InternVL2-8B, performance is more comparable across the two categories for other VLMs.
+These results suggest that white box methods’ competitive advantage comes from detecting hallucinations that persist, even when an image is removed, i.e., the language-based hallucinations, suggesting a general absence of image sensitivity.
+Surprisingly, SVAR and PAS, which do not seem to exhibit image sensitivity, can detect these image-sensitive hallucinations better than random chance, suggesting there is a non-trivial interplay between signal dependencies.
+We leave this for future work to explore.
+
+## C.5 Quantifying image sensitivity and visual grounding
+
+This experimental setup was motivated by prior work that aims to identify the role of language in VLM hallucinations [85, 88, 16, 80].
+While most works compare the outputs of the image and text prompt with the text prompt only, we compare the original setting to a setting with the text prompt with a blank image, since the white box detection methods require some image representation.
+If a method is sensitive to the image, its performance should drop when removing the image but evaluating the original caption over the original labels.
+
+We see most methods are sensitive to the image in Fig. 15.
+Most notably, performance of NLL, Ent, and IC across VLMs drops to near random chance.
+For CL and GLSim, we see this is the case to a slightly lesser degree; across all VLMs except Gemma-4-E4B-it, the blank image performance is slightly above random chance, but significantly lower than in the original image. This suggests that CL and GLSim exhibit a notable degree of sensitivity to the image, but not necessarily as much as NLL, Ent, and IC.
+On the other hand, it is not always the case for SVAR or PAS.
+On LLaVA-1.5-7B, LLaVA-1.5-13B, and InstructBLIP-Vicuna-7B, both PAS and SVAR retain high performance in the blank image setting.
+This suggests that these detection methods with these VLMs tend to be dependent on token position in lieu of visual grounding.
+However, it is not always necessarily the case that image sensitivity is sacrificed, as SVAR with Qwen3VL-8B-Instruct and Gemma-4-E4B-it and PASwith InternVL2-8B demonstrate reduced performance in the blank image setting.
+Taken together, these results suggest that the degree of image sensitivity depends on the method-VLM pair.
+
+## C.6 Token position as an unreliable predictor
+
+In Fig. 16, we demonstrate results for other VLMs when prompting to describe smaller objects first.
+Consistent with the figure in the main paper, we show plots of AUPRC when only looking at the subset of objects that occur in both the original and the new setting.
+For completeness, we also show figures when evaluating over all objects.
+When looking at all objects, we present results as two AUPRC graphs comparing original and small-object-first setting because the baseline AUPRC (i.e., the hallucination rate) differs across settings.
+
+Performance drops for token position-dependent methods (SVAR, PAS) in the small object setting are most notable for LLaVA-1.5-13B, LLaVA-1.5-7B, and InstructBLIP-Vicuna-7B.
+The performance still drops for SVAR and PAS for the remaining three VLMs, but to a smaller extent, relative to other methods.
+Although these methods do not perform as poorly with this prompt, there is likely to be some generation setting where these hallucinations are not as aligned to token position and these methods would fail.
+
+## C.7 Evidence for complementary signals using ensembles
+
+Correlation analysis across scores of all methods including the baseline token position revealed that a majority of white box methods are highly correlated with token position and one another, and the black box methods are correlated with each other.
+However, there is little correlation between these two subgroups.
+In order to understand what additional discriminative power white box methods have over the token position, as well as to determine if black box methods have any differential discriminative power with respect to white box methods we built ensemble models using 5 different groupings of these methods: (1) Token position ({TP}) alone; (2) {TP} + {SVAR, PAS}; (3) {TP} + {SVAR, PAS} + {GLSim, CL}; (4) {TP} + {SVAR, PAS} + {GLSim, CL} + {IC}; (5) {TP} + {SVAR, PAS} + {GLSim, CL} + {IC} + {NLL, Ent}.
+
+We train on $5,000$ randomly sampled images from the MSCOCO [36] 2014 training split and evaluate on the same validation split as other experiments. We report 95% confidence intervals computed via percentile bootstrap of the validation predictions.
+
+For each group, we split the training set of MSCOCO [36] into train and test sets and trained using logistic regression with L2 norm with the default regularization penalty of C=1.0. We used normalized token position as well as normalized scores for all methods in order to avoid imbalanced penalty due to score magnitude.
+All the models were then evaluated and reported on 5,000 images from the official validation set of MSCOCO.
+
+We report in Fig. 17 the additional ensemble model performances for all VLMs: LLaVA-1.5-13B, LLaVA-1.5-7B, InstructBLIP-Vicuna-7B, Qwen3VL-8B-Instruct, InternVL2-8B, and Gemma-4-E4B-it which shows a similar trend to the results reported in § 6 for LLaVA-1.5-13B.
+Namely, that there are complementary signals between methods of different groups, most notably between TP, {SVAR, PAS}, and {GLSim, CL} across most VLMs and even IC and {NLL, Ent} for certain VLMs.
+While the complementarity between groups may slightly differ across VLMs, we observe when {SVAR, PAS} are slightly less (but still strongly) correlated with token position (i.e., Qwen3VL-8B-Instruct, Gemma-4-E4B-it), these methods provide greater complementarity with token position, but in these cases, {NLL, Ent} exhibit reduced benefit.
+
+## C.8 Experiments disentangling dependency on VLM vs. caption-generation patterns.
+
+We additionally conducted experiments to understand complementarity of signals between detection methods.
+Here we try to tease apart why certain detection methods that perform poorly on certain VLMs.
+Specifically, why CL and GLSim performance drop significantly on Qwen3VL-8B-Instruct, InternVL2-8B, and Gemma-4-E4B-it.
+One potential hypothesis is that the methods are tailored to the caption-generation processes of specific VLMs, as opposed to the VLMs themselves.
+To test this hypothesis, we evaluate these methods in a decoupled setting: one VLM generates the caption, and a second VLM detects hallucinations using its own internal or output signals, rather than from the caption-generating VLM.
+
+In Fig. 18, we report all pairwise combinations of LLaVA-1.5-13B, Qwen3VL-8B-Instruct, InternVL2-8B, and Gemma-4-E4B-it.
+While we cannot draw any strong conclusions, we note a few observations here.
+First, that independent of which VLM generated the caption, using CL with Gemma-4-E4B-it always performs the worst, even for Gemma-4-E4B-it captions.
+Similarly, indepndent of the caption-generating VLM, GLSim always performs worst when it is used with Qwen3VL-8B-Instruct to detect hallucinations.
+These results may begin to suggest that the hallucination detection methods are more dependent on the VLM itself (e.g., the architecture or internal representational spaces), than features of the caption generation processes.
+
+Figure 7: Objects mentioned at later positions in the caption are more likely to be hallucinated. Plots demonstrate kernel density functions of token position distributions of hallucinated and correct (or real) objects. The effect is especially pronounced for LLaVA and InstructBLIP, which leverage Vicuna [63] backbones. While less pronounced for non-Vicuna VLMs, the trend still persists. Number of hallucinated and correct objects for each VLM is labeled in the legend.
+
+Figure 8: Qualitative example of hallucination score and token position correlation (1/4). SVAR, GLSim, and CL tend to score later words as more likely to be hallucinated, which sometimes is consistent with the hallucination patterns of the VLM. Captions are repeated to demonstrate scores from each detection method, bold indicates hallucinated object, green indicates low hallucination score, and red indicates high. Image caption generated is by LLaVA-1.5-13B.
+
+Figure 9: Qualitative example of hallucination score and token position correlation (2/4). SVAR, GLSim, and CL tend to score later words as more likely to be hallucinated, even if the object is the same. Captions are repeated to demonstrate scores from each detection method, bold indicates hallucinated object, green indicates low hallucination score, and red indicates high. Image caption generated is by LLaVA-1.5-13B.
+
+Figure 10: Qualitative example of hallucination score and token position correlation (3/4). SVAR, GLSim, and CL tend to score later words as more likely to be hallucinated, whereas NLL and Ent are less likely to do so. Captions are repeated to demonstrate scores from each detection method, bold indicates hallucinated object, green indicates low hallucination score, and red indicates high. Image caption generated is by LLaVA-1.5-13B.
+
+Figure 11: Qualitative example of hallucination score and token position correlation (4/4). SVAR, GLSim, and CL tend to score later words as more likely to be hallucinated, even for correct objects. Captions are repeated to demonstrate scores from each detection method, bold indicates hallucinated object, green indicates low hallucination score, and red indicates high. Image caption generated is by LLaVA-1.5-13B.
+
+Figure 12: Correlations matrices between all methods and token position for all VLMs. The high correlation between SVAR and token position and between black box methods remains consistent across all VLMs. Other correlations appear to be more VLM-dependent.
+
+Figure 13: Change in normalized hallucination scores when removing and replacing preceding context for all VLMs. Trends for all methods hold across VLMs, but we note CL and GLSimseem to be less text sensitive on certain VLMs. 
+
+Figure 14: White box detection methods gain their competitive performance over black box methods for language-based hallucinations but not necessarily for non-language-based hallucinations.
+We partition hallucinations into language and non-language-based depending on whether the generated token differs when using a blank image.
+White box methods are strong at detecting hallucinations that persist even when images are removed, suggesting a lack of image sensitivity.
+
+Figure 15: Across most VLMs except Qwen3VL-8B-Instruct and InternVL2-8B, SVAR and PAS do not exhibit image sensitivity, suggesting they are not visually grounded.
+We replace the original image (solid) with a blank image (hatched) and examine the performance drop.
+Larger performance drops, i.e., to random chance, suggest the detection method is sensitive to image-based signals. 
+
+Including only objects that appear in both captions
+
+Including all objects
+
+Figure 16: Unreliability of token position when prompted to mention small objects first. Left: Comparing AUPRC between original (dots) and small objects first setting (bars) over subset of objects that appear for an image in both settings. Graphs demonstrate how much of the performance drop is due to token position changes, which varies by VLM.
+Right: Comparing hallucinated token position distribution and performance with AUPRC of the original prompt and the small objects first prompt over all objects.
+Across many VLMs, especially LLaVA-1.5-13B, LLaVA-1.5-7B, and InstructBLIP-Vicuna-7B, the performance of SVAR (dark green), PAS (light green), and token position reduce in their competitive advantage, dropping to on par with other methods or even below.
+
+Figure 17: Ensemble method performances for each VLM, where we add {SVAR, PAS}, {GLSim, CL}, {IC} and {NLL, Ent} incrementally on top of token position.
+In all VLMs we observe that token position is a strong baseline.
+Despite high correlation between token position and {SVAR, PAS}, this group improves the AUPRC substantially over token position for Qwen3VL-8B-Instruct, InternVL2-8B, and Gemma-4-E4B-it.
+Meanwhile, {CL, GLSim} contribute significant signal for LLaVA-1.5-13B, LLaVA-1.5-7B, InstructBLIP-Vicuna-7B, InternVL2-8B, and Gemma-4-E4B-it.
+{IC} has additional discriminative power over this ensemble for LLaVA-1.5-13B and LLaVA-1.5-7B.
+Lastly, black box methods {NLL, Ent} the most improvement for LLaVA-1.5-13B and LLaVA-1.5-7B, but less so for other VLMs. 
+
+Figure 18: Disentangling caption-generation process from VLM specificity.
+We observe that independent of the VLM that generated the caption, the relative performance of using InternVL2-8B, Qwen3VL-8B-Instruct, and Gemma-4-E4B-it to detect hallucinations is relatively consistent.
+We use CL and GLSim on certain VLMs (indicated by colored bars) to detect hallucinations in captions from other VLMs (indicated by each grouping).
+We plot AUPRC and dashed horizontal lines indicated the random baseline (i.e., hallucination rate).
+
+## Appendix D Generalization experiments
+
+In this section, we demonstrate how results are consistent when using newer versions of VLMs (§ D.1). Additionally, for the VLMs reported in the main paper and § C (LLaVA-1.5-13B, LLaVA-1.5-7B, InstructBLIP-Vicuna-7B, Qwen3VL-8B-Instruct, InternVL2-8B, and Gemma-4-E4B-it), we demonstrate how results hold across a different dataset (§ D.2) , using sampling with temp > 0 and repeated trials (3 trials) (§ D.4), varying the prompt (§ D.3), and implementing a context-aware filter to avoid evaluating non-objects (e.g., avoid “phone” in “phone number” from being flagged) (§ D.5).
+For generalization experiments in § D.2 - § D.5, we present figures grouped by VLM to demonstrate how trends for a certain VLM are consistent in the variety of settings.
+Because figures tend to be large, most are placed at the end of this section to enable continuity of the text.
+
+## D.1 Newer VLMs
+
+In addition to the six main VLMs (LLaVA-1.5-13B, LLaVA-1.5-7B, InstructBLIP-Vicuna-7B, Qwen3VL-8B-Instruct, InternVL2-8B, and Gemma-4-E4B-it), we also ran experiments for the updated versions of some of the VLMs (Qwen3.5-9B and InternVL3.5-8B).
+As shown in Table 4, token position is still a competitive hallucination detector to other white box methods.
+Largely, GLSim and SVAR are the top performing detection methods for these models, based on AUPRC.
+
+Table 4: Hallucination detection performance on updated versions of Qwen and InternVL on MSCOCO.
+
+Metric
+Model
+
+Black Box
+White Box
+Heuristic
+
+Random
+NLL
+Entropy
+IC
+CL
+GLSim
+SVAR
+PAS
+Token Pos.
+
+Token Pos.
+
+(norm.)
+
+AUROC
+Qwen3.5-9B
+50.0
+68.2
+70.8
+74.2
+69.8
+79.7
+78.7
+79.1
+78.3
+78.3
+
+InternVL3.5-8B
+66.9
+69.0
+62.8
+65.2
+74.6
+77.4
+78.3
+76.3
+77.2
+
+Average
+50.0
+67.6
+69.9
+68.5
+67.5
+77.2
+78.1
+78.7
+77.3
+77.8
+
+AUPRC
+Qwen3.5-9B
+21.3
+37.4
+42.9
+47.5
+38.9
+52.6
+49.5
+48.7
+43.5
+43.5
+
+InternVL3.5-8B
+15.0
+28.9
+31.3
+22.2
+24.7
+35.5
+35.5
+33.5
+30.0
+33.7
+
+Average
+18.1
+33.1
+37.1
+34.9
+31.8
+44.0
+42.5
+41.1
+36.8
+38.6
+
+We additionally present results for their token position dependency and visual sensitivity in Fig. 19.
+Here we demonstrate that trends of token position dependency and image sensitivity are relatively consistent across versions of the same VLM family.
+We observe the largest differences with PAS’s token position dependency for both VLM families and SVAR’s image sensitivity across Qwen.
+Specifically, with Qwen3.5-9B, PAS is less sensitive to token position and contextual changes of the caption compared to Qwen3VL-8B-Instruct. On the other hand, PAS is more sensitive to both with InternVL3.5-8B compared to InternVL2-8B.
+However, across all VLMs, experiments with PAS and SVAR demonstrate that compared to the mean score in the replace setting, the mean score in the remove setting is lower. This suggests that when holding semantic information constant, these methods are still sensitive to token position to some degree.
+
+Regarding image sensitivity, trends across all methods are stable, with an exception of SVAR exhibiting even less image sensitivity on the newer Qwen3.5-9B compared to Qwen3VL-8B-Instruct.
+SVAR is consistently dependent on token position and PAS sometimes is as well. Further, both methods exhibit little sensitivity to the image, suggesting they lack visual grounding. We note that although the change in scores for SVAR with Qwen3.5-9B is small, the change in score of token position itself is low and roughly 80% of SVAR’s change is still accounted for by solely changing token position.
+
+Lastly, we present ensemble results in Fig. 20 which demonstrate more notable complementary strengths between {SVAR, PAS} and {CL, GLSim} but not so much when adding IC, NLL, Ent.
+This suggests for newer models, perhaps SVAR, PAS, CL and GLSim encompass signals of weaker methods.
+
+## D.2 Dataset generalization
+
+In order to demonstrate the robustness of our results, we also run our primary experiments on a different dataset, Objects365 [59].
+Similarly to the experiments in the main paper, we evaluate hallucination detection methods across 5,000 randomly selected images in the validation set.
+Standard evaluation metrics can be found in Table 5 and token position distributions in Fig. 21.
+Results comparing overall performance, token position dependency, and image sensitivity between evaluating on MSCOCO and Objects365 can be found on a per-model basis in Fig. 22-Fig. 33.
+
+We observe that with Objects365 data, the pattern of hallucinations slightly differs from that in MSCOCO.
+For example, Table 5 demonstrates that VLMs tend to hallucinate at a higher rate and Fig. 21 demonstrates for some VLMs, primarily Qwen3VL-8B-Instruct and InternVL2-8B, hallucinations do not occur as reliably at later positions.
+However, despite these differences, we see that methods exhibit similar relative performances between MSCOCO and Objects365.
+Across datasets, methods also exhibit similar reliance to token position and image sensitivity, as demonstrated for each VLM separately in Fig. 22-Fig. 33.
+
+Table 5: Token position remains competitive on a different dataset (Objects365).
+Compared to MSCOCO, hallucination rates tend to be higher and black box methods (NLL, Ent) tend to perform relatively better on Objects365.
+Token position (or normalized token position) is still competitive, outperforming at least one other white box method for all VLMs on AUPRC, except for Qwen3VL-8B-Instruct.
+We report AUROC and AUPRC of hallucination detection methods across the six main VLMs on 5,000 images from Objects365. 
+
+Metric
+Model
+
+Black Box
+White Box
+Heuristic
+
+Random
+NLL
+Entropy
+IC
+CL
+GLSim
+SVAR
+PAS
+Token Pos.
+
+Token Pos.
+
+(norm.)
+
+AUROC
+LLaVA-1.5-13B
+50.0
+69.0
+69.4
+64.2
+71.0
+74.6
+70.0
+72.2
+72.1
+72.7
+
+LLaVA-1.5-7B
+69.8
+69.9
+67.0
+70.5
+75.4
+72.1
+73.9
+72.9
+73.4
+
+InstructBLIP-7B
+73.1
+73.8
+72.9
+66.7
+74.9
+76.1
+76.3
+75.8
+75.9
+
+Qwen3VL-8B
+56.0
+56.7
+68.8
+60.4
+63.1
+71.5
+64.2
+56.8
+57.0
+
+InternVL2-8B
+57.7
+58.4
+69.3
+61.6
+68.9
+69.1
+66.1
+62.3
+63.1
+
+Gemma-4-E4B-it
+57.8
+58.1
+59.0
+40.3
+71.6
+61.9
+58.8
+56.2
+57.0
+
+Average
+50.0
+63.9
+64.4
+66.9
+61.8
+71.4
+70.1
+68.6
+66.0
+66.5
+
+AUPRC
+LLaVA-1.5-13B
+36.8
+55.6
+55.5
+50.8
+56.1
+62.3
+54.0
+55.9
+55.9
+58.1
+
+LLaVA-1.5-7B
+39.2
+58.5
+57.7
+58.2
+60.8
+66.2
+58.9
+61.1
+59.2
+61.7
+
+InstructBLIP-7B
+34.4
+58.9
+59.2
+61.8
+50.4
+59.3
+59.8
+60.3
+58.5
+59.9
+
+Qwen3VL-8B
+43.7
+49.7
+50.8
+61.5
+53.7
+53.6
+67.7
+60.1
+48.4
+48.8
+
+InternVL2-8B
+37.1
+45.5
+46.3
+57.6
+48.5
+56.7
+57.1
+50.6
+47.0
+48.7
+
+Gemma-4-E4B-it
+41.3
+48.3
+49.1
+49.4
+37.3
+66.1
+52.3
+48.7
+46.2
+48.6
+
+Average
+38.8
+52.8
+53.1
+56.6
+51.1
+60.7
+58.3
+56.1
+52.5
+54.3
+
+## D.3 Prompt variation
+
+To ensure our results are not dependent on specific prompts for image captioning, we additionally prompt the model with a variation to describe the image.
+Concretely, we prompt the model to “Describe this image in detail, beginning with the most obvious objects first, then smaller background details.”
+As shown in Table 6 and Fig. 22-Fig. 33, token position is still a competitive baseline, performing on par with or even outperforming at least one white box method on AUPRC.
+We note that performance of LLaVA-1.5-7B is very similar in this setting and the original, indicating that this VLM is not very sensitive to our prompt differences.
+Further, as demonstrated in these figures, trends of token position dependency and image sensitivity are consistent for a given VLM.
+This suggests our results are not due to specific prompt wording, but similar prompts for this task would produce similar results.
+
+Table 6: Token position remains competitive with prompt variations.
+
+Metric
+Model
+
+Black Box
+White Box
+Heuristic
+
+Random
+NLL
+Entropy
+IC
+CL
+GLSim
+SVAR
+PAS
+Token Pos.
+
+Token Pos.
+
+(norm.)
+
+AUROC
+LLaVA-1.5-13B
+50.0
+74.4
+76.1
+75.2
+82.8
+83.4
+81.5
+84.4
+84.0
+85.7
+
+LLaVA-1.5-7B
+72.4
+73.4
+78.6
+79.3
+83.5
+81.1
+84.0
+83.4
+84.7
+
+InstructBLIP-7B
+79.9
+81.4
+86.2
+84.3
+82.1
+87.5
+87.8
+87.4
+87.4
+
+Qwen3VL-8B
+66.7
+68.8
+66.0
+71.0
+64.0
+78.9
+78.4
+77.1
+77.5
+
+InternVL2-8B
+65.2
+66.5
+76.2
+70.0
+79.8
+81.0
+79.3
+78.7
+80.0
+
+Gemma-4-E4B-it
+
+65.9
+67.8
+70.5
+53.3
+79.3
+75.0
+76.3
+75.1
+75.5
+
+Average
+50.0
+70.8
+72.3
+75.5
+73.5
+78.7
+80.8
+81.7
+80.9
+81.8
+
+AUPRC
+LLaVA-1.5-13B
+25.7
+52.0
+52.4
+54.3
+58.1
+58.2
+52.5
+57.0
+56.0
+61.6
+
+LLaVA-1.5-7B
+25.1
+47.2
+46.4
+57.5
+55.5
+60.7
+51.9
+56.5
+54.7
+59.8
+
+InstructBLIP-7B
+21.3
+54.7
+55.8
+66.8
+53.6
+54.9
+60.7
+60.8
+59.4
+60.2
+
+Qwen3VL-8B
+22.8
+37.1
+40.5
+37.1
+40.6
+32.4
+53.2
+49.1
+44.6
+46.4
+
+InternVL2-8B
+20.3
+33.2
+33.9
+43.7
+38.1
+48.9
+50.8
+42.5
+42.3
+46.6
+
+Gemma-4-E4B-it
+15.7
+27.6
+30.1
+27.2
+18.5
+39.8
+31.4
+34.1
+31.8
+33.7
+
+Average
+21.8
+42.0
+43.2
+47.8
+44.1
+49.2
+50.1
+50.0
+48.1
+51.4
+
+## D.4 Repeated trials
+
+In our main paper, we use the convention of using greedy decoding, i.e., no sampling, when evaluating hallucination detection methods, such as in Park and Li [53].
+However, this prevents us from being able to run repeated trials, since outputs are deterministic with greedy decoding.
+To understand the robustness of our results to different generation outputs, we enable sampling with temperature=1.0 and re-run our experiments with 3 random seeds. Here, we present the results with 95% confidence intervals. Results for detection performance, dependence on token position, and sensitivity can be found in Fig. 22-Fig. 33, enabling comparisons between all generalization settings for a specific experiment.
+We note that we are not able to reproduce Fig. 14 with repeated trials and sampling. This is because the partitioning function requires looking at the change in predicted token using argmax, but when sampling is enabled the argmax is no longer indicative of the predicted token.
+
+First, our results demonstrate insensitivity to sampling with a moderate temperature, as trends between the MSCOCO results without repeated trials and experiments with repeated trials exhibit the same trends.
+Second, our results also demonstrate robustness to different random seeds for the VLM, demonstrated by the small 95% confidence intervals.
+
+## D.5 Filtering non-objects
+
+Given the limitations of CHAIR outlined in § B.1, it could be a concern that the findings are primarily driven by the noise caused by the primitive labeling technique.
+Although our main results filter systematic issues we observed (i.e., filtering the word “orange”), there can still be noisy labels.
+To ensure our results are not dependent on the label noise, we conduct an additional experiment using a context-aware language model to help label objects as hallucinated or real.
+Concretely, given a caption and the objects labeled by CHAIR, we pass this information to a sophisticated language model Claude-sonnet-4.6 to filter out any non-objects.
+Concretely, we prompt Claude with the following:
+
+Claude prompt for filtering out non-objects:
+Given a list of words and a caption to an image, your task is to identify whether the words are being used to refer to objects in the image or not. You do not have access to the image. You will output a structured JSON where the keys are the words and the values are boolean (true/false). Do not output any other text so that the outputs can be directly converted into Python dictionaries. Make sure the true/false always start with LOWERCASE letters. You should ensure that the length of the JSON output is the same length as the list of words. 
+
+Here is an example of an input:
+
+Caption: "There is an apple in the image. There is an orange car with a phone number on it. It could be used by a person because there is a window."
+
+Words: [‘‘apple”, “orange”, ‘‘car’’, “phone”, “person”, “window”]
+
+In this case, orange is not referring to an object, but the color, phone is used in the context of phone number, and person is referring to a hypothetical person, not one in the image. 
+
+The output should then be: 
+
+{‘‘apple”: true, “orange”: false, “car”: true, “phone”: false, “person”: false, “window”: true} 
+
+Caption: [new caption] 
+
+Word: [list of words]
+
+Then we re-evaluate all hallucination detection methods on the objects that were not filtered out, and compare how our results on overall performance and token position dependencies differ.
+As demonstrated in Fig. 22-Fig. 33, for each VLM, even when we filter out non-objects using Claude, the relative performance across methods and the behavior in response to token position interventions and image interventions remains consistent.
+This is the case even when 10-15% of objects are filtered, as is the case for Qwen3VL-8B-Instruct, InternVL2-8B, and Gemma-4-E4B-it.
+This suggests although CHAIR is limited in its labeling noise, our findings are not contingent on this noise.
+
+## D.6 Extended results without filtering for “orange”
+
+As mentioned in § B.1, one limitation of CHAIR is that it does not take into account contextual information, so that there are some objects that are falsely labeled as hallucinations.
+For example, Qwen3VL-8B-Instruct tends to describe the colors in many images, so it frequently mentions the color “orange” in generated captions.
+However, these instances are flagged as hallucinations by CHAIR, because oftentimes there is no orange (the fruit) in the image.
+
+Our main results omit the object “orange” from all analyses, but here we demonstrate that even with “orange” included, the main takeaways do not change.
+We reproduce overall performance, token position dependency (i.e., remove/replace experiment), and image sensitivity (i.e., blank image) reported in the main paper with all VLMs.
+We can compare performance and behavior to main setting with MSCOCO as well as all other generalization settings in Fig. 22-Fig. 33.
+
+## Appendix E Hallucination mitigation
+
+A complementary approach to detecting hallucinations is mitigating them.
+Common mitigation techniques include fine-tuning on optimized data [37, 83, 81, 21, 44], improving vision representations [11, 26, 72], intervening during generation [24, 32, 74, 81, 16, 58], or leveraging more sophisticated models to correct mistakes [90, 82].
+However, because hallucinations are unlikely to ever be completely mitigated [4], it will always be important to develop effective hallucination detection methods to filter or flag responses that are likely to be hallucinated.
+
+## Appendix F LLM usage declaration
+
+In this work, LLMs contribute a small component of the core methods in this research.
+As stated in the Appendix, we used Gemini to create sentences for the replacement experiment and Claude to conduct context-aware filtering.
+These tasks could have been completed by the researchers, but using LLMs made it quicker and allowed for larger scale experiments.
+
+LLMs were additionally used to help write code for figure making, data processing, and implementing experiments, which the researchers manually verified for correctness and alignment of intentions.
+We additionally used it to help with grammar, and rewriting small amounts (no more than a few sentences) for clarity of thought.
+LLMs were also used as a more sophisticated search engine to find related works, which we manually checked and verified were real. We did not use LLMs to directly input citations.
+
+Qwen3VL-8B-Instruct
+
+Qwen3.5-9B
+
+InternVL2-8B
+
+InternVL3.5-8B
+
+Figure 19: Evaluation performance, token position dependency, and image-signal sensitivity are similar for newer versions of Qwen3.5-9B and InternVL3.5-8B.
+Overall performance of detection methods (1st and 3rd rows) on newer versions of VLMs are are similar.
+The blue remove/replace graphs (2nd and 5th rows) show that PAS on Qwen3.5-9B exhibits less context dependency than with Qwen3VL-8B-Instruct.
+However the image sensitivity graphs (3rd and 6th rows) show SVAR on Qwen3.5-9B exhibits even less image sensitivity than with Qwen3VL-8B-Instruct.
+On the other hand, PAS with InternVL3.5-8B seems much more sensitive to position and context than with InternVL2-8B while other trends are similar.
+
+Figure 20: Ensemble method performances for Qwen3.5-9B and InternVL3.5-8B, where we add {SVAR, PAS}, {GLSim, CL}, {IC} and {NLL, Ent} incrementally on top of token position. For these models, beyond adding CL and GLSim, additional methods do not seem to contribute much additional signal.
+
+Figure 21: Hallucination patterns on Objects365 slightly differ from MSCOCO. While LLaVA-1.5-13B, LLaVA-1.5-7B, and InstructBLIP-Vicuna-7B still hallucinate objects later than real objects, the distinction is not as pronounced for Qwen3VL-8B-Instruct and InternVL2-8B. We plot token position distributions of real and hallucinated objects on Objects365 dataset.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 22: Left: Performance of hallucination detection methods on LLaVA-1.5-13B generalizes across various data and prompt settings. Right: Method behavior with remove/replace preceding sentences LLaVA-1.5-13B generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 23: Method behavior partitioning by hallucination modality and visual groundedness on LLaVA-1.5-13B generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 24: Left: Performance of hallucination detection methods on LLaVA-1.5-7B generalizes across various data and prompt settings. Right: Method behavior with remove/replace preceding sentences LLaVA-1.5-7B generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 25: Method behavior partitioning by hallucination modality and visual groundedness on LLaVA-1.5-7B generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 26: Left: Performance of hallucination detection methods on InstructBLIP-Vicuna-7B generalizes across various data and prompt settings. Right: Method behavior with remove/replace preceding sentences InstructBLIP-Vicuna-7B generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 27: Method behavior partitioning by hallucination modality and visual groundedness on InstructBLIP-Vicuna-7B generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 28: Left: Performance of hallucination detection methods on Qwen3VL-8B-Instruct generalizes across various data and prompt settings. Right: Method behavior with remove/replace preceding sentences Qwen3VL-8B-Instruct generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 29: Method behavior partitioning by hallucination modality and visual groundedness on Qwen3VL-8B-Instruct generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 30: Left: Performance of hallucination detection methods on InternVL2-8B generalizes across various data and prompt settings. Right: Method behavior with remove/replace preceding sentences InternVL2-8B generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 31: Method behavior partitioning by hallucination modality and visual groundedness on InternVL2-8B generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 32: Left: Performance of hallucination detection methods on Gemma-4-E4B-it generalizes across various data and prompt settings. Right: Method behavior with remove/replace preceding sentences Gemma-4-E4B-it generalizes across various data and prompt settings.
+
+MSCOCO
+
+Objects365
+
+Prompt Variation
+
+Repeated Trials
+
+Context-aware Filtering
+
+No Filtering “orange”
+
+Figure 33: Method behavior partitioning by hallucination modality and visual groundedness on Gemma-4-E4B-it generalizes across various data and prompt settings.
+
+## NeurIPS Paper Checklist
+
+1. 
+
+Claims
+
+Question: Do the main claims made in the abstract and introduction accurately reflect the paper’s contributions and scope?
+
+Answer: [Yes] 
+
+Justification: The abstract and introduction (last paragraph) clearly state the three contributions of our analyses, and each contribution maps to a specific analysis. The introduction clearly describes the scope of our experiments, such as which detection methods we evaluate.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the abstract and introduction do not include the claims made in the paper.
+
+• 
+
+The abstract and/or introduction should clearly state the claims made, including the contributions made in the paper and important assumptions and limitations. A [No] or [N/A] answer to this question will not be perceived well by the reviewers.
+
+• 
+
+The claims made should match theoretical and experimental results, and reflect how much the results can be expected to generalize to other settings.
+
+• 
+
+It is fine to include aspirational goals as motivation as long as it is clear that these goals are not attained by the paper.
+
+2. 
+
+Limitations
+
+Question: Does the paper discuss the limitations of the work performed by the authors?
+
+Answer: [Yes] 
+
+Justification: The limitations of our work are expressed explicitly in § B. We acknowledge that our analyses only considers a subset of hallucination detection methods, a handful of VLMs, and a single dataset.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper has no limitation while the answer [No] means that the paper has limitations, but those are not discussed in the paper.
+
+• 
+
+The authors are encouraged to create a separate “Limitations” section in their paper.
+
+• 
+
+The paper should point out any strong assumptions and how robust the results are to violations of these assumptions (e.g., independence assumptions, noiseless settings, model well-specification, asymptotic approximations only holding locally). The authors should reflect on how these assumptions might be violated in practice and what the implications would be.
+
+• 
+
+The authors should reflect on the scope of the claims made, e.g., if the approach was only tested on a few datasets or with a few runs. In general, empirical results often depend on implicit assumptions, which should be articulated.
+
+• 
+
+The authors should reflect on the factors that influence the performance of the approach. For example, a facial recognition algorithm may perform poorly when image resolution is low or images are taken in low lighting. Or a speech-to-text system might not be used reliably to provide closed captions for online lectures because it fails to handle technical jargon.
+
+• 
+
+The authors should discuss the computational efficiency of the proposed algorithms and how they scale with dataset size.
+
+• 
+
+If applicable, the authors should discuss possible limitations of their approach to address problems of privacy and fairness.
+
+• 
+
+While the authors might fear that complete honesty about limitations might be used by reviewers as grounds for rejection, a worse outcome might be that reviewers discover limitations that aren’t acknowledged in the paper. The authors should use their best judgment and recognize that individual actions in favor of transparency play an important role in developing norms that preserve the integrity of the community. Reviewers will be specifically instructed to not penalize honesty concerning limitations.
+
+3. 
+
+Theory assumptions and proofs
+
+Question: For each theoretical result, does the paper provide the full set of assumptions and a complete (and correct) proof?
+
+Answer: [N/A] 
+
+Justification: Our work does not include theoretical results.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper does not include theoretical results.
+
+• 
+
+All the theorems, formulas, and proofs in the paper should be numbered and cross-referenced.
+
+• 
+
+All assumptions should be clearly stated or referenced in the statement of any theorems.
+
+• 
+
+The proofs can either appear in the main paper or the supplemental material, but if they appear in the supplemental material, the authors are encouraged to provide a short proof sketch to provide intuition.
+
+• 
+
+Inversely, any informal proof provided in the core of the paper should be complemented by formal proofs provided in appendix or supplemental material.
+
+• 
+
+Theorems and Lemmas that the proof relies upon should be properly referenced.
+
+4. 
+
+Experimental result reproducibility
+
+Question: Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper (regardless of whether the code and data are provided or not)?
+
+Answer: [Yes] 
+
+Justification: Our paper includes general information needed to reproduce experimental results in § 3.2 and § A.2. We include experiment-specific details in § C. Code is publicly available at https://github.com/princetonvisualai/hallucination-detection-robustness
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper does not include experiments.
+
+• 
+
+If the paper includes experiments, a [No] answer to this question will not be perceived well by the reviewers: Making the paper reproducible is important, regardless of whether the code and data are provided or not.
+
+• 
+
+If the contribution is a dataset and/or model, the authors should describe the steps taken to make their results reproducible or verifiable.
+
+• 
+
+Depending on the contribution, reproducibility can be accomplished in various ways. For example, if the contribution is a novel architecture, describing the architecture fully might suffice, or if the contribution is a specific model and empirical evaluation, it may be necessary to either make it possible for others to replicate the model with the same dataset, or provide access to the model. In general. releasing code and data is often one good way to accomplish this, but reproducibility can also be provided via detailed instructions for how to replicate the results, access to a hosted model (e.g., in the case of a large language model), releasing of a model checkpoint, or other means that are appropriate to the research performed.
+
+• 
+
+While NeurIPS does not require releasing code, the conference does require all submissions to provide some reasonable avenue for reproducibility, which may depend on the nature of the contribution. For example
+
+(a) 
+
+If the contribution is primarily a new algorithm, the paper should make it clear how to reproduce that algorithm.
+
+(b) 
+
+If the contribution is primarily a new model architecture, the paper should describe the architecture clearly and fully.
+
+(c) 
+
+If the contribution is a new model (e.g., a large language model), then there should either be a way to access this model for reproducing the results or a way to reproduce the model (e.g., with an open-source dataset or instructions for how to construct the dataset).
+
+(d) 
+
+We recognize that reproducibility may be tricky in some cases, in which case authors are welcome to describe the particular way they provide for reproducibility. In the case of closed-source models, it may be that access to the model is limited in some way (e.g., to registered users), but it should be possible for other researchers to have some path to reproducing or verifying the results.
+
+5. 
+
+Open access to data and code
+
+Question: Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental material?
+
+Answer: [Yes] 
+
+Justification: Code will be publicly available at https://github.com/princetonvisualai/hallucination-detection-robustness.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that paper does not include experiments requiring code.
+
+• 
+
+Please see the NeurIPS code and data submission guidelines (https://neurips.cc/public/guides/CodeSubmissionPolicy) for more details.
+
+• 
+
+While we encourage the release of code and data, we understand that this might not be possible, so [No] is an acceptable answer. Papers cannot be rejected simply for not including code, unless this is central to the contribution (e.g., for a new open-source benchmark).
+
+• 
+
+The instructions should contain the exact command and environment needed to run to reproduce the results. See the NeurIPS code and data submission guidelines (https://neurips.cc/public/guides/CodeSubmissionPolicy) for more details.
+
+• 
+
+The authors should provide instructions on data access and preparation, including how to access the raw data, preprocessed data, intermediate data, and generated data, etc.
+
+• 
+
+The authors should provide scripts to reproduce all experimental results for the new proposed method and baselines. If only a subset of experiments are reproducible, they should state which ones are omitted from the script and why.
+
+• 
+
+At submission time, to preserve anonymity, the authors should release anonymized versions (if applicable).
+
+• 
+
+Providing as much information as possible in supplemental material (appended to the paper) is recommended, but including URLs to data and code is permitted.
+
+6. 
+
+Experimental setting/details
+
+Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer) necessary to understand the results?
+
+Answer: [Yes] 
+
+Justification: We include all analysis details in § A.2 and § C, such as hyperparameters for caption generation and detection methods and splits for the logistic regression experiments.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper does not include experiments.
+
+• 
+
+The experimental setting should be presented in the core of the paper to a level of detail that is necessary to appreciate the results and make sense of them.
+
+• 
+
+The full details can be provided either with the code, in appendix, or as supplemental material.
+
+7. 
+
+Experiment statistical significance
+
+Question: Does the paper report error bars suitably and correctly defined or other appropriate information about the statistical significance of the experiments?
+
+Answer: [Yes] 
+
+Justification: We report error and statistical significance when available. For example, we report statistical significance for all reported correlations (§ 4.1), error as 95% confidence intervals (e.g., Fig. 2) for mean score values, and bootstrapped 95% confidence intervals for ensemble results.
+Lastly, we demonstrate the robustness of our resuls in the Appendix, including sampling with multiple seeds (3).
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper does not include experiments.
+
+• 
+
+The authors should answer [Yes] if the results are accompanied by error bars, confidence intervals, or statistical significance tests, at least for the experiments that support the main claims of the paper.
+
+• 
+
+The factors of variability that the error bars are capturing should be clearly stated (for example, train/test split, initialization, random drawing of some parameter, or overall run with given experimental conditions).
+
+• 
+
+The method for calculating the error bars should be explained (closed form formula, call to a library function, bootstrap, etc.)
+
+• 
+
+The assumptions made should be given (e.g., Normally distributed errors).
+
+• 
+
+It should be clear whether the error bar is the standard deviation or the standard error of the mean.
+
+• 
+
+It is OK to report 1-sigma error bars, but one should state it. The authors should preferably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis of Normality of errors is not verified.
+
+• 
+
+For asymmetric distributions, the authors should be careful not to show in tables or figures symmetric error bars that would yield results that are out of range (e.g., negative error rates).
+
+• 
+
+If error bars are reported in tables or plots, the authors should explain in the text how they were calculated and reference the corresponding figures or tables in the text.
+
+8. 
+
+Experiments compute resources
+
+Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments?
+
+Answer: [Yes] 
+
+Justification: We report all compute details in § A.2 including GPU and CPU usage, execution time, and cluster details.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper does not include experiments.
+
+• 
+
+The paper should indicate the type of compute workers CPU or GPU, internal cluster, or cloud provider, including relevant memory and storage.
+
+• 
+
+The paper should provide the amount of compute required for each of the individual experimental runs as well as estimate the total compute.
+
+• 
+
+The paper should disclose whether the full research project required more compute than the experiments reported in the paper (e.g., preliminary or failed experiments that didn’t make it into the paper).
+
+9. 
+
+Code of ethics
+
+Question: Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines?
+
+Answer: [Yes] 
+
+Justification: Our work conforms with the NeurIPS Code of Ethics in all respects. We do not involve human subjects or participants, and we use only publicly available datasets.
+We do not foresee any negative societal impact concerns of our results as it aims to reveal important limitations that current evaluation measures do not consider, and it is not a system to be deployed.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the authors have not reviewed the NeurIPS Code of Ethics.
+
+• 
+
+If the authors answer [No] , they should explain the special circumstances that require a deviation from the Code of Ethics.
+
+• 
+
+The authors should make sure to preserve anonymity (e.g., if there is a special consideration due to laws or regulations in their jurisdiction).
+
+10. 
+
+Broader impacts
+
+Question: Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed?
+
+Answer: [Yes] 
+
+Justification: We discuss the potential positive societal impacts of our analyses throughout the paper, such as encouraging more robust and in-depth evaluations of hallucination detection methods. We also discuss potential negative societal impacts in § B.3, but we do not foresee large negative societal impacts as we are not releasing public models, data, or other artifacts.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that there is no societal impact of the work performed.
+
+• 
+
+If the authors answer [N/A] or [No] , they should explain why their work has no societal impact or why the paper does not address societal impact.
+
+• 
+
+Examples of negative societal impacts include potential malicious or unintended uses (e.g., disinformation, generating fake profiles, surveillance), fairness considerations (e.g., deployment of technologies that could make decisions that unfairly impact specific groups), privacy considerations, and security considerations.
+
+• 
+
+The conference expects that many papers will be foundational research and not tied to particular applications, let alone deployments. However, if there is a direct path to any negative applications, the authors should point it out. For example, it is legitimate to point out that an improvement in the quality of generative models could be used to generate Deepfakes for disinformation. On the other hand, it is not needed to point out that a generic algorithm for optimizing neural networks could enable people to train models that generate Deepfakes faster.
+
+• 
+
+The authors should consider possible harms that could arise when the technology is being used as intended and functioning correctly, harms that could arise when the technology is being used as intended but gives incorrect results, and harms following from (intentional or unintentional) misuse of the technology.
+
+• 
+
+If there are negative societal impacts, the authors could also discuss possible mitigation strategies (e.g., gated release of models, providing defenses in addition to attacks, mechanisms for monitoring misuse, mechanisms to monitor how a system learns from feedback over time, improving the efficiency and accessibility of ML).
+
+11. 
+
+Safeguards
+
+Question: Does the paper describe safeguards that have been put in place for responsible release of data or models that have a high risk for misuse (e.g., pre-trained language models, image generators, or scraped datasets)?
+
+Answer: [N/A] 
+
+Justification: The work does not release data or models that require safeguards against misuse.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper poses no such risks.
+
+• 
+
+Released models that have a high risk for misuse or dual-use should be released with necessary safeguards to allow for controlled use of the model, for example by requiring that users adhere to usage guidelines or restrictions to access the model or implementing safety filters.
+
+• 
+
+Datasets that have been scraped from the Internet could pose safety risks. The authors should describe how they avoided releasing unsafe images.
+
+• 
+
+We recognize that providing effective safeguards is challenging, and many papers do not require this, but we encourage authors to take this into account and make a best faith effort.
+
+12. 
+
+Licenses for existing assets
+
+Question: Are the creators or original owners of assets (e.g., code, data, models), used in the paper, properly credited and are the license and terms of use explicitly mentioned and properly respected?
+
+Answer: [Yes] 
+
+Justification: We use existing frameworks, models, and datasets which we appropriately credit in § 3.2. We include URLs for all resources accessed in § A.2.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper does not use existing assets.
+
+• 
+
+The authors should cite the original paper that produced the code package or dataset.
+
+• 
+
+The authors should state which version of the asset is used and, if possible, include a URL.
+
+• 
+
+The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+
+• 
+
+For scraped data from a particular source (e.g., website), the copyright and terms of service of that source should be provided.
+
+• 
+
+If assets are released, the license, copyright information, and terms of use in the package should be provided. For popular datasets, paperswithcode.com/datasets has curated licenses for some datasets. Their licensing guide can help determine the license of a dataset.
+
+• 
+
+For existing datasets that are re-packaged, both the original license and the license of the derived asset (if it has changed) should be provided.
+
+• 
+
+If this information is not available online, the authors are encouraged to reach out to the asset’s creators.
+
+13. 
+
+New assets
+
+Question: Are new assets introduced in the paper well documented and is the documentation provided alongside the assets?
+
+Answer: [N/A] 
+
+Justification: We do not introduce any new assets.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper does not release new assets.
+
+• 
+
+Researchers should communicate the details of the dataset/code/model as part of their submissions via structured templates. This includes details about training, license, limitations, etc.
+
+• 
+
+The paper should discuss whether and how consent was obtained from people whose asset is used.
+
+• 
+
+At submission time, remember to anonymize your assets (if applicable). You can either create an anonymized URL or include an anonymized zip file.
+
+14. 
+
+Crowdsourcing and research with human subjects
+
+Question: For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots, if applicable, as well as details about compensation (if any)?
+
+Answer: [N/A] 
+
+Justification: We do not perform any crowdsourcing or experiments with human subjects.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper does not involve crowdsourcing nor research with human subjects.
+
+• 
+
+Including this information in the supplemental material is fine, but if the main contribution of the paper involves human subjects, then as much detail as possible should be included in the main paper.
+
+• 
+
+According to the NeurIPS Code of Ethics, workers involved in data collection, curation, or other labor should be paid at least the minimum wage in the country of the data collector.
+
+15. 
+
+Institutional review board (IRB) approvals or equivalent for research with human subjects
+
+Question: Does the paper describe potential risks incurred by study participants, whether such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an equivalent approval/review based on the requirements of your country or institution) were obtained?
+
+Answer: [N/A] 
+
+Justification: We do not perform any crowdsourcing or experiments with human subjects.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the paper does not involve crowdsourcing nor research with human subjects.
+
+• 
+
+Depending on the country in which research is conducted, IRB approval (or equivalent) may be required for any human subjects research. If you obtained IRB approval, you should clearly state this in the paper.
+
+• 
+
+We recognize that the procedures for this may vary significantly between institutions and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the guidelines for their institution.
+
+• 
+
+For initial submissions, do not include any information that would break anonymity (if applicable), such as the institution conducting the review.
+
+16. 
+
+Declaration of LLM usage
+
+Question: Does the paper describe the usage of LLMs if it is an important, original, or non-standard component of the core methods in this research? Note that if the LLM is used only for writing, editing, or formatting purposes and does not impact the core methodology, scientific rigor, or originality of the research, declaration is not required.
+
+Answer: [Yes] 
+
+Justification: Our work minimally uses LLMs for small tasks, but it does not involve LLMs as important, original, or non-standard components. Regardless, a further description of how LLMs were used can be found in § F.
+
+Guidelines:
+
+• 
+
+The answer [N/A] means that the core method development in this research does not involve LLMs as any important, original, or non-standard components.
+
+• 
+
+Please refer to our LLM policy in the NeurIPS handbook for what should or should not be described.

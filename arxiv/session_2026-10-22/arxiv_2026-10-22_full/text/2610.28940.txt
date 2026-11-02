@@ -1,0 +1,2283 @@
+## StyleStream 2.0: Fast and Controllable Streaming Voice Style Conversion
+
+Yisi Liu
+
+Affiliation: University of California, Berkeley
+
+Nicholas Lee
+
+Affiliation: University of California, Berkeley
+
+Gopala K. Anumanchipalli
+
+Affiliation: University of California, Berkeley
+
+Abstract
+
+Voice style conversion (VSC) aims to transform a source utterance to match the timbre, accent, and emotion of a target voice while preserving linguistic content.
+StyleStream 1.0 introduced the first streamable zero-shot VSC system with state-of-the-art conversion quality, but remained limited in two ways: approximately 1s end-to-end latency on consumer hardware, and the lack of a text-based interface for designing or editing target voices.
+We present StyleStream 2.0, a fast and controllable streaming VSC framework that addresses these limitations.
+To reduce latency, we train a few-step pixel MeanFlow model and further fine-tune it with autoregressive feedback inspired by Self Forcing, improving robustness under streaming inference.
+This reduces end-to-end latency to 520 ms on a consumer GPU, a 2x speedup over StyleStream 1.0, while maintaining conversion quality.
+To enable controllable style manipulation, we remove the mel-spectrogram context and instead route target style information through a compact style embedding.
+In this embedding space, we train a unified text-conditioned flow matching model that supports both text-based voice design, which maps natural language prompts to voice styles, and instruction-based voice editing, which modifies a specific attribute of a source utterance while preserving the rest.
+Experiments show that StyleStream 2.0 achieves the strongest target style fidelity on VSC, voice design, and voice editing, while remaining competitive on intelligibility and non-edited attribute preservation. Samples can be found here: https://berkeley-speech-group.github.io/StyleStream2.0.
+
+## 1 Introduction
+
+Voice style conversion (VSC) modifies how an utterance is spoken while preserving what is said.
+Following StyleStream 1.0 [41], we define voice style as the joint combination of timbre, accent, and emotion.
+A large body of voice conversion work focuses on timbre conversion, aiming to change speaker identity while preserving content and other paralinguistic factors [52, 37, 61, 9, 4, 42, 65].
+Separate lines of work address accent conversion [30, 5, 29] and emotional voice conversion [72, 48, 10] as standalone tasks.
+More recent systems have begun to address holistic style transfer, jointly converting timbre, accent, and emotion from a single reference utterance [69, 36, 68, 3, 41].
+Among them, StyleStream 1.0 [41] is the first to demonstrate high-quality zero-shot VSC in a streaming setting.
+However, its approximately one-second end-to-end latency on consumer hardware remains high for latency-sensitive interaction.
+Reducing this latency while preserving holistic conversion quality is therefore a key challenge for making streaming VSC practical.
+
+A second limitation is that existing VSC systems largely require a target reference utterance.
+This makes voice specification indirect: users must provide an example voice rather than describe the desired attributes.
+In contrast, text-prompted control has become increasingly common in text-to-speech, where natural-language prompts can specify accent, emotion, and fine-grained vocal qualities such as a soft, warm, breathy, or singing-like voice [21, 34, 64, 59, 25, 26, 6, 12].
+However, these systems synthesize speech from text rather than converting an input utterance, and therefore do not directly solve streaming speech-to-speech VSC.
+Recent speech-to-speech conversion work also explores text-guided editing [54, 22, 66, 51], but typically over a single axis such as timbre or emotion.
+To our knowledge, no prior system provides text-based voice design and editing for holistic VSC, let alone in a streaming setting.
+
+We present StyleStream 2.0, a fast and controllable streaming VSC framework that addresses both limitations.
+StyleStream 2.0 inherits the two-stage architecture of StyleStream 1.0: a Destylizer that extracts content features disentangled from style, and a Stylizer that reconstructs target speech from those content features and a target style.
+Because StyleStream 1.0 already established the Destylizer as a strong content-style disentangler, we reuse it without modification and focus our changes on the Stylizer.
+
+To reduce latency, we train a few-step pixel MeanFlow [18] Stylizer to replace the multi-step diffusion Stylizer used in StyleStream 1.0.
+We further fine-tune this Stylizer with autoregressive feedback inspired by Self Forcing [27] to improve robustness under chunk-by-chunk inference.
+This reduces end-to-end latency to 520 ms on a consumer GPU, a 2 $\times$ speedup over StyleStream 1.0, while maintaining conversion quality.
+
+To enable text-based control, we change how style enters the Stylizer.
+StyleStream 1.0 conditions the Stylizer on both an unmasked mel-spectrogram context and a style embedding extracted from the target utterance, which leaves style information partially distributed across two conditioning channels.
+We remove the mel-spectrogram context so that target style is represented through a single style embedding.
+This makes text-based design and editing a problem of predicting or modifying this embedding.
+Inspired by the unified image generation and editing model FLUX Kontext [33], we train a unified text-conditioned DiT in the style-embedding space: given a natural-language prompt, the model predicts a target style embedding for voice design; given an existing utterance embedding and a text instruction, the same model modifies the embedding along the requested attribute for voice editing.
+
+For text-based control, we focus on age, gender, accent, and emotion.
+These attributes provide a structured and measurable interface for specifying target voices, while covering the major perceptual factors needed for holistic VSC.
+This structured interface supports both prompt-based voice design and attribute-targeted voice editing, and remains largely unexplored for holistic VSC, especially under streaming constraints.
+
+We evaluate StyleStream 2.0 in two settings.
+First, for standard target-speech-conditioned VSC, we compare against existing reference-based conversion systems and measure conversion quality, intelligibility, and target style fidelity.
+Second, for text-based control, no native holistic VSC baseline exists.
+We therefore construct strong cascaded baselines: for voice design, we combine ASR with prompt-controlled TTS; for voice editing, we combine prompt-controlled TTS with reference-based VSC.
+These cascades benefit from powerful ASR and TTS systems, yet StyleStream 2.0 achieves stronger results on many metrics while remaining a pure speech-to-speech system that also supports streaming inference.
+
+In summary, our contributions are:
+
+• 
+
+We introduce a faster streaming VSC model by training a few-step pixel MeanFlow Stylizer and fine-tuning it with autoregressive feedback, reducing end-to-end latency to approximately 520 ms on consumer hardware while preserving conversion quality.
+
+• 
+
+We propose a unified text-conditioned style-embedding model for natural-language voice design and attribute-targeted editing over age, gender, accent, and emotion in holistic VSC.
+
+• 
+
+We evaluate StyleStream 2.0 across standard target-speech-conditioned VSC and text-based voice design / editing, showing strong target-style fidelity while remaining competitive in intelligibility, non-edited attribute preservation, and audio quality against both reference-based and cascaded baselines.
+
+## 2 Related Work
+
+Prior speech-to-speech conversion work spans several directions, including voice conversion that primarily changes speaker identity while preserving content and other style factors [52, 37, 61, 9, 4, 40, 32], streaming or real-time voice conversion [42, 65, 45, 63], and separate lines on accent conversion and emotional voice conversion [30, 5, 29, 72, 48, 10]. More recent systems have begun to model richer, holistic voice style across timbre, accent, and emotion, including the Vevo family [69, 36, 68] and StyleStream 1.0 [41]. In parallel, prompt-controlled TTS systems enable natural-language specification of target voice characteristics [21, 34, 64, 59, 25, 26, 6, 12], with only a few open-source systems explicitly supporting holistic control over timbre, accent, and emotion [60, 25]. Closer to our setting, a smaller body of work explores text-guided speech-to-speech conversion [54, 22, 66, 51], but these methods typically focus on a single attribute and are evaluated offline. Thus, while prior work shows that speech-to-speech conversion, prompt-based control, and limited text-guided editing are all feasible, no prior system simultaneously provides fast streaming holistic VSC together with unified text-based voice design and editing.
+
+Separately, diffusion and flow-matching models have become strong acoustic generators for speech synthesis and conversion [14, 13, 8, 15, 35, 40], but their iterative sampling cost is a bottleneck for streaming applications. Recent few-step generative models reduce this cost by producing high-quality samples in only a few steps, or even one step [17, 56, 57, 18, 19, 44]. However, fast sampling alone does not guarantee high-quality streaming inference, since short chunks provide limited context and can lead to degraded quality at chunk boundaries. Inspired by Self Forcing for autoregressive video diffusion [27], StyleStream 2.0 combines a few-step pixel MeanFlow Stylizer with autoregressive fine-tuning to improve streaming robustness while also enabling controllable holistic voice design and editing.
+
+## 3 Method
+
+StyleStream 2.0 follows the Destylizer-Stylizer framework of StyleStream 1.0 [41].
+The Destylizer extracts source content features while suppressing speaker timbre, accent, and emotion.
+The Stylizer maps these content features and a target style embedding to a mel-spectrogram, which is converted to waveform by a causal Vocos-based vocoder [55].
+The style embedding can be obtained from a reference utterance or from a text-conditioned Voice Controller, allowing the same Stylizer to support reference-based conversion, text-based design, and text-guided editing.
+
+We first recap the Destylizer, then introduce the redesigned Stylizer with pixel MeanFlow training and autoregressive feedback fine-tuning, and finally present the Voice Controller for unified voice design and editing.
+
+## 3.1 Destylizer
+
+We use the Destylizer from StyleStream 1.0.
+The Destylizer consists of a frozen HuBERT-Large [24] encoder followed by six conformer [20] blocks.
+During training, the Destylizer output is passed through a finite scalar quantization (FSQ) [47] module and then a transformer ASR decoder.
+The conformer blocks and the ASR decoder are jointly optimized with a sequence-to-sequence ASR loss.
+This training setup encourages the representation to preserve linguistic content, while the compact FSQ bottleneck, with a codebook size of 45, discourages encoding style cues that are not needed for character prediction.
+At inference, we discard the FSQ module and ASR decoder, and use the continuous output features immediately before the FSQ layer as content features $f_{c}\in\mathbb{R}^{D_{c}\times T}$ at 50 Hz.
+
+## 3.2 Stylizer
+
+## 3.2.1 Preliminary: Pixel MeanFlow (pMF)
+
+Pixel MeanFlow (pMF) [44] combines JiT-style [39] $x$ -prediction with MeanFlow [18, 19] objective for few-step guided generation.
+Let $x\sim p_{\mathrm{data}}$ be a clean sample and $\epsilon\sim\mathcal{N}(0,I)$ be Gaussian noise.
+We use the linear interpolation path
+
+ $z_{t}=(1-t)x+t\epsilon,\qquad t\in[0,1],$ 
+
+(1)
+
+whose instantaneous Flow Matching velocity is
+
+ $v(z_{t},t)=\frac{dz_{t}}{dt}=\epsilon-x.$ 
+
+(2)
+
+JiT motivates predicting the clean sample $x$ rather than noisy or velocity-space quantities, since $x$ lies closer to the data manifold and can be easier for a Transformer to model in high-dimensional spaces.
+MeanFlow instead improves sampling efficiency by learning an average velocity over an interval $[r,t]$ :
+
+ $u(z_{t},r,t)=\frac{1}{t-r}\int_{r}^{t}v(z_{\tau},\tau)\,d\tau,$ 
+
+(3)
+
+which is related to the instantaneous velocity by the MeanFlow identity
+
+ $v(z_{t},t)=u(z_{t},r,t)+(t-r)\frac{d}{dt}u(z_{t},r,t).$ 
+
+(4)
+
+pMF combines these two ideas by having the network predict an $x$ -like quantity rather than a velocity.
+Because pMF uses classifier-free guidance (CFG) distillation, the guidance scale $\omega$ is also provided as an input to the network.
+Given condition $c$ , the model prediction $\hat{x}_{\theta}(z_{t},r,t,c,\omega)$ is converted to an average velocity by
+
+ $u_{\theta}(z_{t},r,t,c,\omega)=\frac{z_{t}-\hat{x}_{\theta}(z_{t},r,t,c,\omega)}{t}.$ 
+
+(5)
+
+Let $\varnothing$ denote the null condition.
+The conditional and unconditional instantaneous fields are obtained from the degenerate interval $r=t$ :
+
+ $v_{\theta}(z_{t},t,c,\omega)=u_{\theta}(z_{t},t,t,c,\omega),\qquad v_{\theta}(z_{t},t,\varnothing,\omega)=u_{\theta}(z_{t},t,t,\varnothing,\omega).$ 
+
+(6)
+
+Following the pMF CFG distillation formulation, the guided velocity target is
+
+ $v_{\mathrm{cfg}}(z_{t},t,c,\omega)=(\epsilon-x)+\left(1-\frac{1}{\omega}\right)\left(v_{\theta}(z_{t},t,c,\omega)-v_{\theta}(z_{t},t,\varnothing,\omega)\right).$ 
+
+(7)
+
+When $\omega=1$ , the guidance vanishes and the target reduces to the standard Flow Matching velocity.
+
+Using the MeanFlow identity, the instantaneous velocity implied by the predicted average velocity is
+
+ $V_{\theta}(z_{t},r,t,c,\omega)=u_{\theta}(z_{t},r,t,c,\omega)+(t-r)\frac{d}{dt}u_{\theta}(z_{t},r,t,c,\omega),$ 
+
+(8)
+
+where the total derivative is computed with a Jacobian-vector product (JVP).
+The final pMF objective is
+
+ $\mathcal{L}_{\mathrm{pMF}}=\mathbb{E}_{x,\epsilon,c,r,t,\omega}\left[\left\|V_{\theta}(z_{t},r,t,c,\omega)-v_{\mathrm{cfg}}(z_{t},t,c,\omega)\right\|_{2}^{2}\right].$ 
+
+(9)
+
+pMF keeps the network prediction in an $x$ -like space while applying supervision in the MeanFlow velocity space needed for few-step guided generation. With CFG distillation, guided sampling requires only one model evaluation per sampling step, further reducing inference cost.
+
+## 3.2.2 Stylizer Architecture and Training
+
+Architecture.
+
+An overview of the Stylizer is in Figure 1. Our Stylizer is a DiT-based model that follows the overall design of StyleStream 1.0, with two main modifications.
+First, we remove the reference mel-spectrogram context used for mel-inpainting in StyleStream 1.0, so target style must be represented entirely by the style embedding.
+This makes the style space directly usable for voice design and editing.
+Second, because the style embedding is now the only source of target-style information, we replace the original TDNN-based style encoder [31] with a stronger perceiver-resampler encoder [28, 2, 38].
+
+The new style encoder first extracts SSL features from a frozen WavLM [7] model11
+ 1
+
+ https://huggingface.co/microsoft/wavlm-base-plus.
+Let the WavLM hidden states be $H\in\mathbb{R}^{B\times T\times L\times D}$ , where $B$ is the batch size, $T$ is the number of frames, $L=12$ is the number of WavLM layers, and $D$ is the hidden dimension.
+Instead of reducing $H$ by layer-weighted summation and temporal pooling as in StyleStream 1.0, we concatenate all layer outputs along time to obtain $\tilde{H}\in\mathbb{R}^{B\times(TL)\times D}$ .
+A perceiver resampler with $N_{q}$ learnable queries compresses $\tilde{H}$ into a fixed-size representation $S\in\mathbb{R}^{B\times N_{q}\times D_{q}}$ , through cross-attention to $\tilde{H}$ and self-attention among the queries.
+We flatten $S$ and apply an MLP to obtain the style embedding $e_{s}\in\mathbb{R}^{B\times C}$ , where $C$ is the final style embedding dimension.
+The style encoder is trained jointly with the Stylizer under the pMF objective, and we compare it with the StyleStream 1.0 style encoder in Section 5.4.
+
+Training.
+
+We train the Stylizer using the pMF objective introduced in Section 3.2.1.
+Here, $x$ is the target mel-spectrogram, $z_{t}=(1-t)x+t\epsilon$ , and the condition is $c=(f_{c},e_{s})$ , where $f_{c}$ is the Destylizer content representation and $e_{s}$ is the style embedding.
+During training, $f_{c}$ and $e_{s}$ are extracted from the same utterance. At inference, $e_{s}$ may instead come from a different reference utterance or from the Voice Controller (see Section 3.3).
+
+At the DiT input, we concatenate $z_{t}$ , $f_{c}$ , and a past-output channel along the channel dimension.
+This past-output channel is zero during offline pretraining and is filled with generated history during autoregressive fine-tuning (Section 3.2.3).
+The flow times $r$ and $t$ , style embedding $e_{s}$ , and guidance scale $\omega$ are embedded as vectors, summed, and injected into the DiT through adaLN-zero [49].
+The model predicts an $x$ -like mel estimate, which is converted into the average velocity $u_{\theta}(z_{t},r,t,c,\omega)$ by Eq. (5) and the implied instantaneous velocity $V_{\theta}$ by Eq. (8).
+
+For CFG distillation, we randomly sample the guidance scale $\omega$ and replace $c=(f_{c},e_{s})$ with null condition $\varnothing$ with probability $p_{\mathrm{drop}}$ .
+When constructing the CFG target velocity, we stop gradients on $v_{\mathrm{cfg}}$ (Eq. (7)), so the model is updated only through the predicted compound velocity $V_{\theta}$ .
+At inference, we provide the desired $\omega$ directly and require only one model evaluation per sampling step.
+Additional implementation details are provided in Appendix B.
+
+## 3.2.3 Autoregressive Fine-Tuning
+
+Figure 1: Left: Stylizer architecture. $[r,t]$ is the MeanFlow interval, $\omega$ is the CFG strength. Right: Voice Controller architecture. When used for voice design, the auxiliary input is null $\varnothing$ ; for voice editing, source style embedding is also part of the input.
+
+Although pMF reduces the sampling cost, fast sampling alone does not guarantee high-quality streaming generation. When applied chunk by chunk, each generation step only observes a short segment with limited context, making it difficult to produce locally accurate outputs and smooth transitions across chunk boundaries. Inspired by Self Forcing [27], we apply autoregressive fine-tuning to adapt the Stylizer to the streaming setting and align training with inference behavior.
+
+During this stage, we freeze the style encoder and update only the Stylizer, so the offline and streaming models remain aligned in the same style embedding space.
+Following Self Forcing, which trains generative models on rollouts of their own outputs, we adopt the rollout mechanism while retaining our pMF objective.
+For each training utterance, we sample a chunk size and split the utterance into non-overlapping chunks.
+The model rolls out chunks sequentially, maintaining a fixed-length window of generated mel frames as past context $m_{\mathrm{past}}$ .
+Each chunk also receives a fixed-size lookahead window of future content features, which provides limited future linguistic context while preserving the streaming constraint.
+The DiT input uses the same layout as offline training, except that the past-output channel is filled with $m_{\mathrm{past}}$ and the current chunk region is zeroed out.
+The AR-stage condition is therefore $\tilde{c}=(f_{c},e_{s},m_{\mathrm{past}})$ , with $\omega$ sampled as in offline training.
+
+We apply the pMF loss only on the current chunk:
+
+ $\mathcal{L}_{\mathrm{AR}}=\mathbb{E}_{x,\epsilon,\tilde{c},r,t,\omega}\left[\left\|\mathbf{M}\odot\left(V_{\theta}(z_{t},r,t,\tilde{c},\omega)-v_{\mathrm{cfg}}(z_{t},t,\tilde{c},\omega)\right)\right\|_{2}^{2}\right],$ 
+
+(10)
+
+where $\mathbf{M}$ selects the current chunk region and $v_{\mathrm{cfg}}$ is defined in Eq. (7).
+Generated past chunks are detached before being reused, so gradients are computed only through the current chunk loss.
+This exposes the Stylizer to its own imperfect history while keeping training efficient.
+
+At inference, we use the same chunk-by-chunk procedure.
+The model maintains ring buffers for generated mel frames and past content features.
+For each new chunk, the current content features and lookahead are concatenated with the past-content buffer, while the past-mel buffer fills the past-output channel with the current chunk region zeroed out.
+After generation, both buffers are updated with the new content and mel frames.
+
+## 3.3 Voice Controller: Unified Voice Design and Editing
+
+The Voice Controller is a text-conditioned DiT that operates in the style embedding space and supports two tasks: voice design, which generates a new style embedding from a text prompt, and voice editing, which modifies an existing style embedding according to a text instruction.
+In this work, both tasks focus on controllable age, gender, accent, and emotion.
+
+As shown in Figure 1, the Voice Controller is a standard DiT trained with a JiT-style $x$ -prediction objective over the style-embedding space.
+Given a target style embedding, we add noise to obtain $e_{t}$ , patchify it into a token sequence, and feed these tokens to the DiT.
+To unify voice design and editing, we provide an auxiliary embedding sequence with the same patch layout: for voice design, this auxiliary input is a learned null embedding; for voice editing, it is the patchified source style embedding.
+The noised target tokens and auxiliary tokens are concatenated along the channel dimension at each patch.
+The text prompt is encoded by a frozen Flan-T5 encoder22
+ 2
+
+ http://huggingface.co/google/flan-t5-base [11] and injected through cross-attention.
+For more implementation details, please refer to Appendix B.
+
+## 4 Experimental Setup
+
+## 4.1 Datasets
+
+## 4.1.1 Voice Style Conversion
+
+Training Data.
+
+The Destylizer is reused from StyleStream 1.0 without retraining.
+We train the Stylizer on the English portion of Emilia [23], which provides roughly 50k hours of in-the-wild English speech covering diverse speakers, accents, and emotions.
+
+Test Data.
+
+We follow the same construction procedure as StyleStream 1.0.
+We sample 300 source utterances from ESD [71], GLOBE-test [62], and LibriTTS-test-clean [67],
+and select 10 target utterances from ESD [71], RAVDESS [43], GLOBE-test, and L2-ARCTIC [70],
+covering five emotions (happy, angry, sad, fearful, calm) and five accents (British, American, Indian, Arabic, Mandarin).
+Pairing each source with each target yields 3000 source-target pairs.
+
+## 4.1.2 Voice Design and Editing
+
+Training Data.
+
+The Voice Controller is trained on a large synthetic and natural corpus derived from CapSpeech [60]. We assign four controllable attributes: age, gender, accent, and emotion, using style information from CapSpeech captions, with VoxProfile [16] predictions used as fallbacks when caption labels are missing or ambiguous. To construct single-attribute editing pairs, we use CosyVoice3 [13] to align utterances into a shared timbre space for accent and emotion edits: accent-edit pairs differ primarily in accent while sharing emotion, and emotion-edit pairs differ primarily in emotion while sharing accent. For timbre editing, we use natural CapSpeech pairs selected to differ in age, gender, or both while preserving the remaining available labels.
+Categorical labels are converted into natural-language supervision through a controlled template renderer, producing prompts for voice design and single-attribute instructions for voice editing. Full details of the label inventories, template construction, and dataset sizes are provided in Appendix A.1.
+
+Test Data.
+
+We evaluate text-based style control on the same fixed set of 300 source utterances used in Section 4.1.1. For voice design, each source utterance is paired with ten natural-language style prompts, yielding 3000 test items. The prompts cover timbre-only requests, accent-only requests, emotion-only requests, timbre+accent requests, timbre+emotion requests, and all-attribute requests. For voice editing, each source utterance is paired with ten single-axis edit instructions, yielding another 3000 test items: two age edits, two gender edits, three accent edits, and three emotion edits. The target value is sampled to differ from the source label on the edited axis, and the instruction mentions only the requested change, so evaluation measures both edit success and preservation of non-edited attributes. Test prompt rendering and target sampling details are given in Appendix A.2.
+
+## 4.2 Baselines
+
+Voice Style Conversion.
+
+For reference-conditioned VSC, we compare against CosyVoice 2.0 [14], CosyVoice 3.0 [13], Vevo [69], Vevo 2.0 [68], and StyleStream 1.0 [41]. We evaluate CosyVoice in its speech-to-speech mode and run Vevo 2.0 as an ASR+TTS cascade using Whisper-large-v3 [53], since Vevo 2.0 is architecturally a TTS system. StyleStream 2.0 is evaluated in both offline and streaming modes. Sampling, NFE, CFG, chunk-size, and streaming-buffer details are given in Appendix A.3.
+
+Voice Design and Editing.
+
+For text-based voice design, we compare against ASR+prompt-TTS cascades using CapTTS [60] and Qwen3-TTS VoiceDesign [25]. For text-based voice editing, no native holistic text-editing baseline exists, so we use CapTTS as a text-to-reference adapter for Vevo [69] and Vevo 2.0 [68]. The generated reference is routed as either the timbre or style reference depending on the edited attribute. Full routing details are provided in Appendix A.3.
+
+## 4.3 Metrics
+
+Voice Style Conversion.
+
+Following StyleStream 1.0 [41], we evaluate reference-conditioned VSC with WER for intelligibility and embedding-based target-style similarity: S-SIM for speaker similarity, A-SIM [73] for accent similarity, and E-SIM [46] for emotion similarity. Subjective evaluation reports NMOS for naturalness and S/A/E-SMOS for speaker, accent, and emotion similarity to the target reference.
+
+Voice Design and Editing.
+
+For text-based control, we report WER and target-style accuracy using VoxProfile [16] classifiers for age, gender, accent, and emotion, denoted Age-acc, G-acc, A-acc, and E-acc. For voice editing, we additionally measure preservation of non-edited speaker, accent, and emotion attributes using source-output S-SIM, A-SIM, and E-SIM, denoted as S-pres, A-pres, and E-pres. Subjective evaluation reports NMOS for naturalness, SC-MOS for prompt or instruction consistency, and SP-MOS for preservation in editing. Objective metric details and MOS protocols are provided in Appendices A.4 and A.5.
+
+## 5 Results
+
+Table 1: Voice style conversion results (SS denotes StyleStream). The best results are shown in bold, and the second-best results are underlined. Ground-truth NMOS is reported as an upper bound and excluded from ranking.
+
+Model
+NFE $\downarrow$ 
+WER ( $\%$ ) $\downarrow$ 
+S-SIM $\uparrow$ 
+A-SIM $\uparrow$ 
+E-SIM $\uparrow$ 
+NMOS $\uparrow$ 
+S-SMOS $\uparrow$ 
+A-SMOS $\uparrow$ 
+E-SMOS $\uparrow$ 
+
+Ground Truth
+—
+4.42
+—
+—
+—
+3.72 $\pm$ .12
+—
+—
+—
+
+Qwen3-TTS
+—
+4.76
+0.927
+0.833
+0.941
+—
+—
+—
+—
+
+CosyVoice 2.0
+10
+8.07
+0.814
+0.484
+0.674
+3.54 $\pm$ .12
+3.64 $\pm$ .13
+3.25 $\pm$ .15
+2.61 $\pm$ .15
+
+CosyVoice 3.0
+10
+6.56
+0.832
+0.508
+0.668
+3.48 $\pm$ .13
+3.78 $\pm$ .12
+3.21 $\pm$ .14
+2.80 $\pm$ .15
+
+Vevo
+32
+13.33
+0.853
+0.659
+0.745
+3.42 $\pm$ .13
+4.00 $\pm$ .14
+3.94 $\pm$ .13
+3.63 $\pm$ .13
+
+Vevo 2.0
+32
+5.79
+0.843
+0.676
+0.723
+3.44 $\pm$ .13
+4.06 $\pm$ .13
+3.98 $\pm$ .13
+3.11 $\pm$ .15
+
+SS 1.0 (offline)
+16
+7.47
+0.869
+0.699
+0.808
+3.43 $\pm$ .14
+4.23 $\pm$ .10
+4.08 $\pm$ .11
+4.30 $\pm$ .10
+
+SS 2.0 (offline)
+4
+7.00
+0.879
+0.705
+0.774
+3.45 $\pm$ .13
+4.32 $\pm$ .10
+4.04 $\pm$ .11
+4.35 $\pm$ .09
+
+SS 1.0 (streaming)
+12
+11.41
+0.842
+0.656
+0.771
+3.37 $\pm$ .13
+4.10 $\pm$ .14
+3.76 $\pm$ .12
+4.24 $\pm$ .10
+
+SS 2.0 (streaming)
+4
+12.02
+0.866
+0.684
+0.765
+3.40 $\pm$ .13
+4.18 $\pm$ .14
+3.89 $\pm$ .13
+4.27 $\pm$ .10
+
+## 5.1 Voice Style Conversion
+
+Table 1 reports the main reference-conditioned VSC results in both offline and streaming settings.
+In the offline setting, StyleStream 2.0 achieves the strongest overall target-style similarity,
+ranking first on S-SIM, A-SIM, S-SMOS, and E-SMOS, and improving over the previous state-of-the-art StyleStream 1.0 on most style metrics.
+NMOS is statistically comparable across systems.
+Notably, StyleStream 2.0 achieves these results with only 4 sampling steps, compared with 16 for StyleStream 1.0,
+10 for the CosyVoice variants, and 32 for Vevo and Vevo 2.0.
+For intelligibility, Vevo 2.0 obtains the lowest WER, which is expected because it is effectively a strong cascaded ASR and voice-cloning TTS pipeline.
+However, its target-style similarity remains lower than StyleStream 2.0 across all metrics, while StyleStream 2.0 remains competitive in WER.
+
+In the streaming setting, StyleStream 2.0 matches the intelligibility of StyleStream 1.0 while improving target-style similarity on all metrics except for a marginal gap in E-SIM.
+It also uses only 4 sampling steps (versus 12 for the StyleStream 1.0 streaming variant) and reduces the chunk size from 600 ms to 300 ms, enabling lower-latency streaming inference.
+
+## 5.2 Streaming Analysis
+
+Table 2 reports streaming quality and per-chunk processing time across chunk sizes from 160 ms to 600 ms, comparing StyleStream 1.0 and StyleStream 2.0 on the same RTX 4060 GPU under the same evaluation protocol. For the streaming configuration reported in Table 1, we use a 300 ms chunk size and a fixed 80 ms lookahead. Together with the measured per-chunk processing time of 140.7 ms, this gives an end-to-end latency of 520.7 ms, which is 2x faster than StyleStream 1.0.
+For both systems, all metrics improve monotonically with chunk size, since longer context lets the model better capture accent and emotion and smooths transitions across chunk boundaries.
+At every chunk size, StyleStream 2.0 dominates StyleStream 1.0 on nearly every metric.
+StyleStream 2.0 also runs in real time across the entire sweep on RTX 4060, with per-chunk processing time well below the chunk duration, whereas StyleStream 1.0 only meets the real-time requirement at the largest 600 ms chunk and then only with negligible headroom (598 ms processing within a 600 ms budget).
+
+Table 2: Streaming chunk-size analysis on RTX 4060. We compare StyleStream 1.0 (SS 1.0, 12 NFE) and StyleStream 2.0 (SS 2.0, 4 NFE) across chunk sizes from 160 ms to 600 ms, reporting per-chunk processing time and quality. Best per chunk-size group is in bold.
+
+Chunk (ms)
+Model
+Proc (ms) $\downarrow$ 
+WER ( $\%$ ) $\downarrow$ 
+S-SIM $\uparrow$ 
+A-SIM $\uparrow$ 
+E-SIM $\uparrow$ 
+
+160
+SS 1.0
+500.1
+16.59
+0.821
+0.624
+0.724
+
+160
+SS 2.0
+130.5
+14.02
+0.860
+0.669
+0.763
+
+200
+SS 1.0
+528.8
+15.25
+0.825
+0.632
+0.732
+
+200
+SS 2.0
+132.0
+13.22
+0.863
+0.675
+0.764
+
+300
+SS 1.0
+559.3
+13.34
+0.833
+0.644
+0.748
+
+300
+SS 2.0
+140.7
+12.03
+0.866
+0.684
+0.765
+
+400
+SS 1.0
+575.8
+12.21
+0.835
+0.647
+0.761
+
+400
+SS 2.0
+145.9
+11.56
+0.868
+0.687
+0.766
+
+500
+SS 1.0
+589.5
+11.62
+0.837
+0.651
+0.764
+
+500
+SS 2.0
+150.2
+11.12
+0.869
+0.688
+0.766
+
+600
+SS 1.0
+598.4
+11.45
+0.842
+0.656
+0.772
+
+600
+SS 2.0
+157.0
+10.87
+0.870
+0.691
+0.766
+
+Table 3: Voice design results. WER and VoxProfile accuracies are percentages. We use Age-acc, G-acc, A-acc, and E-acc to denote age, gender, accent and emotion classification accuracy. NMOS measures naturalness and SC-MOS measures style consistency with the prompt.
+
+Objective
+Subjective
+
+Model
+WER $\downarrow$ 
+Age-acc $\uparrow$ 
+G-acc $\uparrow$ 
+A-acc $\uparrow$ 
+E-acc $\uparrow$ 
+NMOS $\uparrow$ 
+SC-MOS $\uparrow$ 
+
+CapTTS
+7.36
+41.11
+94.33
+52.00
+29.47
+3.27 $\pm$ .13
+3.54 $\pm$ .13
+
+Qwen3-TTS
+4.86
+44.33
+92.39
+14.73
+36.33
+3.35 $\pm$ .14
+2.97 $\pm$ .15
+
+SS 2.0 (streaming)
+10.42
+67.94
+98.94
+46.73
+30.13
+3.23 $\pm$ .13
+3.78 $\pm$ .12
+
+SS 2.0 (offline)
+6.89
+70.67
+99.44
+52.73
+32.20
+3.45 $\pm$ .12
+3.96 $\pm$ .10
+
+## 5.3 Voice Design and Editing
+
+Table 3 summarizes the voice design results. Compared with the cascaded ASR+TTS baselines, StyleStream 2.0 achieves the strongest overall style fidelity, obtaining the highest style accuracy for age, gender, and accent. The streaming variant also improves over the baselines on age and gender accuracy. CapTTS remains competitive for accent control, while Qwen3-TTS achieves the best intelligibility and emotion accuracy, but shows much lower accent accuracy.
+
+Table 4 reports the voice editing results.
+StyleStream 2.0 offline achieves the highest edited-axis accuracy and the lowest WER, while also receiving the highest naturalness and style-consistency MOS.
+The streaming variant remains close in both style accuracy and SC-MOS, showing that StyleStream 2.0 can follow edit instructions reliably across different style attributes in both offline and streaming settings.
+In contrast, Vevo and Vevo 2 obtain lower edited-axis accuracy, especially for accent and emotion edits.
+Their higher preservation scores therefore should be interpreted together with their lower edit success: in many cases, the source style is preserved because the requested attribute is not changed sufficiently.
+This highlights the trade-off between successful attribute editing and preservation of unedited attributes.
+
+Table 4: Voice editing results. WER and VoxProfile accuracies are percentages. We use Age-acc, G-acc, A-acc, and E-acc to denote age, gender, accent and emotion classification accuracy. SC-MOS measures instruction consistency, SP-MOS measures preservation of non-edited attributes, and NMOS measures naturalness.
+
+Style Consistency
+MOS
+Style Preservation
+
+Model
+WER $\downarrow$ 
+Age-acc $\uparrow$ 
+G-acc $\uparrow$ 
+A-acc $\uparrow$ 
+E-acc $\uparrow$ 
+SC-MOS $\uparrow$ 
+SP-MOS $\uparrow$ 
+NMOS $\uparrow$ 
+S-pres. $\uparrow$ 
+A-pres. $\uparrow$ 
+E-pres. $\uparrow$ 
+
+Vevo
+12.35
+28.33
+94.83
+16.89
+6.56
+2.64 $\pm$ .16
+3.64 $\pm$ .12
+3.44 $\pm$ .13
+0.9092
+0.6303
+0.8902
+
+Vevo2
+7.82
+24.67
+65.17
+6.78
+7.11
+2.26 $\pm$ .15
+3.28 $\pm$ .14
+3.32 $\pm$ .14
+0.8853
+0.5948
+0.8832
+
+SS 2.0 (streaming)
+9.62
+67.17
+99.67
+46.56
+13.67
+3.64 $\pm$ .13
+3.50 $\pm$ .13
+3.21 $\pm$ .15
+0.7644
+0.4864
+0.8794
+
+SS 2.0 (offline)
+6.43
+71.67
+99.17
+54.33
+14.67
+3.76 $\pm$ .13
+3.58 $\pm$ .12
+3.48 $\pm$ .13
+0.7899
+0.5102
+0.8851
+
+## 5.4 Ablation Studies
+
+Table 5 reports two ablations on the key design choices of StyleStream 2.0: the autoregressive fine-tuning (Section 3.2.3) and the perceiver-resampler style encoder (Section 3.2).
+Without self-forcing, the streaming Stylizer loses substantial intelligibility while target-style similarity stays essentially unchanged, indicating that the autoregressive rollout primarily addresses the train-test mismatch of chunk-by-chunk inference for smooth chunk transitions.
+Replacing our perceiver-resampler with the StyleStream 1.0 TDNN style encoder under the same offline pMF objective degrades both intelligibility and accent similarity, supporting the need for a stronger style encoder when the embedding alone must carry timbre, accent, and emotion.
+More ablations on the effect of NFE and CFG scale are in Appendix C. Model-size details and Voice Controller text-encoder ablations are in Appendices B and C.3.
+
+Table 5: Ablation studies. Left: Effect of with or without autoregressive fine-tuning (AR-ft) under streaming inference. Right: Different style encoder effect under offline inference.
+
+Setting
+WER ( $\%$ ) $\downarrow$ 
+S-SIM $\uparrow$ 
+A-SIM $\uparrow$ 
+E-SIM $\uparrow$ 
+
+w/ AR-ft
+12.03
+0.866
+0.684
+0.765
+
+w/o AR-ft
+19.54
+0.866
+0.676
+0.767
+
+Style Encoder
+WER ( $\%$ ) $\downarrow$ 
+S-SIM $\uparrow$ 
+A-SIM $\uparrow$ 
+E-SIM $\uparrow$ 
+
+SS 1.0
+8.04
+0.823
+0.633
+0.765
+
+SS 2.0
+7.00
+0.879
+0.705
+0.774
+
+## 6 Conclusion
+
+We introduced StyleStream 2.0, a fast and controllable streaming VSC system. By combining a few-step pixel MeanFlow Stylizer with autoregressive fine-tuning, it reduces streaming latency while preserving holistic style conversion quality. A unified text-conditioned controller further enables natural-language voice design and single-attribute voice editing in the same style-embedding space. Across reference-conditioned VSC, voice design, and editing, StyleStream 2.0 improves target-style fidelity while remaining competitive in intelligibility and preservation.
+
+## Acknowledgments and Disclosure of Funding
+
+Supported by the IARPA ARTS program, Robert E. & Beverly A. Brooks Endowed Professorship at EECS, UC Berkeley.
+
+## References
+
+[1]
+S. Agarwal, L. Ahmad, J. Ai, S. Altman, A. Applebaum, E. Arbus, R. K. Arora, Y. Bai, B. Baker, H. Bao, et al. (2025)
+
+Gpt-oss-120b & gpt-oss-20b model card.
+
+arXiv preprint arXiv:2508.10925.
+
+Cited by: §A.1,
+§A.1.
+
+[2]
+J. Alayrac, J. Donahue, P. Luc, A. Miech, I. Barr, Y. Hasson, K. Lenc, A. Mensch, K. Millican, M. Reynolds, et al. (2022)
+
+Flamingo: a visual language model for few-shot learning.
+
+Advances in neural information processing systems 35, pp. 23716–23736.
+
+Cited by: §3.2.2.
+
+[3]
+P. Anastassiou, Z. Tang, K. Peng, D. Jia, J. Li, M. Tu, Y. Wang, Y. Wang, and M. Ma (2024)
+
+Voiceshop: a unified speech-to-speech framework for identity-preserving zero-shot voice editing.
+
+arXiv preprint arXiv:2404.06674.
+
+Cited by: §1.
+
+[4]
+M. Baas, B. van Niekerk, and H. Kamper (2023)
+
+Voice conversion with just nearest neighbors.
+
+arXiv preprint arXiv:2305.18975.
+
+Cited by: §1,
+§2.
+
+[5]
+Q. Bai, S. Inoue, S. Wang, Z. Jiang, Y. Wang, and H. Li (2025)
+
+Accent normalization using self-supervised discrete tokens with non-parallel data.
+
+In Proc. Interspeech 2025,
+
+pp. 1618–1622.
+
+Cited by: §1,
+§2.
+
+[6]
+D. Chen, X. Zhang, Y. Wang, K. Dai, L. Ma, and Z. Wu (2026)
+
+FlexiVoice: enabling flexible style control in zero-shot tts with natural language instructions.
+
+arXiv preprint arXiv:2601.04656.
+
+Cited by: §1,
+§2.
+
+[7]
+S. Chen, C. Wang, Z. Chen, Y. Wu, S. Liu, Z. Chen, J. Li, N. Kanda, T. Yoshioka, X. Xiao, et al. (2022)
+
+Wavlm: large-scale self-supervised pre-training for full stack speech processing.
+
+IEEE Journal of Selected Topics in Signal Processing 16 (6), pp. 1505–1518.
+
+Cited by: §3.2.2.
+
+[8]
+Y. Chen, Z. Niu, Z. Ma, K. Deng, C. Wang, J. JianZhao, K. Yu, and X. Chen (2025)
+
+F5-tts: a fairytaler that fakes fluent and faithful speech with flow matching.
+
+In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+
+pp. 6255–6271.
+
+Cited by: §2.
+
+[9]
+H. Choi, J. Lee, W. Kim, J. Lee, H. Heo, and K. Lee (2021)
+
+Neural analysis and synthesis: reconstructing speech from self-supervised representations.
+
+Advances in Neural Information Processing Systems 34, pp. 16251–16265.
+
+Cited by: §1,
+§2.
+
+[10]
+H. Chou, Y. Lin, C. Sung, Y. Tsao, and C. Lee (2025)
+
+ZSDEVC: zero-shot diffusion-based emotional voice conversion with disentangled mechanism.
+
+In Proc. Interspeech 2025,
+
+pp. 4398–4402.
+
+Cited by: §1,
+§2.
+
+[11]
+H. W. Chung, L. Hou, S. Longpre, B. Zoph, Y. Tay, W. Fedus, Y. Li, X. Wang, M. Dehghani, S. Brahma, et al. (2024)
+
+Scaling instruction-finetuned language models.
+
+Journal of Machine Learning Research 25 (70), pp. 1–53.
+
+Cited by: §3.3.
+
+[12]
+A. Diwan, Z. Zheng, D. Harwath, and E. Choi (2025)
+
+Scaling rich style-prompted text-to-speech datasets.
+
+In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing,
+
+pp. 3639–3659.
+
+Cited by: §1,
+§2.
+
+[13]
+Z. Du, C. Gao, Y. Wang, F. Yu, T. Zhao, H. Wang, X. Lv, H. Wang, C. Ni, X. Shi, et al. (2025)
+
+Cosyvoice 3: towards in-the-wild speech generation via scaling-up and post-training.
+
+arXiv preprint arXiv:2505.17589.
+
+Cited by: §A.1,
+§A.3,
+§2,
+§4.1.2,
+§4.2.
+
+[14]
+Z. Du, Y. Wang, Q. Chen, X. Shi, X. Lv, T. Zhao, Z. Gao, Y. Yang, C. Gao, H. Wang, et al. (2024)
+
+Cosyvoice 2: scalable streaming speech synthesis with large language models.
+
+arXiv preprint arXiv:2412.10117.
+
+Cited by: §A.3,
+§2,
+§4.2.
+
+[15]
+S. E. Eskimez, X. Wang, M. Thakker, C. Li, C. Tsai, Z. Xiao, H. Yang, Z. Zhu, M. Tang, X. Tan, et al. (2024)
+
+E2 tts: embarrassingly easy fully non-autoregressive zero-shot tts.
+
+In 2024 IEEE spoken language technology workshop (SLT),
+
+pp. 682–689.
+
+Cited by: §2.
+
+[16]
+T. Feng, J. Lee, A. Xu, Y. Lee, T. Lertpetchpun, X. Shi, H. Wang, T. Thebaud, L. Moro-Velazquez, D. Byrd, et al. (2025)
+
+Vox-profile: a speech foundation model benchmark for characterizing diverse speaker and speech traits.
+
+arXiv preprint arXiv:2505.14648.
+
+Cited by: §A.1,
+§A.4,
+§4.1.2,
+§4.3.
+
+[17]
+K. Frans, D. Hafner, S. Levine, and P. Abbeel (2024)
+
+One step diffusion via shortcut models.
+
+arXiv preprint arXiv:2410.12557.
+
+Cited by: §2.
+
+[18]
+Z. Geng, M. Deng, X. Bai, J. Z. Kolter, and K. He (2025)
+
+Mean flows for one-step generative modeling.
+
+arXiv preprint arXiv:2505.13447.
+
+Cited by: §1,
+§2,
+§3.2.1.
+
+[19]
+Z. Geng, Y. Lu, Z. Wu, E. Shechtman, J. Z. Kolter, and K. He (2025)
+
+Improved mean flows: on the challenges of fastforward generative models.
+
+arXiv preprint arXiv:2512.02012.
+
+Cited by: §2,
+§3.2.1.
+
+[20]
+A. Gulati, J. Qin, C. Chiu, N. Parmar, Y. Zhang, J. Yu, W. Han, S. Wang, Z. Zhang, Y. Wu, et al. (2020)
+
+Conformer: convolution-augmented transformer for speech recognition.
+
+arXiv preprint arXiv:2005.08100.
+
+Cited by: §3.1.
+
+[21]
+Z. Guo, Y. Leng, Y. Wu, S. Zhao, and X. Tan (2023)
+
+Prompttts: controllable text-to-speech with text descriptions.
+
+In ICASSP 2023-2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+pp. 1–5.
+
+Cited by: §1,
+§2.
+
+[22]
+J. Hai, K. Thakkar, H. Wang, Z. Qin, and M. Elhilali (2024)
+
+DreamVoice: text-guided voice conversion.
+
+In Proc. Interspeech 2024,
+
+pp. 4373–4377.
+
+Cited by: §1,
+§2.
+
+[23]
+H. He, Z. Shang, C. Wang, X. Li, Y. Gu, H. Hua, L. Liu, C. Yang, J. Li, P. Shi, et al. (2024)
+
+Emilia: an extensive, multilingual, and diverse speech dataset for large-scale speech generation.
+
+In 2024 IEEE Spoken Language Technology Workshop (SLT),
+
+pp. 885–890.
+
+Cited by: §4.1.1.
+
+[24]
+W. Hsu, B. Bolte, Y. H. Tsai, K. Lakhotia, R. Salakhutdinov, and A. Mohamed (2021)
+
+Hubert: self-supervised speech representation learning by masked prediction of hidden units.
+
+IEEE/ACM transactions on audio, speech, and language processing 29, pp. 3451–3460.
+
+Cited by: §3.1.
+
+[25]
+H. Hu, X. Zhu, T. He, D. Guo, B. Zhang, X. Wang, Z. Guo, Z. Jiang, H. Hao, Z. Guo, et al. (2026)
+
+Qwen3-tts technical report.
+
+arXiv preprint arXiv:2601.15621.
+
+Cited by: §A.3,
+§A.3,
+§1,
+§2,
+§4.2.
+
+[26]
+J. Hu, H. Chen, L. Ma, D. Guo, Q. Zhan, W. Li, H. Zhang, K. Xia, Z. Zhang, W. Tian, et al. (2026)
+
+Voicesculptor: your voice, designed by you.
+
+arXiv preprint arXiv:2601.10629.
+
+Cited by: §1,
+§2.
+
+[27]
+X. Huang, Z. Li, G. He, M. Zhou, and E. Shechtman (2025)
+
+Self forcing: bridging the train-test gap in autoregressive video diffusion.
+
+arXiv preprint arXiv:2506.08009.
+
+Cited by: §1,
+§2,
+§3.2.3.
+
+[28]
+A. Jaegle, F. Gimeno, A. Brock, O. Vinyals, A. Zisserman, and J. Carreira (2021)
+
+Perceiver: general perception with iterative attention.
+
+In International conference on machine learning,
+
+pp. 4651–4664.
+
+Cited by: §3.2.2.
+
+[29]
+D. Jia, Q. Tian, K. Peng, J. Li, Y. Chen, M. Ma, Y. Wang, and Y. Wang (2023)
+
+Zero-shot accent conversion using pseudo siamese disentanglement network.
+
+In Proc. Interspeech 2023,
+
+pp. 5476–5480.
+
+Cited by: §1,
+§2.
+
+[30]
+Z. Jia, H. Xue, X. Peng, and Y. Lu (2024)
+
+Convert and speak: zero-shot accent conversion with minimum supervision.
+
+In Proceedings of the 32nd ACM International Conference on Multimedia,
+
+pp. 4446–4454.
+
+Cited by: §1,
+§2.
+
+[31]
+C. Jin, B. He, K. Hui, and L. Sun (2018)
+
+TDNN: a two-stage deep neural network for prompt-independent automated essay scoring.
+
+In Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), I. Gurevych and Y. Miyao (Eds.),
+
+Melbourne, Australia, pp. 1088–1097.
+
+External Links: Link,
+Document
+
+Cited by: §3.2.2.
+
+[32]
+T. Kaneko, H. Kameoka, K. Tanaka, and N. Hojo (2019)
+
+StarGAN-vc2: rethinking conditional methods for stargan-based voice conversion.
+
+In Proc. Interspeech 2019,
+
+pp. 679–683.
+
+Cited by: §2.
+
+[33]
+B. F. Labs, S. Batifol, A. Blattmann, F. Boesel, S. Consul, C. Diagne, T. Dockhorn, J. English, Z. English, P. Esser, et al. (2025)
+
+FLUX. 1 kontext: flow matching for in-context image generation and editing in latent space.
+
+arXiv preprint arXiv:2506.15742.
+
+Cited by: §1.
+
+[34]
+Y. Lacombe, V. Srivastav, and S. Gandhi (2024)
+
+Parler-tts.
+
+ GitHub.
+
+Note: https://github.com/huggingface/parler-tts
+
+Cited by: §1,
+§2.
+
+[35]
+K. Lee, D. W. Kim, J. Kim, S. Chung, and J. Cho (2024)
+
+DiTTo-tts: diffusion transformers for scalable text-to-speech without domain-specific factors.
+
+arXiv preprint arXiv:2406.11427.
+
+Cited by: §2.
+
+[36]
+J. Li, X. Zhang, Y. Wang, H. He, C. Wang, L. Wang, H. Liao, J. Ao, Z. Xie, Y. Huang, J. Zhang, and Z. Wu (2025)
+
+Overview of the amphion toolkit (v0.2).
+
+arXiv preprint arXiv:2501.15442.
+
+Cited by: §A.3,
+§1,
+§2.
+
+[37]
+J. Li, W. Tu, and L. Xiao (2023)
+
+Freevc: towards high-quality text-free one-shot voice conversion.
+
+In ICASSP 2023-2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+pp. 1–5.
+
+Cited by: §1,
+§2.
+
+[38]
+J. Li, D. Li, S. Savarese, and S. Hoi (2023)
+
+Blip-2: bootstrapping language-image pre-training with frozen image encoders and large language models.
+
+In International conference on machine learning,
+
+pp. 19730–19742.
+
+Cited by: §3.2.2.
+
+[39]
+T. Li and K. He (2025)
+
+Back to basics: let denoising generative models denoise.
+
+arXiv preprint arXiv:2511.13720.
+
+Cited by: §3.2.1.
+
+[40]
+S. Liu (2024)
+
+Zero-shot voice conversion with diffusion transformers.
+
+arXiv preprint arXiv:2411.09943.
+
+Cited by: §2,
+§2.
+
+[41]
+Y. Liu, N. Lee, and G. Anumanchipalli (2026)
+
+StyleStream: real-time zero-shot voice style conversion.
+
+arXiv preprint arXiv:2602.20113.
+
+Cited by: §A.3,
+§A.3,
+§1,
+§2,
+§3,
+§4.2,
+§4.3.
+
+[42]
+Y. Liu, C. Wang, H. Kim, R. Khan, and G. Anumanchipalli (2025)
+
+RT-vc: real-time zero-shot voice conversion with speech articulatory coding.
+
+In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 3: System Demonstrations),
+
+pp. 385–393.
+
+Cited by: §1,
+§2.
+
+[43]
+S. R. Livingstone and F. A. Russo (2018)
+
+The ryerson audio-visual database of emotional speech and song (ravdess): a dynamic, multimodal set of facial and vocal expressions in north american english.
+
+PloS one 13 (5), pp. e0196391.
+
+Cited by: §4.1.1.
+
+[44]
+Y. Lu, S. Lu, Q. Sun, H. Zhao, Z. Jiang, X. Wang, T. Li, Z. Geng, and K. He (2026)
+
+One-step latent-free image generation with pixel mean flows.
+
+arXiv preprint arXiv:2601.22158.
+
+Cited by: §2,
+§3.2.1.
+
+[45]
+G. Ma, J. Yao, Z. Ning, Y. Jiang, L. Xiong, L. Xie, and P. Zhu (2026)
+
+Meanvc: lightweight and streaming zero-shot voice conversion via mean flows.
+
+In ICASSP 2026-2026 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+pp. 17347–17351.
+
+Cited by: §2.
+
+[46]
+Z. Ma, Z. Zheng, J. Ye, J. Li, Z. Gao, S. Zhang, and X. Chen (2024)
+
+Emotion2vec: self-supervised pre-training for speech emotion representation.
+
+In Findings of the Association for Computational Linguistics: ACL 2024,
+
+pp. 15747–15760.
+
+Cited by: §A.4,
+§4.3.
+
+[47]
+F. Mentzer, D. Minnen, E. Agustsson, and M. Tschannen (2023)
+
+Finite scalar quantization: vq-vae made simple.
+
+arXiv preprint arXiv:2309.15505.
+
+Cited by: §3.1.
+
+[48]
+Y. Pan, Y. Hu, Y. Yang, J. Yao, J. Ye, H. Zhou, L. Ma, and J. Zhao (2025)
+
+ClapFM-evc: high-fidelity and flexible emotional voice conversion with dual control from natural language and speech.
+
+In Proc. Interspeech 2025,
+
+pp. 4583–4587.
+
+Cited by: §1,
+§2.
+
+[49]
+W. Peebles and S. Xie (2023)
+
+Scalable diffusion models with transformers.
+
+In Proceedings of the IEEE/CVF international conference on computer vision,
+
+pp. 4195–4205.
+
+Cited by: §B.1,
+§3.2.2.
+
+[50]
+O. Press, N. A. Smith, and M. Lewis (2021)
+
+Train short, test long: attention with linear biases enables input length extrapolation.
+
+arXiv preprint arXiv:2108.12409.
+
+Cited by: §B.1.
+
+[51]
+T. Qi, S. Wang, C. Lu, T. Song, H. Yang, Z. Wu, and W. Zheng (2025)
+
+PromptEVC: controllable emotional voice conversion with natural language prompts.
+
+In Proc. Interspeech 2025,
+
+pp. 4588–4592.
+
+Cited by: §1,
+§2.
+
+[52]
+K. Qian, Y. Zhang, S. Chang, X. Yang, and M. Hasegawa-Johnson (2019)
+
+Autovc: zero-shot voice style transfer with only autoencoder loss.
+
+In International Conference on Machine Learning,
+
+pp. 5210–5219.
+
+Cited by: §1,
+§2.
+
+[53]
+A. Radford, J. W. Kim, T. Xu, G. Brockman, C. McLeavey, and I. Sutskever (2023)
+
+Robust speech recognition via large-scale weak supervision.
+
+In International conference on machine learning,
+
+pp. 28492–28518.
+
+Cited by: §A.3,
+§A.3,
+§A.4,
+§4.2.
+
+[54]
+Z. Sheng, L. Liu, Y. Ai, J. Pan, and Z. Ling (2025)
+
+Voice attribute editing with text prompt.
+
+IEEE Transactions on Audio, Speech and Language Processing.
+
+Cited by: §1,
+§2.
+
+[55]
+H. Siuzdak (2024)
+
+Vocos: closing the gap between time-domain and fourier-based neural vocoders for high-quality audio synthesis.
+
+In International Conference on Learning Representations,
+
+Vol. 2024, pp. 25719–25733.
+
+Cited by: §A.3,
+§3.
+
+[56]
+Y. Song, P. Dhariwal, M. Chen, and I. Sutskever (2023)
+
+Consistency models.
+
+In Proceedings of the 40th International Conference on Machine Learning,
+
+pp. 32211–32252.
+
+Cited by: §2.
+
+[57]
+Y. Song and P. Dhariwal (2023)
+
+Improved techniques for training consistency models.
+
+arXiv preprint arXiv:2310.14189.
+
+Cited by: §2.
+
+[58]
+J. Su, M. Ahmed, Y. Lu, S. Pan, W. Bo, and Y. Liu (2024)
+
+Roformer: enhanced transformer with rotary position embedding.
+
+Neurocomputing 568, pp. 127063.
+
+Cited by: §B.2.
+
+[59]
+A. Vyas, B. Shi, M. Le, A. Tjandra, Y. Wu, B. Guo, J. Zhang, X. Zhang, R. Adkins, W. Ngan, et al. (2023)
+
+Audiobox: unified audio generation with natural language prompts.
+
+arXiv preprint arXiv:2312.15821.
+
+Cited by: §1,
+§2.
+
+[60]
+H. Wang, J. Hai, D. Chong, K. Thakkar, T. Feng, D. Yang, J. Lee, T. Thebaud, L. M. Velazquez, J. Villalba, et al. (2025)
+
+Capspeech: enabling downstream applications in style-captioned text-to-speech.
+
+arXiv preprint arXiv:2506.02863.
+
+Cited by: §A.3,
+§2,
+§4.1.2,
+§4.2.
+
+[61]
+J. Wang, L. Fu, Y. Li, Y. Zhu, Y. Jing, X. Wu, and J. Zheng (2026)
+
+DiffVC: a non-autoregressive framework based on diffusion model for video captioning.
+
+arXiv preprint arXiv:2604.08084.
+
+Cited by: §1,
+§2.
+
+[62]
+W. Wang, Y. Song, and S. Jha (2024)
+
+Globe: a high-quality english corpus with global accents for zero-shot speaker adaptive text-to-speech.
+
+arXiv preprint arXiv:2406.14875.
+
+Cited by: §4.1.1.
+
+[63]
+Z. Wang, Y. Chen, X. Wang, L. Xie, and Y. Wang (2024)
+
+Streamvoice: streamable context-aware language modeling for real-time zero-shot voice conversion.
+
+In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+
+pp. 7328–7338.
+
+Cited by: §2.
+
+[64]
+D. Yang, S. Liu, R. Huang, C. Weng, and H. Meng (2024)
+
+Instructtts: modelling expressive tts in discrete latent space with natural language style prompt.
+
+IEEE/ACM Transactions on Audio, Speech, and Language Processing 32, pp. 2913–2925.
+
+Cited by: §1,
+§2.
+
+[65]
+Y. Yang, Y. Kartynnik, Y. Li, J. Tang, X. Li, G. Sung, and M. Grundmann (2024)
+
+Streamvc: real-time low-latency voice conversion.
+
+In ICASSP 2024-2024 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+pp. 11016–11020.
+
+Cited by: §1,
+§2.
+
+[66]
+J. Yao, Y. Yang, Y. Lei, Z. Ning, Y. Hu, Y. Pan, J. Yin, H. Zhou, H. Lu, and L. Xie (2024)
+
+Promptvc: flexible stylistic voice conversion in latent space driven by natural language prompts.
+
+In ICASSP 2024-2024 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+pp. 10571–10575.
+
+Cited by: §1,
+§2.
+
+[67]
+H. Zen, V. Dang, R. Clark, Y. Zhang, R. J. Weiss, Y. Jia, Z. Chen, and Y. Wu (2019)
+
+Libritts: a corpus derived from librispeech for text-to-speech.
+
+arXiv preprint arXiv:1904.02882.
+
+Cited by: §4.1.1.
+
+[68]
+X. Zhang, J. Zhang, Y. Wang, C. Wang, Y. Chen, D. Jia, Z. Chen, and Z. Wu (2025)
+
+Vevo2: a unified and controllable framework for speech and singing voice generation.
+
+arXiv preprint arXiv:2508.16332.
+
+Cited by: §A.3,
+§A.3,
+§1,
+§2,
+§4.2,
+§4.2.
+
+[69]
+X. Zhang, X. Zhang, K. Peng, Z. Tang, V. Manohar, Y. Liu, J. Hwang, D. Li, Y. Wang, J. Chan, et al. (2025)
+
+Vevo: controllable zero-shot voice imitation with self-supervised disentanglement.
+
+arXiv preprint arXiv:2502.07243.
+
+Cited by: §A.3,
+§A.3,
+§1,
+§2,
+§4.2,
+§4.2.
+
+[70]
+G. Zhao, S. Sonsaat, A. Silpachai, I. Lucic, E. Chukharev-Hudilainen, J. Levis, and R. Gutierrez-Osuna (2018)
+
+L2-arctic: a non-native english speech corpus.
+
+In Proc. Interspeech,
+
+pp. 2783–2787.
+
+External Links: Document,
+Link
+
+Cited by: §4.1.1.
+
+[71]
+K. Zhou, B. Sisman, R. Liu, and H. Li (2022)
+
+Emotional voice conversion: theory, databases and esd.
+
+Speech Communication 137, pp. 1–18.
+
+Cited by: §4.1.1.
+
+[72]
+K. Zhou, B. Sisman, R. Rana, B. W. Schuller, and H. Li (2022)
+
+Emotion intensity and its control for emotional voice conversion.
+
+IEEE Transactions on Affective Computing 14 (1), pp. 31–48.
+
+Cited by: §1,
+§2.
+
+[73]
+J. Zuluaga-Gomez, S. Ahmed, D. Visockas, and C. Subakan (2023)
+
+Commonaccent: exploring large acoustic pretrained models for accent classification based on common voice.
+
+arXiv preprint arXiv:2305.18283.
+
+Cited by: §A.4,
+§4.3.
+
+## Appendix A Extended Data Generation and Evaluation Details
+
+This appendix gives additional details for the data generation and evaluation protocol used in the StyleStream 2.0 experiments. We describe the text-based style-control corpus, evaluation manifests, baseline routing for reference-conditioned VSC and text-based control, and objective metrics.
+
+## A.1 Training Corpus for Text-Based Style Control
+
+The main text summarizes the CapSpeech-derived supervised corpus used to train
+the text-conditioned style-control model. The construction proceeds in four
+steps: extract candidate attributes from captions and waveforms, normalize and
+filter those attributes with confidence rules, form nested utterance
+inventories, and finally sample source–target pairs whose text supervision is
+rendered from templates. Synthesized portions of the corpus were generated with
+CosyVoice3 [13] and stored as 24 kHz mono PCM audio.
+
+Caption-attribute extraction.
+
+CapSpeech captions contain useful natural-language descriptions of speaker
+attributes, but the descriptions are not normalized into the evaluation
+taxonomy. We therefore first extract explicit caption attributes with
+gpt-oss-20b [1]. The model is instructed to copy the
+caption’s own wording for accent and emotion rather than normalizing them, so
+that normalization can be performed by a separate deterministic mapping. The
+extraction prompt used a structured function call with fields for age, sex,
+accent, and emotion:
+
+You are given a short description of a speaker’s voice. Extract ONLY the
+attributes the description explicitly states:
+ - age (e.g. ’young’, ’middle-aged’, ’elderly’)
+ - sex (’male’ / ’female’)
+ - accent (regional / national / dialect speech descriptor)
+ - emotion (affective tone)
+
+Rules:
+1. Copy the description’s own words VERBATIM for accent and emotion. Do not
+normalize, translate, bucket, or map them (e.g. if the description says
+’Italian accent’, return ’Italian’, NOT ’Romance’; if it says ’slightly
+irritated’, return ’slightly irritated’, not ’Anger’).
+2. Return the literal string ’N/A’ for any attribute the description does
+not mention. Do not infer or guess from unrelated cues.
+3. Voice-quality words like ’deep’, ’raspy’, ’melodic’, ’silky’, ’husky’,
+’booming’ are NOT emotions -- return ’N/A’ for emotion unless an actual
+affective tone is stated.
+4. Call the extract_speaker_attributes tool exactly once with the four
+fields filled in. Output nothing else.
+
+The function schema required four string fields. Age was copied when stated,
+sex was mapped to male/female when explicit, and accent and emotion were copied
+verbatim from the caption; any missing attribute was returned as N/A.
+
+Waveform-profile extraction.
+
+Caption attributes are sparse, especially for accent and emotion, so we also
+run VoxProfile [16] on each CapSpeech utterance. VoxProfile
+provides an age prediction and posterior distributions for sex, accent, and
+emotion. These waveform-derived predictions are not used blindly; they serve as
+fallback labels only when the caption does not provide a trusted value.
+
+Label normalization and confidence.
+
+The extracted caption strings are mapped into the training taxonomy with
+deterministic normalization rules. Age is bucketed into child [10,15), teen
+[15,20), young adult [20,35), middle aged [35,55), and old [55,90). Sex labels
+are male/female. The accent vocabulary is North America, British, Scottish,
+Northern Irish, Irish, Welsh, Oceania, South African, South Asia, East Asia,
+Southeast Asia, Romance, Germanic, Slavic, Semitic, African, and Nordic. The
+emotion vocabulary is Happiness, Sadness, Anger, Fear, Disgust, Surprise,
+Neutral, Calm, Friendly, and Authoritative; Contempt is dropped from the final
+training vocabulary due to lack of samples.
+
+Caption labels that normalize to a first-class bucket take precedence. When a
+caption label is missing or cannot be mapped, VoxProfile is used only if it
+passes the confidence threshold for that attribute. Sex fallback requires
+maximum posterior probability at least 0.99. Accent fallback requires maximum
+posterior probability at least 0.8 and margin at least 0.4. Emotion fallback
+requires maximum posterior probability at least 0.7 and margin at least 0.35.
+Source utterances are further constrained to 2–20 seconds and predicted age in
+[10, 90].
+
+Attribute inventories.
+
+After normalization, we build three nested inventories from CapSpeech
+utterances. The broadest inventory, $I_{\mathrm{vc}}$ , contains utterances with
+confident age and sex labels and is used as a pool of target voice prompts for
+voice conversion. The generation inventory, $I_{\mathrm{gen}}$ , additionally
+requires either an accent or an emotion label. The editing inventory,
+ $I_{\mathrm{ed}}$ , requires all four labels: age, sex, accent, and emotion. The
+final inventory sizes are 496,954 rows for $I_{\mathrm{vc}}$ , 403,013 rows for
+ $I_{\mathrm{gen}}$ , and 59,613 rows for $I_{\mathrm{ed}}$ .
+
+Pair sampling and training tiers.
+
+Training examples are sampled from the inventories after the label taxonomy and
+inventory filters are fixed. For voice design, a source utterance from
+ $I_{\mathrm{gen}}$ is converted using a target speaker from $I_{\mathrm{vc}}$ .
+The content is held fixed while the target profile specifies either age, sex,
+and accent, or age, sex, and emotion. For accent editing, source and target
+utterances share the same emotion but differ in accent; both sides are
+re-voiced with a shared timbre so that accent is the intended changing factor.
+For emotion editing, source and target utterances share the same accent but
+differ in emotion. For timbre editing, pairs are natural recordings selected to
+differ in age, sex, or both while preserving the other available labels.
+Table 6 summarizes the produced training tiers.
+
+Table 6: Training tiers for the text-based StyleStream 2.0 corpus.
+
+Tier
+Samples
+Audio source
+
+Voice design
+2,000,005
+Synthesized
+
+Accent editing
+3,000,028
+Synthesized
+
+Emotion editing
+2,999,992
+Synthesized
+
+Age editing
+1,499,961
+Natural
+
+Gender editing
+1,481,314
+Natural
+
+Joint age+gender editing
+1,000,001
+Natural
+
+Total
+ $\sim$ 11.98M
+
+Template generation and rendering.
+
+Each sampled example is rendered into a voice-design prompt or edit instruction
+using a shared template inventory. We generated this inventory with
+gpt-oss-120b [1] by providing hand-written seed templates
+for each template shape and asking for diverse paraphrases that preserve a
+fixed set of placeholders. The template shapes were: all-attribute design,
+timbre+accent design, timbre+emotion design, age editing, gender editing, joint
+age+gender editing, accent editing, and emotion editing. The total inventory
+contains approximately 9000 generated phrasings plus attribute surface-form
+expansions such as American for North America and Australian
+or New Zealand for Oceania.
+
+The template-generation prompt was:
+
+You generate caption templates for a text-to-speech dataset.
+Shape: <shape name>
+Each template MUST contain exactly these placeholders, each used exactly once:
+<placeholder list>.
+No other placeholders. Do not expand the placeholders into words.
+Keep each template to one natural-sounding English sentence, under 25 words.
+Vary sentence structure, word choice, and phrasing.
+
+Here are <N> seed templates for reference:
+ 1. <seed template 1>
+ 2. <seed template 2>
+ ...
+
+Produce <K> NEW templates, distinct from the seeds and from each other.
+Output a single JSON array of <K> strings, and nothing else.
+
+For example, an all-attribute design template required the placeholders
+{age}, {gender}, {accent}, and
+{emotion}, while an accent-editing instruction required only
+{tgt_accent}. Generated templates were filtered to require every
+specified placeholder exactly once, reject unknown placeholders, and limit the
+length of each sentence.
+
+## A.2 Text-Based Evaluation Manifests
+
+The main text describes the 300-source, 3000-design-item, and 3000-edit-item
+evaluation setup. The source set contains 50 utterances from ESD, 100 from
+GLOBE, and 150 from LibriTTS. Below we report the source-label distribution and
+target-sampling details that are not shown in the main text.
+
+Evaluation task structure.
+
+All text-based evaluations use the same fixed 300 source utterances as the reference-conditioned VSC evaluation. The voice-design manifest contains 3000 items, formed by pairing each source with ten style prompts. The voice-editing manifest also contains 3000 items, formed by pairing each source with ten single-axis edit instructions: two age edits, two gender edits, three accent edits, and three emotion edits. For each edit, the target value is sampled to differ from the source label on the edited axis, and the instruction text mentions only the edited attribute.
+Evaluation prompts and edit instructions are rendered with the same controlled template renderer used for training.
+
+Voice design mix.
+
+Table 7 gives the fixed prompt mix. Timbre denotes the joint
+age+gender target.
+
+Table 7: Voice design prompt mix for evaluation.
+
+Design prompt type
+Target axes
+Count
+
+Timbre
+age, gender
+600
+
+Accent
+accent
+600
+
+Emotion
+emotion
+600
+
+Timbre+accent
+age, gender, accent
+300
+
+Timbre+emotion
+age, gender, emotion
+300
+
+All attributes
+age, gender, accent, emotion
+600
+
+Voice editing mix.
+
+The edit manifest contains 600 age edits, 600 gender edits, 900 accent edits,
+and 900 emotion edits. The target value is always sampled to differ from the
+source label on the edited axis. The instruction text mentions only the edited
+attribute; it does not contain explicit “preserve” clauses.
+
+## A.3 Systems and Baseline Generation
+
+The main text lists the compared systems. Here we give the routing details that
+are easy to omit from the compact experimental setup.
+
+Reference-conditioned VSC systems.
+
+For reference-conditioned VSC, we compare against CosyVoice 2.0 [14], CosyVoice 3.0 [13], Vevo [69], Vevo 2.0 [68], and StyleStream 1.0 [41]. We use the CosyVoice 2.0 and CosyVoice 3.0 flow-matching speech-to-speech usage. Vevo 2.0 is run as an ASR+TTS cascade: Whisper-large-v3 [53] transcribes the source and target utterances, and the transcripts together with the target waveform are fed to Vevo 2.0 to synthesize the output. All systems are evaluated with the standard Euler sampler. Baseline NFEs follow each system’s recommended setting when applicable: 32 for Vevo and Vevo 2.0, 10 for the CosyVoice variants, and 16 for StyleStream 1.0 offline.
+
+Qwen3-TTS [25] is additionally evaluated as an offline Whisper-large-v3 + voice-cloning TTS cascade, using the source transcript and target reference speech.
+
+Streaming inference settings.
+
+StyleStream 2.0 uses 4 function evaluations (NFE) and a fixed CFG guidance scale $\omega=3$ in both offline and streaming modes. The main streaming configuration uses a 300 ms chunk size and an 80 ms lookahead. During streaming inference, we maintain two 3-second ring buffers: a content ring buffer and a past self-generated mel-context ring buffer. For streaming baselines, we use the largest NFE that satisfies the real-time per-chunk budget on RTX 4060; this gives 12 NFE for StyleStream 1.0 streaming at a 600 ms chunk size.
+
+Vocoder and timing.
+
+We use the same causal Vocos-based streaming vocoder as StyleStream 1.0 [41, 55].
+Processing times include mel generation and vocoder inference through waveform output; the vocoder contributes approximately 3.139 ms per 300 ms chunk, already included in the reported 140.7 ms processing time.
+
+Design systems.
+
+For CapTTS [60] and Qwen3-TTS VoiceDesign
+[25], the source utterance is first transcribed with Whisper-large-v3
+[53]; the baseline receives this ASR transcript plus the
+design prompt. The known source transcript is reserved for WER evaluation.
+
+Editing systems.
+
+The editing baselines are Vevo [69] and Vevo2
+[68], using the Amphion implementations [36].
+For each edit row, CapTTS first generates a target reference WAV using the
+post-edit target labels rendered through the same template family and a random
+Whisper transcript from the source transcript pool. This reference provides the
+requested target style or timbre to Vevo/Vevo2.
+
+For Vevo, we use the Vevo-Style for all text-based editing. For age
+or gender edits, the CapTTS reference is used as the timbre reference and the
+original source is used as the style reference. For accent or emotion edits, the
+original source is used as the timbre reference and the CapTTS reference is used
+as the style reference.
+
+For Vevo2, the source utterance is transcribed
+with Whisper to form $T_{\mathrm{src}}$ , and the CapTTS reference is transcribed
+with Whisper to form $T_{\mathrm{tgt}}$ . For age or gender edits, Vevo2 receives
+the source style reference with $T_{\mathrm{src}}$ and the CapTTS timbre
+reference. For accent or emotion edits, Vevo2 receives the CapTTS style
+reference with $T_{\mathrm{tgt}}$ and the source timbre reference. In all cases,
+the target text for the output is $T_{\mathrm{src}}$ .
+
+## A.4 Objective Evaluation Details
+
+Similarity models.
+
+S-SIM is computed with Resemblyzer33
+ 3
+
+ https://github.com/resemble-ai/Resemblyzer, A-SIM with the CommonAccent ECAPA model44
+ 4
+
+ https://huggingface.co/Jzuluaga/accent-id-commonaccentecapa [73], and E-SIM with emotion2vec55
+ 5
+
+ https://github.com/ddlBoJack/emotion2vec [46]. For reference-conditioned VSC, similarities are computed between the converted utterance and the target reference. For editing, similarities are computed between the source utterance and the generated edit output.
+
+VoxProfile classifiers.
+
+The main text defines the attribute accuracies. The VoxProfile
+[16] checkpoints used for scoring are
+tiantiaf/wavlm-large-age-sex for age/sex,
+tiantiaf/wavlm-large-narrow-accent for accent, and
+tiantiaf/whisper-large-v3-msp-podcast-emotion for emotion. Generated
+audio is downmixed to mono, resampled to 16 kHz, and truncated to 15 seconds
+before inference. Age predictions are collapsed into young, middle-aged.
+
+WER and similarity.
+
+WER is computed by transcribing generated audio with Whisper-large-v3 [53] and
+comparing against the known source transcript, not against the Whisper transcript
+used to drive cascaded baselines. For editing, S-SIM, A-SIM, and E-SIM are
+computed between the source utterance and the generated edit output. Each
+similarity is split according to whether the corresponding factor should be
+preserved or changed by the instruction; preservation scores are better when
+higher, while change scores are better when lower.
+
+## A.5 Subjective Evaluation Protocol
+
+Recruitment and screening.
+
+All subjective evaluations are deployed on Prolific66
+ 6
+
+ https://www.prolific.com.
+We recruit 40 participants. We restrict participation to listeners whose first language is English and who report fluent English proficiency, with a Prolific approval rating of at least 95%.
+Submissions completed faster than the expected minimum task duration are automatically rejected to filter low-effort responses, and listeners are encouraged to take the survey on a laptop or desktop with headphones for the best audio experience.
+
+Survey types.
+
+We deploy four types of subjective surveys, all using a 5-point integer scale: NMOS for naturalness (90 items per survey); SMOS for style similarity, in three variants: S-SMOS (speaker), A-SMOS (accent), E-SMOS (emotion),
+with 80 paired items per variant; voice-design (VD) for text-prompted voice design (40 items per survey); and voice-editing (VE) for instruction-based voice editing (40 items per survey).
+Representative survey interfaces are shown in Figures 2 and 3.
+
+We compensate participants at a rate of at least $20 per hour.
+The NMOS studies take approximately 10 minutes on average, corresponding to $3.50 per participant.
+The SMOS studies take approximately 20 minutes on average, corresponding to $7.00 per participant.
+The voice design and voice editing studies take approximately 10 minutes on average, corresponding to $3.50 per participant.
+
+NMOS.
+
+Listeners rate the naturalness of a single test audio sample on a 5-point scale (1: completely unnatural, 5: completely natural), guided by the question “Do they sound like real humans?”.
+
+SMOS (speaker, accent, emotion).
+
+For each SMOS survey, listeners are presented with a Test and a Target audio pair, and rate similarity along the indicated style axis on a 5-point scale (1: not similar at all, 5: very similar).
+S-SMOS rates speaker timbre, A-SMOS rates accent, and E-SMOS rates emotion.
+Listeners are explicitly instructed to focus only on the indicated axis and to ignore the other style axes as well as recording-quality differences.
+
+Voice design (VD).
+
+Each item pairs a Source recording with a Test audio (the model’s attempt to re-render the source content in the prompted style), accompanied by a natural-language style prompt (e.g., “Hear a young adult guy articulate words with a British accent.”).
+Listeners give two 5-point ratings: naturalness, and style match against the prompt.
+The question text on each page lists exactly which prompt-mentioned attributes the listener should focus on for the style-match rating.
+
+Voice editing (VE).
+
+Each item pairs a Source recording with a Test audio (the source after the requested edit), accompanied by a natural-language edit instruction (e.g., “Produce an older person sounding output.”).
+Listeners give three 5-point ratings: naturalness, edit match (does the test apply the instruction correctly?), and preservation (does the test keep the non-edited attributes the same as the source?).
+The question text on each page lists which attribute is being edited and which attributes should be preserved.
+
+(a) NMOS
+
+(b) E-SMOS
+
+Figure 2: Naturalness MOS (NMOS) and Emotion SMOS (E-SMOS) evaluation interfaces. The S-SMOS and A-SMOS surveys are analogous to E-SMOS, with the emotion target replaced by speaker identity or accent and the listener instructed to ignore the other style axes.
+
+(a) Voice design (VD)
+
+(b) Voice editing (VE)
+
+Figure 3: Voice-design (VD) and voice-editing (VE) evaluation interfaces. Each item pairs a source and a test audio sample with a natural-language style prompt (VD) or edit instruction (VE), and asks for naturalness plus task-specific match (and preservation, for VE) ratings.
+
+## Appendix B Implementation Details
+
+This section reports the full architecture and training configurations of all StyleStream 2.0 components.
+The Destylizer is reused from StyleStream 1.0 without modification.
+
+## B.1 Stylizer
+
+Architecture.
+
+The Stylizer is a 16-layer DiT with hidden dimension 768, FFN expansion ratio 4 (FFN dimension 3072), and 12 attention heads.
+StyleStream 1.0 uses the same 16-layer Stylizer DiT backbone.
+We use ALiBi positional encoding [50] and adaLN-Zero conditioning [49] driven by the summed embedding of $(r,t,e_{s},\omega)$ .
+At the input, $z_{t}$ (100 mel bins), $f_{c}$ (768-dimensional content features), and the past-mel-context channel (100 mel bins, zeroed during offline training) are concatenated along the channel dimension and projected to the hidden size.
+The output is a 100-channel $x$ -prediction of the target mel-spectrogram, from which the average velocity $u_{\theta}$ and the implied instantaneous velocity $V_{\theta}$ are computed as in §3.2.
+
+Style encoder.
+
+The style encoder uses a frozen microsoft/wavlm-base-plus backbone, with the outputs of all 12 transformer layers concatenated along the time axis as in §3.2.
+The perceiver-resampler stacks 4 blocks; each block first cross-attends from $N_{q}=8$ learnable queries (query dimension 128) to the WavLM features, then self-attends among the queries, with 4 attention heads in both stages.
+The flattened pooled representation of size $N_{q}\cdot 128=1024$ is mapped through an MLP to the output style embedding $e_{s}\in\mathbb{R}^{C}$ with $C=768$ .
+Including the frozen speech backbone, the StyleStream 2.0 style encoder has 97.5M parameters compared with 128.4M for StyleStream 1.0.
+
+Mel-spectrogram and audio configuration.
+
+Audio is sampled at 16 kHz and converted to 100-bin mel-spectrograms at a 50 Hz frame rate, matching the Destylizer output rate.
+Training uses 6-second segments.
+
+Offline pMF training.
+
+The Stylizer is trained from scratch on Emilia-EN with the pMF objective.
+For each training utterance we sample $r$ and $t$ with $r=t$ on 75% of training samples (a pure flow-matching step, where the loss reduces to direct supervision of the instantaneous velocity) and $r<t$ on the remaining 25% (a MeanFlow average-velocity step, with the total derivative in $V_{\theta}$ computed via JVP).
+The diffusion time is sampled as logitnormal distribution $t=\sigma(\ell)$ with $\ell\sim\mathcal{N}(P_{\mathrm{mean}},P_{\mathrm{std}}^{2})$ and $P_{\mathrm{mean}}=P_{\mathrm{std}}=0.8$ , and replaced with $t\sim\mathcal{U}[0,1]$ on 10% of training samples. Here $\sigma(\cdot)$ is the sigmoid function.
+The guidance scale is sampled as $\omega=(1+\omega_{\max})^{u}$ with $u\sim\mathcal{U}[0,1]$ and $\omega_{\max}=7$ , equivalent to log-uniform sampling on $[1,1+\omega_{\max}]$ .
+We drop the condition $c=(f_{c},e_{s})$ with probability $p_{\mathrm{drop}}=0.2$ , replacing it with $\varnothing$ .
+We optimize with AdamW at peak learning rate $10^{-4}$ , weight decay $10^{-6}$ , 2000 warmup steps and cosine decay to $10^{-6}$ , in bf16-mixed precision, for 1M steps with a global batch size of 256 on 8 H100 GPUs.
+
+Autoregressive fine-tuning.
+
+We initialize from the offline pMF checkpoint and fine-tune with the Self Forcing chunked rollout while keeping the pMF objective; the FM / MeanFlow split is shifted to 90% / 10% so that most fine-tuning steps are pure flow-matching.
+The $t$ sampling, $\omega$ sampling, and conditioning dropout follow the offline stage.
+Each rollout uses one ODE step per chunk with a fixed rollout-time guidance scale $\omega_{\mathrm{rollout}}=3$ .
+For each batch we randomly sample the chunk size $C\in\{8,\ldots,30\}$ frames (160 to 600 ms at 50 Hz), and use a 3-second prefix and a 3-second past-context window (150 frames each at 50 Hz).
+The training loss is computed only on the current chunk region.
+We optimize with AdamW at peak learning rate $10^{-4}$ , weight decay $10^{-6}$ , 1000 warmup steps and cosine decay to $10^{-6}$ , in bf16-mixed precision, for 400k steps with a global batch size of 64 on 32 H100 GPUs.
+
+## B.2 Voice Controller
+
+Architecture.
+
+The Voice Controller is a standard 16-layer DiT with hidden dimension 1024, FFN expansion ratio 4 (FFN dimension 4096), and 16 attention heads, using RoPE positional encoding [58].
+It is an additional module for text-based design/editing and is not involved in reference-conditioned VSC.
+The text prompt is encoded by a frozen Flan-T5 base77
+ 7
+
+ http://huggingface.co/google/flan-t5-base and injected via cross-attention.
+The model operates on style embeddings of dimension $C=768$ .
+We patchify the noised embedding $e_{t}$ with patch size $P=32$ into $C/P=24$ tokens of dimension 32, and concatenate them channel-wise with an auxiliary input of the same shape (a learned null embedding for voice design, the patchified source style embedding for voice editing) before projecting to the hidden dimension.
+Style embeddings are normalized using the global training-set mean and standard deviation during training, and de-normalized at inference.
+
+Training.
+
+We train the Voice Controller jointly on voice design and voice editing with the x-prediction flow-matching objective, splitting each mini-batch evenly between the two tasks.
+The diffusion time is sampled from the same logit-normal distribution as the Stylizer (§B.1), $t=\sigma(\ell)$ with $\ell\sim\mathcal{N}(P_{\mathrm{mean}},P_{\mathrm{std}}^{2})$ and $P_{\mathrm{mean}}=P_{\mathrm{std}}=0.8$ .
+We apply standard CFG dropout on the text prompt with probability $p_{\mathrm{drop}}=0.2$ .
+We optimize with AdamW at peak learning rate $10^{-4}$ , weight decay $10^{-6}$ , 1000 warmup steps and cosine decay to $3\times 10^{-5}$ , in bf16-mixed precision, for 500k steps with a global batch size of 1024 on 8 H100 GPUs.
+
+Inference.
+
+We sample the target style embedding with the standard two-pass CFG sampler, using NFE = 64 and CFG guidance scale $\omega=4$ .
+The generated embedding is de-normalized with the stored training-set statistics before being passed to the Stylizer as $e_{s}$ . The controller prepares this embedding once before streaming, and it is reused across chunks.
+
+## Appendix C Additional Ablation Studies
+
+We report two further inference-time ablations of the offline StyleStream 2.0 model: the CFG guidance scale $\omega$ and the number of pMF sampling steps (NFE).
+Both use the same evaluation protocol as Table 1. We additionally ablate Voice Controller text conditioning below.
+
+## C.1 CFG Guidance Scale
+
+Table 8 sweeps $\omega\in\{1,2,3,4,5,6\}$ at NFE ${}=4$ .
+Removing guidance ( $\omega=1$ ) hurts every metric and pushes WER from around 7% up to 9.53%.
+For $\omega\geq 2$ , WER stays in a narrow band; the similarity metrics show shallow optima with S-SIM and A-SIM peaking near $\omega=2$ and E-SIM near $\omega=4$ , while S-SIM declines steadily as $\omega$ grows.
+We set $\omega=3$ as the default operating point, which sits inside the high-similarity band on every axis while keeping WER below 7.1%.
+
+Table 8: CFG guidance-scale ablation on the offline StyleStream 2.0 model at NFE ${}=4$ .
+
+ $\omega$ 
+WER ( $\%$ ) $\downarrow$ 
+S-SIM $\uparrow$ 
+A-SIM $\uparrow$ 
+E-SIM $\uparrow$ 
+
+1
+9.53
+0.8806
+0.6852
+0.7462
+
+2
+7.19
+0.8835
+0.7071
+0.7711
+
+3
+7.03
+0.8791
+0.7055
+0.7751
+
+4
+6.98
+0.8741
+0.7000
+0.7766
+
+5
+6.97
+0.8694
+0.6929
+0.7747
+
+6
+7.00
+0.8653
+0.6870
+0.7722
+
+## C.2 Number of Sampling Steps (NFE)
+
+Table 9 sweeps NFE $\in\{1,2,4,8,16\}$ at $\omega=3$ .
+Thanks to pMF training, the gap between one-step and many-step inference is small: the one-step model already reaches WER 7.06% (on par with every higher-NFE setting)
+and similarity scores within roughly 0.01 of the saturated values, so the one-step and few-step variants are themselves strong generators.
+All similarity metrics are essentially saturated from NFE ${}=2$ onwards.
+We adopt NFE ${}=4$ in the main paper as a robust operating point, while the one-step and two-step variants remain attractive options for latency-sensitive deployments.
+
+Table 9: NFE ablation on the offline StyleStream 2.0 model at $\omega=3$ .
+
+NFE
+WER ( $\%$ ) $\downarrow$ 
+S-SIM $\uparrow$ 
+A-SIM $\uparrow$ 
+E-SIM $\uparrow$ 
+
+1
+7.06
+0.8755
+0.6976
+0.7689
+
+2
+7.05
+0.8791
+0.7052
+0.7740
+
+4
+7.02
+0.8787
+0.7058
+0.7744
+
+8
+7.06
+0.8785
+0.7047
+0.7768
+
+16
+7.09
+0.8791
+0.7056
+0.7756
+
+## C.3 Voice Controller Text Conditioning
+
+We train four Voice Controllers for 150k steps with identical DiT architecture, training data, and inference settings, comparing randomly initialized trainable token embeddings (using the Flan-T5 tokenizer) with frozen Flan-T5-small/base/XL encoders.
+These controlled runs use a shorter training budget than the 500k-step controller in the main results.
+Tables 10 and 11 report the voice-design and editing results.
+
+Pretrained Flan-T5 representations substantially improve instruction following: design gender accuracy rises from 81.17% to 97.61–98.33%, and editing gender accuracy from 60.00% to 92.17–97.33%, while WER remains similar.
+Larger encoders give mixed, attribute-dependent gains; Flan-T5-base performs best on several voice-design metrics, supporting our choice of base as a balance between semantic conditioning and model size.
+
+Table 10: Voice-design text-encoder ablation after 150k controller training steps. WER and attribute accuracies are percentages. Flan-T5 encoders are frozen; trainable embeddings are randomly initialized. Bold/underline mark the best/second-best values within this ablation.
+
+Text conditioning
+WER $\downarrow$ 
+Age-acc $\uparrow$ 
+G-acc $\uparrow$ 
+A-acc $\uparrow$ 
+E-acc $\uparrow$ 
+
+Trainable embeddings
+6.80
+59.67
+81.17
+45.60
+29.47
+
+Flan-T5-small
+7.02
+61.06
+97.94
+47.87
+33.60
+
+Flan-T5-base
+7.05
+64.56
+98.33
+49.20
+39.93
+
+Flan-T5-XL
+6.91
+58.94
+97.61
+49.13
+38.40
+
+Table 11: Voice-editing text-encoder ablation after 150k controller training steps, under the same conditions as Table 10. WER and accuracies are percentages; preservation scores are similarities to the source. Best/second-best values include ties.
+
+Text conditioning
+WER $\downarrow$ 
+Age-acc $\uparrow$ 
+G-acc $\uparrow$ 
+A-acc $\uparrow$ 
+E-acc $\uparrow$ 
+S-pres. $\uparrow$ 
+A-pres. $\uparrow$ 
+E-pres. $\uparrow$ 
+
+Trainable embeddings
+6.77
+60.00
+60.00
+43.56
+12.56
+0.5873
+0.4480
+0.8723
+
+Flan-T5-small
+6.86
+54.17
+97.00
+47.44
+16.11
+0.5795
+0.4350
+0.8689
+
+Flan-T5-base
+6.86
+61.50
+92.17
+49.00
+22.89
+0.5960
+0.4535
+0.8721
+
+Flan-T5-XL
+6.95
+55.00
+97.33
+49.44
+24.33
+0.5992
+0.4433
+0.8718
+
+## Appendix D Limitations
+
+StyleStream 2.0 reduces end-to-end streaming latency by roughly $2\times$ over StyleStream 1.0, but the resulting 520 ms still leaves room for improvement in tightly interactive use cases.
+On the controllability side, our timbre interface covers age and gender; finer-grained vocal qualities such as breathiness, brightness, and vocal effort would broaden the design and editing interface and are a natural next step.
+Emotion editing, while ahead of all baselines, still trails the corresponding timbre and accent results, and editing introduces some drift on non-targeted attributes; further reducing these gaps is left to future work.
+
+## Appendix E Broader Impacts
+
+StyleStream 2.0 enables low-latency, controllable voice style conversion and text-conditioned voice design and editing.
+Beneficial applications include accessibility tools, voice-based privacy and anonymization, accent localization for media, language-learning aids, and creative audio production.
+
+Like other high-quality generative voice systems, StyleStream 2.0 also carries risks of misuse, particularly for voice impersonation, fraud, or synthetic disinformation.
+Our training data comes entirely from existing publicly released speech corpora, with no additional scraping of identifiable individuals.
+As safeguards for responsible release, we plan to release model weights under a license that prohibits impersonation and other malicious applications,
+accompanied by a model card documenting training data, intended uses, and known biases, and we support continued research on synthetic-speech detection and audio watermarking.
+
+## Appendix F Licenses and Terms for Existing Assets
+
+Table 12 summarizes the licenses or stated terms of use for the main external datasets, pretrained models, toolkits, and evaluation models used in this work. We use all assets for non-commercial academic research and cite the corresponding papers or repositories. For assets with non-commercial, research-only, or responsible-use terms, we restrict our use to the permitted research and evaluation setting.
+
+Table 12: Licenses and terms for existing assets used in this work.
+
+Asset
+License / terms
+Source
+
+Emilia / Emilia-EN
+CC BY-NC 4.0; audio copyright remains with original owners
+https://huggingface.co/datasets/amphion/Emilia
+
+CapSpeech
+CC BY-NC 4.0
+https://github.com/WangHelin1997/CapSpeech
+
+ESD
+Free for research use only
+https://hltsingapore.github.io/ESD/download.html
+
+GLOBE
+CC0 1.0
+https://huggingface.co/datasets/MushanW/GLOBE
+
+LibriTTS
+CC BY 4.0
+https://www.openslr.org/60/
+
+RAVDESS
+CC BY-NC-SA 4.0
+https://zenodo.org/records/1188976
+
+L2-ARCTIC
+CC BY-NC 4.0
+https://psi.engr.tamu.edu/l2-arctic-corpus/
+
+HuBERT / fairseq
+Apache 2.0 checkpoint; MIT code
+https://huggingface.co/facebook/hubert-large-ls960-ft
+
+WavLM
+CC BY-SA 3.0 / UniSpeech license terms
+https://huggingface.co/microsoft/wavlm-large
+
+Flan-T5 base
+Apache 2.0
+https://huggingface.co/google/flan-t5-base
+
+Whisper / Whisper-large-v3
+MIT
+https://github.com/openai/whisper
+
+gpt-oss-20b / gpt-oss-120b
+Apache 2.0 plus usage policy
+https://openai.com/index/gpt-oss-model-card/
+
+CosyVoice2 / CosyVoice3
+Apache 2.0
+https://github.com/FunAudioLLM/CosyVoice
+
+Vevo checkpoint
+CC BY-NC 4.0
+https://huggingface.co/amphion/Vevo
+
+Vevo2 checkpoint
+CC BY-NC-ND 4.0
+https://huggingface.co/RMSnow/Vevo2
+
+Amphion toolkit
+MIT
+https://github.com/open-mmlab/Amphion
+
+VoxProfile classifiers
+Open RAIL; excludes clinical, surveillance, privacy-invasive, and commercial use
+https://huggingface.co/tiantiaf
+
+Resemblyzer
+Apache 2.0
+https://github.com/resemble-ai/Resemblyzer
+
+CommonAccent ECAPA model
+MIT
+https://huggingface.co/Jzuluaga/accent-id-commonaccent_ecapa
+
+emotion2vec
+Model license as specified by the model card; used for research evaluation
+https://huggingface.co/emotion2vec/emotion2vec_plus_large

@@ -1,0 +1,5159 @@
+\workshoptitle
+
+WORKSHOP TITLE
+
+## Turning TS2Vec into a Foundation Model
+
+for Time Series Classification
+
+Vasilii Feofanov
+
+Affiliation: 42 NL
+
+Email: vfeofanov@42.com
+
+Zhenghan Tai
+
+Affiliation: University of Toronto
+
+Andrei Ermakov
+
+Affiliation: 42 NL
+
+Irina Rish
+
+Affiliation: Université de Montréal
+
+Affiliation: Mila - Quebec AI Institute
+
+Abstract
+
+TS2Vec is one of the strongest self-supervised methods for time series classification, introduced in 2022. It is designed to be trained anew on every dataset: self-supervised pre-training followed by linear probing. Since then, the field has shifted towards foundation models that reuse one encoder across datasets. Yet TS2Vec offers a compact convolutional architecture that operates directly on temporal samples and accepts variable-length inputs without resampling. We ask whether these properties can be retained when the encoder is pre-trained only once, and show that they can: TS2Vec can essentially be turned into a foundation model. Three changes suffice: pre-train on a synthetic corpus, feed the encoder a raw amplitude view and an instance-normalized shape view of the input through two small stems, and distill one specialist encoder per view into a single encoder. The result, TS2Vec-FM, is a 1.6M-parameter dilated convolutional network that, kept frozen, reaches 83.3% on UCR-128 and 75.3% on UEA-27 under linear probing, within 0.3 pp of MantisV2, the current state of the art, and above TS2Vec trained separately on each target dataset. What we find most interesting is how different TS2Vec-FM is from other foundation models in design: near-parity is reached without attention, without a patch tokenizer, and without intermediate-layer extraction, using an “old-school” convolutional encoder and a two-layer MLP stem.
+
+## 1 Introduction
+
+Time series foundation models (TSFMs) aim to provide a single frozen encoder whose
+features are useful across downstream datasets, removing the need to train a
+specialized model per task (Feofanov et al., 2026a; Lin et al., 2024; Goswami et al., 2024).
+Most of TSFMs use transformer architecture pre-trained on a large corpus of time series, real and / or synthetic (Xie et al., 2026).
+Prior to foundation models, the same problem was attacked from another angle: self-supervised
+methods such as TS2Vec (Yue et al., 2022), T-Loss (Franceschi et al., 2019) and
+TNC (Tonekaboni et al., 2021) train a small encoder separately on each
+target dataset. TS2Vec in particular remains a standard and strong baseline, but its
+design is viewed as somewhat outdated, and it has never been evaluated as a
+universal encoder itself. This paper asks whether it can become one.
+
+The answer is yes, with three changes (Figure 1): pretrain once on synthetic data;
+give the encoder raw and instance-normalized input views through separate stems; and
+distill (Hinton et al., 2015) two resulting specialists into a single encoder.
+The specialists retain the original TS2Vec architecture and contrastive objective,
+while the student uses the same residual-block design with modified input and output layers and is trained by distillation.
+
+The result is notable for two reasons. First, the resulting 1.6M-parameter
+encoder is competitive: frozen, it outperforms per-dataset TS2Vec and the
+evaluated forecasting-based extractors, and comes within a few tenths of a
+percentage point of MantisV2 while using about 25% fewer parameters.
+Second, it reaches this performance with a markedly different design —
+convolutions instead of attention, a two-layer MLP stem instead of a
+hand-designed multi-view tokenizer, and the final representation rather than a
+selected intermediate layer. This near-parity suggests that the information
+exposed to the encoder may matter more than the specific tokenizer design;
+our ablations point in particular to the complementarity of amplitude and shape.
+
+Figure 1: TS2Vec-FM architecture and training. (a) Raw and instance-normalized inputs pass through an MLP and a linear stem, respectively. Their concatenation feeds a shared convolutional trunk and temporal max pooling. (b) Two specialists are pretrained on synthetic data with the TS2Vec objective and then frozen. On the same data, each teacher supervises one 320-dimensional half of the student through timestamp-level and pooled cosine losses. Downstream, only a classifier on frozen student features is fitted.
+
+## 2 From per-dataset TS2Vec to a foundation model
+
+Original TS2Vec. The reference encoder first maps each timestamp to
+64 channels, then applies ten hidden residual blocks and one output block with
+exponentially increasing dilation, producing a 320-dimensional representation
+at every timestamp. It is trained on aligned regions of two overlapping
+contextual crops with a hierarchical objective that contrasts both timestamps
+within a series and instances within a batch. A global series embedding is the
+temporal maximum of these representations. Appendix A specifies
+the architecture, crops, and losses exactly.
+
+Step 1: the pre-training regime. We pretrain once on univariate synthetic series generated by CauKer (Xie et al., 2026) algorithm, so all encoder weight updates use synthetic data.
+The advantage of the TS2Vec architercture is that a convolutional encoder needs no fixed input size,
+so series keep their native lengths. However, similar to most time series foundation models,
+our encoder is univariate, so for multivariate datasets, we encode channels independently
+with the embeddings concatenated.
+
+Step 2: normalization. Original TS2Vec does not apply instance-wise normalization.
+For classification, however, absolute signal values may contain discriminative information. We therefore pretrain separate TS2Vec encoders on raw and instance-normalized inputs.
+The results (Table 2) have been quite unexpected. The encoder without normalization
+performs significantly better on the multivariate (UEA) datasets, while the encoder with normalization greatly outperforms
+its counterpart on the univariate (UCR) datasets: instance normalization gains 2.9 pp on UCR but costs 1.5 pp on UEA,
+and the raw-input encoder is the mirror image.
+We suggest that this phenomenon is explained by the nature of contrastive pre-training which looks for shortcuts to
+discriminate different samples in the embedding space.
+In the un-normalized case, the shortcut is the amplitude of the signal, so embeddings encode mostly this kind of information.
+In the normalized case, the shortcut is rather the shape of the signal.
+More arguments to this hypothesis gives the fact that in many multivariate datasets a deviation of one channel
+compared to the others gives a discriminative signal, so encoding signal amplitude is important.
+
+Step 3: architecture. Given the aforementioned results, we slightly modify the encoder to include both normalized and raw views:
+the instance-normalized view is linearly mapped into 32 channels, while the raw view is embedded
+through a two-layer MLP with a GELU nonlinearity.
+Their concatenation forms the 64-channel input of the shared convolutional part. So, we retain the TS2Vec residual-block design and increase the output dimension from 320 to 640, yielding a 1.64M-parameter encoder.
+We note that the asymmetry between the two views matters as the raw view needs the extra nonlinearity to align its encodings with the normalized one.
+
+Step 4: distillation.
+The performance discrepancy between the normalized and un-normalized encoders has motivated us to use them as teachers (further also called specialists) to distill their knowledge into our dual-input single encoder. We use a factorized objective, matching each half of the 640-dimensional student representation to its corresponding teacher by cosine loss,
+per timestamp and after pooling.
+What is interesting is that directly pre-training the dual-input encoder with the usual TS2Vec contrastive objective yields inferior results (Table 2).
+
+## 3 Experimental Results
+
+Setup.
+Further, we refer our approach (synthetic pre-training, dual-input architecture, distillation) as TS2Vec-FM. We compare it with other methods by evaluating frozen representations on UCR-128 (Dau et al., 2019) and UEA-27 (Bagnall et al., 2018),
+following Feofanov et al. (2026a).
+Dataset-specific classifiers are a 200-tree random forest (RF), averaged over three predictor seeds,
+and logistic regression (LogReg) preceded by StandardScaler.
+Pre-training checkpoints are selected by UCR RF accuracy at seed 42; UEA is not used for checkpoint selection.
+We compare against Catch22+ (Lubba et al., 2019), MOMENT (Goswami et al., 2024),
+TiRex (Auer et al., 2025b), Chronos-2 (Ansari et al., 2025),
+TiViT-H / TiConvNext (Roschmann et al., 2025), NuTime (Lin et al., 2024),
+and Mantis (V2 checkpoint, Feofanov et al., 2026a; Feofanov et al., 2026b).
+
+Table 1: Zero-shot feature extraction accuracy (%), with parameters counted after layer
+pruning where applicable. The dashed rule separates the
+original per-dataset TS2Vec, which is not a foundation model: it trains one encoder
+on each dataset’s own training split (128 UCR and 27 UEA encoders of 0.6M
+parameters). ‡With its original RBF-SVM probe it reaches 82.10 on UCR.
+
+Random forest
+LogReg
+
+Model
+Type
+Params
+UCR
+UEA
+UCR
+UEA
+
+Catch22+
+statistics
+—
+79.69
+69.63
+77.04
+67.56
+
+MOMENT
+forecasting
+161.4M
+77.89
+69.91
+79.84
+71.74
+
+NuTime
+classification
+2.0M
+77.32
+71.99
+79.05
+74.91
+
+TiRex
+forecasting
+16.5M
+80.13
+69.52
+82.02
+72.48
+
+Chronos-2
+forecasting
+44.0M
+80.02
+69.67
+82.44
+72.43
+
+TiViT-H
+vision
+276.6M
+79.43
+70.91
+82.88
+73.30
+
+TiConvNext
+vision
+180.3M
+80.29
+71.05
+83.47
+73.50
+
+MantisV2
+classification
+2.2M
+81.95
+74.20
+83.60
+75.52
+
+TS2Vec-FM, one encoder
+classification
+1.64M
+81.76
+73.60
+83.32
+75.30
+
+Reference (not zero-shot: one encoder trained per target dataset)
+
+TS2Vec, per dataset‡
+self-supervised
+0.6M each
+79.83
+69.50
+81.36
+70.79
+
+The recipe produces a competitive TSFM (Table 1).
+The proposed TS2Vec-FM shows the second-best result, trailing MantisV2 by 0.19 / 0.60 pp with RF and 0.28 / 0.22 pp with LogReg,
+respectively, while using about 25% fewer parameters. At the same time, it outperforms the forecasting- and vision-based extractors
+(10–170 $\times$ as many parameters), except TiConvNext on UCR LogReg. We would like to note that unlike MantisV2, our encoder uses native lengths and does not need interpolate each series to a fixed length. In Appendix D, we show that interpolating series worsen the performance of TS2Vec-FM.
+
+It also beats TS2Vec trained per dataset. Under both the random forest and logistic regression probe, the margin between the foundation model and per-dataset encoder is more that 1.9 % on UCR. The gap widens even more on multivariate UEA-27, even though TS2Vec-FM was pre-trained on univariate data. Note that in the original TS2Vec paper, they use an RBF-SVM with hyperparameters tuned, which increases the probing performance, though still below TS2Vec-FM with logistic regression. We have also tried to reproduce the results published by Yue et al. (2022) in two different setups: first, our reimplementation of the original protocol that reproduces the published UCR-128 performance to within 0.8 pp with a per-dataset correlation of 0.984, and second, we have run the
+authors’ unmodified code that reproduces fifteen of the sixteen evaluable headline
+metrics of the original paper (across all classification, forecasting and anomaly
+detection) within 5% relative (see Appendix C).
+
+Table 2: What each ingredient contributes (random forest, %) at 100K, 1M and 2M
+synthetic series. Instance normalization trades UEA for UCR at every scale, the
+specialists and the direct contrastive baseline do not improve with more data, and
+distillation consolidates the two specialists into the stronger single encoder at
+every scale. †mean over three pre-training seeds; ‡with gradient
+clipping.
+
+100K series
+1M series
+2M series
+
+Encoder input
+Training
+UCR
+UEA
+UCR
+UEA
+UCR
+UEA
+
+raw only
+contrastive
+77.43†
+72.02†
+76.99
+71.56
+77.68
+72.22
+
+normalized only
+contrastive
+80.35†
+70.56†
+80.26
+69.78
+79.89
+70.19
+
+dual-input
+contrastive
+80.52†
+73.41†
+80.52‡
+73.41‡
+80.52‡
+73.07‡
+
+dual-input
+distillation (ours)
+81.08†
+73.90†
+81.62†
+73.48†
+81.76
+73.60
+
+Ablation of the recipe (Table 2). We first ask whether more synthetic data helps. For the ingredients taken alone the answer is negative: from 100K to 1M and 2M series, the two specialists and the dual-input encoder pre-trained directly with the contrastive TS2Vec loss stay within seed noise or slightly degrade (the instance-normalized specialist loses 0.5 pp on UCR). The distilled encoder is the only one that benefits: on UCR it gains 0.54 pp from 100K to 1M (81.08 to 81.62%, three pre-training seeds each, seed standard deviation 0.12 pp) and a further 0.14 pp at 2M, while on UEA it stays flat (73.9, 73.5 and 73.6%). We detail the scaling experiments further in Appendix D.
+The comparison with the directly pre-trained dual-input encoder also isolates the contribution of distillation: it is superior at every scale, and its margin widens with data, from 0.56 pp at 100K to 1.10 pp at 1M and 1.24 pp at 2M on UCR. We also note that we had to use gradient clipping for the contrastive baseline due to numerical instability. The pattern suggests that direct training underuses the complementary views, while
+already-specialized teachers keep both subspaces alive. This is, in effect, a
+learned substitute for what hand-designed TSFM tokenizers provide by construction when
+they devote separate branches to the normalized signal and to raw patch
+statistics (Feofanov et al., 2026a; Lin et al., 2024).
+
+## 4 Discussion
+
+In this paper, we introduced TS2Vec-FM, showing that synthetic pretraining and specialist distillation can make a compact
+convolutional encoder competitive for cross-dataset classification while retaining
+native-length processing.
+The results motivate revisiting earlier self-supervised architectures, adapting them to the current setup and thereby enriching the family of available time series foundation models.
+
+Limitations.
+The 2M headline model is trained at a single pre-training seed, although the
+100K ablations and the 1M student use three seeds.
+TS2Vec-FM remains slightly below MantisV2 on all four metrics, so our claim is
+competitive performance with a smaller encoder rather than superiority.
+Evaluation is limited to UCR and UEA, and whether specialist distillation
+generalizes to other backbones and tokenizer designs remains open.
+
+## References
+
+Ansari et al. (2025)
+A. F. Ansari, O. Shchur, J. Küken, A. Auer, B. Han, P. Mercado, S. S. Rangapuram, H. Shen, L. Stella, X. Zhang, et al.
+
+Chronos-2: from univariate to universal forecasting.
+
+arXiv preprint arXiv:2510.15821.
+
+Cited by: §3.
+
+Auer et al. (2025a)
+A. Auer, D. Klotz, S. Böck, and S. Hochreiter
+
+Pre-trained forecasting models: strong zero-shot feature extractors for time series classification.
+
+arXiv preprint arXiv:2510.26777.
+
+Cited by: Appendix B.
+
+Auer et al. (2025b)
+A. Auer, P. Podest, D. Klotz, S. Böck, G. Klambauer, and S. Hochreiter
+
+TiRex: zero-shot forecasting across long and short horizons with enhanced in-context learning.
+
+arXiv preprint arXiv:2505.23719.
+
+Cited by: §3.
+
+Bagnall et al. (2018)
+A. Bagnall, H. A. Dau, J. Lines, M. Flynn, J. Large, A. Bostrom, P. Southam, and E. Keogh
+
+The UEA multivariate time series classification archive, 2018.
+
+arXiv preprint arXiv:1811.00075.
+
+Cited by: §3.
+
+Dau et al. (2019)
+H. A. Dau, A. Bagnall, K. Kamgar, C. M. Yeh, Y. Zhu, S. Gharghabi, C. A. Ratanamahatana, and E. Keogh
+
+The UCR time series archive.
+
+IEEE/CAA Journal of Automatica Sinica 6 (6), pp. 1293–1305.
+
+Cited by: §3.
+
+Eldele et al. (2021)
+E. Eldele, M. Ragab, Z. Chen, M. Wu, C. K. Kwoh, X. Li, and C. Guan
+
+Time-series representation learning via temporal and contextual contrasting.
+
+In Proceedings of the Thirtieth International Joint Conference on Artificial Intelligence, IJCAI-21,
+
+pp. 2352–2359.
+
+Cited by: Appendix B.
+
+Feofanov et al. (2026a)
+V. Feofanov, S. Wen, S. Xie, S. Roschmann, M. Alonso, H. Guo, R. Ilbert, M. Tiomoko, Q. Bouniot, Z. Akata, L. Pan, J. Zhang, and I. Redko
+
+Mantis: lightweight foundation model for time series classification.
+
+In Forty-third International Conference on Machine Learning,
+
+External Links: Link
+
+Cited by: Appendix B,
+§1,
+§3,
+§3.
+
+Feofanov et al. (2026b)
+V. Feofanov, S. Wen, J. Zhang, L. Pan, and I. Redko
+
+MantisV2: closing the zero-shot gap in time series classification with synthetic data and test-time strategies.
+
+External Links: 2602.17868,
+Link
+
+Cited by: Appendix B,
+§3.
+
+Foumani et al. (2024)
+N. M. Foumani, C. W. Tan, G. I. Webb, H. Rezatofighi, and M. Salehi
+
+Series2vec: similarity-based self-supervised representation learning for time series classification: nm foumani et al..
+
+Data Mining and Knowledge Discovery 38 (4), pp. 2520–2544.
+
+Cited by: Appendix B.
+
+Franceschi et al. (2019)
+J. Franceschi, A. Dieuleveut, and M. Jaggi
+
+Unsupervised scalable representation learning for multivariate time series.
+
+Advances in neural information processing systems 32.
+
+Cited by: Appendix B,
+§1.
+
+Goswami et al. (2024)
+M. Goswami, K. Szafer, A. Choudhry, Y. Cai, S. Li, and A. Dubrawski
+
+MOMENT: a family of open time-series foundation models.
+
+arXiv preprint arXiv:2402.03885.
+
+Cited by: Appendix B,
+§1,
+§3.
+
+Hinton et al. (2015)
+G. Hinton, O. Vinyals, and J. Dean
+
+Distilling the knowledge in a neural network.
+
+In NeurIPS Deep Learning and Representation Learning Workshop,
+
+Cited by: Appendix B,
+§1.
+
+Lee et al. (2024)
+S. Lee, T. Park, and K. Lee
+
+Soft contrastive learning for time series.
+
+In International Conference on Learning Representations,
+
+Vol. 2024, pp. 46815–46839.
+
+Cited by: Appendix B.
+
+Lin et al. (2024)
+C. Lin, X. Wen, W. Cao, C. Huang, J. Bian, S. Lin, and Z. Wu
+
+NuTime: numerically multi-scaled embedding for large- scale time-series pretraining.
+
+Transactions on Machine Learning Research.
+
+Note: 
+
+External Links: ISSN 2835-8856,
+Link
+
+Cited by: Appendix B,
+§1,
+§3,
+§3.
+
+Liu and Chen (2024)
+J. Liu and S. Chen
+
+Timesurl: self-supervised contrastive learning for universal time series representation learning.
+
+In Proceedings of the AAAI conference on artificial intelligence,
+
+Vol. 38, pp. 13918–13926.
+
+Cited by: Appendix B.
+
+Lubba et al. (2019)
+C. H. Lubba, S. S. Sethi, P. Knaute, S. R. Schultz, B. D. Fulcher, and N. S. Jones
+
+Catch22: CAnonical Time-series CHaracteristics: selected through highly comparative time-series analysis.
+
+Data mining and knowledge discovery 33 (6), pp. 1821–1852.
+
+Cited by: §3.
+
+Luo et al. (2023)
+D. Luo, W. Cheng, Y. Wang, D. Xu, J. Ni, W. Yu, X. Zhang, Y. Liu, Y. Chen, H. Chen, et al.
+
+Time series contrastive learning with information-aware augmentations.
+
+In Proceedings of the AAAI conference on artificial intelligence,
+
+Vol. 37, pp. 4534–4542.
+
+Cited by: Appendix B.
+
+Mandalika and V (2025)
+S. Mandalika and L. V
+
+CoMAD: a multiple-teacher self-supervised distillation framework.
+
+External Links: 2508.04816,
+Link
+
+Cited by: Appendix B.
+
+Moakher et al. (2026)
+Y. Moakher, Y. A. E. Hili, and V. Feofanov
+
+UTICA: multi-objective self-distllation foundation model pretraining for time series classification.
+
+External Links: 2603.01348,
+Link
+
+Cited by: Appendix B.
+
+Moroshan et al. (2025)
+V. Moroshan, J. Siems, A. Zela, T. Carstensen, and F. Hutter
+
+TempoPFN: synthetic pre-training of linear rnns for zero-shot time series forecasting.
+
+arXiv preprint arXiv:2510.25502.
+
+Cited by: Appendix B.
+
+Nagpal et al. (2026)
+A. Nagpal, D. Sanyal, M. Mandal, D. Kumar, and S. Deshpande
+
+Mix, don’t pick: why synthetic corpus composition matters for time series foundation model pretraining.
+
+External Links: 2606.09912,
+Link
+
+Cited by: Appendix B.
+
+O’Rourke et al. (2026)
+F. M. O’Rourke, A. Trisovic, and D. Bertsimas
+
+A causal dag prior for synthetic time-series classification datasets.
+
+External Links: 2606.21776,
+Link
+
+Cited by: Appendix B.
+
+Roschmann et al. (2025)
+S. Roschmann, Q. Bouniot, V. Feofanov, I. Redko, and Z. Akata
+
+Time series representations for classification lie hidden in pretrained vision transformers.
+
+arXiv preprint arXiv:2506.08641.
+
+External Links: Link
+
+Cited by: Appendix B,
+§3.
+
+Tonekaboni et al. (2021)
+S. Tonekaboni, D. Eytan, and A. Goldenberg
+
+Unsupervised representation learning for time series with temporal neighborhood coding.
+
+arXiv preprint arXiv:2106.00750.
+
+Cited by: Appendix B,
+§1.
+
+Xie et al. (2026)
+S. Xie, V. Feofanov, J. Zhang, T. Palpanas, and I. Redko
+
+CauKer: classification time series foundation models can be pretrained on synthetic data.
+
+In The Fourteenth International Conference on Learning Representations,
+
+External Links: Link
+
+Cited by: Appendix B,
+§1,
+§2.
+
+Yue et al. (2022)
+Z. Yue, Y. Wang, J. Duan, T. Yang, C. Huang, Y. Tong, and B. Xu
+
+TS2Vec: towards universal representation of time series.
+
+Proceedings of the AAAI Conference on Artificial Intelligence 36 (8), pp. 8980–8987.
+
+External Links: Link,
+Document
+
+Cited by: Appendix A,
+Appendix B,
+§C.4,
+§1,
+§3.
+
+Zerveas et al. (2021)
+G. Zerveas, S. Jayaraman, D. Patel, A. Bhamidipaty, and C. Eickhoff
+
+A transformer-based framework for multivariate time series representation learning.
+
+In Proceedings of the 27th ACM SIGKDD conference on knowledge discovery & data mining,
+
+pp. 2114–2124.
+
+Cited by: Appendix B.
+
+## Appendix A TS2Vec: architecture and objective
+
+This section gives more details on the TS2Vec model and training objective. Our implementation follows the authors’ released
+code [Yue et al., 2022].
+
+Figure 2: Reference TS2Vec encoder. Ten width-64 residual blocks with dilation
+ $2^{i}$ are followed by a width-320 output block; one block is detailed in
+Figure 3.
+
+Figure 3: One TS2Vec residual block: two GELU–dilated-convolution pairs
+plus a skip connection (identity, or a $1\times 1$ convolution when the
+width changes).
+
+## Encoder.
+
+Let $\mathbf{X}_{i}=(\mathbf{x}_{i,1},\ldots,\mathbf{x}_{i,T})\in\mathbb{R}^{T\times C}$ denote series $i$ . A learned affine map sends each
+timestamp from $C$ input channels to a hidden width $H=64$ , with
+ $\mathbf{W}_{\mathrm{in}}\in\mathbb{R}^{H\times C}$ and
+ $\mathbf{b}_{\mathrm{in}}\in\mathbb{R}^{H}$ . During pre-training,
+an independent mask $m_{i,t}\sim\operatorname{Bernoulli}(0.5)$ is sampled for
+each contextual view, and a masked timestamp is replaced by the zero vector
+after the affine map:
+
+ $\mathbf{h}^{(0)}_{i,t}=m_{i,t}\bigl(\mathbf{W}_{\mathrm{in}}\mathbf{x}_{i,t}+\mathbf{b}_{\mathrm{in}}\bigr).$ 
+
+(1)
+
+Missing timestamps are masked in the same way. The trunk contains eleven
+residual blocks indexed by $k=0,\ldots,10$ , each with two same-padded
+one-dimensional convolutions of kernel size three and dilation
+ $\delta_{k}=2^{k}$ . Writing $\mathcal{C}_{k,1}$ and $\mathcal{C}_{k,2}$ for these
+convolutions, a block is
+
+ $\displaystyle\mathbf{u}^{(k)}$ 
+ $\displaystyle=\mathcal{C}_{k,1}\!\left(\operatorname{GELU}(\mathbf{h}^{(k)})\right),$ 
+
+(2)
+
+ $\displaystyle\mathbf{h}^{(k+1)}$ 
+ $\displaystyle=\mathcal{C}_{k,2}\!\left(\operatorname{GELU}(\mathbf{u}^{(k)})\right)+\mathcal{P}_{k}(\mathbf{h}^{(k)}).$ 
+
+(3)
+
+The first ten blocks preserve width 64; the final block maps 64 to the
+representation dimension $D=320$ . The residual projection $\mathcal{P}_{k}$ is
+the identity when dimensions agree and a pointwise convolution otherwise.
+Dropout with probability 0.1 follows the trunk. The output of the last block is
+the timestamp representation
+ $\mathbf{r}_{i,t}=\mathbf{h}^{(11)}_{i,t}\in\mathbb{R}^{D}$ ; we drop the series
+index $i$ when it is not needed. For a univariate input this encoder contains
+637,248 trainable parameters.
+
+## Input length and receptive field.
+
+The encoder is fully convolutional and the readout is a max-pool over all
+timestamps, so the model accepts any length $T$ with cost linear in $T$ , and the
+series embedding always depends on every timestamp. What is bounded is the
+context of each timestamp representation: with symmetric padding, $\mathbf{r}_{t}$ 
+sees at most $1+4\sum_{k=0}^{10}2^{k}=8189$ timestamps ( $\pm 4094$ around $t$ ).
+For $T\leq 8189$ every $\mathbf{r}_{t}$ observes the whole series; this holds for
+all 128 UCR datasets (longest: Rock, $T=2844$ ) and for 26 of the 27 UEA datasets
+(MotorImagery, $T=3000$ ). Beyond that bound no single $\mathbf{r}_{t}$ sees the
+whole series and the only cross-window integration is the order-free max-pool,
+so a class that is defined by relating two events more than $\sim$ 8k steps apart
+cannot be represented, whereas locally detectable patterns still are. The one
+benchmark case beyond the bound, EigenWorms ( $T=17{,}984$ ), is nevertheless
+handled well (88.0% RF and 90.8% LogReg versus 81.4% and 88.5% for MantisV2,
+Appendix E). A second, more practical limitation is the
+trained receptive field: pre-training used 512-timestamp series, which
+the 8189-timestamp field covers many times over, so the long-range taps of the
+last blocks (dilations 128 to 1024) were mostly fitted against zero padding
+and only receive signal at both ends on long inputs. We do not quantify this
+shift; downsampling very long inputs or pre-training on longer series are the
+natural remedies.
+
+## Contextual crops.
+
+For each minibatch, TS2Vec samples an overlap length
+ $L$ uniformly from $\{2,\ldots,T\}$ . It samples an overlap $[a,b)$ with $b-a=L$ , a left extension
+boundary $a_{\mathrm{e}}\in\{0,\ldots,a\}$ , and an extended right boundary
+ $b_{\mathrm{e}}\in\{b,\ldots,T\}$ . Each series receives a shift
+ $o_{i}\in\{-a_{\mathrm{e}},\ldots,T-b_{\mathrm{e}}\}$ . The two encoder inputs are
+
+ $\widetilde{\mathbf{X}}^{\,A}_{i}=\mathbf{X}_{i}[o_{i}+a_{\mathrm{e}}:o_{i}+b],\qquad\widetilde{\mathbf{X}}^{\,B}_{i}=\mathbf{X}_{i}[o_{i}+a:o_{i}+b_{\mathrm{e}}].$ 
+
+(4)
+
+Their contexts differ, but the last $L$ outputs of the first view and the first
+ $L$ outputs of the second refer to the same timestamps. Stacking these aligned
+timestamp representations $\mathbf{r}_{i,t}$ over the minibatch gives
+ $\mathbf{A},\mathbf{B}\in\mathbb{R}^{B\times L\times D}$ , with minibatch size
+ $B$ .
+
+## Dual contrastive loss.
+
+For an anchor $\mathbf{q}$ , positive $\mathbf{p}$ and negative set
+ $\mathcal{N}$ , define
+
+ $\ell(\mathbf{q},\mathbf{p};\mathcal{N})=-\log\frac{\exp(\mathbf{q}^{\top}\mathbf{p})}{\exp(\mathbf{q}^{\top}\mathbf{p})+\sum_{\mathbf{n}\in\mathcal{N}}\exp(\mathbf{q}^{\top}\mathbf{n})}.$ 
+
+(5)
+
+The implementation uses raw dot products: it applies neither $\ell_{2}$ 
+normalization nor a temperature parameter. The negative collections below are
+indexed lists rather than mathematical sets: equal-valued vectors remain
+distinct denominator terms, and $\mathbin{\|}$ denotes list concatenation.
+Instance contrast fixes a timestamp $t$ and treats the other series in both
+views as negatives:
+
+ $\displaystyle\mathcal{N}^{A}_{\mathrm{inst}}(i,t)$ 
+ $\displaystyle=(\mathbf{A}_{j,t})_{j\neq i}\mathbin{\|}(\mathbf{B}_{j,t})_{j\neq i},$ 
+
+(6)
+
+ $\displaystyle\mathcal{N}^{B}_{\mathrm{inst}}(i,t)$ 
+ $\displaystyle=(\mathbf{B}_{j,t})_{j\neq i}\mathbin{\|}(\mathbf{A}_{j,t})_{j\neq i},$ 
+
+(7)
+
+ $\displaystyle\mathcal{L}_{\mathrm{inst}}(\mathbf{A},\mathbf{B})$ 
+ $\displaystyle=\frac{1}{2BL}\sum_{i=1}^{B}\sum_{t=1}^{L}\Bigl[\ell(\mathbf{A}_{i,t},\mathbf{B}_{i,t};\mathcal{N}^{A}_{\mathrm{inst}}(i,t))+\ell(\mathbf{B}_{i,t},\mathbf{A}_{i,t};\mathcal{N}^{B}_{\mathrm{inst}}(i,t))\Bigr].$ 
+
+(8)
+
+Temporal contrast instead fixes a series $i$ and treats all other aligned
+timestamps in both views as negatives. Thus
+
+ $\displaystyle\mathcal{N}^{A}_{\mathrm{temp}}(i,t)$ 
+ $\displaystyle=(\mathbf{A}_{i,s})_{s\neq t}\mathbin{\|}(\mathbf{B}_{i,s})_{s\neq t},$ 
+
+(9)
+
+ $\displaystyle\mathcal{N}^{B}_{\mathrm{temp}}(i,t)$ 
+ $\displaystyle=(\mathbf{B}_{i,s})_{s\neq t}\mathbin{\|}(\mathbf{A}_{i,s})_{s\neq t},$ 
+
+(10)
+
+ $\displaystyle\mathcal{L}_{\mathrm{temp}}(\mathbf{A},\mathbf{B})$ 
+ $\displaystyle=\frac{1}{2BL}\sum_{i=1}^{B}\sum_{t=1}^{L}\Bigl[\ell(\mathbf{A}_{i,t},\mathbf{B}_{i,t};\mathcal{N}^{A}_{\mathrm{temp}}(i,t))+\ell(\mathbf{B}_{i,t},\mathbf{A}_{i,t};\mathcal{N}^{B}_{\mathrm{temp}}(i,t))\Bigr].$ 
+
+(11)
+
+Both objectives are symmetric across the two views. The positive is included
+once in the denominator of Equation (5); only the anchor
+self-similarity is excluded.
+
+## Hierarchical contrasting.
+
+Set $(\mathbf{A}^{(0)},\mathbf{B}^{(0)})=(\mathbf{A},\mathbf{B})$ and obtain
+scale $s+1$ by max-pooling each representation over adjacent pairs of
+timestamps with stride two:
+ $L_{s+1}=\lfloor L_{s}/2\rfloor$ . For odd $L_{s}$ , the unmatched final timestamp
+is dropped, exactly as in the released implementation. This continues until
+ $L_{S-1}=1$ , where
+ $S=\lfloor\log_{2}L\rfloor+1$ . Define
+ $\beta_{s}=\mathbf{1}[L_{s}>1]$ , which switches temporal contrast off at the
+singleton scale. The optimized objective is
+
+ $\displaystyle\mathcal{L}_{\mathrm{hier}}=\frac{1}{S}\sum_{s=0}^{S-1}\Big[$ 
+ $\displaystyle\alpha\,\mathcal{L}_{\mathrm{inst}}(\mathbf{A}^{(s)},\mathbf{B}^{(s)})$ 
+
+(12)
+
+ $\displaystyle+\beta_{s}(1-\alpha)\,\mathcal{L}_{\mathrm{temp}}(\mathbf{A}^{(s)},\mathbf{B}^{(s)})\Big],\qquad\alpha=\tfrac{1}{2}.$ 
+
+Consequently, fine scales discriminate timestamps as well as series, while the
+singleton top scale contributes instance contrast only. The original paper
+writes the unweighted sum
+ $\mathcal{L}_{\mathrm{inst}}+\mathcal{L}_{\mathrm{temp}}$ at each non-singleton
+scale; the released code uses $\alpha=\tfrac{1}{2}$ as above, which differs by the
+global factor $\tfrac{1}{2}$ . Equation (12) states the
+implementation used in our experiments.
+
+## Optimization and readout.
+
+We use AdamW with learning rate $10^{-3}$ , weight decay $10^{-2}$ and batch size
+8 when reproducing per-dataset TS2Vec. The foundation-model specialists use
+batch size 128 at the same learning rate; the throughput experiments use batch
+size 512 and learning rate $4\times 10^{-3}$ . Checkpoints contain a running
+arithmetic average initialized from the starting weights and updated after every
+optimizer step. At test time masking and dropout are disabled, timestamp
+representations are max-pooled over the complete series. Original per-dataset
+TS2Vec maps all $C$ channels jointly through $\mathbf{W}_{\mathrm{in}}$ and
+therefore always returns one 320-dimensional vector. Our foundation encoder is
+pre-trained on univariate synthetic series; when evaluating it on multivariate
+data, we instead encode the $C$ channels independently and concatenate them,
+giving a $320C$ -dimensional frozen representation.
+
+## Appendix B Related work
+
+Self-supervised representation learning for time series.
+A first line of work learns representations without labels by training an encoder on the
+target dataset and then fitting a simple classifier on its frozen output. T-Loss uses a
+triplet loss over subsequences [Franceschi et al., 2019], TNC contrasts temporal
+neighborhoods [Tonekaboni et al., 2021], TS-TCC combines temporal and contextual
+contrasting [Eldele et al., 2021], TST reconstructs masked timestamps with a
+transformer [Zerveas et al., 2021], and TS2Vec optimizes a hierarchical contrastive
+loss over two overlapping views of each series [Yue et al., 2022]. TS2Vec has remained a
+standard baseline, and subsequent work refines its objective through soft contrastive
+assignments [Lee et al., 2024], information-aware augmentation [Luo et al., 2023],
+frequency-domain augmentation [Liu and Chen, 2024], and augmentation-free similarity
+prediction [Foumani et al., 2024]. What these methods share is the training regime
+rather than the objective: the encoder is fitted to the dataset on which it is evaluated.
+Transfer between datasets has been examined within this line, but from a single real source
+dataset and in comparison with other per-dataset
+methods [Franceschi et al., 2019, Yue et al., 2022].
+
+Foundation models for time series classification.
+A second line pre-trains one encoder on a large corpus, keeps it frozen, and fits only a
+probe on each downstream dataset. NuTime [Lin et al., 2024],
+MOMENT [Goswami et al., 2024], Mantis [Feofanov et al., 2026a, Feofanov et al., 2026b] follow this protocol with transformer encoders and
+tokenizers built for time series. Several of these tokenizers keep the normalized shape of
+a window and its amplitude statistics in separate input
+branches [Lin et al., 2024, Feofanov et al., 2026a], on the view that both are informative
+for classification. MantisV2 additionally reports that test-time choices matter, in
+particular which intermediate layer is read and how output tokens are
+aggregated [Feofanov et al., 2026b], and UTICA keeps the same backbone while replacing
+the contrastive objective with self-distillation from a slowly updated copy of the
+student [Moakher et al., 2026]. A related body of work obtains competitive frozen
+features from models never trained for classification, such as vision
+transformers [Roschmann et al., 2025] and
+forecasters [Auer et al., 2025a], and reports the same sensitivity to layer
+selection and token aggregation.
+
+Synthetic corpora and distillation.
+Since large curated collections of real series are scarce, pre-training data for these
+models is increasingly synthetic. CauKer generates series by composing Gaussian process
+kernels inside structural causal models and reports regular scaling in both corpus size
+and model capacity [Xie et al., 2026]. Other priors have been proposed for
+classification [O’Rourke et al., 2026] and forecasting [Moroshan et al., 2025], and mixing several generators is reported to
+be preferable to selecting one [Nagpal et al., 2026]. Distillation has been applied to time
+series models mostly for compression, transferring a large pre-trained encoder into a
+smaller one. Using it to merge several specialized models into a single one is a classical
+idea from the distillation literature [Hinton et al., 2015], and has been studied
+more extensively in vision, where teachers trained under different objectives may disagree
+and have to be reconciled [Mandalika and V, 2025].
+
+## Appendix C Per-dataset baseline reproduction
+
+Our central comparison is against TS2Vec trained the way it was designed to be trained,
+so the credibility of that baseline matters as much as the credibility of our own model.
+We therefore validated it twice: once at the level of the per-dataset protocol we use for
+the paired comparison (§C.1–C.3), and once by reproducing
+the original paper end to end across all three of its tasks (§C.4).
+
+## C.1 Protocol
+
+For each of the 128 UCR datasets we train one TS2Vec encoder from scratch with the reference implementation and its defaults: ten
+dilated residual blocks, hidden width 64, a 320-dimensional representation, learning rate
+ $10^{-3}$ , batch size 8, maximum training length 3000, Bernoulli(0.5) timestamp masking,
+and the upstream iteration rule of 200 iterations for training sets with at most
+ $10^{5}$ values and 600 iterations otherwise. Frozen representations are then probed two ways: with the upstream grid-searched RBF-SVM, which
+is what the original paper reports, and with the StandardScaler plus logistic regression
+probe of Table 1, so that the comparison against our encoder is
+probe-matched. Aggregated over all 128 datasets this gives 82.10% (RBF-SVM) and 81.36%
+(logistic regression); the same frozen representations under the random-forest probe of
+Table 1 (200 trees, three predictor seeds) give 79.83%.
+
+The UEA-27 entries of Table 1 follow the same recipe with upstream’s
+multivariate handling: one encoder per dataset whose input projection maps all $C$ 
+channels jointly, series standardized per channel with training-split statistics, the
+same optimizer, iteration rule and final-checkpoint readout, and the paper’s two probes on
+the resulting 320-dimensional embeddings. This gives 69.50% (random forest) and 70.79%
+(logistic regression); per dataset the numbers track the published TS2Vec UEA table
+closely (e.g. 0.99 vs. 0.987 on ArticularyWordRecognition, 0.32 vs. 0.308 on
+EthanolConcentration, 0.68 vs. 0.682 on PEMS-SF).
+
+## C.2 Agreement with the published numbers
+
+The original paper tabulates per-dataset accuracies for all 128 UCR datasets (its Table 9,
+default batch size 8); its headline 0.830 averages the 125 datasets on which every
+baseline runs, dropping the three DodgerLoop datasets with missing values. Over all 128
+datasets our reproduction reaches 82.10% against the published 82.87%, a gap
+of 0.77 pp, with a mean absolute per-dataset deviation of 1.65 pp and a
+per-dataset Pearson correlation of 0.984; on the paper’s 125-dataset subset the
+aggregates are 82.25% against 82.96%. Agreement is not concentrated in the aggregate:
+69 of the 128 datasets are within 1 pp, 98 within 2 pp, and 119 within 5 pp.
+
+Eight datasets deviate by more than 5 pp, all downward.
+We rerun these datasets at four additional pre-training seeds
+(Table 3).
+The reruns show substantial seed sensitivity on several of the largest discrepancies:
+replacing the seed-42 values by five-seed means raises the UCR-128 aggregate from
+82.10% to 82.23%.
+PLAID remains an unresolved exception, with $34.9\pm 10.1$ % across five seeds against
+56.1% published.
+We retain seed 42 for the main per-dataset reproduction to keep this baseline protocol uniform.
+
+Table 3: The eight datasets on which the seed-42 reproduction deviates from the published
+value by more than 5 pp, with a four-extra-seed diagnostic (per-dataset TS2Vec, RBF-SVM
+probe, %). The main per-dataset baseline uses seed 42.
+
+ours, per pre-training seed
+
+Dataset
+published
+42
+43
+44
+45
+46
+mean $\pm$ sd
+
+PLAID
+56.1
+37.4
+30.9
+19.4
+42.8
+44.1
+34.9 $\pm$ 10.1
+
+Car
+83.3
+70.0
+78.3
+71.7
+83.3
+70.0
+74.7 $\pm$ 5.9
+
+DodgerLoopDay
+56.2
+47.5
+48.8
+48.8
+50.0
+52.5
+49.5 $\pm$ 1.9
+
+Herring
+64.1
+56.2
+59.4
+59.4
+68.8
+57.8
+60.3 $\pm$ 4.9
+
+FaceFour
+93.2
+86.4
+84.1
+90.9
+89.8
+89.8
+88.2 $\pm$ 2.9
+
+MiddlePhalanxOutlineCorrect
+83.8
+77.3
+78.0
+83.8
+80.1
+79.4
+79.7 $\pm$ 2.5
+
+PhalangesOutlinesCorrect
+80.9
+75.3
+81.0
+81.5
+82.1
+79.7
+79.9 $\pm$ 2.7
+
+WormsTwoClass
+80.5
+75.3
+75.3
+67.5
+76.6
+79.2
+74.8 $\pm$ 4.4
+
+## C.3 The paired comparison
+
+Table 4 gives the three comparisons summarised in
+Section 3. Under the matched logistic-regression probe our single
+frozen encoder improves on 128 dataset-specific encoders by 1.95 pp, winning on 88
+datasets, tying on 9 and losing on 31; the Wilcoxon signed-rank test rejects equality at
+ $p=1.3\times 10^{-6}$ . Giving the baseline its own RBF-SVM probe, which is worth 0.74 pp
+to it, leaves a 1.22 pp advantage at $p=0.02$ . Against the published per-dataset
+numbers on all 128 datasets the two are statistically indistinguishable (83.32% vs
+82.87%, $p=0.43$ ), which is the honest reading: our encoder clearly beats a faithful
+reimplementation of per-dataset TS2Vec, and ties the numbers as originally published.
+
+Table 4: TS2Vec-FM (one encoder, frozen, synthetic pre-training only) against TS2Vec
+trained per dataset (TS2Vec/ds) on UCR-128. W / T / L counts the datasets on which
+TS2Vec-FM wins, ties and loses against that row; $p$ -values (two-sided Wilcoxon
+signed-rank) are given in the text.
+
+Method
+Probe
+UCR acc.
+W / T / L
+
+of TS2Vec-FM
+
+TS2Vec-FM
+LogReg
+83.32
+—
+
+TS2Vec/ds (reproduced)
+LogReg
+81.36
+88 / 9 / 31
+
+TS2Vec/ds (reproduced)
+RBF-SVM
+82.10
+71 / 11 / 46
+
+TS2Vec/ds (published)
+RBF-SVM
+82.87
+62 / 10 / 56
+
+## C.4 Independent reproduction of the original paper
+
+The protocol above validates only the classification numbers we compare against. To check
+that the baseline is faithful more broadly, we separately reproduced the whole TS2Vec
+paper — classification, forecasting and anomaly detection — by running the authors’
+released code unmodified (commit b0088e14, no source edits) on its own
+scripts and seeds. We couldn’t match exactly the environment and used torch 2.5.1 with Python 3.9, i.e., bit-exact reproduction is therefore impossible by construction.
+
+We follow [Yue et al., 2022] exactly in metrics and evaluation protocol. For more details, please see their paper. Table 5 lists every headline metric. 15 of 16
+metrics land within 5% relative of the published value and thirteen within 3%. The two
+flagship accuracies, 0.830 on UCR-125 and 0.712 on UEA-29, come back as 0.8257 and 0.7055;
+anomaly-detection precision on KPI matches to three decimals in both settings. Agreement
+holds per dataset as well: 109 of 125 UCR datasets and 25 of 29 UEA datasets fall within
+run-to-run noise, with mean deviations of $-0.39$ and $-0.68$ pp. Note that this table
+uses the original paper’s benchmark subsets, UCR-125 and UEA-29, rather than the
+UCR-128 and UEA-27 used elsewhere in this paper.
+
+Three qualifications belong with these numbers. First, the reproduction is consistently
+and slightly pessimistic on classification, so the residual is best attributed to the forced library and hardware
+change rather than to seed selection; 70% of our per-dataset means still fall inside the
+paper’s own batch-size sensitivity band. Second, the one genuine miss is the UEA average
+rank (2.776 vs 2.40). That statistic is hypersensitive on a 29-dataset benchmark where
+six methods cluster tightly: a 0.9% accuracy change produces a 15.7% rank change, and
+three datasets (DuckDuckGeese, MotorImagery, EigenWorms) contribute 8 of the 11 shifted
+rank units, in each case from an accuracy change below 0.02. TS2Vec still ranks first, but
+its margin over T-Loss narrows from 0.72 to 0.26 rank units. Third, coverage is
+incomplete as Yahoo Webscope has been discontinued and we have not performed the experiments on the associated data. All baseline numbers are taken as published;
+no baseline was re-run, so every rank above compares our TS2Vec against the paper’s
+reported baselines.
+
+Taken together with §C.2, the two exercises corroborate each other. On
+the paper’s 125-dataset subset, with the same upstream probe and the same seed, the
+per-dataset protocol of §C.1 gives 82.25% and the unmodified-code
+reproduction gives 82.61%, against a published 82.96%. We conclude that
+the baseline our main claim is measured against is a faithful TS2Vec, and that the small
+residual against the published aggregate is environmental rather than methodological.
+
+Table 5: Reproducing the original TS2Vec paper with unmodified released code. Accuracy
+and F1/precision/recall higher is better; MSE/MAE lower is better. †mean over
+three seeds (42, the paper’s own, plus 43 and 44; 1–3 for anomaly detection, as in the
+released scripts). Status uses a 5% relative tolerance.
+
+Task
+Benchmark
+Metric
+published
+ours†
+
+classification
+UCR-125
+accuracy
+0.830
+0.8257
+
+UCR-125
+avg. rank
+1.82
+1.876
+
+UEA-29
+accuracy
+0.712
+0.7055
+
+UEA-29
+avg. rank
+2.40
+2.776
+
+UCR-125, $B{=}4$ 
+accuracy
+0.824
+0.8267
+
+UCR-125, $B{=}16$ 
+accuracy
+0.827
+0.8250
+
+forecasting
+univariate
+avg. MSE
+0.209
+0.2056
+
+univariate
+avg. MAE
+0.296
+0.2936
+
+multivariate
+avg. MSE
+0.828
+0.8441
+
+multivariate
+avg. MAE
+0.636
+0.6420
+
+anomaly detection
+KPI, normal
+F1
+0.677
+0.6582
+
+KPI, normal
+precision
+0.929
+0.9279
+
+KPI, normal
+recall
+0.533
+0.5110
+
+KPI, cold-start
+F1
+0.676
+0.6644
+
+KPI, cold-start
+precision
+0.907
+0.9072
+
+KPI, cold-start
+recall
+0.540
+0.5244
+
+## Appendix D Scaling and checkpoint selection
+
+Figure 4: Colours are shared across panels; accuracy is UCR-128 with the random-forest
+probe. (a) At 100K, the distilled student stabilizes after the first few epochs and
+remains above the same trunk trained contrastively; bands span the three pre-training
+seeds. (b) At 2M (one seed) the student peaks at epoch 7 and then declines,
+while the gradient-clipped contrastive control stays within 0.56 pp of its epoch-1
+accuracy across ten epochs.
+(c) Probing each dilated residual block of the two 100K specialists: accuracy
+increases with depth and the final block is best for both.
+
+Checkpoint selection. Downstream accuracy is not monotone in pre-training epoch,
+so we select the checkpoint on UCR random-forest accuracy at pre-training seed 42
+(Figure 4a,b). At 100K the student is stable: it rises to 81.13/81.07/81.04%
+at epoch 9 across the three seeds, and any epoch from 5 on is within 0.2 pp of that. At 2M
+the same recipe peaks earlier and then decays — 81.70% at epoch 1, 81.76% at epoch 7,
+81.35% at epoch 10 — while the pre-training loss keeps falling, so more optimization of
+the contrastive teachers’ objective stops buying downstream accuracy well before
+convergence. The teachers behave the same way and are selected independently: at 2M the
+amplitude teacher improves over its three epochs (77.43 to 77.68%) while the shape teacher
+degrades (79.89 to 79.49%), so they are taken at epochs 3 and 1. The specialists are
+trained for three epochs only, and a 100-epoch run of both at 100K (batch 512, learning
+rate $4\times 10^{-3}$ , seed 42) shows why: the shape specialist peaks at epoch 5 (80.65%)
+and drifts down to 79.79% by epoch 100, the amplitude specialist peaks at epoch 10
+(77.19%) and falls to 74.67%. Epoch 3 is within 0.4 pp of the best epoch of either
+curve, and the frontier in Table 7 shows that 16 times more updates at
+batch 8 do not help either, so longer specialist training buys nothing. The contrastive control
+requires a separate stability qualification. Without clipping, nominally identical 1M
+runs agree through roughly 200 updates but undergo gradient explosions at different
+steps and differ by 4.15 pp at the same 1954-update checkpoint. With a global gradient
+clip of 10, the 1M run and its exact-seed repeat agree within 0.15 pp over their shared
+three epochs. The clipped 2M control is correspondingly stable, starting at 80.52% and
+remaining between 79.97% and 80.52% over ten epochs.
+
+Input length. A convolutional encoder accepts any length, so we evaluate at native
+lengths; resampling every series to 512 steps, the preprocessing that fixed-context TSFMs
+require, costs 0.20/0.22 pp on UCR and 0.90/0.56 pp on UEA with the random-forest and
+logistic-regression probes (Table 6). Native lengths therefore matter more on
+the multivariate archive, where series run from 25 steps (JapaneseVowels) to 17984
+(EigenWorms), so one fixed context must both upsample and heavily compress, than on UCR.
+The comparison matters because our baselines are evaluated at 512: the model stays
+within 0.5 pp of MantisV2 on UCR under the baselines’ own input handling, so the result is
+not an artifact of longer inputs.
+
+Table 6: Native lengths versus resampling to 512 steps, for the released 2M model
+(epoch 7, %).
+
+Input handling
+UCR RF
+UCR LogReg
+UEA RF
+UEA LogReg
+
+native lengths
+81.76
+83.32
+73.60
+75.30
+
+resampled to 512
+81.57
+83.10
+72.70
+74.74
+
+Where the representation lives. We probed each of the eleven dilated residual
+blocks of both 100K specialists (Figure 4c). Accuracy increases with depth
+throughout, and the largest single jump is into the final block: 75.11 to 77.50% for the
+amplitude specialist and 77.58 to 80.49% for the shape specialist. The ordering is
+unchanged at a fixed length of 512. For both specialists the final block gives the highest UCR RF accuracy among the evaluated layers.
+This comparison also changes feature dimensionality: hidden blocks output 64 channels,
+whereas the final block outputs 320.
+We therefore use the final block for downstream evaluation.
+
+Batch size and learning rate. The teachers’ optimization frontier is flat
+(Table 7): across a 64-fold range of batch size and a fourfold range of
+learning rate, the best epoch of each configuration spans 1.1 pp for the amplitude view and
+0.7 pp for the shape view, with no interior optimum worth tuning for. We therefore train
+the teachers at batch 128 with learning rate $10^{-3}$ , which is best for the shape view and
+within 0.3 pp of best for the amplitude view, and note that the reference
+implementation’s batch of 8 is not better despite 16 times more updates. The student is
+trained at batch 512 with learning rate $4\times 10^{-3}$ purely for throughput at 2M scale;
+at 100K, where both are available, that substitution costs 0.18 pp (81.08 to 80.90%).
+
+Table 7: Teacher pre-training frontier at 100K (UCR random forest, best of the trained
+epochs, pre-training seed 42, %). Dashes are configurations we did not run.
+
+amplitude view
+
+shape view
+
+Batch
+ $10^{-3}$ 
+ $2\cdot 10^{-3}$ 
+ $4\cdot 10^{-3}$ 
+
+ $10^{-3}$ 
+ $2\cdot 10^{-3}$ 
+ $4\cdot 10^{-3}$ 
+
+8
+77.31
+–
+–
+
+79.80
+–
+–
+
+128
+77.53
+77.36
+–
+
+80.49
+80.33
+–
+
+256
+77.73
+77.82
+–
+
+80.01
+80.34
+–
+
+512
+77.52
+77.40
+76.70
+
+79.84
+80.25
+80.26
+
+## Appendix E Full results
+
+This section provides the complete per-dataset results that correspond to the aggregated Table 1.
+Tables 8–11 show UCR-128 and UEA-27 performance, each under the random-forest probe (200
+trees, mean over predictor seeds 0/1/2) and the StandardScaler plus logistic-regression
+probe (seed 0). Input handling
+follows each model’s prescribed configuration: ours, TiRex, Chronos-2, TiViT-H,
+TiConvNext and Catch22+ consume native lengths, while MOMENT, NuTime and Mantis
+interpolate to 512. The TS2Vec/ds column is the original TS2Vec trained on each dataset’s
+own training split (§C.1), so unlike every other column it is not a
+zero-shot result.
+
+Table 8: Per-dataset accuracy (%) on UCR-128 with the random-forest probe (mean over predictor seeds 0/1/2). TS2Vec / ds is the original TS2Vec trained on each dataset (the reference row of Table 1); TS2Vec-FM is our single frozen encoder. Best per row in bold.
+
+Dataset
+
+Catch22+
+
+MOMENT
+
+NuTime
+
+TiRex
+
+Chronos-2
+
+TiViT-H
+
+TiConvNext
+
+MantisV2
+
+TS2Vec / ds
+
+TS2Vec-FM
+
+ACSF1
+82.3
+82.0
+75.0
+85.0
+84.7
+85.0
+86.7
+82.3
+87.7
+86.7
+
+Adiac
+73.4
+78.9
+73.6
+78.5
+81.1
+70.6
+65.5
+84.8
+77.0
+80.6
+
+AllGestureWiimoteX
+59.6
+61.4
+65.0
+65.0
+60.4
+60.3
+66.8
+68.4
+70.5
+69.1
+
+AllGestureWiimoteY
+63.2
+66.2
+63.0
+70.5
+64.2
+65.1
+68.0
+69.1
+72.4
+74.7
+
+AllGestureWiimoteZ
+54.6
+57.7
+62.2
+60.6
+62.0
+61.3
+60.7
+68.8
+68.0
+69.7
+
+ArrowHead
+74.1
+79.4
+77.3
+78.9
+77.9
+76.4
+77.1
+80.6
+76.6
+81.1
+
+Beef
+68.9
+78.9
+66.7
+84.4
+73.3
+75.6
+82.2
+68.9
+67.8
+72.2
+
+BeetleFly
+78.3
+95.0
+80.0
+91.7
+86.7
+93.3
+95.0
+98.3
+80.0
+93.3
+
+BirdChicken
+85.0
+98.3
+96.7
+88.3
+90.0
+85.0
+100.0
+90.0
+95.0
+90.0
+
+BME
+100.0
+98.7
+84.7
+96.0
+96.7
+97.8
+99.3
+99.6
+90.2
+97.1
+
+Car
+75.6
+75.6
+76.7
+66.7
+73.9
+73.9
+72.2
+75.6
+78.9
+77.2
+
+CBF
+97.6
+96.8
+97.3
+99.1
+99.3
+99.8
+99.4
+99.5
+98.7
+98.4
+
+Chinatown
+98.0
+97.8
+92.8
+96.9
+97.2
+96.3
+87.2
+95.3
+97.4
+97.2
+
+ChlorineConcentration
+66.8
+69.7
+67.1
+70.2
+71.0
+70.8
+70.7
+70.4
+69.6
+68.2
+
+CinCECGTorso
+88.7
+68.3
+73.1
+89.8
+81.4
+81.6
+81.0
+80.9
+69.6
+72.2
+
+Coffee
+98.8
+92.9
+92.9
+98.8
+92.9
+100.0
+100.0
+100.0
+97.6
+100.0
+
+Computers
+73.5
+62.7
+76.3
+76.0
+74.1
+73.3
+74.1
+72.1
+64.8
+69.9
+
+CricketX
+69.7
+68.5
+66.7
+69.2
+69.9
+71.4
+66.4
+77.4
+68.5
+70.8
+
+CricketY
+69.2
+67.4
+68.9
+72.2
+71.4
+71.3
+66.5
+78.8
+70.4
+70.7
+
+CricketZ
+74.3
+74.9
+67.8
+72.5
+73.0
+76.4
+71.2
+81.7
+75.0
+75.3
+
+Crop
+75.2
+71.4
+67.5
+72.0
+72.1
+65.5
+64.1
+73.4
+73.3
+74.0
+
+DiatomSizeReduction
+94.0
+88.2
+86.2
+86.2
+90.0
+86.5
+90.1
+83.0
+91.5
+86.9
+
+DistalPhalanxOutlineAgeGroup
+71.7
+75.3
+73.9
+74.1
+78.2
+78.2
+77.7
+76.0
+72.4
+73.1
+
+DistalPhalanxOutlineCorrect
+79.1
+79.6
+77.8
+78.7
+80.3
+77.9
+75.5
+78.9
+78.7
+78.7
+
+DistalPhalanxTW
+64.7
+65.7
+68.8
+66.7
+69.3
+67.1
+69.5
+70.7
+66.2
+68.3
+
+DodgerLoopDay
+64.2
+45.8
+54.2
+50.4
+49.2
+44.2
+53.3
+53.3
+58.3
+63.6
+
+DodgerLoopGame
+83.3
+81.2
+78.3
+76.3
+83.3
+81.6
+78.3
+80.0
+85.7
+88.2
+
+DodgerLoopWeekend
+98.6
+97.6
+95.9
+94.9
+96.4
+92.8
+90.1
+95.2
+96.1
+98.4
+
+Earthquakes
+75.1
+74.6
+74.3
+74.8
+74.6
+74.1
+74.6
+74.3
+74.8
+74.8
+
+ECG200
+85.0
+87.0
+82.3
+86.0
+84.0
+83.0
+78.3
+83.7
+83.0
+84.0
+
+ECG5000
+94.0
+93.8
+93.3
+93.3
+93.3
+94.0
+93.9
+93.8
+93.7
+94.3
+
+ECGFiveDays
+79.8
+81.3
+78.7
+89.5
+91.0
+93.5
+97.1
+87.1
+99.9
+99.9
+
+ElectricDevices
+74.0
+72.6
+70.7
+70.4
+74.9
+76.2
+76.2
+74.2
+70.7
+72.5
+
+EOGHorizontalSignal
+59.5
+56.5
+45.2
+53.1
+53.9
+53.9
+56.3
+58.8
+58.4
+58.0
+
+EOGVerticalSignal
+50.9
+45.3
+26.7
+41.4
+38.4
+44.2
+37.6
+48.2
+46.7
+43.0
+
+EthanolLevel
+38.0
+44.0
+34.9
+30.6
+43.7
+40.5
+34.8
+37.9
+32.3
+58.8
+
+FaceAll
+76.8
+71.8
+64.9
+76.5
+70.2
+69.1
+68.7
+72.1
+74.6
+73.6
+
+FaceFour
+89.8
+76.9
+80.3
+79.2
+68.2
+64.8
+81.8
+91.7
+77.3
+91.3
+
+FacesUCR
+85.6
+79.6
+71.4
+80.0
+76.0
+78.1
+76.7
+84.4
+89.0
+85.1
+
+FiftyWords
+72.6
+71.0
+61.4
+63.8
+66.9
+64.2
+67.4
+71.1
+63.2
+66.4
+
+Fish
+76.2
+84.8
+91.6
+83.2
+86.3
+90.3
+90.7
+93.1
+90.7
+94.1
+
+FordA
+91.0
+86.1
+89.3
+94.1
+91.7
+89.7
+90.8
+93.0
+92.4
+91.5
+
+FordB
+72.9
+73.7
+75.3
+81.4
+79.2
+77.9
+76.3
+79.8
+76.6
+77.9
+
+FreezerRegularTrain
+100.0
+91.1
+97.7
+92.6
+97.2
+98.3
+99.1
+98.6
+98.4
+97.9
+
+FreezerSmallTrain
+92.5
+78.8
+94.0
+82.1
+91.8
+93.5
+95.6
+93.5
+83.2
+96.3
+
+Fungi
+92.3
+100.0
+70.1
+84.1
+91.0
+91.4
+88.4
+94.3
+94.4
+98.0
+
+GestureMidAirD1
+67.9
+67.4
+65.6
+66.2
+66.9
+70.0
+73.6
+71.3
+62.1
+62.8
+
+GestureMidAirD2
+62.1
+57.7
+56.7
+65.1
+74.4
+66.7
+67.9
+61.5
+54.1
+61.3
+
+GestureMidAirD3
+39.2
+38.5
+39.2
+39.0
+35.4
+44.1
+46.9
+43.8
+38.2
+30.8
+
+GesturePebbleZ1
+87.8
+87.8
+89.1
+87.0
+88.6
+86.6
+82.9
+92.1
+89.5
+89.5
+
+GesturePebbleZ2
+73.8
+86.5
+83.8
+87.6
+81.9
+84.4
+84.4
+91.1
+83.8
+85.7
+
+GunPoint
+94.7
+98.7
+94.2
+96.4
+99.6
+99.3
+96.7
+97.8
+95.3
+99.3
+
+GunPointAgeSpan
+98.8
+95.3
+97.2
+98.2
+98.5
+98.7
+96.7
+98.4
+99.2
+99.5
+
+GunPointMaleVersusFemale
+99.4
+99.2
+97.9
+99.5
+98.8
+99.7
+99.8
+100.0
+100.0
+100.0
+
+GunPointOldVersusYoung
+100.0
+96.0
+100.0
+96.7
+97.8
+98.5
+99.4
+99.7
+100.0
+100.0
+
+Ham
+60.6
+73.3
+71.1
+71.4
+64.1
+65.1
+63.5
+67.0
+78.7
+73.3
+
+HandOutlines
+90.4
+90.9
+89.6
+87.6
+91.1
+88.7
+88.7
+90.4
+91.7
+91.8
+
+Haptics
+48.4
+52.4
+47.4
+52.7
+54.4
+50.8
+51.4
+50.1
+48.1
+50.4
+
+Herring
+52.1
+58.9
+64.6
+63.5
+66.7
+59.4
+55.7
+63.0
+60.9
+64.1
+
+HouseTwenty
+96.9
+93.8
+88.5
+96.9
+95.8
+97.8
+95.0
+95.2
+95.0
+73.9
+
+InlineSkate
+38.9
+32.2
+32.0
+44.9
+41.9
+38.5
+45.8
+38.5
+39.9
+44.0
+
+InsectEPGRegularTrain
+100.0
+93.0
+100.0
+96.9
+95.2
+100.0
+98.9
+100.0
+100.0
+100.0
+
+InsectEPGSmallTrain
+100.0
+82.5
+100.0
+88.9
+87.1
+94.5
+95.0
+100.0
+100.0
+100.0
+
+InsectWingbeatSound
+62.9
+62.6
+51.7
+65.1
+62.7
+52.6
+53.7
+60.6
+61.8
+63.6
+
+ItalyPowerDemand
+95.4
+94.8
+87.4
+96.2
+95.6
+87.8
+92.5
+92.5
+91.8
+95.3
+
+LargeKitchenAppliances
+81.7
+73.4
+75.6
+80.5
+87.3
+81.6
+87.0
+76.6
+82.7
+87.0
+
+Lightning2
+73.2
+78.7
+67.8
+74.3
+72.7
+76.0
+74.3
+72.7
+80.9
+76.0
+
+Lightning7
+76.7
+73.5
+65.8
+73.5
+65.3
+74.9
+73.1
+72.1
+78.1
+72.6
+
+Mallat
+95.6
+91.6
+83.1
+91.7
+90.2
+90.3
+83.9
+88.9
+88.1
+93.5
+
+Meat
+92.2
+92.2
+92.8
+86.1
+93.3
+83.9
+86.7
+91.1
+93.3
+92.8
+
+MedicalImages
+77.4
+71.4
+71.3
+70.9
+72.5
+75.0
+73.7
+75.2
+71.6
+71.5
+
+MelbournePedestrian
+96.0
+86.4
+91.7
+88.1
+89.3
+80.7
+81.9
+95.1
+94.9
+95.8
+
+MiddlePhalanxOutlineAgeGroup
+59.5
+56.5
+60.6
+60.0
+55.8
+60.4
+63.0
+58.0
+59.5
+56.5
+
+MiddlePhalanxOutlineCorrect
+81.1
+85.8
+78.9
+81.8
+87.2
+82.5
+81.6
+83.4
+84.1
+81.3
+
+MiddlePhalanxTW
+58.4
+57.8
+52.8
+57.4
+57.1
+55.2
+56.9
+53.2
+55.6
+58.0
+
+MixedShapesRegularTrain
+93.1
+91.7
+93.8
+94.7
+94.3
+95.1
+95.6
+94.7
+89.1
+92.7
+
+MixedShapesSmallTrain
+88.3
+85.1
+90.8
+90.9
+90.2
+91.9
+91.8
+91.6
+82.6
+87.5
+
+MoteStrain
+88.2
+89.0
+94.8
+91.9
+93.3
+85.9
+90.5
+93.1
+88.9
+89.5
+
+NonInvasiveFetalECGThorax1
+88.8
+88.6
+78.0
+86.6
+83.0
+81.4
+82.4
+86.4
+88.0
+91.9
+
+NonInvasiveFetalECGThorax2
+90.9
+91.0
+81.7
+88.8
+86.8
+87.5
+86.9
+88.7
+91.6
+93.8
+
+OliveOil
+84.4
+88.9
+70.0
+87.8
+85.6
+57.8
+85.6
+86.7
+86.7
+90.0
+
+OSULeaf
+68.3
+75.2
+80.0
+91.7
+89.5
+94.6
+97.9
+93.5
+67.2
+81.5
+
+PhalangesOutlinesCorrect
+82.5
+82.2
+77.7
+82.0
+83.5
+79.6
+79.5
+82.4
+83.6
+82.7
+
+Phoneme
+32.2
+29.4
+29.1
+37.7
+39.4
+35.5
+37.4
+36.4
+28.4
+30.8
+
+PickupGestureWiimoteZ
+69.3
+58.7
+66.7
+73.3
+68.0
+82.0
+82.0
+78.7
+87.3
+88.0
+
+PigAirwayPressure
+23.7
+10.7
+34.8
+34.6
+33.3
+47.4
+57.7
+49.0
+59.8
+37.3
+
+PigArtPressure
+89.1
+53.7
+93.6
+87.3
+80.6
+81.7
+90.9
+93.4
+91.2
+92.5
+
+PigCVP
+51.3
+44.1
+82.9
+83.5
+67.3
+67.9
+71.3
+89.7
+75.2
+88.6
+
+PLAID
+87.5
+73.9
+77.7
+86.8
+85.9
+87.1
+89.2
+81.9
+29.5
+87.5
+
+Plane
+100.0
+99.7
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+
+PowerCons
+99.4
+94.1
+93.3
+89.8
+94.1
+89.1
+90.7
+96.5
+97.4
+95.9
+
+ProximalPhalanxOutlineAgeGroup
+84.7
+83.4
+85.0
+85.2
+85.7
+85.4
+85.4
+82.9
+83.4
+84.7
+
+ProximalPhalanxOutlineCorrect
+86.5
+86.0
+83.7
+87.7
+87.1
+85.1
+83.3
+86.7
+90.0
+89.0
+
+ProximalPhalanxTW
+80.3
+81.1
+81.5
+80.7
+79.8
+77.7
+79.2
+82.1
+80.7
+81.6
+
+RefrigerationDevices
+54.9
+54.9
+53.7
+56.8
+55.0
+54.7
+59.1
+56.4
+57.2
+55.6
+
+Rock
+62.0
+83.3
+65.3
+90.0
+87.3
+89.3
+90.0
+82.0
+42.0
+74.7
+
+ScreenType
+52.7
+42.8
+50.6
+51.6
+48.7
+54.5
+54.0
+46.0
+44.4
+49.3
+
+SemgHandGenderCh2
+92.7
+77.8
+85.6
+88.2
+89.1
+83.9
+87.2
+91.4
+91.6
+90.2
+
+SemgHandMovementCh2
+86.1
+42.5
+67.6
+64.9
+62.6
+53.7
+59.7
+73.1
+77.2
+69.1
+
+SemgHandSubjectCh2
+88.4
+65.0
+76.2
+82.4
+82.6
+78.2
+82.4
+83.4
+85.3
+81.5
+
+ShakeGestureWiimoteZ
+84.7
+84.0
+91.3
+88.0
+86.0
+84.7
+82.7
+93.3
+86.7
+91.3
+
+ShapeletSim
+97.0
+95.9
+92.0
+94.3
+100.0
+100.0
+100.0
+95.9
+98.1
+100.0
+
+ShapesAll
+82.1
+83.2
+83.9
+83.6
+88.4
+86.8
+84.4
+87.0
+86.6
+87.3
+
+SmallKitchenAppliances
+83.0
+71.1
+82.0
+83.8
+83.7
+82.8
+83.0
+83.7
+77.5
+78.6
+
+SmoothSubspace
+98.7
+95.8
+87.3
+92.2
+92.9
+93.3
+92.7
+95.1
+93.8
+95.1
+
+SonyAIBORobotSurface1
+84.0
+85.4
+80.9
+86.2
+66.3
+78.8
+76.4
+82.3
+81.3
+90.6
+
+SonyAIBORobotSurface2
+88.4
+82.8
+83.9
+82.5
+84.7
+90.4
+91.9
+92.2
+88.1
+89.4
+
+StarLightCurves
+97.0
+97.7
+97.9
+97.9
+98.0
+97.9
+98.0
+98.1
+96.9
+98.1
+
+Strawberry
+93.3
+95.7
+93.6
+95.3
+94.3
+92.7
+94.1
+95.9
+96.1
+95.7
+
+SwedishLeaf
+91.1
+92.1
+92.2
+93.8
+93.8
+94.1
+93.8
+95.5
+91.4
+93.0
+
+Symbols
+96.2
+93.8
+93.9
+93.7
+97.5
+97.8
+97.6
+97.0
+96.4
+98.1
+
+SyntheticControl
+99.2
+95.8
+97.2
+98.7
+99.3
+99.6
+99.8
+99.0
+99.3
+99.7
+
+ToeSegmentation1
+85.5
+93.1
+84.4
+94.7
+92.4
+94.2
+86.1
+95.5
+93.4
+92.7
+
+ToeSegmentation2
+78.5
+84.6
+73.8
+90.3
+87.7
+85.6
+85.1
+88.2
+88.2
+91.3
+
+Trace
+100.0
+99.0
+99.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+
+TwoLeadECG
+85.8
+94.8
+91.7
+95.1
+93.1
+99.4
+98.3
+99.6
+97.2
+99.6
+
+TwoPatterns
+99.4
+91.6
+85.0
+98.1
+90.8
+94.7
+96.9
+98.2
+99.8
+98.8
+
+UMD
+94.0
+98.4
+93.5
+91.9
+99.3
+98.6
+99.1
+98.1
+97.0
+98.8
+
+UWaveGestureLibraryAll
+94.5
+91.6
+88.8
+90.7
+92.3
+86.4
+87.0
+88.5
+86.6
+87.3
+
+UWaveGestureLibraryX
+80.6
+79.4
+81.2
+78.2
+80.4
+79.5
+79.9
+81.3
+77.3
+77.6
+
+UWaveGestureLibraryY
+72.5
+71.4
+73.9
+72.4
+73.4
+73.9
+76.3
+75.7
+69.1
+70.6
+
+UWaveGestureLibraryZ
+75.2
+73.4
+75.2
+73.6
+74.6
+74.3
+75.6
+75.9
+74.5
+72.9
+
+Wafer
+99.9
+98.8
+99.3
+99.9
+98.5
+99.5
+99.9
+99.4
+99.0
+99.5
+
+Wine
+63.6
+75.3
+71.0
+63.0
+87.0
+51.2
+66.0
+80.9
+76.5
+74.7
+
+WordSynonyms
+63.9
+61.9
+53.0
+52.0
+57.1
+56.7
+55.7
+61.8
+57.9
+56.2
+
+Worms
+72.3
+73.6
+72.3
+80.1
+76.6
+83.1
+80.1
+75.8
+64.9
+82.7
+
+WormsTwoClass
+81.8
+80.1
+78.4
+84.8
+81.4
+83.5
+82.3
+81.8
+85.7
+83.5
+
+Yoga
+82.9
+83.7
+82.1
+76.8
+81.6
+80.9
+81.4
+84.8
+84.2
+83.4
+
+Mean
+79.69
+77.89
+77.32
+80.13
+80.02
+79.43
+80.29
+81.95
+79.83
+81.76
+
+Table 9: Per-dataset accuracy (%) on UCR-128 with the logistic-regression probe. Columns as in Table 8.
+
+Dataset
+
+Catch22+
+
+MOMENT
+
+NuTime
+
+TiRex
+
+Chronos-2
+
+TiViT-H
+
+TiConvNext
+
+MantisV2
+
+TS2Vec / ds
+
+TS2Vec-FM
+
+ACSF1
+70.0
+75.0
+70.0
+75.0
+86.0
+83.0
+83.0
+76.0
+85.0
+85.0
+
+Adiac
+66.5
+77.7
+80.1
+78.3
+82.9
+71.9
+70.6
+83.6
+77.5
+80.3
+
+AllGestureWiimoteX
+54.9
+66.1
+60.7
+70.1
+68.4
+67.0
+69.4
+73.0
+72.0
+74.7
+
+AllGestureWiimoteY
+52.3
+70.3
+65.3
+73.1
+70.4
+73.7
+72.3
+74.7
+75.0
+77.1
+
+AllGestureWiimoteZ
+48.3
+60.6
+54.1
+63.4
+66.0
+67.7
+65.9
+68.1
+65.6
+72.3
+
+ArrowHead
+71.4
+77.7
+72.6
+78.3
+85.1
+82.3
+82.3
+85.1
+78.9
+82.9
+
+Beef
+63.3
+80.0
+73.3
+93.3
+70.0
+76.7
+83.3
+73.3
+73.3
+76.7
+
+BeetleFly
+70.0
+95.0
+70.0
+90.0
+80.0
+85.0
+95.0
+85.0
+80.0
+85.0
+
+BirdChicken
+80.0
+100.0
+100.0
+90.0
+90.0
+90.0
+95.0
+90.0
+90.0
+90.0
+
+BME
+99.3
+99.3
+96.7
+99.3
+100.0
+100.0
+100.0
+100.0
+96.7
+99.3
+
+Car
+83.3
+90.0
+73.3
+80.0
+85.0
+81.7
+85.0
+81.7
+88.3
+88.3
+
+CBF
+97.3
+98.9
+99.0
+99.7
+100.0
+99.9
+99.9
+99.7
+99.8
+99.6
+
+Chinatown
+97.7
+98.3
+96.2
+98.3
+98.5
+96.8
+93.9
+96.2
+97.7
+98.3
+
+ChlorineConcentration
+58.9
+77.9
+60.9
+80.2
+76.7
+76.2
+77.7
+71.1
+75.9
+76.6
+
+CinCECGTorso
+84.3
+76.8
+85.5
+95.7
+89.9
+93.6
+94.2
+85.1
+78.1
+80.2
+
+Coffee
+100.0
+96.4
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+
+Computers
+66.8
+61.2
+78.8
+80.0
+76.8
+76.4
+82.8
+70.4
+66.0
+70.8
+
+CricketX
+61.0
+74.4
+70.5
+70.0
+75.6
+75.9
+74.9
+78.2
+72.8
+78.2
+
+CricketY
+59.5
+70.8
+69.0
+75.4
+73.6
+78.7
+74.6
+81.5
+74.6
+78.2
+
+CricketZ
+63.3
+74.4
+65.9
+73.3
+72.3
+79.7
+75.9
+81.3
+80.0
+81.5
+
+Crop
+68.7
+72.3
+69.0
+70.3
+71.6
+68.7
+67.4
+73.5
+73.4
+72.8
+
+DiatomSizeReduction
+96.7
+94.1
+91.5
+92.8
+94.8
+96.7
+96.7
+92.8
+96.7
+94.1
+
+DistalPhalanxOutlineAgeGroup
+71.2
+66.9
+70.5
+74.8
+74.1
+71.2
+72.7
+77.7
+71.2
+73.4
+
+DistalPhalanxOutlineCorrect
+75.4
+75.4
+74.3
+75.0
+76.4
+75.4
+76.8
+76.8
+76.8
+74.3
+
+DistalPhalanxTW
+61.9
+62.6
+68.3
+65.5
+65.5
+66.9
+65.5
+68.3
+65.5
+66.9
+
+DodgerLoopDay
+57.5
+43.8
+55.0
+55.0
+52.5
+50.0
+56.2
+50.0
+51.2
+67.5
+
+DodgerLoopGame
+85.5
+84.1
+81.9
+79.0
+89.1
+84.1
+84.1
+86.2
+83.3
+91.3
+
+DodgerLoopWeekend
+97.8
+98.6
+96.4
+95.7
+96.4
+94.9
+91.3
+97.1
+96.4
+98.4
+
+Earthquakes
+74.1
+70.5
+73.4
+69.1
+74.8
+70.5
+69.8
+71.9
+69.8
+72.7
+
+ECG200
+85.0
+90.0
+85.0
+83.0
+84.0
+86.0
+86.0
+88.0
+87.0
+91.0
+
+ECG5000
+93.9
+93.3
+91.9
+93.9
+93.4
+93.8
+93.1
+93.5
+93.7
+94.3
+
+ECGFiveDays
+87.0
+97.0
+89.9
+97.6
+99.1
+97.9
+99.0
+99.3
+100.0
+99.7
+
+ElectricDevices
+67.5
+74.0
+67.9
+67.1
+71.7
+76.3
+77.6
+71.8
+66.4
+68.4
+
+EOGHorizontalSignal
+52.8
+56.4
+53.3
+57.2
+58.8
+59.7
+57.5
+56.9
+54.1
+60.8
+
+EOGVerticalSignal
+47.8
+50.0
+33.1
+41.7
+43.9
+47.2
+42.5
+51.4
+49.7
+42.5
+
+EthanolLevel
+56.8
+68.2
+52.0
+50.8
+65.4
+58.4
+58.0
+59.2
+48.6
+64.6
+
+FaceAll
+80.2
+77.9
+72.1
+78.8
+75.3
+75.2
+73.7
+75.7
+89.3
+79.4
+
+FaceFour
+88.6
+87.5
+96.6
+95.5
+90.9
+87.5
+92.0
+98.9
+89.8
+94.3
+
+FacesUCR
+85.0
+89.1
+82.0
+87.8
+85.8
+87.5
+85.6
+91.2
+94.1
+93.8
+
+FiftyWords
+72.3
+77.6
+71.6
+72.3
+79.6
+78.7
+77.1
+82.0
+79.8
+82.0
+
+Fish
+86.3
+96.0
+91.4
+90.3
+94.3
+94.9
+97.1
+96.0
+97.7
+96.6
+
+FordA
+87.4
+90.6
+90.6
+94.7
+92.8
+91.4
+92.3
+94.3
+90.7
+91.2
+
+FordB
+72.7
+75.6
+76.5
+81.6
+80.7
+79.6
+77.9
+81.0
+76.4
+73.6
+
+FreezerRegularTrain
+99.2
+98.8
+99.4
+99.1
+99.5
+99.6
+99.8
+99.6
+99.1
+99.2
+
+FreezerSmallTrain
+94.1
+81.9
+98.6
+89.1
+96.9
+98.4
+99.0
+98.5
+93.5
+94.2
+
+Fungi
+91.9
+100.0
+74.7
+95.2
+94.6
+97.8
+99.5
+97.3
+96.2
+97.8
+
+GestureMidAirD1
+62.3
+68.5
+68.5
+69.2
+73.1
+75.4
+76.2
+77.7
+66.2
+66.2
+
+GestureMidAirD2
+63.8
+57.7
+56.2
+61.5
+70.0
+66.2
+67.7
+64.6
+60.8
+68.5
+
+GestureMidAirD3
+40.8
+36.9
+44.6
+40.8
+35.4
+46.9
+49.2
+44.6
+39.2
+35.4
+
+GesturePebbleZ1
+82.0
+89.5
+89.5
+88.4
+90.1
+90.7
+85.5
+93.0
+91.9
+90.7
+
+GesturePebbleZ2
+70.3
+89.2
+77.2
+84.2
+86.7
+85.4
+81.6
+90.5
+86.1
+84.2
+
+GunPoint
+92.7
+100.0
+97.3
+98.0
+99.3
+99.3
+99.3
+98.0
+98.0
+100.0
+
+GunPointAgeSpan
+94.3
+97.8
+96.8
+99.1
+99.1
+99.4
+98.7
+99.4
+98.7
+98.1
+
+GunPointMaleVersusFemale
+100.0
+99.7
+98.7
+99.4
+99.4
+100.0
+99.7
+100.0
+100.0
+100.0
+
+GunPointOldVersusYoung
+100.0
+92.7
+100.0
+96.5
+97.8
+98.7
+99.4
+99.7
+100.0
+100.0
+
+Ham
+62.9
+65.7
+73.3
+70.5
+69.5
+74.3
+72.4
+70.5
+73.3
+73.3
+
+HandOutlines
+88.4
+94.1
+88.6
+87.6
+93.8
+94.3
+92.2
+93.0
+91.9
+93.8
+
+Haptics
+41.9
+49.0
+42.5
+47.7
+50.3
+49.4
+52.3
+50.3
+48.4
+49.7
+
+Herring
+57.8
+64.1
+53.1
+60.9
+51.6
+53.1
+60.9
+68.8
+67.2
+70.3
+
+HouseTwenty
+95.0
+93.3
+89.9
+98.3
+97.5
+98.3
+98.3
+93.3
+93.3
+78.2
+
+InlineSkate
+37.8
+36.4
+35.6
+43.8
+43.6
+39.8
+44.7
+39.1
+42.4
+44.5
+
+InsectEPGRegularTrain
+99.2
+94.8
+100.0
+99.6
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+
+InsectEPGSmallTrain
+93.2
+83.5
+100.0
+95.6
+92.0
+98.8
+98.8
+100.0
+100.0
+100.0
+
+InsectWingbeatSound
+58.2
+62.1
+51.0
+62.5
+63.1
+55.1
+56.5
+59.6
+63.4
+62.6
+
+ItalyPowerDemand
+93.9
+95.4
+91.2
+96.0
+96.4
+94.1
+93.8
+94.6
+95.5
+96.2
+
+LargeKitchenAppliances
+83.7
+76.0
+77.1
+82.9
+86.1
+87.2
+89.3
+81.6
+85.6
+89.3
+
+Lightning2
+75.4
+78.7
+73.8
+73.8
+78.7
+82.0
+83.6
+78.7
+88.5
+80.3
+
+Lightning7
+69.9
+74.0
+78.1
+80.8
+79.5
+84.9
+76.7
+86.3
+84.9
+78.1
+
+Mallat
+88.7
+91.9
+84.9
+95.5
+94.7
+97.7
+96.4
+92.0
+88.5
+91.1
+
+Meat
+93.3
+100.0
+93.3
+90.0
+93.3
+81.7
+85.0
+96.7
+91.7
+93.3
+
+MedicalImages
+67.9
+74.6
+70.9
+72.5
+74.7
+73.2
+75.1
+77.1
+76.1
+78.7
+
+MelbournePedestrian
+90.3
+89.5
+93.3
+89.4
+90.5
+86.3
+87.0
+95.8
+94.7
+96.5
+
+MiddlePhalanxOutlineAgeGroup
+55.8
+50.6
+55.2
+48.7
+55.2
+55.8
+52.6
+54.5
+50.6
+48.1
+
+MiddlePhalanxOutlineCorrect
+77.7
+80.8
+74.9
+80.8
+83.5
+79.4
+81.8
+84.2
+78.7
+82.8
+
+MiddlePhalanxTW
+54.5
+54.5
+44.2
+50.0
+50.0
+51.9
+48.1
+51.3
+51.3
+55.2
+
+MixedShapesRegularTrain
+91.5
+93.6
+93.6
+97.0
+96.7
+97.8
+97.8
+97.4
+91.5
+94.6
+
+MixedShapesSmallTrain
+86.9
+89.0
+92.1
+93.6
+93.9
+95.0
+95.4
+94.6
+85.2
+91.3
+
+MoteStrain
+85.0
+90.5
+95.5
+92.4
+92.6
+91.6
+90.7
+93.9
+87.4
+89.3
+
+NonInvasiveFetalECGThorax1
+89.9
+92.4
+85.4
+89.9
+88.4
+90.0
+89.1
+92.9
+93.1
+95.1
+
+NonInvasiveFetalECGThorax2
+91.8
+93.7
+90.3
+90.3
+91.3
+92.4
+92.3
+93.6
+93.7
+95.4
+
+OliveOil
+83.3
+90.0
+76.7
+93.3
+83.3
+73.3
+90.0
+86.7
+83.3
+90.0
+
+OSULeaf
+73.6
+79.3
+86.0
+93.8
+93.8
+98.3
+99.2
+96.3
+77.7
+86.8
+
+PhalangesOutlinesCorrect
+74.6
+81.4
+74.7
+79.3
+82.3
+80.0
+78.3
+79.5
+80.8
+81.4
+
+Phoneme
+24.2
+30.0
+27.6
+39.0
+41.7
+39.6
+39.7
+35.5
+28.1
+30.4
+
+PickupGestureWiimoteZ
+66.0
+70.0
+64.0
+84.0
+66.0
+92.0
+88.0
+76.0
+88.0
+90.0
+
+PigAirwayPressure
+14.4
+11.1
+45.2
+41.8
+41.8
+63.0
+74.5
+57.7
+56.2
+32.7
+
+PigArtPressure
+76.4
+54.8
+94.2
+88.9
+84.1
+88.9
+93.3
+90.9
+94.7
+88.9
+
+PigCVP
+41.8
+53.4
+88.5
+86.5
+78.8
+79.3
+83.2
+93.8
+84.1
+94.2
+
+PLAID
+65.4
+78.6
+75.6
+87.0
+88.6
+91.8
+93.1
+85.3
+26.3
+90.5
+
+Plane
+99.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+
+PowerCons
+98.9
+95.6
+97.2
+93.9
+93.3
+90.6
+92.2
+97.2
+96.7
+97.2
+
+ProximalPhalanxOutlineAgeGroup
+83.9
+82.9
+85.4
+84.9
+83.4
+82.9
+82.9
+83.9
+81.5
+82.4
+
+ProximalPhalanxOutlineCorrect
+84.5
+88.7
+83.8
+88.7
+88.3
+87.3
+86.3
+87.6
+88.3
+90.4
+
+ProximalPhalanxTW
+79.0
+79.5
+78.5
+76.1
+75.6
+76.1
+74.6
+76.1
+78.5
+79.5
+
+RefrigerationDevices
+53.3
+51.5
+56.3
+54.1
+56.8
+57.6
+59.7
+52.5
+57.9
+57.9
+
+Rock
+80.0
+90.0
+76.0
+88.0
+90.0
+96.0
+92.0
+84.0
+64.0
+90.0
+
+ScreenType
+46.9
+39.2
+46.9
+52.8
+53.9
+53.6
+49.9
+50.9
+38.7
+46.9
+
+SemgHandGenderCh2
+92.0
+76.5
+86.2
+85.8
+88.8
+90.2
+91.0
+89.7
+90.5
+90.0
+
+SemgHandMovementCh2
+65.8
+44.4
+62.4
+52.0
+57.6
+56.0
+59.1
+62.4
+80.9
+62.4
+
+SemgHandSubjectCh2
+82.7
+70.9
+75.6
+81.3
+84.4
+86.4
+84.9
+85.3
+90.4
+85.3
+
+ShakeGestureWiimoteZ
+82.0
+84.0
+90.0
+88.0
+92.0
+84.0
+86.0
+92.0
+94.0
+92.0
+
+ShapeletSim
+95.6
+96.7
+92.8
+96.7
+100.0
+100.0
+100.0
+97.8
+97.8
+100.0
+
+ShapesAll
+78.0
+84.8
+87.2
+86.3
+89.7
+91.2
+89.7
+90.2
+88.2
+91.0
+
+SmallKitchenAppliances
+77.3
+61.1
+82.9
+81.3
+81.1
+82.1
+82.7
+78.7
+70.9
+72.5
+
+SmoothSubspace
+94.0
+98.0
+94.7
+96.7
+96.7
+96.7
+98.0
+97.3
+96.7
+98.0
+
+SonyAIBORobotSurface1
+75.9
+82.5
+81.5
+93.7
+82.4
+86.4
+85.0
+83.4
+82.9
+89.5
+
+SonyAIBORobotSurface2
+92.8
+89.1
+88.4
+89.1
+88.5
+93.8
+94.5
+93.7
+87.2
+93.5
+
+StarLightCurves
+96.0
+96.4
+97.5
+97.4
+97.5
+97.4
+97.2
+97.3
+96.2
+97.6
+
+Strawberry
+94.3
+96.2
+95.9
+96.5
+97.3
+95.7
+95.4
+96.2
+96.2
+98.1
+
+SwedishLeaf
+89.8
+93.1
+93.9
+95.4
+94.7
+95.8
+94.6
+97.3
+93.1
+94.7
+
+Symbols
+95.5
+95.6
+96.9
+96.7
+98.4
+98.6
+98.6
+97.7
+95.6
+92.4
+
+SyntheticControl
+98.0
+97.7
+97.3
+99.3
+99.7
+100.0
+100.0
+99.0
+99.7
+99.3
+
+ToeSegmentation1
+75.9
+94.7
+84.2
+96.9
+91.7
+93.9
+90.4
+96.5
+93.4
+93.9
+
+ToeSegmentation2
+76.9
+90.8
+86.9
+91.5
+86.2
+90.0
+87.7
+93.1
+92.3
+91.5
+
+Trace
+100.0
+99.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+
+TwoLeadECG
+95.1
+99.2
+96.2
+98.5
+99.3
+100.0
+99.3
+99.9
+99.5
+99.8
+
+TwoPatterns
+97.9
+99.2
+94.2
+99.6
+99.5
+99.8
+99.9
+99.7
+100.0
+99.9
+
+UMD
+99.3
+99.3
+97.2
+95.8
+99.3
+99.3
+99.3
+99.3
+98.6
+99.3
+
+UWaveGestureLibraryAll
+91.7
+96.0
+93.2
+94.3
+95.9
+94.4
+93.7
+95.1
+92.0
+93.0
+
+UWaveGestureLibraryX
+78.1
+79.3
+80.0
+80.0
+82.1
+83.1
+84.2
+84.5
+78.2
+81.2
+
+UWaveGestureLibraryY
+68.8
+71.4
+69.6
+70.7
+73.9
+77.4
+77.4
+76.6
+66.6
+72.9
+
+UWaveGestureLibraryZ
+71.7
+74.0
+75.5
+73.3
+75.5
+77.4
+77.4
+77.5
+72.3
+74.9
+
+Wafer
+99.4
+99.4
+99.6
+99.9
+99.8
+99.9
+100.0
+99.7
+99.6
+99.6
+
+Wine
+70.4
+83.3
+77.8
+87.0
+85.2
+66.7
+83.3
+83.3
+79.6
+77.8
+
+WordSynonyms
+56.4
+68.5
+60.0
+59.9
+66.8
+67.7
+67.7
+71.2
+68.3
+71.0
+
+Worms
+58.4
+68.8
+76.6
+79.2
+77.9
+77.9
+85.7
+77.9
+64.9
+79.2
+
+WormsTwoClass
+72.7
+75.3
+67.5
+80.5
+80.5
+81.8
+84.4
+79.2
+63.6
+77.9
+
+Yoga
+71.1
+85.1
+74.9
+79.5
+81.9
+84.0
+87.9
+85.6
+85.0
+86.2
+
+Mean
+77.04
+79.84
+79.05
+82.02
+82.44
+82.88
+83.47
+83.60
+81.36
+83.32
+
+Table 10: Per-dataset accuracy (%) on UEA-27 with the random-forest probe (mean over predictor seeds 0/1/2). TS2Vec/ds is the original TS2Vec trained on each dataset (the reference row of Table 1); TS2Vec-FM is our single frozen encoder. Best per row in bold.
+
+Dataset
+
+Catch22+
+
+MOMENT
+
+NuTime
+
+TiRex
+
+Chronos-2
+
+TiViT-H
+
+TiConvNext
+
+MantisV2
+
+TS2Vec/ds
+
+TS2Vec-FM
+
+ArticularyWordRecognition
+96.0
+98.4
+99.1
+99.0
+99.3
+98.3
+98.0
+99.2
+96.0
+99.1
+
+BasicMotions
+100.0
+97.5
+100.0
+96.7
+100.0
+98.3
+100.0
+100.0
+99.2
+100.0
+
+CharacterTrajectories
+98.1
+97.0
+96.7
+96.0
+96.3
+93.7
+95.2
+97.6
+98.7
+98.6
+
+Cricket
+94.4
+97.2
+99.1
+99.5
+98.6
+100.0
+99.5
+98.6
+97.7
+98.6
+
+DuckDuckGeese
+51.3
+44.7
+42.7
+42.0
+41.3
+43.3
+44.0
+54.0
+53.3
+50.7
+
+EigenWorms
+87.5
+76.1
+73.5
+78.6
+80.2
+88.8
+93.1
+81.4
+82.4
+88.0
+
+Epilepsy
+98.6
+99.3
+100.0
+100.0
+100.0
+100.0
+100.0
+99.8
+92.5
+98.8
+
+ERing
+88.3
+96.8
+97.7
+97.7
+98.8
+98.1
+96.3
+98.8
+84.2
+92.7
+
+EthanolConcentration
+42.7
+29.5
+41.3
+27.5
+34.9
+38.7
+36.6
+41.8
+30.9
+35.6
+
+FaceDetection
+52.7
+55.4
+56.9
+61.3
+57.2
+55.0
+53.2
+54.9
+50.9
+53.5
+
+FingerMovements
+49.7
+53.0
+52.7
+52.0
+52.3
+53.7
+53.3
+55.0
+52.0
+54.0
+
+HandMovementDirection
+33.8
+29.3
+28.8
+31.5
+27.5
+28.8
+32.9
+27.9
+32.9
+29.3
+
+Handwriting
+28.1
+26.0
+20.5
+25.3
+25.8
+23.7
+24.9
+28.1
+39.6
+30.7
+
+Heartbeat
+75.0
+73.2
+77.6
+72.5
+73.2
+72.5
+73.5
+79.2
+74.8
+77.6
+
+InsectWingbeatSubset
+36.2
+26.7
+61.4
+28.7
+28.0
+32.0
+32.4
+60.7
+27.4
+63.9
+
+JapaneseVowels
+95.5
+88.5
+93.4
+89.3
+81.6
+88.2
+87.2
+94.0
+98.2
+94.0
+
+Libras
+83.9
+84.6
+87.8
+89.6
+86.5
+90.4
+90.7
+92.4
+82.8
+83.3
+
+LSST
+61.6
+63.1
+56.7
+57.3
+58.9
+59.5
+60.0
+66.0
+54.3
+66.7
+
+MotorImagery
+43.3
+52.3
+48.0
+49.3
+53.0
+51.0
+49.0
+46.7
+49.3
+55.0
+
+NATOPS
+71.5
+83.5
+83.3
+83.0
+83.9
+86.9
+85.7
+88.9
+89.3
+89.1
+
+PEMS-SF
+84.0
+99.6
+99.2
+99.6
+99.6
+97.3
+97.7
+99.6
+67.1
+100.0
+
+PhonemeSpectra
+25.0
+21.1
+26.6
+26.9
+27.1
+27.1
+27.1
+32.1
+20.3
+25.9
+
+RacketSports
+80.0
+84.6
+91.2
+83.6
+82.5
+85.3
+85.1
+91.0
+85.5
+89.0
+
+SelfRegulationSCP1
+77.0
+77.5
+79.5
+78.8
+78.5
+79.9
+79.3
+81.3
+78.7
+76.2
+
+SelfRegulationSCP2
+49.3
+49.1
+50.7
+49.6
+51.7
+49.1
+50.6
+51.7
+55.2
+52.4
+
+SpokenArabicDigits
+89.0
+94.5
+90.2
+75.5
+76.2
+89.3
+91.4
+93.7
+94.8
+96.0
+
+UWaveGestureLibrary
+87.6
+89.2
+88.9
+86.1
+88.3
+85.4
+81.6
+89.0
+88.5
+88.5
+
+Mean
+69.63
+69.91
+71.99
+69.52
+69.67
+70.91
+71.05
+74.20
+69.50
+73.60
+
+Table 11: Per-dataset accuracy (%) on UEA-27 with the logistic-regression probe. Columns as in Table 10.
+
+Dataset
+
+Catch22+
+
+MOMENT
+
+NuTime
+
+TiRex
+
+Chronos-2
+
+TiViT-H
+
+TiConvNext
+
+MantisV2
+
+TS2Vec/ds
+
+TS2Vec-FM
+
+ArticularyWordRecognition
+93.3
+98.7
+99.3
+99.0
+99.3
+98.3
+97.7
+99.3
+99.0
+99.3
+
+BasicMotions
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+
+CharacterTrajectories
+98.4
+98.4
+98.5
+96.9
+97.4
+96.6
+97.1
+98.7
+99.4
+99.0
+
+Cricket
+90.3
+98.6
+100.0
+100.0
+100.0
+100.0
+100.0
+98.6
+98.6
+100.0
+
+DuckDuckGeese
+42.0
+48.0
+50.0
+38.0
+34.0
+48.0
+56.0
+50.0
+56.0
+56.0
+
+EigenWorms
+76.3
+83.2
+87.0
+84.0
+84.0
+93.1
+96.2
+88.5
+80.9
+90.8
+
+Epilepsy
+96.4
+99.3
+100.0
+100.0
+100.0
+100.0
+100.0
+100.0
+94.9
+99.3
+
+ERing
+90.7
+97.0
+98.1
+97.8
+97.8
+98.5
+98.1
+98.9
+89.3
+96.7
+
+EthanolConcentration
+37.3
+47.1
+41.1
+40.3
+54.8
+50.6
+46.0
+42.6
+31.6
+37.6
+
+FaceDetection
+54.7
+62.1
+61.9
+66.0
+63.6
+60.0
+58.1
+58.3
+50.3
+59.6
+
+FingerMovements
+52.0
+57.0
+61.0
+62.0
+60.0
+57.0
+53.0
+64.0
+59.0
+56.0
+
+HandMovementDirection
+35.1
+31.1
+37.8
+32.4
+33.8
+29.7
+39.2
+31.1
+29.7
+32.4
+
+Handwriting
+23.1
+37.9
+25.3
+41.6
+35.4
+33.4
+34.7
+39.9
+52.9
+47.2
+
+Heartbeat
+75.6
+70.2
+74.1
+77.1
+75.1
+72.7
+74.1
+79.5
+68.8
+78.0
+
+InsectWingbeatSubset
+32.4
+29.8
+61.8
+39.3
+34.4
+41.1
+42.2
+60.4
+31.0
+60.9
+
+JapaneseVowels
+96.5
+92.4
+98.1
+94.1
+90.0
+94.9
+94.3
+95.9
+98.6
+97.6
+
+Libras
+84.4
+85.6
+91.7
+89.4
+90.6
+92.8
+92.8
+94.4
+83.3
+91.1
+
+LSST
+50.9
+60.5
+55.7
+59.2
+60.1
+60.1
+59.1
+65.9
+50.7
+64.3
+
+MotorImagery
+50.0
+49.0
+59.0
+48.0
+53.0
+57.0
+50.0
+50.0
+50.0
+55.0
+
+NATOPS
+81.7
+84.4
+86.7
+83.9
+82.2
+87.2
+87.2
+89.4
+95.0
+92.2
+
+PEMS-SF
+71.1
+78.6
+89.6
+77.5
+81.5
+70.5
+80.3
+83.2
+67.1
+82.1
+
+PhonemeSpectra
+20.6
+19.9
+24.8
+23.6
+24.3
+25.2
+25.7
+32.2
+17.2
+22.6
+
+RacketSports
+73.0
+84.9
+91.4
+88.8
+86.8
+86.8
+85.5
+90.1
+85.5
+89.5
+
+SelfRegulationSCP1
+74.4
+82.6
+85.7
+85.0
+85.0
+85.0
+85.0
+86.7
+80.2
+81.9
+
+SelfRegulationSCP2
+47.8
+51.1
+55.0
+49.4
+48.3
+52.8
+49.4
+51.1
+53.9
+54.4
+
+SpokenArabicDigits
+90.0
+97.9
+96.5
+96.4
+91.6
+96.0
+96.7
+98.0
+98.1
+98.8
+
+UWaveGestureLibrary
+85.9
+91.6
+92.5
+87.2
+92.5
+91.9
+85.9
+92.2
+90.3
+90.6
+
+Mean
+67.56
+71.74
+74.91
+72.48
+72.43
+73.30
+73.50
+75.52
+70.79
+75.30

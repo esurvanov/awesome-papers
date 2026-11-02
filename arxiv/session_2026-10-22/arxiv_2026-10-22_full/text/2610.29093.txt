@@ -1,0 +1,2463 @@
+## Agentic Music Post-Production
+
+Jaywon Koo
+††thanks: Work done while intern at Sony
+Affiliation: Rice University
+
+Junghyun Koo
+
+Affiliation: Sony Corporate Technology Center America, Inc.
+
+Marco A. Martínez-Ramírez
+
+Affiliation: Sony Corporate Technology Center America, Inc.
+
+Wei-Hsiang Liao
+
+Affiliation: Sony Group Corporation
+Correspondence:jk125@rice.edu
+
+Seungheon Doh
+
+Affiliation: Sony Group Corporation
+Correspondence:jk125@rice.edu
+
+Qiyu Wu
+
+Affiliation: Sony Group Corporation
+Correspondence:jk125@rice.edu
+
+Vicente Ordonez
+
+Affiliation: Rice University
+
+Yuki Mitsufuji
+
+Affiliation: Sony Corporate Technology Center America, Inc.
+
+Affiliation: Sony Group Corporation
+Correspondence:jk125@rice.edu
+
+Abstract
+
+We introduce MixAgent, an agentic pipeline for music post-production that follows the workflow of audio engineers to build interpretable and editable mixing plans guided by a reference song.
+A grouping agent first routes related input tracks, such as drum recordings, into subgroups. A planning agent then uses retrieved examples to choose and order audio effects, such as volume control and reverb, for tracks, subgroups, and the full mix. To refine the mix, a detector identifies what needs correction, and a critic proposes numerical parameter adjustments from tracks to the full mix.
+In our experiments, prompting recent multimodal models to listen and revise often worsens the mix, making reliable correction a central challenge.
+We therefore build MixCritic, a dataset of 45,657 repair critiques derived from parameters fitted to professional mixes, and train the critic with supervised fine-tuning followed by preference optimization on rendered audio outcomes. On MedleyDB, learned refinement reduces error by 19% relative to the initial mix, with preference optimization reducing it by 8.4% over supervised training alone. Retrieved examples further improve effects selection, and a human listening test shows that MixAgent gets higher quality ratings than mixes produced by Qwen3-Omni, Gemini 3.8 Flash and GPT-4o-audio.
+
+## 1 Introduction
+
+Language-model agents use tools to write code (Yang et al., 2024) and edit images (Ye et al., 2026). In creative software, a key challenge is turning a high-level goal into precise settings.
+Noticing that “the vocal is too quiet” does not specify which control to move or by how much. Music mixing combines separately recorded instruments and vocals (input tracks) into a song by applying audio effects that control volume, frequency balance, and acoustic space.
+Related tracks can also be processed together as subgroups, such as all drum recordings, before processing the full mix.
+Settings interact, as louder drums can hide the vocal.
+Because the desired sound can be difficult to describe in words, we study reference-guided mixing, where a reference song provides an example.
+
+Figure 1: Comparison of music post-production workflows.
+(a) Neural mixing systems predict final mixes or audio effects settings without explicit critique–revision loops.
+(b) Prior LLM-based approaches focus on audio effects chain prediction and iterative mix refinement.
+(c) MixAgent introduces an agentic framework that integrates hierarchical planning, execution, and iterative refinement into a unified music post-production pipeline.
+
+Existing systems address parts of this problem (Figure 1).
+Neural and generative models produce competitive audio without exposing
+audio effects settings (Koo et al., 2023; Moliner et al., 2026),
+while Diff-MST predicts editable parameters for fixed sequences of audio effects (Vanka et al., 2024). Prior LLM-based systems address narrower tasks.
+LLM2Fx-Tools predicts audio effects chains for individual tracks (Doh et al., 2026), and RIME edits an existing mix to follow instructions (Schaffer and Singh, 2026).
+Building a mix from tracks requires choosing and ordering effects at the track, subgroup, and full-mix levels, setting their parameters, and identifying corrections without editing instructions.
+Simply prompting an audio-language model to listen and revise does not consistently improve the mix.
+
+MixAgent builds an editable mixing plan and refines its parameters. A grouping agent organizes related tracks into subgroups. Guided by retrieved examples, a frozen planner chooses and orders audio effects at all three levels, then initializes their parameters. A learned detector selects what needs correction, and a critic proposes how to fix it. Refinement makes one pass at each level, from tracks to subgroups to the full mix, so later stages hear earlier corrections.
+Because no known corpus pairs mixing critiques with parameter repairs, we build MixCritic, containing 45,657 critiques.
+We train the critic with supervised fine-tuning (SFT), then direct preference optimization (DPO), favoring corrections toward the audio produced by the fitted parameters. Every effect, parameter, and correction remains explicit and editable.
+
+The design also raises a broader question. What makes feedback useful for agents acting through numerical tools?
+Our analyses show that retrieved examples improve audio effects selection, while learned refinement improves their parameters.
+This refinement benefits from more specific feedback, with numerical corrections giving lower reconstruction error than perceptual or tool-specific advice.
+With numerical feedback, DPO reduces this error by a further 8.4% over SFT.
+Beyond feedback, selecting correction targets and refining tracks before subgroups and the full mix further reduces error.
+
+Training and objective evaluation use non-overlapping excerpts of the same song as inputs and references, allowing comparison against its professional mix. On held-out MedleyDB songs, MixAgent achieves lowest reconstruction error and higher predicted quality than all tested multimodal LLM baselines. An 11-participant listening test with references from other songs within the same genre also gives MixAgent higher quality ratings. Our contributions are:
+
+• 
+
+To our knowledge, MixAgent is the first LLM mixing agent to combine editable audio effects planning across tracks, subgroups, and the full mix with learned detection and correction of parameter errors.11
+ 1
+
+ Demo: https://github.com/SonyResearch/Agentic_Music_Post-Production
+
+• 
+
+We construct MixCritic, providing repair critiques in three feedback forms and preference pairs ranked by the resulting audio.
+
+• 
+
+We show complementary reconstruction gains from retrieval and learned numerical refinement, with further improvements from selecting correction targets and refining tracks before subgroups and the full mix.
+
+## 2 Preliminaries
+
+Figure 2: Overview of MixAgent.
+(a) The grouping agent assigns tracks to subgroups. (b) Using retrieved examples, the planner selects audio effects chains sequentially at the track, subgroup, and full-mix levels.
+(c) After parameter initialization, the detector flags elements for improvement, and the critic provides perceptual, tool-specific, or numerical feedback. Refinement proceeds from tracks to subgroups to the full mix.
+
+## Music Post-production.
+
+The input consists of individual audio recordings, called input tracks, such as a lead vocal, a bass guitar, or a single drum microphone. Mixing proceeds at three levels: individual tracks, subgroups of related tracks summed and processed together (e.g., all drum tracks), and the full mix formed by summing all subgroup outputs. Subgroup and full-mix processing correspond to subgroup buses and the master bus, respectively. The output after all processing is the final mix. Mixing engineers shape the audio at each level with audio effects, signal-processing tools controlled by numerical parameters. Typical audio effects include gain (volume), panning (left–right position), equalization (EQ, the balance of low and high frequencies), compression (reducing loudness fluctuations), and reverb (a sense of acoustic space). An ordered list of audio effects, such as EQ followed by compression, is an audio effects chain.
+
+## Task.
+
+We study reference-guided mixing. The input is a set of unprocessed input tracks $X$ with instrument labels, a library of available audio effects $\mathcal{T}$ (Appendix A.2), and a style reference $r$ , which is a finished mix with the desired mixing style from a different song. LLM2Fx-Tools (Doh et al., 2026) predicts audio effects chains for individual tracks. We extend this task to multitrack mixing, producing a mixing plan $G$ and parameters $\theta$ . The plan assigns the tracks $x_{i}\in X$ to subgroups, where $S_{b}$ is the set of tracks in subgroup $b$ (possibly a single track), and assigns an audio effect chain to each track, each subgroup, and the full mix, written $f_{i}$ , $f_{b}$ , and $f_{m}$ with parameters $\theta_{i}$ , $\theta_{b}$ , and $\theta_{m}$ . Executing the plan, which we call rendering, produces the output mix $\widehat{y}$ in three stages:
+
+ $\displaystyle y_{i}$ 
+ $\displaystyle=f_{i}(x_{i};\theta_{i})$ 
+
+ $\displaystyle\text{(track)}$ 
+
+(1)
+
+ $\displaystyle y_{b}$ 
+ $\displaystyle=f_{b}\big(\textstyle\sum_{i\in S_{b}}y_{i};\,\theta_{b}\big)$ 
+
+ $\displaystyle\text{(subgroup)}$ 
+
+ $\displaystyle\widehat{y}$ 
+ $\displaystyle=f_{m}\big(\textstyle\sum_{b}y_{b};\,\theta_{m}\big)$ 
+
+ $\displaystyle\text{(full mix)}$ 
+
+We denote the audio after each stage by $R_{1}(\theta)=\sum_{i\in S_{b}}y_{i}$ , $R_{2}(\theta)=\sum_{b}y_{b}$ , and $R_{3}(\theta)=\hat{y}$ .
+
+The agent must infer audio effects chains and settings to match the reference’s mixing style rather than copy audio, since instrumentation, arrangement, or genre may differ. It must also account for interactions across tracks, subgroups, and the full mix.
+Our datasets lack ground-truth mixes with references from other songs. We therefore use two non-overlapping excerpts of the same song for training and main evaluation (§4.1).
+The listening test uses references from other songs within the same genre (§4.3). MixAgent keeps every audio effect and setting explicit, so users can inspect the plan, change values, and render the mix again. Audio is produced only by applying these audio effects to the input tracks, avoiding hallucinated musical content and artifacts from direct neural audio generation.
+
+## 3 MixAgent
+
+MixAgent runs automatically and splits mixing into three decisions (Figure 2). It decides which audio effects to use (§3.1), what to fix in the current mix, and how to fix it (§3.2). We describe how the components that make the last two decisions are trained (§3.3).
+
+## 3.1 Planning Audio effects Chains with Retrieved Examples
+
+A grouping agent first listens to the input tracks, reads their instrument labels, and assigns each track to a subgroup (e.g., kick, snare, and cymbals form a drum subgroup). A frozen audio-language tool-planning agent then selects audio effects chains.
+Without examples, the planner tends to select short chains (§ 5.2). To guide its choices, we use GRAFX (Lee et al., 2024), a differentiable audio-processing library, to estimate example plans.
+GRAFX fits audio effect parameters to approximate each database song’s professional mix, then removes effects that barely change the rendered audio (Lee et al., 2025b).
+Each database entry stores these pseudo-ground-truth (pseudo-GT) plans and a caption of the rendered mix. For a new song, text retrieval matches automatically generated input-track captions to database captions to find similar instrumentation. Audio retrieval matches the reference to rendered database mixes for similar mixing styles. We provide three text-retrieved and one audio-retrieved plan, excluding all excerpts of the input song.
+These examples show effect choices and order, but not parameter values. The planner selects track, subgroup, and full-mix chains in order, with each level guided by earlier choices.
+The chains remain fixed.
+Appendix B.1 and F provide details and prompts.
+
+Figure 3: 
+Data generation for MixCritic. (a) From a fixed tool plan, we obtain parameters through gradient-based optimization against the professional mix with GRAFX (green) and LLM generation (pink). Replacing the optimized parameters of randomly selected tracks with LLM outputs creates corrupted mixing states. (b) The teacher LLM compares the selected track’s corrupted and optimized parameters to generate A1–A3 critiques. The critic agent is trained to repair one corrupted track’s parameters at a time.
+
+## 3.2 Hierarchical Estimation
+
+The planner first sets the initial parameters of selected effect chains based on the reference audio.
+MixAgent then revises them bottom-up, following common engineering practice (Fox, 2024), first the tracks, then the subgroups, and finally the full mix (Figure 2). We call each track, subgroup, or the full mix an element $e$ , and two trained components carry out each revision.
+
+## Detector (what to fix).
+
+At the track and subgroup stages, the trained detector hears the processed tracks within a subgroup or the subgroup outputs, together with the reference $r$ , and reads the current plan and parameters. For each $e$ , it predicts the probability $p_{e}$ that an element needs correction and identifies audio effects that may need changes. The critic inspects elements with $p_{e}>\tau$ , starting with the highest probability. The full mix is always inspected. Appendix B.3 describes its architecture and training.
+
+## Critic (how to fix it).
+
+For each selected $e$ , the audio-language critic $\pi_{\phi}$ hears the audio of $e$ with its current audio effects, the current mix, and the reference. Its input $o_{e}$ also includes the detector’s output and the audio effects chain and parameters of $e$ . The critic proposes a correction $a_{e}$ , and $\mathrm{Exec}$ applies it to the parameters of $e$ :
+
+ $a_{e}\sim\pi_{\phi}(\cdot\mid o_{e}),\qquad\theta\leftarrow\mathrm{Exec}(a_{e},\theta),$ 
+
+(2)
+
+where $\mathrm{Exec}$ changes only the parameters of $e$ . We compare three forms of feedback that describe the same repair (Table 1). For perceptual advice (A1) and tool-specific advice (A2), it asks the planner to turn the advice into numbers. For numerical corrections (A3), it applies the proposed values directly. MixAgent uses A3.
+
+Each refinement pass calls the critic once per selected $e$ , using audio from the pass’s start. Then, applies corrections, re-renders the stage again, so the next stage hears the updated audio. We use one pass per stage, record every parameter change, and study additional passes (Appendix B.2 and D.6).
+
+## 3.3 Learning from Repairs with MixCritic
+
+We build MixCritic, a dataset of corrupted mixing states, target repairs, and critiques (Figure 3).
+
+Form
+
+Critic output (abridged)
+
+A1
+
+The vocal sounds heavily squashed and lifeless… It needs to breathe naturally with smooth dynamics, a cleaner noise floor, and a touch of high-frequency air.
+
+A2
+
+{"tools": [{"tool": "noisegate", "comment":
+Raise the threshold significantly so it only engages on actual noise, and reduce the wet mix to make the processing transparent and eliminate pumping artifacts.
+}
+]}
+
+A3
+
+{"tool": "noisegate", "parameters":
+{"log_threshold": 1.28, "log_ratio": 1.04,
+"log_knee": 2.45, "z_alpha_pre": 4.35},
+"drywet": 0.599} …
+
+Table 1: Critic output examples. A1 provides high-level semantic feedback, A2 names tools and revision directions, and A3 provides explicit numerical parameter values.
+
+## Corrupted states.
+
+For each of the 165 MedleyDB training examples, we fit the parameters of the agent’s selected audio effects chains to the professional mix using GRAFX. This gives pseudo-GT parameters $\theta^{\ast}$ and rendered audio $y_{k}^{\ast}$ at each stage $k$ . Qwen3-30B Thinking also predicts parameters for the same chains. We create a corrupted state $\tilde{\theta}$ by replacing the fitted parameters of randomly selected tracks with these predictions, then render the audio. The input tracks, audio effects chains, and pseudo-GT targets remain fixed.
+
+MedleyDB
+AlbumDB
+
+Reconst.
+Quality
+Similarity
+Reconst.
+Quality
+Similarity
+
+Method
+
+MSS $\downarrow$ 
+TuneJury $\uparrow$ 
+AAPQ $\uparrow$ 
+FxEnc++ $\uparrow$ 
+AF $\downarrow$ 
+MSS $\downarrow$ 
+TuneJury $\uparrow$ 
+AAPQ $\uparrow$ 
+FxEnc++ $\uparrow$ 
+AF $\downarrow$ 
+
+Random
+
+7.04
+-2.18
+5.96
+0.51
+8.7e4
+7.90
+-2.26
+5.84
+0.46
+401.6
+
+ Qwen3-Omni
+
+Single-pass
+
+3.73
+-0.55
+6.38
+0.65
+0.36
+4.34
+0.44
+6.44
+0.78
+0.14
+
+Self-Refine
+
+4.57
+-1.22
+5.78
+0.63
+2.86
+4.50
+0.17
+6.09
+0.76
+0.21
+
+Self-Critic
+
+4.79
+-0.77
+5.85
+0.63
+8.97
+4.55
+0.23
+6.06
+0.77
+0.10
+
+ Gemini 3.8 Flash
+
+Single-pass
+
+3.77
+-0.43
+6.52
+0.68
+0.20
+4.62
+0.70
+6.70
+0.79
+0.08
+
+Self-Refine
+
+3.69
+-0.43
+6.30
+0.75
+0.16
+4.89
+0.54
+6.21
+0.78
+0.07
+
+Self-Critic
+
+3.73
+-0.50
+5.67
+0.71
+0.18
+4.90
+0.41
+5.62
+0.77
+0.09
+
+ GPT-4o-audio
+
+Single-pass
+
+3.67
+-0.47
+6.47
+0.66
+0.29
+3.84
+0.26
+6.31
+0.81
+0.06
+
+Self-Refine
+
+3.95
+-0.79
+6.20
+0.64
+0.30
+3.77
+0.36
+6.04
+0.80
+0.08
+
+Self-Critic
+
+4.53
+-1.55
+5.55
+0.63
+0.28
+4.91
+-0.40
+6.25
+0.77
+0.10
+
+ MixAgent
+
+2.83
+0.21
+7.03
+0.73
+0.20
+3.81
+0.70
+7.41
+0.79
+0.11
+
+Table 2: Results on MedleyDB and AlbumDB. Bold and underline mark the best
+and second-best reported scores across all methods for each metric and
+dataset.
+ denotes off-the-shelf LLM baselines without task-specific training; marks MixAgent with a trained detector and critic.
+Single-pass uses no audio-feedback revision.
+
+## Repair score.
+
+We score a correction $a$ by how much it reduces the difference between the rendered audio and the pseudo-GT audio.
+
+ $\displaystyle s(a)={}$ 
+ $\displaystyle\mathrm{MRS}\big(\mathcal{R}_{k}(\tilde{\theta}),y^{\ast}_{k}\big)$ 
+
+(3)
+
+ $\displaystyle-\mathrm{MRS}\big(\mathcal{R}_{k}(\mathrm{Exec}(a,\tilde{\theta})),y^{\ast}_{k}\big),$ 
+
+where MRS measures audio distance (Steinmetz and Reiss, 2020). Positive scores mean improvement toward the stage- $k$ pseudo-GT audio $y^{\ast}_{k}$ .
+
+## Supervised critiques.
+
+For each corrupted state, we select one corrupted track and define a target correction $a^{\ast}$ that restores its pseudo-GT parameters. The other tracks keep their current settings.
+A larger teacher LLM (Qwen3.6-35B) receives the corrupted state and the target track’s LLM-generated and fitted parameters, and writes critiques in forms A1–A3, each with a step-by-step rationale.
+We keep a critique if its target repair satisfies $s(a^{\ast})>\delta_{0}$ , leaving 45,657 examples. The detector is trained on the same states, plus states with random parameters, to predict which tracks, subgroups, and audio effects were corrupted (class-weighted binary cross-entropy). Pseudo-GT parameters are used only to build MixCritic and never at inference.
+
+## Supervised fine-tuning (SFT).
+
+The critic uses a Qwen3.5-4B language model (Qwen Team, 2026) and a frozen RLAT encoder trained to represent audio effects (Lee et al., 2026). A trainable audio adapter connects them.
+Following LLM2Fx-Tools (Doh et al., 2026), we first train the adapter alone and then train it jointly with low-rank adaptation (LoRA) weights. The loss is $\mathcal{L}_{\mathrm{SFT}}=\mathcal{L}_{\mathrm{CE}}+0.3\,\mathcal{L}_{\mathrm{NTL}}$ , which adds to token cross-entropy a number-token loss that penalizes numerically distant predictions (Zausinger et al., 2025).
+
+## Preference training on audio outcomes (DPO).
+
+SFT learns one target correction, but other corrections may also improve the mix. For each $e$ selected by the detector in a training state, the SFT critic samples eight candidate critiques. We apply each candidate to the same starting parameters, render the result, and normalize its repair score as $\hat{s}(a)=s(a)/s(a^{\ast})$ . The highest-scoring candidate is paired with each of the two lowest-scoring candidates when their normalized score gap is at least $\delta$ . About 30% of pairs come from detector false alarms, where $e$ was not corrupted and no target repair exists. For these, we normalize by the initial audio error $\mathrm{MRS}(\mathcal{R}_{k}(\tilde{\theta}),y_{k}^{\ast})$ instead. Starting from the SFT critic, direct preference optimization (DPO) (Rafailov et al., 2023) favors higher-scoring corrections using the frozen SFT critic as reference. Only the audio adapter and LoRA weights are updated (learning rate of $5\times 10^{-6}$ , $\beta=0.1$ , and 24 pairs per batch).
+Appendix B.4 gives the critic architecture and training settings, and Appendix C gives MixCritic statistics.
+
+## 4 Experiments
+
+## 4.1 Setup
+
+## Data.
+
+We build the task from MedleyDB (Bittner et al., 2014), using its unprocessed recordings as unprocessed input tracks and its professional mixes as targets. Our datasets lack ground-truth mixes made to match references from other songs. We therefore sample two non-overlapping 15-second windows from each song section: one provides the unprocessed input tracks and the ground-truth mix (GT), for supervision and evaluation, and the other provides the style reference. This preserves a similar mixing style without providing the target audio as the reference. At evaluation, GT is used only for scoring.
+This gives 185 clips from 123 songs (Appendix A.1). We hold out 20 clips for evaluation, with artists disjoint from training. For cross-corpus transfer, we build AlbumDB clips (McKenzie et al., 2026) identically.
+
+## Baselines.
+
+We evaluate Qwen3-Omni (Xu et al., 2025), Gemini 3.8 Flash (Google, 2026), and GPT-4o-audio (OpenAI, 2024) under three settings (Table 2). Single-pass generates a mixing plan and its parameters without revision. Self-Refine listens to its current mix and revises it directly.
+Self-Critic first writes a critique of the mix, then revises it using that critique. Both adapt Madaan et al. (2023) and iterate three rounds.
+All settings use the same unprocessed input tracks, style reference, and list of available audio effects as MixAgent.
+A random baseline samples audio effects and parameters.
+
+## Metrics.
+
+We evaluate reconstruction, audio quality, and mixing-style similarity. Multi-Scale Spectral (MSS) (Engel et al., 2020) compares the frequency content of the output and GT over time at several resolutions, using the sum and difference of the left and right channels. Multi-Resolution STFT (MRS) (Yamamoto et al., 2020), used in training and analyses, makes this comparison for each channel. TuneJury (Kim et al., 2026) predicts listener preference, and Audiobox (Tjandra et al., 2025) predicts production quality (AAPQ). Neither uses GT or the style reference.
+For similarity to GT, FxEnc++ (Yeh et al., 2025) compares learned audio effects representations, while Audio Feature loss (AF) (Vanka et al., 2024) compares hand-crafted features of volume, loudness fluctuations, frequency balance, and left–right spread. We omit RLAT similarity because we train on its representations.
+
+## 4.2 Main Results
+
+On MedleyDB, MixAgent achieves the lowest MSS (2.83 vs. 3.67 for single-pass GPT-4o-audio) and the highest TuneJury and Audiobox PQ scores (Table 2). Gemini 3.8 Flash with Self-Refine scores best on FxEnc++ and AF. Results on AlbumDB are mixed. MixAgent has the highest Audiobox PQ and ties single-pass Gemini on TuneJury, while its MSS is second best (3.81 vs. 3.77 for GPT-4o-audio with Self-Refine). Single-pass GPT-4o-audio scores best on FxEnc++ and AF.
+
+Prompted revision does not consistently improve on single-pass mixing. Self-Critic yields higher MSS than Self-Refine for every model on both datasets. In MixAgent, learned refinement lowers MSS from 3.70 to 2.83 with fixed audio effects chains (§5). Appendix D.1 compares MixAgent with dedicated mixing models (Diff-MST, MST, and StemFX). MixAgent has the lowest MedleyDB MSS, although MST and StemFX use tracks extracted from the professional mix.
+
+Final output
+Applied revisions
+
+Configuration
+
+MRS $\downarrow$ 
+TuneJury $\uparrow$ 
+FxEnc++ $\uparrow$ 
+Improved (%) $\uparrow$ 
+Mean $\Delta$ MRS $\uparrow$ 
+Count
+
+No refinement (planner only)
+
+2.17
+-0.72
+0.71
+—
+—
+—
+
+Oracle feedback and parameter fitting (GT access)
+
+Oracle A1
+
+1.87
+-0.41
+0.78
+53.6
++0.0331
+250
+
+Oracle A2
+
+1.78
+-0.44
+0.80
+60.9
++0.0374
+243
+
+Oracle A3
+
+0.90
+0.51
+0.93
+—
+—
+—
+
+A1: Perceptual advice (converted to settings by the planner)
+
+ Qwen3-Omni
+
+2.26
+-0.83
+0.68
+41.9
+-0.0212
+117
+
+ SFT
+
+2.08
+-0.47
+0.71
+50.6
++0.0050
+245
+
+ SFT+DPO
+
+2.09
+-0.56
+0.69
+56.3
++0.0026
+245
+
+A2: Tool-specific advice (converted to settings by the planner)
+
+ Qwen3-Omni
+
+2.44
+-0.77
+0.66
+48.7
+-0.0079
+113
+
+ SFT
+
+2.24
+-0.37
+0.74
+54.0
++0.0045
+252
+
+ SFT+DPO
+
+1.98
+-0.57
+0.71
+60.0
++0.0220
+215
+
+A3: Numerical corrections (applied directly)
+
+ Qwen3-Omni
+
+2.18
+-0.75
+0.69
+52.2
+-0.0076
+113
+
+ SFT
+
+1.91
+-0.30
+0.70
+64.7
++0.0221
+238
+
+ SFT+DPO (MixAgent)
+
+1.75
+0.21
+0.73
+66.8
++0.0398
+241
+
+Table 3: Critic training and feedback form on MedleyDB. Improved is the percentage of revisions that lower full-mix MRS, Mean $\Delta$ MRS is the average reduction per revision, and Count is the number of corrections
+applied across all clips.
+ denotes prompted Qwen3-Omni critic without fine-tuning and
+ marks trained detector and critic (trained critics use Qwen3.5-4B).
+Gray oracle entries use GT.
+
+Figure 4: Human evaluation of mixing quality.
+
+## 4.3 Human Listening Test
+
+## Human Listening Test.
+
+We conducted a multi-stimulus listening test to evaluate perceptual music production quality in a practical reference-based mixing scenario. Input tracks were paired with a reference mix from a different song within the same genre.
+Eleven participants completed 10 trials each, evaluating the production quality of mixes by MixAgent, three LLM baselines, a randomly processed anchor, and the original human mix on a 0–100 scale.
+Figure 4 shows that three LLM baselines exhibit largely overlapping score distributions, with no statistically significant differences among them. In contrast, MixAgent achieves significantly higher scores than all three baselines ( $p<0.001$ , Holm-corrected paired t-tests), while a substantial perceptual gap remains relative to the original human mixes.
+
+## 5 What Makes Feedback Useful?
+
+We examine what makes learned refinement effective.
+Protocols are in Appendix E.
+
+## 5.1 Critic Training and Feedback Form
+
+Table 3 compares critic training and feedback forms with fixed audio effect chains and detector.
+Untrained critics make harmful corrections. Because our critic has a trained audio adapter, we use prompted Qwen3-Omni as the untrained critic. Its corrections increase error on average across all three forms, with only 42–52% improving the mix. Final MRS is 2.18 to 2.44, versus 2.17 for the planner alone and 1.75 for trained A3 refinement. The base model’s judgments are unreliable for correction.
+Appendix D.5 provides stage-wise errors.
+
+Preference training improves numerical feedback (A3) under the same detector, planner, and execution. MRS falls from 1.91 to 1.75 (8.4%), mean improvement per correction nearly doubles (+0.022 to +0.040), and success rises from 64.7% to 66.8%. It also improves A2 (2.24 to 1.98), but not A1 (2.08 to 2.09), suggesting preference training benefits most from specific feedback.
+
+After SFT+DPO, error falls with more specific feedback, from 2.09 MRS for perceptual advice to 1.98 for tool-specific advice and 1.75 for numerical corrections.
+Without GT access, trained A3 also outperforms oracle A1/A2 advice (1.87/1.78) on MRS and TuneJury, suggesting that converting verbal advice into settings remains difficult. GT-fitting the same plans reaches 0.90 MRS, leaving substantial room for better parameter estimation.
+
+## 5.2 Choosing Audio effects with Retrieved Examples
+
+To isolate audio effects selection, Table 4 fits each plan’s parameters to GT on 100 MedleyDB clips and measure what the chosen audio effects can achieve. Retrieved examples improve the plans. The fitted MRS drops from 2.13 without examples to 1.08 with three text-retrieved and one audio-retrieved example, while random examples reach only 1.71. Text retrieval provides most of the gain. Retrieval also leads the planner to select more tools per track (3.8 vs. 1.6), which accounts for part of this gain.
+Appendix D.2 reports audio effects chain F1, while Appendix D.3 shows MixAgent plans with more engineer-like track grouping and effect ordering than GRAFX.
+
+## 5.3 Component Ablations
+
+Retrieval and learned refinement are complementary. We run the hierarchical planner with and without retrieved examples, each with and without learned refinement (Table 5). Retrieval lowers MRS by 0.64, both without refinement (2.81 to 2.17) and with it (2.39 to 1.75), and refinement lowers MRS by 0.42 in either case. MSS likewise improves by 0.82 from retrieval and 0.87 from refinement. Retrieval improves the choice of audio effects, and refinement improves their parameters, with additive gains.
+We compare MixAgent’s bottom-up order with a top-down order (full mix, then subgroups, then tracks) and with a variant where corrections are computed from the initial audio and applied at once. Bottom-up refinement gives the lowest MRS (1.75, vs. 1.82 and 1.88) and MSS (Table 5), suggesting that later corrections benefit from hearing earlier ones.
+With the critic fixed, detector selection yields lower MRS (1.75) than inspecting all tracks and subgroups (1.87) or an equally sized random subset (1.81), and the lowest MSS. Selecting appropriate targets matters more than inspecting additional elements. Appendix D.4 reports detector accuracy.
+
+Examples
+MRS $\downarrow$ 
+FxEnc++ $\uparrow$ 
+Tools/track
+
+No examples
+2.13
+0.70
+1.55
+
+Random (3)
+1.71
+0.75
+1.74
+
+Text (3)
+1.10
+0.94
+3.75
+
+Text (3) + audio (1)
+1.08
+0.94
+3.77
+
+GRAFX
+0.89
+0.98
+4.38
+
+Table 4: Audio effects chain planning on 100 randomly selected MedleyDB clips.
+Parentheses denote number of retrieved in-context examples. 
+
+## 5.4 An Inspectable Output
+
+Each step of MixAgent acts on named audio effects and parameters, so its output records how the mix was made. On the evaluation set, the critic applies 241 corrections (about 12 per clip), each a change to a named parameter, and two thirds of them reduce the error of the full mix. Users can trace, revert, or adjust edits unavailable in audio-only outputs.
+
+## 6 Related Work
+
+## Agents with tools and learned feedback.
+
+LLM agents call tools (Yao et al., 2023; Schick et al., 2023) and refine their outputs with self-generated feedback (Madaan et al., 2023; Shinn et al., 2023), but self-correction without an external signal often fails (Huang et al., 2024), which motivates trained correctors (Welleck et al., 2023). In music production, LLM2Fx predicts audio effects parameters from text (Doh et al., 2025), LLM2Fx-Tools recovers the audio effect chain of a single track through tool calls (Doh et al., 2026), and MixAssist gives mixing advice in conversation (Clemens and Marasović, 2025). RIME listens between tool calls and edit finished mixes from synthetic instruction–edit pairs (Schaffer and Singh, 2026). MixAgent instead builds mixes from unprocessed input tracks, and its detector and critic are trained on whether each correction improves the rendered audio.
+
+## Automatic mixing.
+
+Explicit-processing methods estimate differentiable audio-effect parameters (Steinmetz et al., 2021; Steinmetz et al., 2022; Vanka et al., 2024; Steinmetz et al., 2024; Koo et al., 2025) or variable-length chains (Cheng et al., 2026), but most use fixed consoles without selecting effects or grouping tracks. GRAFX fits graphs to known targets (Lee et al., 2024; Lee et al., 2025b), supplying our retrieval plans, training data, and oracles. Neural approaches include end-to-end mixing (Martínez-Ramírez et al., 2022), style transfer (Koo et al., 2023), and diffusion or flow-based generation (Levy et al., 2023; Melechovsky et al., 2026; Moliner et al., 2026; Yeh et al., 2026). Diff2Mix instead decodes generated embeddings into fixed-console parameters (Zong et al., 2026). Direct audio generation can introduce artifacts and obscure audio effect settings (Melechovsky et al., 2026; Moliner et al., 2026). MixAgent combines open-ended chains, subgroups, and editable parameters with detection and correction learned from rendered audio.
+
+Configuration
+MRS $\downarrow$ 
+MSS $\downarrow$ 
+TuneJury $\uparrow$ 
+FxEnc++ $\uparrow$ 
+
+MixAgent (full)
+1.75
+2.83
+0.21
+0.73
+
+Retrieval and learned refinement
+
+w/o learned refinement
+2.17  $+$ 0.42
+3.70  $+$ 0.87
+ $-0.72$   $-$ 0.93
+0.71  $-$ 0.02
+
+w/o retrieval
+2.39  $+$ 0.64
+3.65  $+$ 0.82
+0.28  $+$ 0.07
+0.70  $-$ 0.03
+
+w/o both
+2.81  $+$ 1.06
+4.52  $+$ 1.69
+ $-0.82$   $-$ 1.03
+0.65  $-$ 0.08
+
+Refinement order
+
+top-down (full mix first)
+1.82  $+$ 0.07
+3.07  $+$ 0.24
+0.07  $-$ 0.14
+0.69  $-$ 0.04
+
+all corrections at once
+1.88  $+$ 0.13
+3.05  $+$ 0.22
+ $-0.07$   $-$ 0.28
+0.70  $-$ 0.03
+
+Correction targets
+
+inspect every element
+1.87  $+$ 0.12
+3.01  $+$ 0.18
+0.13  $-$ 0.08
+0.72  $-$ 0.01
+
+random (same number)
+1.81  $+$ 0.06
+2.96  $+$ 0.13
+0.07  $-$ 0.14
+0.71  $-$ 0.02
+
+Table 5: Component ablations on MedleyDB.
+
+## 7 Conclusion
+
+We presented MixAgent, an audio-language agent that mixes music by building an explicit plan of audio effects over tracks, subgroups, and the full mix, then refines it bottom-up with a learned detector and critic. Our results suggest a broader lesson for agents that act through numerical tools. Targeted, executable feedback trained on outcomes improves mixing. Because each decision logs a named audio effect and value, users can inspect the result, trace corrections, and edit the plan.
+
+## Limitations
+
+First, multiple mixes can be valid for the same input tracks, so reconstruction error against one professional mix does not fully capture mixing quality (Moliner et al., 2026).
+In our experiments, TuneJury is useful mainly for detecting severe degradation and is not yet sufficient as a standalone objective metric for assessing mixing quality. TuneJury (Kim et al., 2026) operates on mono audio (48 kHz for CLAP (Wu et al., 2023) and 24 kHz for MERT (Li et al., 2024)), while Audiobox Aesthetics uses 16 kHz mono audio. These representations limit direct assessment of stereo imaging and, for Audiobox, high-frequency detail. Developing reliable perceptual metrics for multitrack mixing remains a separate research challenge beyond the scope of this work.
+Second, the evaluation sets are small (20 MedleyDB clips from 17 songs, 14 AlbumDB clips, and 10 clips for the listening study), limiting generalizability and the precision of perceptual comparisons. Results on AlbumDB are mixed.
+MST accepts only four sources, so we ran it on the separated professional mix rather than on identical input tracks, limiting direct comparability.
+Third, supervision and oracles come from GRAFX-fitted parameters, which approximate, but do not recover, the engineer’s settings. The large gap to GT-fitted parameters (1.75 vs. 0.90 MRS) shows that parameter setting remains far from solved.
+Fourth, our audio effects library covers only a small subset of the processing tools available to professional audio engineers, creating a tool gap that limits the range of achievable mixes. The plan is also fixed after planning, so the critic cannot add or remove audio effects.
+Finally, although explicit plans expose editable audio effects and parameters, we have not evaluated how users interpret or modify them in practice. Producing a mix also requires many calls to large audio-language models, limiting computational efficiency.
+
+## Ethical Considerations
+
+We use the MedleyDB and AlbumDB research datasets in accordance with their terms of use. Automatic mixing tools may change the work of audio engineers. We designed MixAgent to expose and accept edits to any decision so that it supports, rather than replaces, human judgment. MixAgent can also be used as an educational tool for audio engineers.
+
+## References
+
+Bittner et al. (2014)
+R. M. Bittner, J. Salamon, M. Tierney, M. Mauch, C. Cannam, and J. P. Bello
+
+MedleyDB: a multitrack dataset for annotation-intensive MIR research.
+
+In Proceedings of the 15th International Society for Music Information Retrieval Conference (ISMIR),
+
+Cited by: §4.1.
+
+Cheng et al. (2026)
+Y. Cheng, J. Wu, B. Chen, Y. Yeh, Y. Chen, and Y. Yang
+
+StemFX: learning mixing style representations via autoregressive FX chain prediction on source-separated stems.
+
+In Proceedings of the 27th International Society for Music Information Retrieval Conference (ISMIR),
+
+External Links: 2607.15634,
+Link
+
+Cited by: §D.1,
+§6.
+
+Clemens and Marasović (2025)
+M. Clemens and A. Marasović
+
+MixAssist: an audio-language dataset for co-creative AI assistance in music mixing.
+
+In Conference on Language Modeling (COLM),
+
+External Links: 2507.06329,
+Link
+
+Cited by: §6.
+
+Défossez (2021)
+A. Défossez
+
+Hybrid spectrogram and waveform source separation.
+
+In Proceedings of the ISMIR 2021 Workshop on Music Source Separation,
+
+Cited by: §D.1.
+
+Doh et al. (2026)
+S. Doh, J. Koo, M. A. Martínez-Ramírez, W. Choi, W. Liao, Q. Wu, J. Nam, and Y. Mitsufuji
+
+LLM2Fx-Tools: tool calling for music post-production.
+
+In International Conference on Learning Representations (ICLR),
+
+External Links: 2512.01559,
+Link
+
+Cited by: §1,
+§2,
+§3.3,
+§6.
+
+Doh et al. (2025)
+S. Doh, J. Koo, M. A. Martínez-Ramírez, W. Liao, J. Nam, and Y. Mitsufuji
+
+Can large language models predict audio effects parameters from natural language?.
+
+In IEEE Workshop on Applications of Signal Processing to Audio and Acoustics (WASPAA),
+
+External Links: 2505.20770,
+Link
+
+Cited by: §6.
+
+Engel et al. (2020)
+J. Engel, L. Hantrakul, C. Gu, and A. Roberts
+
+DDSP: differentiable digital signal processing.
+
+In International Conference on Learning Representations (ICLR),
+
+External Links: 2001.04643
+
+Cited by: §4.1.
+
+Fox (2024)
+A. Fox
+
+What is top-down mixing? (versus bottom-up mixing).
+
+Note: Fox Music ProductionUpdated July 26, 2024
+
+External Links: Link
+
+Cited by: §3.2.
+
+Google (2026)
+Google
+
+Gemini 3.8 Flash.
+
+Note: Google DeepMind model documentation
+
+External Links: Link
+
+Cited by: §4.1.
+
+Huang et al. (2024)
+J. Huang, X. Chen, S. Mishra, H. S. Zheng, A. W. Yu, X. Song, and D. Zhou
+
+Large language models cannot self-correct reasoning yet.
+
+In International Conference on Learning Representations,
+
+Cited by: §6.
+
+Kim et al. (2026)
+Y. Kim, J. Lee, H. Xia, Y. Ma, J. Koo, K. Saito, Y. Mitsufuji, and C. Donahue
+
+TuneJury: an open metric for improving music generation preference alignment.
+
+arXiv preprint arXiv:2606.17006.
+
+External Links: 2606.17006,
+Link
+
+Cited by: §4.1,
+Limitations.
+
+Kong et al. (2026)
+Z. Kong, S. Lee, J. Kim, B. Wang, Z. Liu, S. Kim, Y. Chen, A. Goel, R. Roy, W. Dai, Z. Yang, Y. Chen, D. Jiang, S. Ghosh, T. Rintamaki, A. Tao, J. Raiman, M. Shoeybi, B. Catanzaro, and W. Ping
+
+Unified audio intelligence without regressing on text intelligence.
+
+arXiv preprint arXiv:2607.05196.
+
+External Links: 2607.05196,
+Link
+
+Cited by: §B.1.
+
+Koo et al. (2025)
+J. Koo, M. A. Martínez-Ramírez, W. Liao, G. Fabbro, M. Mancusi, and Y. Mitsufuji
+
+ITO-Master: inference-time optimization for audio effects modeling of music mastering processors.
+
+In Proceedings of the 26th International Society for Music Information Retrieval Conference (ISMIR),
+
+External Links: 2506.16889,
+Link
+
+Cited by: §6.
+
+Koo et al. (2023)
+J. Koo, M. A. Martínez-Ramírez, W. Liao, S. Uhlich, K. Lee, and Y. Mitsufuji
+
+Music mixing style transfer: a contrastive learning approach to disentangle audio effects.
+
+In IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+External Links: 2211.02247,
+Link
+
+Cited by: §D.1,
+§1,
+§6.
+
+Lee et al. (2025a)
+J. Lee, F. Chen, S. Dua, D. Cer, M. Shanbhogue, I. Naim, G. Hernández Ábrego, Z. Li, K. Chen, H. Schechter Vera, X. Ren, S. Zhang, D. Salz, M. Boratko, J. Han, B. Chen, S. Huang, V. Rao, P. Suganthan, F. Han, A. Doumanoglou, N. Gupta, F. Moiseev, C. Yip, A. Jain, S. Baumgartner, S. Shahi, F. Palma Gomez, S. Mariserla, M. Choi, P. Shah, S. Goenka, K. Chen, Y. Xia, K. Chen, S. M. K. Duddu, Y. Chen, T. Walker, W. Zhou, R. Ghiya, Z. Gleicher, K. Gill, Z. Dong, M. Seyedhosseini, Y. Sung, R. Hoffmann, and T. Duerig
+
+Gemini Embedding: generalizable embeddings from Gemini.
+
+arXiv preprint arXiv:2503.07891.
+
+External Links: 2503.07891,
+Link
+
+Cited by: §B.1.
+
+Lee et al. (2024)
+S. Lee, M. A. Martínez-Ramírez, W. Liao, S. Uhlich, G. Fabbro, K. Lee, and Y. Mitsufuji
+
+GRAFX: an open-source library for audio processing graphs in PyTorch.
+
+In Proceedings of the 27th International Conference on Digital Audio Effects (DAFx),
+
+External Links: 2408.03204,
+Link
+
+Cited by: §A.2,
+§B.1,
+§D.3,
+§3.1,
+§6.
+
+Lee et al. (2025b)
+S. Lee, M. A. Martínez-Ramírez, W. Liao, S. Uhlich, G. Fabbro, K. Lee, and Y. Mitsufuji
+
+Reverse engineering of music mixing graphs with differentiable processors and iterative pruning.
+
+Journal of the Audio Engineering Society 73 (6), pp. 344–365.
+
+External Links: Document,
+2509.15948,
+Link
+
+Cited by: §B.1,
+§D.3,
+§3.1,
+§6.
+
+Lee et al. (2026)
+S. Lee, M. Martínez-Ramírez, J. Koo, W. Liao, K. Lee, and Y. Mitsufuji
+
+Exploring the design space of representation learning for audio transformations.
+
+In Proceedings of the 27th International Society for Music Information Retrieval Conference (ISMIR),
+
+External Links: 2608.28127,
+Link
+
+Cited by: §B.1,
+§B.3,
+§B.4,
+§3.3.
+
+Levy et al. (2023)
+M. Levy, B. Di Giorgi, F. Weers, A. Katharopoulos, and T. Nickson
+
+Controllable music production with diffusion models and guidance gradients.
+
+In NeurIPS Workshop on Diffusion Models,
+
+External Links: 2311.00613,
+Link
+
+Cited by: §6.
+
+Li et al. (2024)
+Y. Li, R. Yuan, G. Zhang, Y. Ma, X. Chen, H. Yin, C. Xiao, C. Lin, A. Ragni, E. Benetos, et al.
+
+Mert: acoustic music understanding model with large-scale self-supervised training.
+
+In International Conference on Learning Representations,
+
+Vol. 2024, pp. 12181–12204.
+
+Cited by: Limitations.
+
+Madaan et al. (2023)
+A. Madaan, N. Tandon, P. Gupta, S. Hallinan, L. Gao, S. Wiegreffe, U. Alon, N. Dziri, S. Prabhumoye, Y. Yang, S. Gupta, B. P. Majumder, K. Hermann, S. Welleck, A. Yazdanbakhsh, and P. Clark
+
+Self-refine: iterative refinement with self-feedback.
+
+In Advances in Neural Information Processing Systems (NeurIPS),
+
+External Links: 2303.17651,
+Link
+
+Cited by: §4.1,
+§6.
+
+Martínez-Ramírez et al. (2022)
+M. A. Martínez-Ramírez, W. Liao, G. Fabbro, S. Uhlich, C. Nagashima, and Y. Mitsufuji
+
+Automatic music mixing with deep learning and out-of-domain data.
+
+In Proceedings of the 23rd International Society for Music Information Retrieval Conference (ISMIR),
+
+External Links: 2208.11428,
+Link
+
+Cited by: §6.
+
+McKenzie et al. (2026)
+T. McKenzie, E. Moliner, and A. Wright
+
+AlbumDB: a multitrack dataset of a ten-song album with stereo and immersive 7.1.4 masters.
+
+In 2026 AES European Convention (160th Convention),
+
+pp. 1–8.
+
+External Links: Link
+
+Cited by: §4.1.
+
+Melechovsky et al. (2026)
+J. Melechovsky, A. Mehrish, A. Roy, and D. Herremans
+
+SonicMaster: towards controllable all-in-one music restoration and mastering.
+
+In International Conference on Machine Learning (ICML),
+
+External Links: 2508.03448,
+Link
+
+Cited by: §6.
+
+Moliner et al. (2026)
+E. Moliner, M. A. Martínez-Ramírez, J. Koo, W. Liao, K. W. Cheuk, J. Serrà, V. Välimäki, and Y. Mitsufuji
+
+Automatic music mixing using a generative model of effect embeddings.
+
+In IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+External Links: 2511.08040,
+Link
+
+Cited by: §1,
+§6,
+Limitations.
+
+OpenAI (2024)
+OpenAI
+
+GPT-4o system card.
+
+arXiv preprint arXiv:2410.21276.
+
+Cited by: §4.1.
+
+Qwen Team (2026)
+Qwen Team
+
+Qwen3.5.
+
+Note: Qwen release blog and model card (Qwen3.5-4B)
+
+External Links: Link
+
+Cited by: §B.4,
+§3.3.
+
+Rafailov et al. (2023)
+R. Rafailov, A. Sharma, E. Mitchell, S. Ermon, C. D. Manning, and C. Finn
+
+Direct preference optimization: your language model is secretly a reward model.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 36.
+
+External Links: Link
+
+Cited by: §B.4,
+§3.3.
+
+Schaffer and Singh (2026)
+N. Schaffer and N. Singh
+
+RIME: enabling large-scale agentic music post-production.
+
+arXiv preprint arXiv:2607.19605.
+
+External Links: Link
+
+Cited by: §1,
+§6.
+
+Schick et al. (2023)
+T. Schick, J. Dwivedi-Yu, R. Dessì, R. Raileanu, M. Lomeli, E. Hambro, L. Zettlemoyer, N. Cancedda, and T. Scialom
+
+Toolformer: language models can teach themselves to use tools.
+
+In Advances in Neural Information Processing Systems (NeurIPS),
+
+External Links: 2302.04761,
+Link
+
+Cited by: §6.
+
+Shinn et al. (2023)
+N. Shinn, F. Cassano, A. Gopinath, K. Narasimhan, and S. Yao
+
+Reflexion: language agents with verbal reinforcement learning.
+
+In Advances in Neural Information Processing Systems (NeurIPS),
+
+External Links: 2303.11366,
+Link
+
+Cited by: §6.
+
+Steinmetz et al. (2022)
+C. J. Steinmetz, N. J. Bryan, and J. D. Reiss
+
+Style transfer of audio effects with differentiable signal processing.
+
+Journal of the Audio Engineering Society.
+
+External Links: 2207.08759,
+Link
+
+Cited by: §6.
+
+Steinmetz et al. (2021)
+C. J. Steinmetz, J. Pons, S. Pascual, and J. Serrà
+
+Automatic multitrack mixing with a differentiable mixing console of neural audio effects.
+
+In IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+External Links: 2010.10291,
+Link
+
+Cited by: §6.
+
+Steinmetz and Reiss (2020)
+C. J. Steinmetz and J. D. Reiss
+
+auraloss: audio focused loss functions in PyTorch.
+
+In Digital Music Research Network One-day Workshop (DMRN+15),
+
+External Links: Link
+
+Cited by: §3.3.
+
+Steinmetz et al. (2024)
+C. J. Steinmetz, S. Singh, M. Comunità, I. Ibnyahya, S. Yuan, E. Benetos, and J. D. Reiss
+
+ST-ITO: controlling audio effects for style transfer with inference-time optimization.
+
+In Proceedings of the 25th International Society for Music Information Retrieval Conference (ISMIR),
+
+External Links: 2410.21233,
+Link
+
+Cited by: §6.
+
+Tjandra et al. (2025)
+A. Tjandra, Y. Wu, B. Guo, J. Hoffman, B. Ellis, A. Vyas, B. Shi, S. Chen, M. Le, N. Zacharov, C. Wood, A. Lee, and W. Hsu
+
+Meta Audiobox Aesthetics: unified automatic quality assessment for speech, music, and sound.
+
+arXiv preprint arXiv:2502.05139.
+
+External Links: Link
+
+Cited by: §4.1.
+
+Vanka et al. (2024)
+S. S. Vanka, C. J. Steinmetz, J. Rolland, J. D. Reiss, and G. Fazekas
+
+Diff-MST: differentiable mixing style transfer.
+
+In Proceedings of the 25th International Society for Music Information Retrieval Conference (ISMIR),
+
+pp. 563–570.
+
+External Links: 2407.08889,
+Link
+
+Cited by: §D.1,
+§1,
+§4.1,
+§6.
+
+Welleck et al. (2023)
+S. Welleck, X. Lu, P. West, F. Brahman, T. Shen, D. Khashabi, and Y. Choi
+
+Generating sequences by learning to self-correct.
+
+In International Conference on Learning Representations,
+
+Cited by: §6.
+
+Won et al. (2024)
+M. Won, Y. Hung, and D. Le
+
+A foundation model for music informatics.
+
+In ICASSP 2024 - 2024 IEEE International Conference
+on Acoustics, Speech and Signal Processing,
+
+Cited by: §B.3.
+
+Wu et al. (2023)
+Y. Wu, K. Chen, T. Zhang, Y. Hui, T. Berg-Kirkpatrick, and S. Dubnov
+
+Large-scale contrastive language-audio pretraining with feature fusion and keyword-to-caption augmentation.
+
+In ICASSP 2023-2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+pp. 1–5.
+
+Cited by: Limitations.
+
+Xu et al. (2025)
+J. Xu, Z. Guo, H. Hu, Y. Chu, X. Wang, J. He, Y. Wang, X. Shi, T. He, X. Zhu, Y. Lv, Y. Wang, D. Guo, H. Wang, L. Ma, P. Zhang, X. Zhang, H. Hao, Z. Guo, B. Yang, B. Zhang, Z. Ma, X. Wei, S. Bai, K. Chen, X. Liu, P. Wang, M. Yang, D. Liu, X. Ren, B. Zheng, R. Men, F. Zhou, B. Yu, J. Yang, L. Yu, J. Zhou, and J. Lin
+
+Qwen3-Omni technical report.
+
+arXiv preprint arXiv:2509.17765.
+
+External Links: 2509.17765,
+Link
+
+Cited by: §B.1,
+§4.1.
+
+Yamamoto et al. (2020)
+R. Yamamoto, E. Song, and J. Kim
+
+Parallel wavegan: a fast waveform generation model based on generative adversarial networks with multi-resolution spectrogram.
+
+In ICASSP 2020-2020 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),
+
+pp. 6199–6203.
+
+Cited by: §4.1.
+
+Yang et al. (2024)
+J. Yang, C. E. Jimenez, A. Wettig, K. Lieret, S. Yao, K. Narasimhan, and O. Press
+
+SWE-agent: agent-computer interfaces enable automated software engineering.
+
+In Advances in Neural Information Processing Systems,
+
+External Links: Link
+
+Cited by: §1.
+
+Yao et al. (2023)
+S. Yao, J. Zhao, D. Yu, N. Du, I. Shafran, K. Narasimhan, and Y. Cao
+
+ReAct: synergizing reasoning and acting in language models.
+
+In International Conference on Learning Representations (ICLR),
+
+External Links: 2210.03629,
+Link
+
+Cited by: §6.
+
+Ye et al. (2026)
+R. Ye, J. Zhang, Z. Liu, Z. Zhu, S. Yang, L. Li, T. Fu, F. Dernoncourt, Y. Zhao, J. Zhu, R. Rossi, W. Chai, and Z. Tu
+
+Agent banana: high-fidelity image editing with agentic thinking and tooling.
+
+arXiv preprint arXiv:2602.09084.
+
+Cited by: §1.
+
+Yeh et al. (2026)
+Y. Yeh, C. Chan, Y. (. Hung, and Y. Yang
+
+Rethinking automatic music mixing as sequential stem blending.
+
+In Proceedings of the 27th International Society for Music Information Retrieval Conference (ISMIR),
+
+External Links: 2608.05506,
+Link
+
+Cited by: §6.
+
+Yeh et al. (2025)
+Y. Yeh, J. Koo, M. A. Martínez-Ramírez, W. Liao, Y. Yang, and Y. Mitsufuji
+
+Fx-Encoder++: extracting instrument-wise audio effects representations from mixtures.
+
+In Proceedings of the 26th International Society for Music Information Retrieval Conference (ISMIR),
+
+External Links: 2507.02273,
+Link
+
+Cited by: §4.1.
+
+Zausinger et al. (2025)
+J. Zausinger, L. Pennig, A. Kozina, S. Sdahl, J. Sikora, A. Dendorfer, T. Kuznetsov, M. Hagog, N. Wiedemann, K. Chlodny, V. Limbach, A. Ketteler, T. Prein, V. M. Singh, M. Danziger, and J. Born
+
+Regress, don’t guess: a regression-like loss on number tokens for language models.
+
+In Proceedings of the 42nd International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 267, pp. 73995–74017.
+
+External Links: Link
+
+Cited by: §3.3.
+
+Zong et al. (2026)
+Y. Zong, J. Shi, and J. Reiss
+
+Diff2Mix: controllable music mixing via diffusion models and differentiable audio effects.
+
+In Proceedings of the 27th International Society for Music Information Retrieval Conference (ISMIR),
+
+External Links: 2608.05442,
+Link
+
+Cited by: §6.
+
+## Appendix A Experimental Setup
+
+## A.1 Data
+
+We run a music-structure analysis on each MedleyDB song and, in every section longer than 35 s, sample one pair of non-overlapping 15-s windows at least 5 s apart (§4.1). This gives 214 candidate clips from 137 songs, of which 185 clips from 123 songs remain after filtering (44.1 kHz, 24-bit, $-12$  LUFS). We split by artist into 165 training clips (106 songs) and 20 evaluation clips (17 songs). The 14 AlbumDB evaluation clips are built in the same way.
+
+## A.2 Audio effects Library
+
+Table 6 lists the audio effects available to the planner
+( $\mathcal{T}$ in §2), their parameters, and the levels
+at which they can be used. All audio effects are differentiable processors from
+GRAFX (Lee et al., 2024) and related libraries, so the same plan can be
+rendered by the agent and fitted to GT for the oracle analyses. Every audio effect
+also has a dry/wet mix control. The planner and critic write raw
+(pre-activation) values. After every edit, values are clipped to a safe
+range, and the ranges in Table 6 are those safe ranges in
+physical units. The planner fixes the chains before parameters are set, so
+refinement cannot add, remove, or reorder audio effects.
+
+Audio effect
+
+Parameters (safe range)
+
+Levels
+
+Gain / panning
+
+left and right gain ( $-7.8$ to $+2.2$  dB each), with
+panning from unequal channel gains
+
+S, B, M
+
+Parametric EQ
+
+10 bands (low shelf, 8 peaking, high shelf) with
+frequency (0.1–10.4 kHz), gain ( $-6.1$ to $+4.3$  dB), and $Q$ 
+(0.45–3.3)
+
+S, B, M
+
+Compressor
+
+threshold ( $-30$ to $-12$  dB), ratio (1.3–3.3:1), makeup
+( $\pm 3$  dB), attack, release, expander threshold and ratio
+
+S, B, M
+
+Multiband compressor
+
+3 bands (crossovers 41–279 Hz and 2.8–11.2 kHz),
+per-band threshold ( $-57$ to $-3$  dB), ratio (1.3–17.7:1), attack,
+release
+
+M
+
+Noise gate
+
+threshold ( $\approx-41$ to $-28$  dB), ratio, knee,
+smoothing
+
+S, B, M
+
+Distortion
+
+drive (0.2–0.7 dB)
+
+S, B, M
+
+Stereo imager
+
+side gain ( $-4.3$ to $+3.0$  dB)
+
+S, B, M
+
+Delay
+
+single tap with feedback, time (110–342 ms), gain
+( $-44$ to $-19$  dB), feedback, tone filter
+
+S, B, M
+
+Reverb
+
+filtered-noise reverb, 12 bands $\times$ mid/side, per-band decay
+and level
+
+S, B, M
+
+Limiter
+
+threshold ( $-44$ to $-0.2$  dB), attack (0.5–5.4 ms), release
+(21–180 ms)
+
+M
+
+Table 6: Audio effects library. S, B, and M denote track, subgroup, and full mix. Ranges are the safe ranges enforced after every edit, converted to physical units.
+The multiband compressor and limiter start bypassed.
+
+## A.3 Baselines
+
+Single-pass baselines render their first plan. Self-Refine and Self-Critic
+run up to three rounds of listening and revision, and we score the final
+output. The random baseline pools valid outputs across seeds.
+
+## A.4 Metrics
+
+All outputs are normalized to $-12$  LUFS before scoring, and we report means over clips. TuneJury ranks the professional mix above randomly processed versions 70.5% of the time, but above the dry sum only 48% of the time and above random track gains only 41%. It thus detects severe processing errors but not subtler differences, so we use it only as a check for severe problems.
+
+## Appendix B MixAgent Implementation
+
+## B.1 Retrieval and Audio effects Chain Planning
+
+We use frozen Qwen3-Omni (Xu et al., 2025) for grouping and planning agents.
+Database entries store GRAFX-pruned audio effects chains (Lee et al., 2024; Lee et al., 2025b), the mix rendered from them, and its caption. Text
+queries concatenate captions of the unprocessed input tracks, generated by
+Audex (Kong et al., 2026) conditioned on instrument labels, and are
+matched to database captions with Gemini
+Embedding (Lee et al., 2025a). Audio queries embed the style
+reference with RLAT (Lee et al., 2026) and are matched
+to the rendered mixes. Both use cosine similarity, and all excerpts of the
+input song are excluded. Algorithm 1 gives the full
+planning procedure.
+
+Algorithm 1 Retrieval-Augmented Audio effects Chain Planning
+
+ 0:
+
+  unprocessed input tracks $X$ with instrument labels, reference $r$ ,
+database $\mathcal{M}$ of mixed songs, retrieval counts
+ $n_{\text{text}}$ and $n_{\text{audio}}$ 
+
+ 0:
+
+  subgroup assignments and audio effects chains for all tracks, subgroups,
+and the full mix, without parameters
+
+ 1:
+
+   $\{S_{b}\}\leftarrow\text{{Group}}(X)$ 
+{use track audio and instrument labels}
+
+ 2:
+
+   $\mathcal{M}^{\prime}\leftarrow\mathcal{M}$ without excerpts of the input song
+
+ 3:
+
+   $u_{\text{text}}\leftarrow\text{embed}(\text{captions of }X\text{ and its labels})$ 
+
+ 4:
+
+   $\mathcal{N}_{\text{text}}\leftarrow$ 
+top- $n_{\text{text}}$ entries of $\mathcal{M}^{\prime}$ 
+by caption similarity to $u_{\text{text}}$ 
+
+ 5:
+
+   $u_{\text{audio}}\leftarrow\text{embed}(r)$ 
+
+ 6:
+
+   $\mathcal{N}_{\text{audio}}\leftarrow$ 
+top- $n_{\text{audio}}$ entries of $\mathcal{M}^{\prime}$ 
+by mix similarity to $u_{\text{audio}}$ 
+
+ 7:
+
+   $\mathrm{ICL}\leftarrow$ audio effects chains of
+ $\mathcal{N}_{\text{text}}\cup\mathcal{N}_{\text{audio}}$ 
+{parameter values omitted}
+
+ 8:
+
+   $\{f_{i}\}\leftarrow\text{{Planner}}(X,\{S_{b}\},\mathrm{ICL})$ 
+{track stage}
+
+ 9:
+
+   $\{f_{b}\}\leftarrow\text{{Planner}}(\{S_{b}\},\{f_{i}\},\mathrm{ICL})$ 
+{subgroup stage using the track plans}
+
+ 10:
+
+   $f_{m}\leftarrow\text{{Planner}}(\{f_{i}\},\{f_{b}\},\mathrm{ICL})$ 
+{full-mix stage using the track and subgroup plans}
+
+ 11:
+
+  return $\{S_{b}\},\{f_{i}\},\{f_{b}\},f_{m}$ 
+
+## B.2 Hierarchical Refinement
+
+Algorithm 2 gives the refinement procedure. MixAgent
+uses one pass per stage ( $N=1$ ), and Appendix D.6 studies
+more passes.
+
+Algorithm 2 Hierarchical Refinement
+
+ 0:
+
+  plan $G$ , tracks $X$ , reference $r$ ,
+feedback form (A1, A2, or A3), detector threshold $\tau$ ,
+maximum passes $N$ ( $N=1$ for MixAgent)
+
+ 0:
+
+  parameters $\theta$ of all elements
+
+ 1:
+
+   $\theta\leftarrow\text{{Planner}}(r,\text{text of }G)$ 
+
+ 2:
+
+  for stage $k=1,2,3$ (tracks, subgroups, full mix) do
+
+ 3:
+
+   for pass $t=1$ to $N$ do
+
+ 4:
+
+    render $\mathcal{R}_{k}(\theta)$ and store the
+processed element audio and current mix
+{audio fixed throughout this pass}
+
+ 5:
+
+    if $k=3$ then
+
+ 6:
+
+      $\mathcal{Q}\leftarrow\{m\}$ 
+{the full mix is always inspected}
+
+ 7:
+
+      $d_{m}\leftarrow\emptyset$ 
+{no detector output for the full mix}
+
+ 8:
+
+    else
+
+ 9:
+
+      $H\leftarrow$ fixed audio embeddings of stored processed
+element audio and reference $r$ , with audio effects chains and $\theta$ 
+
+ 10:
+
+      $\{(p_{e},d_{e})\}_{e}\leftarrow\text{{Detector}}(H)$ 
+{error probabilities and audio effects flags}
+
+ 11:
+
+      $\mathcal{Q}\leftarrow\{e\mid p_{e}>\tau\}$ ,
+highest $p_{e}$ first
+
+ 12:
+
+     if $\mathcal{Q}=\emptyset$ then
+
+ 13:
+
+      break
+{end passes for this stage}
+
+ 14:
+
+     end if
+
+ 15:
+
+    end if
+
+ 16:
+
+    for each $e\in\mathcal{Q}$ do
+
+ 17:
+
+      $o_{e}\leftarrow$ stored processed audio of $e$ ,
+stored mix, reference $r$ , and text containing $d_{e}$ ,
+ $e$ ’s audio effects chain in $G$ , and current parameters $\theta_{e}$ 
+
+ 18:
+
+      $a_{e}\sim\pi_{\phi}(\cdot\mid o_{e})$ 
+{the critic proposes a correction}
+
+ 19:
+
+      $\theta\leftarrow\mathrm{Exec}(a_{e},\theta)$ 
+{update only $e$ , A3 directly, A1/A2 through the planner}
+
+ 20:
+
+    end for
+
+ 21:
+
+   end for
+
+ 22:
+
+   render $\mathcal{R}_{k}(\theta)$ 
+{the next stage receives the corrected audio}
+
+ 23:
+
+  end for
+
+ 24:
+
+  return $\theta$ 
+
+## B.3 Detector
+
+The detector is a 34.9M-parameter classifier with a four-layer bidirectional Transformer encoder and two output heads. It takes fixed embeddings of each element’s processed audio and of the reference $r$ , together with the element’s audio effects chain and current parameters. For each audio input, we average MusicFM layer 7 features (Won et al., 2024) over time and concatenate them with RLAT features (Lee et al., 2026). One head predicts the element’s error probability $p_{e}$ , and the other identifies audio effects that may need changes. The embeddings remain fixed during detector training. The detector is trained on the 40,264 states in Table 8. A positive label requires a replaced parameter that changes the MRS of that track by at least 1.0. Appendix D.4 reports its accuracy.
+
+## B.4 Critic Architecture and Training
+
+The critic connects a frozen RLAT audio effects encoder (Lee et al., 2026) to Qwen3.5-4B (Qwen Team, 2026) through a trained audio adapter. We use RLAT’s audio effects embedding $z_{T}$ . The three audio inputs are the selected track, subgroup, or full mix with its current audio effects, the current mix, and the reference. Each is labeled by role and encoded separately. The adapter uses 32 queries to produce 32 tokens per audio input. The text input contains the detector’s output and the selected element’s audio effects chain and current parameters.
+
+SFT first trains the adapter alone (stage 1) and then trains it jointly with LoRA weights (stage 2). DPO (Rafailov et al., 2023) then trains on the preference pairs of §3.3,
+
+ $\displaystyle\mathcal{L}_{\mathrm{DPO}}(\phi)$ 
+ $\displaystyle=-\mathbb{E}_{\mathcal{D}_{\mathrm{pref}}}\log\sigma\!\left(\beta[h(a^{+})-h(a^{-})]\right),$ 
+
+(4)
+
+ $\displaystyle h(a)$ 
+ $\displaystyle=\log\pi_{\phi}(a\mid o)-\log\pi_{\mathrm{SFT}}(a\mid o),$ 
+
+where $\pi_{\mathrm{SFT}}$ is the frozen SFT critic, $\sigma$ is the sigmoid function, and $\beta=0.1$ . The policy starts from the SFT checkpoint, and reference log-probabilities are precomputed. We use AdamW with weight decay $0.01$ . The learning rate follows 15 linear warmup steps and then cosine decay to $10^{-8}$ . We use bf16 mixed precision and no gradient clipping. Table 7 lists all training and inference hyperparameters.
+
+Setting
+
+Value
+
+Critic backbone
+
+Qwen3.5-4B + frozen RLAT
+
+Audio adapter
+
+32 queries, 32 tokens per audio input
+
+Trainable parameters (adapter + LoRA)
+
+89M + 99M
+
+SFT learning rate (stage 1 / 2)
+
+ $10^{-4}$ / $5\cdot 10^{-5}$ 
+
+SFT effective batch size (stage 1 / 2)
+
+32 / 16
+
+SFT stage 1 length
+
+ $\approx$ 14 epochs
+
+SFT stage 2 length (selected checkpoint)
+
+5.8–7.4 epochs
+
+LoRA rank / $\alpha$ / dropout
+
+128 / 256 / 0.05
+
+NTL weight
+
+0.3
+
+DPO $\beta$ / learning rate
+
+0.1 / $5\cdot 10^{-6}$ 
+
+DPO batch size
+
+24 pairs
+
+Margins $\delta_{0}$ / $\delta$ 
+
+0.02 / 0.1
+
+DPO candidates per inspected element
+
+8
+
+DPO sampling (temperature, top- $p$ )
+
+1.0, 0.95
+
+Detector threshold $\tau$ 
+
+0.15
+
+Critic decoding (max tokens)
+
+greedy, 3,072 (A3), 768 (A1/A2)
+
+Planner decoding (temperature, top- $p$ )
+
+0.6, 0.95
+
+GPUs per run
+
+4 $\times$ A100 80 GB or 2–3 $\times$ H100
+
+Table 7: Training and inference hyperparameters.
+
+## Appendix C The MixCritic Dataset
+
+Section 3.3 and Figure 3 describe how MixCritic is built, and Table 8 summarizes it. All examples come from the 165 MedleyDB training clips, which share no artist with the evaluation clips. To build preference pairs, we sample candidate critiques from the SFT critic with temperature $1.0$ and top- $p$ $0.95$ , and apply each valid candidate independently to the same corrupted parameters. Responses that cannot be read in the required feedback format receive a score of 0. The 2,200 validation examples are randomly selected from states built on validation clips, which are training clips held out from training. We select model weights on this validation set, and the evaluation clips are used only for testing.
+
+Statistic
+Value
+
+Source clips / songs
+165 / 106
+
+Supervised critique examples (train, A1–A3)
+45,657
+
+Validation examples
+2,200
+
+Feedback forms
+A1, A2, A3
+
+Preference pairs (DPO)
+47,857
+
+Detector training states
+40,264
+
+Corrupted tracks per state (range)
+1–36
+
+Table 8: MixCritic statistics. Example counts are totals across the
+three feedback forms.
+
+## Appendix D Additional Results
+
+## D.1 Comparison with Dedicated Mixing Models
+
+Dedicated mixing models are trained for reference-guided mixing but differ
+from our setting in their inputs or output space, so we report them
+separately (Table 9). Diff-MST (Vanka et al., 2024)
+takes the unprocessed input tracks and predicts the parameters of a fixed differentiable
+console, with gain, EQ, compression, and panning on each track and EQ and
+compression on the full mix. It cannot choose audio effects or group tracks.
+Diff-MST is trained on MedleyDB and Cambridge-MT, so its training songs
+may overlap our MedleyDB evaluation clips, and the comparison is not
+strictly fair.
+MST (Koo et al., 2023) is an end-to-end network that
+outputs processed audio and exposes no audio effects parameters. It is trained on
+four instrument classes (vocals, drums, bass, and other), and for mixture
+inputs its authors first apply source separation. Following this setup, we
+separate the professional mix into the four sources with
+Demucs (Défossez, 2021, mdx_extra;), and MST
+restyles each of them to match the reference. StemFX (Cheng et al., 2026) predicts
+variable-length audio effects chains on source-separated tracks and is applied in
+the same way. MST and StemFX therefore start from the professionally mixed
+version of the target, which gives them privileged access to GT.
+
+On MedleyDB, MixAgent has the lowest MSS of all four systems.
+MST scores better on Audiobox PQ, FxEnc++, and AF, and StemFX on TuneJury. Both models
+largely inherit their global audio effects style from the professional mix they
+start from. On AlbumDB, MixAgent improves
+on Diff-MST in reconstruction (3.81 vs. 4.72 MSS), whereas MST and StemFX,
+which start from the professional mix, score higher on most metrics.
+
+MedleyDB
+
+AlbumDB
+
+Reconst.
+Quality
+Similarity
+
+Reconst.
+Quality
+Similarity
+
+Method
+MSS $\downarrow$ 
+TuneJury $\uparrow$ 
+Audiobox PQ $\uparrow$ 
+FxEnc++ $\uparrow$ 
+AF $\downarrow$ 
+
+MSS $\downarrow$ 
+TuneJury $\uparrow$ 
+Audiobox PQ $\uparrow$ 
+FxEnc++ $\uparrow$ 
+AF $\downarrow$ 
+
+Diff-MST
+4.31
+-0.70
+6.49
+0.72
+0.19
+
+4.72
+1.02
+7.15
+0.73
+0.11
+
+MST∗
+3.08
+-0.18
+7.04
+0.79
+0.08
+
+3.60
+1.50
+7.70
+0.83
+0.04
+
+StemFX∗
+3.31
+0.28
+–
+0.65
+1.08
+
+3.55
+1.35
+–
+0.79
+0.21
+
+MixAgent
+2.83
+0.21
+7.03
+0.73
+0.20
+
+3.81
+0.70
+7.41
+0.79
+0.11
+
+Table 9: Comparison with dedicated mixing models. Lower is better for MSS and AF;
+higher is better for TuneJury, Audiobox PQ, and FxEnc++. Audiobox PQ is
+reference-free and computed at $-12$  LUFS.
+∗Gray rows start from the professional mix separated into
+four sources and thus have privileged access to GT.
+
+## D.2 Audio effects Chain Planning
+
+Table 10 extends Table 4
+with audio effects chain F1, which measures agreement with the pseudo-GT plan of
+the professional mix. The 100 clips are drawn from MedleyDB to test
+retrieval at a larger scale. This study involves no training, and all
+excerpts of each query song are excluded from retrieval, so there is no
+leakage. The configuration used by MixAgent (Text (3) + audio (1)) raises F1 at every level, e.g., from 0.33 to 0.57 for tracks.
+
+Audio effects chain F1 $\uparrow$ 
+GT-assisted parameter fitting
+Plan size
+
+Retrieved examples
+Track
+Subgroup
+Full mix
+MRS $\downarrow$ 
+FxEnc++ $\uparrow$ 
+TuneJury $\uparrow$ 
+PQ $\uparrow$ 
+Tools/track
+
+No examples
+0.33
+0.38
+0.49
+2.13
+0.70
+-0.12
+7.03
+1.55
+
+Random (3)
+0.37
+0.42
+0.69
+1.71
+0.75
+0.09
+7.05
+1.74
+
+Text (1) + audio (1)
+0.54
+0.56
+0.61
+1.12
+0.94
+0.25
+7.28
+3.65
+
+Text (3)
+0.56
+0.59
+0.79
+1.10
+0.94
+0.28
+7.29
+3.75
+
+Text (3) + audio (1)
+0.57
+0.59
+0.83
+1.08
+0.94
+0.29
+7.26
+3.77
+
+GRAFX (pseudo-GT plan)
+1.00
+1.00
+1.00
+0.89
+0.98
+0.28
+7.30
+4.38
+
+Table 10: Audio effects chain planning on 100 MedleyDB clips. Audio effects chain F1 measures agreement with the pseudo-GT plan of the professional mix. Audio scores are computed after fitting each plan’s parameters to GT, so they measure what the chosen audio effects can achieve rather than agent performance. PQ is the reference-free Audiobox-Aesthetics production-quality score; TuneJury and PQ are computed at $-12$  LUFS. GRAFX uses the pseudo-GT plan itself (F1 $=1$ by construction) and serves as an upper bound.
+MixAgent uses Text (3) + audio (1).
+
+## D.3 Example Plans: MixAgent and GRAFX
+
+MixAgent builds its plan the way an engineer would. Its grouping agent
+listens to the tracks and reads their labels before assigning subgroups, and its
+planner chooses the audio effects and their order for each track, subgroup, and the
+full mix. GRAFX, which builds the pseudo-GT plans used for retrieval and
+audio effects chain F1 (§3.1), instead starts from a fixed
+console that applies every audio effect in the same order everywhere. It fits all
+parameters to the professional mix and prunes processors that barely affect
+the result (Lee et al., 2024; Lee et al., 2025b).
+Figures 5–8
+compare the final plans of MixAgent with GRAFX plans for two MedleyDB and
+two AlbumDB clips.
+
+## Grouping.
+
+MixAgent forms subgroups that follow the instrumentation. In
+Figure 7, it creates drum, bass, guitar, and
+vocal subgroups, whereas GRAFX uses no subgroups and sends all eight tracks to the
+full mix. In Figure 8, it places the violins,
+cello, and viola in one subgroup together with the bass, whereas GRAFX groups
+only the two violins and splits the rest of the string section. In
+Figures 5 and 6,
+both plans use the same subgroups.
+
+## Audio effects order.
+
+MixAgent chooses the order for each element. It places the noise gate
+before the compressor on the drums (Figure 5)
+and on the vocals (Figures 7
+and 8), as engineers usually do, and it
+compresses before equalizing on the AlbumDB bass and drum subgroups
+(Figure 6). Every GRAFX chain keeps the console
+order of EQ, distortion, compressor, noise gate, stereo imager,
+gain/panning, delay, and reverb, so its gate always follows the compressor.
+
+## Audio effects choice.
+
+MixAgent uses two to five audio effects per track, adds no delay or reverb to bass
+tracks, and often applies reverb once on a subgroup rather than on each track, as
+on the drum and piano subgroups in Figure 5. Its
+full-mix chain varies across clips and includes a multiband compressor in
+Figure 5. GRAFX keeps one to seven audio effects per
+track and adds delay or reverb to most tracks, including the bass tracks in
+Figures 5 and 6.
+Its full-mix chain always contains EQ, distortion, a stereo imager, and
+gain/panning, and three of the four add a limiter.
+
+Because audio effects chain F1 (Table 10) measures
+agreement with GRAFX plans, it counts such choices as errors when they
+differ from GRAFX. We therefore also report audio scores after fitting each
+plan’s parameters.
+
+(a) GRAFX (fitted to GT, pruned)
+
+(b) MixAgent
+
+Figure 5: Mixing consoles for MedleyDB clip sample_129. Each input is labeled with its instrument and index, and input $k$ is the same track in both panels. Both consoles use the same three subgroups: double bass, drums, and piano. GRAFX is shown after pruning near-inactive processors. MixAgent shows every tool in its final plan.
+
+(a) GRAFX (fitted to GT, pruned)
+
+(b) MixAgent
+
+Figure 6: Mixing consoles for AlbumDB clip sample_010. Both consoles use the same three subgroups: bass, drums (kick, overheads, snares, toms), and electric guitars. Layout as in Figure 5.
+
+(a) GRAFX (fitted to GT, pruned)
+
+(b) MixAgent
+
+Figure 7: Mixing consoles for MedleyDB clip sample_110. The GRAFX console has no subgroups: all eight tracks feed the full mix directly. MixAgent groups the four guitars and the two vocals into subgroups and gives drums and bass their own subgroups. Layout as in Figure 5.
+
+(a) GRAFX (fitted to GT, pruned)
+
+(b) MixAgent
+
+Figure 8: Mixing consoles for AlbumDB clip sample_013. The GRAFX console groups the two acoustic guitars and the two violins, and sends bass, cello, viola, and lead vocal to the full mix directly. MixAgent places the two violins, cello, viola, and bass in one subgroup, the two acoustic guitars on another, and the lead vocal in its own subgroup. Layout as in Figure 5.
+
+## D.4 Detector Accuracy
+
+On a validation set of 3,130 corrupted states from 13 training clips
+held out from training, the detector
+reaches 0.81 F1 for tracks and 0.77 for audio effects at threshold 0.5
+(Table 11). This threshold is used only for
+validation, and MixAgent uses $\tau=0.15$ at inference.
+
+Target
+ $N$ 
+Prec.
+Recall
+F1
+AUROC
+
+Track
+9,779
+0.797
+0.822
+0.809
+0.893
+
+Audio effect
+33,329
+0.700
+0.849
+0.767
+0.874
+
+Table 11: Detector validation at threshold 0.50. $N$ counts decisions.
+
+## D.5 Error at Each Stage
+
+Table 12 measures MRS after each stage against the
+GT-fitted audio of that stage. With numerical feedback, DPO has lower error
+than SFT at every stage.
+
+Critic
+Track
+Subgroup
+Full mix
+Final
+
+Untrained A1
+1.50
+1.82
+2.12
+2.26
+
+SFT A1
+1.46
+1.73
+1.99
+2.08
+
+DPO A1
+1.47
+1.81
+1.96
+2.09
+
+Untrained A2
+1.71
+2.13
+2.34
+2.44
+
+SFT A2
+1.53
+1.97
+2.19
+2.24
+
+DPO A2
+1.60
+1.88
+1.89
+1.98
+
+Untrained A3
+1.46
+1.81
+2.09
+2.18
+
+SFT A3
+1.42
+1.88
+1.84
+1.91
+
+DPO A3
+1.33
+1.80
+1.68
+1.75
+
+Table 12: MRS after each processing stage (lower is better). Track, subgroup, and full mix targets
+are the corresponding GT-fitted outputs. The final target is the real mix.
+Untrained rows use prompted Qwen3-Omni as the critic.
+
+## D.6 Number of Refinement Passes
+
+Additional passes do not consistently help (Figure 9).
+With A3, MixAgent improves from 1.75 to 1.69 MRS with three passes and
+returns to 1.73 with five, while A1 and A2 are best with one pass.
+
+Figure 9: MRS (lower is better) with a maximum of one, three, or five
+refinement passes per stage for A1, A2, and A3, from left to right. Parentheses
+show the score change from the preceding plotted pass budget.
+
+## Appendix E Ablation Protocols
+
+## E.1 Critic Training and Feedback Form
+
+All rows use the same learned detector. The untrained rows prompt
+Qwen3-Omni as the critic. The trained critic is a different model (Table 7), and DPO
+starts from its SFT checkpoint. Within each
+feedback form, SFT and SFT+DPO share the detector, planner, plan, initial
+state, prompts, and decoding. Later states can diverge as corrections are
+applied. For each applied correction,
+ $\Delta\mathrm{MRS}=\mathrm{MRS}_{\mathrm{before}}-\mathrm{MRS}_{\mathrm{after}}$ 
+on the full mix, and a correction counts as an improvement if
+ $\Delta\mathrm{MRS}>0$ . Oracle A1 and A2 replace the critic’s output with
+the GT critique in the same feedback form, which the planner converts into
+parameter values as in the other A1 and A2 rows. Oracle A3 fits the
+parameters of the same plan directly to GT with GRAFX.
+
+## E.2 Target Selection
+
+All conditions share the plan, starting state, DPO A3 critic, and the
+detector’s audio effects-level diagnoses, and they visit selected elements in
+order of detector score. Only the set of selected tracks and subgroups changes.
+The full mix is always inspected. Inspect-all averages 13.1 turns and
+56.6 minutes per clip, and random selection 12.1 turns.
+
+## E.3 Refinement Order
+
+Top-down visits the full mix, then subgroups, then tracks, rendering between
+levels (11.9 turns and 54.2 minutes per clip). The variant without
+hierarchy computes all corrections from the initial audio and applies them
+at once (11.8 turns).
+
+## Appendix F Prompts
+
+Figures 10–17 show the
+prompts of the language-model calls in MixAgent and the prompt used to build MixCritic. Text in braces, such as
+{stem_count}, is filled in at run time, and “[…]” marks lines
+cut for space.
+
+⬇
+
+You are an expert mixing engineer setting up a session. You have direct audio access to {stem_count} full dry stem audio files (attached in fixed order) plus their filenames. You CAN hear every file – listen carefully before you respond.
+
+Dry stem filename order:
+
+{stem_file_list}
+
+Your task is ONLY to group these {stem_count} dry stems into a small number of mixing buses (submix groups), exactly as an engineer routes related tracks to shared buses before balancing them. Do NOT choose any tools or parameters yet and do NOT try to mix – only decide the grouping.
+
+Grouping guidance:
+
+- Infer each stem’s role from its filename and audio content: drums (kick, snare, toms, hats, overheads, room), bass / low-end foundation, lead vocal, backing/harmony vocals, […]
+
+- Put stems that should be balanced and processed together into the same group. For example, all drum mics belong in one "drums" bus; a lead vocal with its doubles and harmonies belongs in one "vocals" bus; the DI and amp of a single guitar belong together.
+
+- Choose the number of groups yourself based on what the song actually contains. Typical mixes use about 3 to 6 groups. Use at most {max_groups} groups.
+
+- Every stem must be placed in exactly one group. […]
+
+- Prefer a few meaningful buses over many tiny ones. A solo instrument with no relatives can be its own group.
+
+Output format. Return a single JSON object with exactly one key "groups": […]
+
+{"groups": [{"name": "drums", "stem_indices": [1, 2, 3]},
+
+ {"name": "vocals", "stem_indices": [4, 5]},
+
+ {"name": "bass", "stem_indices": [6]}]}
+
+Figure 10: Prompt of the grouping agent, which hears all unprocessed input tracks together with their file names. The reproduced prompts retain their original terminology: stems are input tracks, buses process subgroups, and the master bus processes the full mix.
+
+⬇
+
+You are an expert mixing engineer planning ONE submix bus ("{group_name}") of a song. You have direct audio access to the {stem_count} dry stem audio files of this bus, attached in fixed order. You CAN hear every file – listen carefully before you respond.
+
+Bus stem filename order:
+
+{stem_file_list}
+
+Your task: choose WHICH mixing tools to apply – you are NOT choosing any parameter values in this pass. A separate optimizer will set all parameters later; you only decide the processing structure, exactly like an engineer patching processors into a console before touching any knob.
+
+Decide two things:
+
+1. For each stem in this bus: an ordered per-stem tool chain (possibly empty, if the stem needs no individual processing before the bus).
+
+2. One ordered tool chain for the bus itself (the shared "{group_name}" group chain applied to the summed bus; possibly empty).
+
+Allowed tools (both per-stem and bus chains): eq, distortion, compressor, noisegate, stereo_imager, gain_panning, delay, reverb.
+
+Guidance:
+
+- Choose tools by role and by what you hear: gates for bleed, compressors for uneven dynamics, eq for tone/separation, gain_panning for level/placement, reverb/delay for space, stereo_imager for width, distortion for grit.
+
+- Don’t default to minimal. A single tool per stem is usually too little […]
+
+- The in-context examples show the kind of fuller, multi-tool treatment expert mixes use. Treat them as an illustration of how thorough to be when a stem calls for it, not a tool count to copy.
+
+- Put shared, glue-style processing (bus compression, shared ambience, overall bus tone) in the group chain – but still give each individual stem its own full treatment […]
+
+[…]
+
+{icl_examples}
+
+Output format. Return a single JSON object with exactly these two keys: […]
+
+{"stems": [{"stem_index": 1, "chain": ["noisegate", "eq", "compressor", "gain_panning"]},
+
+ {"stem_index": 2, "chain": ["eq", "compressor"]}],
+
+ "group_chain": ["compressor", "eq", "gain_panning"]}
+
+Figure 11: Prompt of the tool-planning agent for the track and subgroup steps (one call per subgroup). The retrieved examples replace {icl_examples} (Figure 13).
+
+⬇
+
+You are an expert mixing engineer finalizing the master bus of a song. You choose WHICH tools to apply on the master bus – no parameter values; a separate optimizer will set all parameters later.
+
+Session structure (groups, their member stems, and the tool chains already chosen):
+
+{session_summary}
+
+Your task: one ordered tool chain for the master bus (applied to the sum of all group buses and passthrough stems).
+
+Allowed master-bus tools: eq, distortion, compressor, noisegate, stereo_imager, gain_panning, delay, reverb, multiband_compressor, limiter.
+
+Guidance:
+
+- Typical masters use a handful of tools: tonal eq, glue compression (single-band or multiband), optional width/saturation, a level trim, and a final limiter last when a peak ceiling is needed.
+
+- Choose based on what the session structure implies (how much dynamics/tone work already happened at stem/group level) and general mastering practice. Empty is allowed but rare.
+
+{icl_examples}
+
+Output format. Return a single JSON object with exactly one key:
+
+{"master_chain": ["eq", "compressor", "gain_panning", "limiter"]}
+
+Figure 12: Prompt of the tool-planning agent for the full mix step. This call is text only, and {session_summary} lists the subgroups, their tracks, and the chains already chosen.
+
+⬇
+
+In-context examples from previously mixed songs, structured by an expert hierarchical mixing console (a gradient-descent optimizer). Guidance only – adapt to THIS song; do not copy blindly. Parameters are intentionally omitted: study WHICH tools were kept per stem, per bus, and on the master, and how selective the choices are. […]
+
+Example [text] (text 0.901) – 16 stems, 4 buses, 0 routed straight to master:
+
+ Bus ’piano’ bus chain: eq -> compressor -> noisegate
+
+ 1 piano eq -> compressor -> gain_panning -> delay -> reverb
+
+ sounds like: An isolated dry piano stem with no other instruments or ambience. […]
+
+ 2 piano eq -> compressor -> noisegate -> delay -> reverb
+
+ sounds like: […]
+
+ Bus ’double bass’ bus chain: eq -> compressor -> stereo_imager
+
+ 5 double bass eq -> compressor -> gain_panning
+
+ sounds like: […]
+
+ […]
+
+ Master chain: eq -> distortion -> gain_panning
+
+[…]
+
+Figure 13: Format of the retrieved examples, shown for one example
+retrieved for MedleyDB clip sample_129. MixAgent inserts three examples
+retrieved by text and one retrieved by audio.
+
+⬇
+
+You are a professional mixing engineer. You are mixing ONE instrument group of song {song_id}: the "{group_name}" group. The tools on each stem are already chosen and FIXED – your job is to set their PARAMETERS so this group sounds right and sits the way the same group sits inside the Reference mix.
+
+## AUDIO ORDER
+
+{audio_order}
+
+Listening notes:
+
+- Each dry stem clip is loudness-normalized on its own, so the stem clips do NOT tell you the current relative levels. Set relative levels yourself with the gain_panning sites (where present) and compressor make_up.
+
+- Match the Reference closely: how loud, bright, wide, dry/wet and dynamic is this group inside the Reference? That is your target.
+
+- The dry stems are MONO and all sit dead-center. The mix can ONLY become stereo through UNEQUAL [left, right] values on gain_panning sites […]
+
+## THE GROUP’S STEMS
+
+{group_table}
+
+## PARAMETER SITES (set values ONLY for these numbered sites)
+
+{site_table}
+
+## TOOL PARAMETER CONTRACT
+
+{tool_contract}
+
+## YOUR TASK
+
+Listen to every stem, then choose parameters for the sites above so that, summed together, the group is balanced internally (lead elements clear, doubles/mics supporting, no masking), panned into a sensible stereo picture where gain_panning exists, tonally clean (cut mud, tame harshness – cuts before boosts), and dynamically controlled but alive. […] Restraint wins: near-neutral parameters on most sites plus a few decisive moves beat processing everything.
+
+## OUTPUT
+
+Return ONLY one json fenced block:
+
+{"sites": {"<site_id>": {"<param>": <value>, …}, …}, "notes": "<one sentence of intent>"}
+
+[…]
+
+Figure 14: Prompt for parameter initialization by the planner (track step). The subgroup and full mix steps use analogous prompts. {tool_contract} gives each tool’s parameter names, units, and valid ranges.
+
+⬇
+
+You are a mixing critic for one element of a multitrack music mix.
+
+You will hear three audio clips, in this order:
+
+1. TARGET – {target_clip_desc}
+
+2. MIX – the current mix.
+
+3. REFERENCE – the reference mix for this song: how it should sound.
+
+The detector flagged these elements as sounding wrong, worst first: {flagged_list}.
+
+Criticize ONLY the target element: {target_name} ({target_instrument}, {target_level} level).
+
+The other flagged elements are context – do not propose fixes for them.
+
+Diagnosis (given): the corrupted tools on this element are: {diagnosis_tools}. Exactly these tools are set wrong; every other tool in the chain is already correct.
+
+{chain_header}
+
+{chain_block}
+
+Listen and compare the clips, think it through, then answer with ONE JSON object only:
+
+{"tools": [{"tool": "<a tool name from the chain above>", "comment": "apply the parameter values below", "parameters": {<the tool’s new raw parameter values>}, "drywet": <new raw drywet value>}, …],
+
+ "keep": "<one clause: what already works and must be preserved>"}
+
+Give exactly one entry for each corrupted tool listed above, carrying the exact new values.
+
+Figure 15: Prompt of the MixAgent critic at inference, which uses the A3 answer format. Each audio clip is preceded by a text label. {diagnosis_tools} are the audio effects flagged by the detector, and {chain_block} lists the element’s audio effects with their current values. The critic reasons before answering, and only the final JSON is used.
+
+⬇
+
+You are a mixing critic for one element of a multitrack music mix. You do not hear the audio. Judge the element from its effect settings.
+
+Target element: {target_name} ({target_instrument}, {target_level} level).
+
+Other elements set wrong in this mix: {flagged_list}. They are context only – do not propose fixes for them.
+
+Diagnosis (given): the corrupted tools on this element are: {diagnosis_tools}. Exactly these tools are set wrong; every other tool in the chain is already correct.
+
+The target element’s effect chain, in raw parameter space. Each tool lists its CURRENT values. Each corrupted tool also lists its CORRECT values, the settings that fix the problem:
+
+{chain_block}
+
+ e.g. eq CURRENT {…} (already correct)
+
+ noisegate CURRENT {…} CORRECT {…} (corrupted)
+
+Compare the CURRENT and CORRECT values. Explain what would sound wrong in the target element with the CURRENT values and how changing the corrupted tools to their CORRECT values fixes it. Then answer with ONE JSON object only:
+
+{answer_format}
+
+Figure 16: Prompt used to build MixCritic, shared by A1, A2, and A3. The teacher LLM receives text only. The answer format of each feedback form replaces {answer_format} (Figure 17). {diagnosis_tools} are the corrupted audio effects, and {chain_block} lists the element’s audio effects with their current values and, for each corrupted audio effect, its pseudo-GT values $\theta^{\ast}$ .
+
+⬇
+
+A1 (free text):
+
+{"feedback": "<2-4 sentences of plain-language criticism of the target element – what sounds wrong and how it should sound instead. No effect names, no parameter names, no numbers.>"}
+
+A2 (per-tool comments):
+
+{"tools": [{"tool": "<a tool name from the chain above>", "comment": "<1-3 sentences: what is wrong involving this tool and how to fix it. No numbers.>"}, …],
+
+ "keep": "<one clause: what already works and must be preserved>"}
+
+Give exactly one entry for each corrupted tool listed above.
+
+A3 (parameter values):
+
+{"tools": [{"tool": "<a tool name from the chain above>", "comment": "apply the parameter values below", "parameters": {<the tool’s new raw parameter values>}, "drywet": <new raw drywet value>}, …],
+
+ "keep": "<one clause: what already works and must be preserved>"}
+
+Give exactly one entry for each corrupted tool listed above, carrying the exact new values.
+
+Figure 17: Answer formats of A1, A2, and A3, which replace {answer_format} in Figure 16.

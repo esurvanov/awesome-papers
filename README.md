@@ -18,6 +18,9 @@
 | Статья | Папка | Паспорт |
 |---|---|---|
 | 2610.23637 · разрыв соотношений (Бартольди, Бридсон, Михайлов, Николсон) | `papers/2610.23637-relation-gap` | ✅ |
+| 2502.13266 · большие кубики Рубика (Червов, Хоружий и др., CayleyPy) — [ролик](https://youtu.be/bg7tVawVWMc), [статья в блоге](https://www.urvanov.com/blog/rubik-cube-neural-network/) | `papers/2502.13266-rubik` | ✅ |
+| 2502.18663 · кольцо с шариками, гипотеза о потолке (Червов, Обозов и др., CayleyPy RL) | `papers/2502.18663-ring` | ✅ |
+| 2509.19162 · башни расстановок: ритм потолков, задача Глушкова, рекорды (Червов, Федоряка, Константинова и др., CayleyPy Growth) | `papers/2509.19162-growth` | ✅ |
 | 2610.22161 · склейка слабой аппроксимируемости (Pat Lank) | `papers/2610.22161-weak-approx` | — |
 | 2610.22128 · реликтовое излучение и G | `papers/2610.22128-cmb` | — |
 | 2610.00011 · модель спинового стекла | `papers/2610.00011-spin-glass` | — |
@@ -51,6 +54,8 @@ cp -R core/templates/paper papers/<arxiv-id>-<слово>
 | ManimGL | [3b1b/manim](https://github.com/3b1b/manim), © 3Blue1Brown LLC | MIT (`vendor/manim/LICENSE.md`) | копия исходников с правками (`vendor/manim/UPSTREAM.md`) |
 | Animator | [ashishjamarkattel/Animator](https://github.com/ashishjamarkattel/Animator), автор — Ashish Jamarkattel | **не указана** (ни файла, ни отметки на GitHub) | вложенный репозиторий: форк [esurvanov/Animator](https://github.com/esurvanov/Animator); код в этот репозиторий не копируется |
 | Детектор текста CRAFT (внутри Animator, `animator/models/craft.onnx`) | [clovaai/CRAFT-pytorch](https://github.com/clovaai/CRAFT-pytorch), NAVER Corp. | код — MIT; лицензия весов не указана | в составе форка Animator |
+| STORM (`knowledge-storm`) | [stanford-oval/storm](https://github.com/stanford-oval/storm), Stanford OVAL | MIT | пакет в отдельном окружении `.venvs/storm`; вызывается из `core/pipeline/research.py`, код не копируется |
+| Humanizer | [blader/humanizer](https://github.com/blader/humanizer), автор — Siqi Chen | MIT (`core/skills/humanizer/LICENSE`) | копия `SKILL.md` в `core/skills/humanizer/` (источник и коммит — `SOURCE.md`); навык Claude Code `.claude/skills/humanizer` |
 
 Пока у Animator нет лицензии, его код живёт только в форке на GitHub (форк публичных репозиториев разрешён правилами
 GitHub). Переносить его исходники в этот репозиторий — только после того, как автор добавит лицензию.

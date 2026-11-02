@@ -1,0 +1,2163 @@
+## PORA: Learning When More Reasoning Pays Off for LLM Agents
+
+Bo Yan
+
+Affiliation: University of Central Florida
+
+Email: bo.yan@ucf.edu
+
+Qi Zhang
+
+Affiliation: Independent Researcher
+
+Email: owl.zqq@gmail.com
+
+Zhen Tan
+
+Affiliation: Stevens Institute of Technology
+
+Email: ztan21@stevens.edu
+
+Tianlong Chen
+
+Affiliation: UNC Chapel Hill
+
+Email: tianlong@cs.unc.edu
+
+Song Wang
+††thanks: ˜Corresponding author.
+Affiliation: University of Central Florida
+
+Email: song.wang@ucf.edu
+
+Abstract
+
+LLM agents perform tasks over multiple steps and revise their actions based on feedback. As the total reasoning budget is often limited and must support future steps, the agent must choose between short and long reasoning before each action.
+Longer reasoning may improve the final task outcome by preventing later errors, but it also uses budget capacity that may be needed for future decisions.
+This creates two challenges: estimating the downstream value of long reasoning and deciding when that value is worth using the remaining budget.
+We propose Paired Outcome-guided Reasoning Allocation (PORA), which learns this decision by comparing short and long reasoning from the same interaction state. During training, PORA completes the task twice from each selected state, once with a short reasoning allowance and once with a long allowance, and compares their final quality and total processing to estimate when longer reasoning is valuable. During inference, a controller weighs this estimate against learned prices on remaining-budget pressure and chooses either short or long reasoning without running both alternatives.
+We evaluate PORA across application, memory, code, retail, and mathematics tasks, achieving strong results across all settings. On BFCL memory, it exceeds the strongest existing method by 17.4–32.9 percentage points. Within the same agent, it matches or exceeds always using long reasoning on code and mathematics with 50.6% fewer actor tokens and 31.2% fewer model requests, respectively.
+
+## 1 Introduction
+
+LLM agents solve tasks by using tools, maintaining memory, and revising their actions in response to execution feedback (Yao et al., 2023; Shinn et al., 2023; Trivedi et al., 2024; Berkeley Function Calling Leaderboard, 2026). Under a finite episode budget, an agent must balance how much computation to allocate before each action. Specifically, a short reasoning allowance saves computation for later steps, while a longer allowance may help the agent resolve uncertainty before acting (Wei et al., 2022; Snell et al., 2025). For example, when updating a calendar with conflicting records, additional reasoning may prevent an incorrect write and the repairs that follow (Figure 1). However, the extra computation also consumes a finite episode budget that may be needed for later evidence acquisition and verification. The value of reasoning therefore depends on its effect on the rest of the task, not only on the current action. This raises an important question: given the current interaction state and the remaining budget, when is it worth using a longer reasoning allowance?
+
+Figure 1: Deciding how long to reason at one step (illustrative). ❶ From the same state, short reasoning leads to a wrong write and two repairs, while long reasoning writes correctly; which is better is known only after the task ends. ❷ Long reasoning uses budget that later steps also need, so the same choice can help with ample budget and hurt with a tight one.
+
+Since long reasoning is often wasted on easy inputs (Chen et al., 2025; Sui et al., 2025), existing methods choose reasoning budgets based on task complexity, plans, or confidence (Fang et al., 2025; Han et al., 2025; Lin et al., 2026; Fu et al., 2025; Lee et al., 2026). For agents, ARES estimates the effort needed for successful step completion (Yang et al., 2026), and TAB learns turn-level budgets from trajectory rewards under a global token constraint (Jali et al., 2026). Re-FORC estimates the reward available from additional thinking (Zabounidis et al., 2026).
+These signals describe step difficulty, the payoff of further thinking, or the return of a whole trajectory, but none measures how the rest of an interaction changes when only the current allowance changes, with the interaction state and the subsequent policy held fixed.
+Closing this gap raises two challenges.
+❶ Quantifying the Benefit of Long Reasoning.
+A longer allowance at the current state can change subsequent actions and observations. It may improve terminal quality by preventing downstream errors, or reduce total processing by avoiding later corrective work. Local step success and current-step token counts therefore cannot supervise this value, which has to be measured through the completed interaction.
+❷ Choosing Long Reasoning Under a Shared Budget.
+Even when longer reasoning helps, it uses capacity that later steps may need. The interaction state can therefore warrant different allowances depending on the remaining budget and the number of future decision rounds. An allocation rule must weigh the expected benefit of longer reasoning against this capacity pressure.
+
+We propose Paired Outcome-guided Reasoning Allocation (PORA), which learns when to use short or long reasoning by comparing their outcomes from the same interaction state. To address ❶, during training we start two separate task executions from each selected state: one uses a short reasoning allowance (Preserve), and the other uses a long allowance (Spend). Both executions follow the same subsequent policy until the task ends, and we record their final quality and total processing. A small controller learns to predict the paired differences from the visible interaction history.
+To address ❷, the controller turns the remaining budget and future decision rounds into two capacity-pressure terms and weighs them, with learned positive prices, against the predicted benefit. At inference, it makes a single choice at each step and does not run both alternatives. Pairs can be recollected under the updated controller, since it determines how preserved capacity is later used.
+Overall, PORA enables an interactive agent to spend more reasoning when it is useful and save capacity when it is not.
+
+We evaluate PORA across application, memory, code, retail, and mathematics tasks, achieving strong results across all settings. On three BFCL memory settings, PORA exceeds the strongest existing method by 17.4–32.9 percentage points. Within the same agent, PORA improves over always using the short allowance in all six settings with complete fixed-allowance runs, and on code and mathematics it matches or exceeds always using the long allowance while using 50.6% fewer actor tokens and 31.2% fewer model requests, respectively. Refitting the controller with targets shuffled across states lowers code success by 7.9 points, showing the value of learning from paired outcomes.
+Our contributions are as follows:
+
+• 
+
+Problem. We formulate reasoning allocation in interactive LLM agents as a same-state comparison: a longer allowance is valued by its effect on final quality and later processing, under the same subsequent policy.
+
+• 
+
+Method. We propose PORA, which learns this value from paired executions and selects the allowance by weighing the predicted benefit against learned prices on remaining budget.
+
+• 
+
+Experiments. We evaluate PORA across application, memory, code, retail, and mathematics tasks, showing that it improves task success and processing efficiency over existing methods and fixed allowances, and we analyze the value of paired outcomes and capacity prices.
+
+## 2 Methodology
+
+## 2.1 Problem Formulation
+
+An interactive LLM agent reasons before taking each task action. At decision $t$ , a controller observes the visible history $s_{t}$ , the remaining episode budget $b_{t}$ out of a total bank $B$ , and the remaining decision rounds $N_{t}$ . It chooses between a short reasoning allowance $\kappa_{s}$ (Preserve) and a long allowance $\kappa_{l}>\kappa_{s}$ (Spend). An allocation policy $\rho$ maps these inputs to a binary proposal and its allowance:
+
+ $\displaystyle\widetilde{a}_{t}$ 
+ $\displaystyle=\rho(s_{t},b_{t},N_{t})\in\{0,1\},$ 
+
+(1)
+
+ $\displaystyle\widetilde{\kappa}_{t}$ 
+ $\displaystyle=(1-\widetilde{a}_{t})\kappa_{s}+\widetilde{a}_{t}\kappa_{l}.$ 
+
+Here $0$ denotes Preserve and $1$ denotes Spend. Native phase and budget rules $\mathcal{F}$ map the proposal to a feasible grant $\kappa_{t}=\mathcal{F}(\widetilde{a}_{t},s_{t},b_{t},N_{t})$ , which may differ from $\widetilde{\kappa}_{t}$ . A fixed LLM actor acts under $\kappa_{t}$ , the observation extends the history, and $b_{t+1}=b_{t}-c_{t}$ , where the charge $c_{t}$ is the granted allowance or the realized use, depending on the interface.
+
+Our goal is to allocate reasoning where it improves the completed task while preserving capacity for later steps. The task’s evaluator supplies terminal quality $Y$ , and we measure complete processing $C$ , in a declared unit such as tokens, from the current decision to termination. $C$ includes subsequent work such as retrievals, repairs, and failed requests, differing from the charges. The controller uses only information available before allocation.
+
+## 2.2 Paired Outcome-guided Reasoning Allocation
+
+## Overview.
+
+Figure 2 shows PORA in three stages. Paired rollouts (\raisebox{-0.9pt}{\footnotesize1}⃝) measure how short and long allowances differ in terminal quality and complete processing, addressing ❶. A controller (\raisebox{-0.9pt}{\footnotesize2}⃝) learns to predict these differences and to price remaining-budget pressure. At inference (\raisebox{-0.9pt}{\footnotesize3}⃝), it weighs its predictions against the priced pressure, addressing ❷. Collection and training can be repeated as the policy changes.
+
+Figure 2: Overview of PORA. \raisebox{-0.9pt}{\footnotesize1}⃝ From one checkpoint $(s_{i},b_{i},N_{i})$ , a Preserve branch and a Spend branch continue under the same policy $\rho_{k}$ ; their differences in terminal quality and complete processing give the paired targets $(q_{i},g_{i})$ . \raisebox{-0.9pt}{\footnotesize2}⃝ The controller learns to predict these targets from the visible history and learns the prices on the pressure terms $(O_{i},H_{i})$ through the direction label $d_{i}$ . \raisebox{-0.9pt}{\footnotesize3}⃝ At inference, the predicted gain is weighed against the priced pressure, and native rules map the proposal to a feasible grant $\kappa_{t}$ . The dashed arrow repeats collection and training under the updated policy. The calendar case is illustrative.
+
+## Paired Supervision Collection.
+
+The benefit of additional reasoning may appear several steps later. In the calendar example, a short allowance may leave a record conflict that causes later repairs, while a long allowance may resolve it before a write. We thus construct supervision from completed trajectories rather than local step success.
+
+At training iteration $k$ , we collect decision checkpoints under an allocation policy $\rho_{k}$ , starting from an initial policy $\rho_{0}$ . For checkpoint $i$ , we restore the same history, environment, memory, budget, and random state into two isolated branches. One receives the short allowance (Preserve), and the other receives the long allowance (Spend). Both then follow $\rho_{k}$ until termination, so the branches differ only in the allowance at the checkpoint, and their later actions and observations can diverge as a consequence. The memory instances draw their checkpoints from synthetic fixtures under the native memory interfaces (Appendix A.3).
+
+Let $(Y_{s,i},C_{s,i})$ and $(Y_{l,i},C_{l,i})$ be the terminal quality and complete processing of the short and long branches. They provide two regression labels and a training set:
+
+ $\displaystyle q_{i}$ 
+ $\displaystyle=Y_{l,i}-Y_{s,i},$ 
+
+(2)
+
+ $\displaystyle g_{i}$ 
+ $\displaystyle=(C_{s,i}-C_{l,i})/Z_{i},$ 
+
+ $\displaystyle\mathcal{D}_{k}$ 
+ $\displaystyle=\bigl\{((s_{i},b_{i},N_{i}),(q_{i},g_{i}))\bigr\}_{i=1}^{M_{k}}.$ 
+
+ $M_{k}$ denotes the number of pairs and $Z_{i}=\max(C_{s,i},C_{l,i},z_{\min})$ , with $z_{\min}>0$ , normalizes processing. Positive $q_{i}$ means that long allowance improves terminal quality; positive $g_{i}$ means that it saves complete processing despite allowing more reasoning now. For a tradeoff $\lambda\geq 0$ , $q_{i}+\lambda g_{i}$ equals the difference between the branch utilities $Y-\lambda C/Z_{i}$ of the long and short branches. Each branch runs once, so $(q_{i},g_{i})$ is a single-sample estimate of the expected paired difference under $\rho_{k}$ , whose conditional mean is estimated below.
+
+## Controller Training.
+
+The controller needs to recognize relevant evidence and unfinished work from the visible history. Let $u^{\mathrm{task}}$ be the task text and $u^{\mathrm{plan}}$ a textual evidence plan describing the evidence the task requires; both are visible from the first decision. A frozen pretrained encoder $E_{\psi}$ embeds these texts and the observations already returned by tools. We construct a compact controller representation as
+
+ $\displaystyle e^{\mathrm{task}}$ 
+ $\displaystyle=\operatorname{norm}\!\left(E_{\psi}(u^{\mathrm{task}})\right),$ 
+
+(3)
+
+ $\displaystyle e^{\mathrm{plan}}$ 
+ $\displaystyle=\operatorname{norm}\!\left(E_{\psi}(u^{\mathrm{plan}})\right),$ 
+
+ $\displaystyle x_{\phi}(s)$ 
+ $\displaystyle=[r(s);\,f(s);$ 
+
+ $\displaystyle\operatorname{proj}_{\phi}(e^{\mathrm{task}},e^{\mathrm{plan}});\,\omega(s)].$ 
+
+Here $\operatorname{norm}$ denotes L2 normalization, also applied to observation embeddings, and the brackets denote concatenation. The features $r(s)$ summarize cosine similarities between the task, plan, and accumulated or recent observations, capturing evidence relevance. The feedback features $f(s)$ summarize interaction progress and tool successes or failures. The function $\operatorname{proj}_{\phi}$ concatenates learned affine projections of the task and plan embeddings, providing semantic context beyond their similarity summaries. Finally, $\omega(s)$ records visible obligations, such as missing evidence, pending writes, or repair needs. The budget quantities do not enter $x_{\phi}(s)$ ; they affect the decision only through the capacity terms in Eq. 6. Exact features, dimensions, and encoder configurations are specified in Appendix A.1 and the native recipes.
+
+Two independent MLP heads read $x_{i}=x_{\phi}(s_{i})$ and predict the paired consequences:
+
+ $\displaystyle\widehat{Q}_{i}$ 
+ $\displaystyle=\widehat{Q}_{\phi}(x_{i})=\operatorname{MLP}_{Q}(x_{i};\phi_{Q}),$ 
+
+(4)
+
+ $\displaystyle\widehat{G}_{i}$ 
+ $\displaystyle=\widehat{G}_{\phi}(x_{i})=\operatorname{MLP}_{G}(x_{i};\phi_{G}).$ 
+
+The quality head estimates the terminal-quality gain $q_{i}$ , and the processing head estimates normalized complete-processing savings $g_{i}$ , both for the long allowance relative to the short one. Their parameter blocks $\phi_{Q}$ and $\phi_{G}$ are independent. Separate outputs keep quality and processing interpretable and allow an explicit tradeoff when choosing an allowance. The trainable parameters $\phi$ comprise the semantic projections, the two heads, and the capacity prices introduced below; through Eq. 7, they define the allocation policy $\rho_{\phi}$ .
+
+To train both consequence estimates and allowance selection, we combine two regression losses with an allocation-direction loss. Let $U_{i}=U_{\phi}(s_{i},b_{i},N_{i})$ be the capacity-priced allocation score of Eq. 6, with pressure terms $O_{i}$ and $H_{i}$ computed from $(b_{i},N_{i})$ . The shared per-example loss is
+
+ $\displaystyle\mathcal{L}_{i}(\phi)={}$ 
+ $\displaystyle w_{Q}\ell_{Q}(\widehat{Q}_{i},q_{i})+w_{G}\ell_{G}(\widehat{G}_{i},g_{i})$ 
+
+(5)
+
+ $\displaystyle+w_{D}\ell_{D}(U_{i}/\tau,d_{i}).$ 
+
+We minimize the mean of these losses over $\mathcal{D}_{k}$ . The first two terms fit the observed quality and processing differences. The third is binary cross-entropy with logits on the direction label $d_{i}=\mathbf{1}[q_{i}+\lambda g_{i}>\delta]$ , which indicates whether the observed utility difference favors the long allowance by more than a margin $\delta\geq 0$ ; $\tau>0$ scales the score, and the weights $w_{Q},w_{G},w_{D}$ control the loss contributions. The direction loss back-propagates through the projections, both heads, and the prices, and it is the only term that trains the prices. Since $d_{i}$ already reflects downstream budget effects under $\rho_{k}$ , the prices act as a learned correction, fitted to the extent that $O_{i}$ and $H_{i}$ explain direction errors left by $\widehat{Q}_{i}+\lambda\widehat{G}_{i}$ . Actor and encoder weights remain frozen. Appendix A.3 specifies regression choices, label margins, tie handling, sample weighting, and additional task-specific loss terms.
+
+After fitting, we select parameters $\phi_{k+1}$ with an instance-specific rule and set $\rho_{k+1}=\rho_{\phi_{k+1}}$ . We can then collect new checkpoints and paired continuations on training tasks under $\rho_{k+1}$ . This refresh matters because changing the continuation changes how preserved capacity is later used, and hence the labels to be predicted. Choosing Spend exactly when the expected paired utility difference under $\rho_{k}$ is nonnegative is the improvement step of rollout-based policy iteration (Lagoudakis and Parr, 2003); the controller approximates this step from visible inputs, and the capacity terms calibrate it to current budget pressure. Algorithm 1 and Appendix A.4 specify the loop; the application instance uses one recollection round.
+
+## Online Inference with Capacity Pricing.
+
+At inference, we encode the current visible history and construct $x_{t}=x_{\phi}(s_{t})$ using the same representation as in training. Relative to a short allowance, the two heads estimate the long allowance’s terminal-quality gain, $\widehat{Q}_{\phi}(x_{t})$ , and normalized complete-processing savings, $\widehat{G}_{\phi}(x_{t})$ . These are predictions of the paired consequences; inference does not execute either paired rollout.
+
+A predicted benefit must also justify using capacity needed by later steps. In the calendar example, resolving a conflict now must leave budget for subsequent evidence acquisition and verification. We therefore derive two pressure terms in $[0,1]$ from the remaining budget and rounds (Eq. 10). $O_{t}$ measures the extra commitment $\kappa_{l}-\kappa_{s}$ relative to $b_{t}$ , scaled by the share of rounds still to come. $H_{t}$ measures how far the budget left after a long grant falls short of funding short allowances in all future rounds, relative to $B$ . Both vanish at the final decision. The allocation score is
+
+ $\displaystyle U_{\phi}(s_{t},b_{t},N_{t})={}$ 
+ $\displaystyle\widehat{Q}_{\phi}(x_{t})+\lambda\widehat{G}_{\phi}(x_{t})$ 
+
+(6)
+
+ $\displaystyle-p_{O}O_{t}-p_{H}H_{t}.$ 
+
+The first two terms combine predicted quality gain and processing savings using the tradeoff $\lambda$ . The learned positive prices $p_{O}=\operatorname{softplus}(\alpha)$ and $p_{H}=\operatorname{softplus}(\eta)$ scale the capacity penalties.
+Writing $U_{t}=U_{\phi}(s_{t},b_{t},N_{t})$ , the controller proposes
+
+ $\widetilde{a}_{t}=\begin{cases}1\ (\textsc{Spend}{}),&U_{t}\geq 0,\\
+0\ (\textsc{Preserve}{}),&U_{t}<0.\end{cases}$ 
+
+(7)
+
+The native rules then give the feasible grant $\kappa_{t}=\mathcal{F}(\widetilde{a}_{t},s_{t},b_{t},N_{t})$ . The actor executes under $\kappa_{t}$ . The returned observation and the charge $c_{t}$ update the inputs for the next decision. This cycle repeats until termination with all parameters fitted (details in Appendix A.2).
+
+Table 1: Task success rate (%) on seven settings from five benchmarks. Completed cells report percentages over the full task counts shown above. A dash marks a setting without a complete run. Fixed Preserve and fixed Spend run the PORA agent with every allowance decision set to short or long; the LCB entries come from the shared-initial-program study, in which PORA also solves 93 of 126 problems. Bold marks the highest completed rate in each column, including ties. The last row gives PORA minus the best completed external method in percentage points. †Action-adapted configuration (Appendix B).
+
+AppWorld
+BFCL memory
+LCB
+ $\tau$ -bench
+MATH500
+
+KV
+Vector
+Recursive
+
+retail
+
+# tasks
+417
+155
+155
+155
+126
+40
+500
+
+Reasoning-budget methods
+
+   Plan and Budget
+27.3
+18.1
+16.1
+58.7
+65.1
+62.5
+94.8
+
+   Certaindex
+4.1
+41.9
+15.5†
+25.8†
+39.7
+72.5
+73.4
+
+Search and rollout methods
+
+   DORA
+4.1
+30.3
+29.0
+28.4
+49.2
+62.5
+95.0†
+
+   BATS
+22.5
+36.1
+39.4
+63.9
+73.0
+65.0
+94.4†
+
+   LATS
+29/172
+44.5
+49.7
+60.0
+38.9
+65.0
+95.6†
+
+   Forest-of-Thought
+7.0
+–
+–
+–
+18.3
+72.5
+91.8
+
+PORA agent with a fixed allowance
+
+   Fixed Preserve
+–
+74.2
+71.0
+79.4
+68.3
+70.0
+91.8
+
+   Fixed Spend
+–
+73.5
+74.8
+83.9
+73.0
+70.0
+95.0
+
+PORA
+30.9
+77.4
+81.3
+81.3
+73.8
+72.5
+95.4
+
+    $\Delta$ vs. best external
++3.6
++32.9
++31.6
++17.4
++0.8
+0.0
+ $-$ 0.2
+
+## 3 Experimental Setup
+
+The experiments address three questions. Q1: how does PORA compare with existing reasoning-budget and search methods in task success and processing cost? Q2: does state-dependent allocation improve over granting the same allowance at every step? Q3: how do the paired targets and the capacity prices contribute?
+
+## Benchmarks and metrics.
+
+We evaluate on five benchmarks covering seven settings. AppWorld (Trivedi et al., 2024) provides 417 application tasks scored by AppWorld.evaluate. BFCL memory (Berkeley Function Calling Leaderboard, 2026) provides 155 questions for each of three memory backends (key–value, vector, and recursive summary), scored by official validity. LiveCodeBench (LCB) (Jain et al., 2024) provides 126 programming problems with public and private tests. The retail domain of $\tau$ -bench (Yao et al., 2024) provides 40 customer-service conversations scored by the task evaluator and its assertion judge. MATH500 (Hendrycks et al., 2021) provides 500 problems with exact answer checking. We report the task success rate.
+
+## Models and budgets.
+
+The AppWorld actor is OpenAI gpt-oss-120b with a BGE-M3 encoder. All other settings use Google Gemma 4 31B IT with a MiniLM encoder. On AppWorld and BFCL, an episode has a bank of 8,192 reasoning tokens, a short allowance of 128, a long allowance of 1,024, and at most twenty rounds. The code, retail, and mathematics settings adapt the bank and allowances to their interfaces (Appendix C.3).
+
+## Controller training.
+
+Every setting uses the same controller architecture, with 2,400 to 4,960 trainable parameters, and fits its own weights. Paired rollouts come from public AppWorld training tasks, synthetic memory fixtures for BFCL, and earlier programming problems for LCB. The AppWorld and memory controllers are each fitted on no more than two dozen pairs; AppWorld uses one recollection round (Appendix A.3).
+
+## Baselines.
+
+Reasoning-budget methods decide how much the model reasons: Plan and Budget (Lin et al., 2026) and Certaindex (Fu et al., 2025). Search and rollout methods spend additional rollouts, branches, or tool calls: DORA (Wang et al., 2025), BATS (Liu et al., 2026), LATS (Zhou et al., 2024), and Forest-of-Thought (Bi et al., 2025). Each baseline keeps its own procedure and runs with the same actor model inside the benchmark’s tool interface (Appendix B).
+
+## Controlled comparisons.
+
+For Q2, we run the PORA agent with a fixed allowance: fixed Preserve always grants the short allowance, and fixed Spend grants the long allowance whenever the budget rules permit. These controls are complete for the three memory backends, LCB, $\tau$ -bench retail, and MATH500; on LCB and MATH500, all policies start from the same initial programs or solutions, and the LCB rerun of PORA from these programs again solves 93 of 126 problems. For Q3, we refit the controller with jointly shuffled targets, with absolute per-branch utilities in place of paired differences, with current-turn targets, and without the obligation features. We rescale the learned prices on vector memory, rescale the processing coefficient of a frozen MATH500 controller, and replay the 6,245 recorded AppWorld decision states with one term of Eq. 6 removed at a time.
+
+## Cost.
+
+Cost is the total number of model tokens, prompt plus completion, and the number of model requests. AppWorld totals count actor and encoder tokens on evaluated trajectories, and memory totals include memory preparation. Some recorded totals are lower bounds (Appendix C).
+
+Figure 3: Task success against total tokens. Each marker is one method with a recorded token total; hollow markers are lower bounds. The dotted line marks PORA, and each subtitle gives its difference from the best external method in Table 1. The logarithmic horizontal axis differs across panels.
+
+## 4 Results and Analysis
+
+## 4.1 Comparative Results (Q1)
+
+## Task success.
+
+In Table 1, PORA reaches the highest success rate on AppWorld, key–value memory, vector memory, and LCB, and shares the highest rate on $\tau$ -bench retail. The margin is largest on BFCL memory, where PORA reaches 77.4%, 81.3%, and 81.3% on the three backends. These rates are 32.9, 31.6, and 17.4 points above the strongest external method in each setting. On AppWorld, PORA completes 129 of 417 tasks against 114 for Plan and Budget, a 3.6-point difference. On LCB and MATH500, PORA and the strongest external method are within one point of each other. MATH500 is close to saturation for this actor: even fixed Preserve solves 91.8% of the problems.
+
+## Processing cost.
+
+Figure 3 plots success against total tokens for the five settings in which several methods have recorded totals. In all five, the recorded total of PORA is below that of every search and rollout method. Plan and Budget records fewer tokens than PORA on key–value memory, recursive-summary memory, and LCB, as does Certaindex on LCB, with lower success in each case. On $\tau$ -bench retail, PORA, Certaindex, and Forest-of-Thought reach 72.5% with recorded totals of 3.3M, at least 10.5M, and 98.4M tokens. On AppWorld, where totals are recorded for PORA and Plan and Budget, PORA processes 67.3M actor and encoder tokens against 122.8M, a 45.2% reduction.
+
+## Backbone generalization.
+
+Across additional LLM backbones evaluated on BFCL memory (Appendix D), PORA consistently sustains its advantage over fixed allocations, demonstrating that the learned capacity trade-offs generalize beyond a single base model.
+
+Table 2: Controlled comparisons. Each variant changes one factor of the PORA run in its block header. $\Delta$ is PORA minus the variant in points. Tokens are actor tokens in millions.
+
+Variant
+Succ.
+ $\Delta$ 
+Tokens
+
+Allocation policy
+
+BFCL vector (PORA: 81.3, 3.39M tokens)
+
+   Fixed Preserve
+71.0
+10.3
+3.14
+
+   Fixed Spend
+74.8
+6.5
+3.84
+
+LCB, shared initial programs (PORA: 73.8, 0.51M)
+
+   Fixed Preserve
+68.3
+5.6
+0.26
+
+   Fixed Spend
+73.0
+0.8
+1.03
+
+MATH500, shared initial solutions (PORA: 95.4)
+
+   Fixed Preserve
+91.8
+3.6
+ $\geq$ 0.30
+
+   Fixed Spend
+95.0
+0.4
+ $\geq$ 0.89
+
+Supervision target and state
+
+LCB, shared initial programs (PORA: 73.8, 0.51M)
+
+   Shuffled targets
+65.9
+7.9
+0.29
+
+   Absolute utility
+73.0
+0.8
+ $\geq$ 0.53
+
+LCB, obligation refit (full state: 71.4, 0.51M)
+
+   Obligations removed
+65.1
+6.3
+–
+
+BFCL recursive, 24-pair refit (terminal targets: 78.7)
+
+   Shuffled targets
+76.1
+2.6
+4.91
+
+   Current-turn targets
+77.4
+1.3
+5.76
+
+Capacity prices
+
+BFCL vector (PORA: 81.3)
+
+   Prices $\times 0.5$ 
+72.9
+8.4
+ $\geq$ 3.52
+
+   Prices $\times 2$ 
+76.1
+5.2
+ $\geq$ 3.40
+
+## 4.2 Effect of State-dependent Allocation (Q2)
+
+Figure 4: Fixed and learned allocation in the same agent where all three token totals are recorded. Shading marks the region cheaper and more accurate than fixed Spend; hollow markers are lower bounds.
+
+The fixed-allowance rows separate the allocation decision from the rest of the agent. Figure 4 places the three policies by success and actor tokens. On key–value memory, PORA reaches 77.4% with 6.76M tokens, against 73.5% for fixed Spend with at least 9.59M. On vector memory, it is 10.3 points above fixed Preserve and 6.5 above fixed Spend, with a token total between the two. On LCB, it solves 93 of 126 problems against 86 and 92 and uses 50.6% fewer actor tokens than fixed Spend. On MATH500, it solves 477 of 500 problems against 459 and 475 with 31.2% fewer requests than fixed Spend. In these four settings, PORA matches or exceeds fixed Spend at a lower recorded cost. Table 2 summarizes these results.
+
+On $\tau$ -bench retail, the three policies complete 29, 28, and 28 of 40 tasks with nearly equal token totals (3.33M, 3.38M, and 3.30M), so the lower total relative to Forest-of-Thought is shared by the fixed-allowance agent.
+
+## 4.3 Effect of Paired Supervision and Capacity Pricing (Q3)
+
+## Supervision target.
+
+On LCB, all supervision variants share the fitting problems, the initial programs, and the executor (Appendix C.4). As summarized in Table 2, jointly shuffling the quality and processing targets across states lowers the solved count from 93 to 83, a 7.9-point difference. Absolute per-branch utilities give 92. On recursive-summary memory, a 24-pair refit with shuffled or current-turn targets scores 2.6 and 1.3 points below the terminal-target refit. In a separate LCB refit, removing the obligation features lowers the solved count from 90 to 82, a 6.3-point difference.
+
+Table 3: Native MATH500 sensitivity to the processing coefficient with a frozen controller.
+
+Coefficient
+Success
+Repairs
+Requests
+
+ $0.5\times$ 
+475/500
+207
+712
+
+ $1.0\times$ 
+476/500
+187
+689
+
+ $2.0\times$ 
+474/500
+153
+655
+
+## Capacity prices and processing coefficient.
+
+Scaling both learned prices by 0.5 or by 2 on vector memory lowers success from 81.3% to 72.9% and 76.1% (Table 2). With a frozen MATH500 controller, scaling the processing coefficient by 0.5, 1, and 2 gives 475, 476, and 474 correct answers with 712, 689, and 655 requests (Table 3). A larger coefficient lowers the number of requests while correctness stays within two problems, so the processing term mainly adjusts cost.
+
+## 5 Related Work
+
+## Sequential computation allocation.
+
+TAB treats multi-turn reasoning as a sequential budget problem, explicitly considers downstream dependencies and delayed feedback, and trains a budgeter with GRPO using accuracy and global token constraints (Jali et al., 2026). Its trajectory-level reward supplies a shared advantage to the turn-level allocation decisions. ARES predicts the minimum suitable reasoning effort from interaction history using labels for successful step completion (Yang et al., 2026). PORA instead compares two allowances from the same state under a common continuation policy.
+
+## Predicting the value of reasoning.
+
+Re-FORC predicts expected future reward as a function of additional thinking tokens and uses it for stopping and resource selection (Zabounidis et al., 2026). PORA instead predicts how two allowances change the rest of an interaction. Thinkless learns to select short or long reasoning, and Token-Budget-Aware Reasoning adjusts budgets according to problem complexity (Fang et al., 2025; Han et al., 2025). Budget forcing and length-controlled reinforcement learning set the length of a single reasoning trace (Muennighoff et al., 2025; Aggarwal and Welleck, 2025). Certaindex uses confidence signals to adapt computation, Plan and Budget allocates effort through a plan, and DART uses draft agreement and entropy to route thinking (Fu et al., 2025; Lin et al., 2026; Lee et al., 2026). PORA also prices the remaining episode budget.
+
+## Tool use and search.
+
+ReAct interleaves reasoning with actions (Yao et al., 2023); AppWorld and $\tau$ -bench evaluate longer tool-mediated tasks (Trivedi et al., 2024; Yao et al., 2024). LATS, DORA, BATS, and Forest-of-Thought allocate search, rollouts, or tool effort (Zhou et al., 2024; Wang et al., 2025; Liu et al., 2026; Bi et al., 2025). We compare with them as complete systems.
+
+## Metareasoning.
+
+Valuing computation by its expected downstream benefit has a long history (Russell and Wefald, 1991; Hay et al., 2012; Callaway et al., 2018). Rational Metareasoning for LLMs uses a value-of-computation reward with Expert Iteration to learn selective reasoning (De Sabbata et al., 2025). Rollout-based approximate policy iteration evaluates alternative actions from sampled states under a common continuation policy and learns an updated policy (Lagoudakis and Parr, 2003). PORA applies these principles to reasoning allowances in interactive tasks.
+
+## 6 Conclusion
+
+We presented PORA, which learns when an interactive LLM agent should use short or long reasoning by comparing the two allowances from the same interaction state. Paired executions measure how a longer allowance changes final quality and total processing, a compact controller learns to predict these differences, and learned prices on remaining-budget pressure turn the predictions into a feasible allowance. Pairs are recollected as the controller changes, since it determines how preserved capacity is later used. Across five benchmarks, PORA achieves strong task success; within the same agent, it matches or exceeds always using long reasoning on code and mathematics at lower cost, and shuffled paired targets lower code success.
+
+## Limitations
+
+Each task family uses its own fitted controller and native phase and budget rules, which are specified per interface. Paired collection requires restoring the environment, memory, and budget into two isolated branches and running both to termination, which adds training cost and is not available for every environment; the memory instances therefore draw their checkpoints from synthetic fixtures. Each branch is executed once, and some controllers are fitted on a few dozen pairs or fewer, so the paired targets are noisy estimates. The controller chooses between two allowances and does not consider finer-grained budgets. Most results use one actor per setting; with the additional actors in Appendix D, the differences between allocation policies are smaller.
+
+## Use of AI Assistants
+
+We used AI assistants to help edit the text. The authors designed the method and experiments, checked all content and results, and take full responsibility for the paper.
+
+## Ethics Statement
+
+The study uses benchmark-provided environments and licensed task data. All reported actions remain inside the permissions exposed by each benchmark. Deployment in consequential settings requires task-specific authorization and monitoring.
+
+## Reproducibility Statement
+
+The appendix defines the state contract, paired targets, model heads, capacity prices, native feasibility interface, selected populations, scoring boundaries, and resource units.
+
+## References
+
+Aggarwal and Welleck (2025)
+P. Aggarwal and S. Welleck
+
+L1: controlling how long a reasoning model thinks with reinforcement learning.
+
+In Conference on Language Modeling,
+
+Cited by: §5.
+
+Berkeley Function Calling Leaderboard (2026)
+Berkeley Function Calling Leaderboard
+
+BFCL V4 Published Leaderboard Snapshot.
+
+Note: https://gorilla.cs.berkeley.edu/leaderboard.htmlAccessed 3 October 2026; page update 12 April 2026; evaluation revision f7cf735
+
+Cited by: §1,
+§3.
+
+Bi et al. (2025)
+Z. Bi, K. Han, C. Liu, Y. Tang, and Y. Wang
+
+Forest-of-thought: scaling test-time compute for enhancing LLM reasoning.
+
+In Proceedings of the 42nd International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 267, pp. 4253–4267.
+
+External Links: Link
+
+Cited by: §3,
+§5.
+
+Callaway et al. (2018)
+F. Callaway, A. Rangel, and T. L. Griffiths
+
+Learning to select computations.
+
+External Links: 1711.06892
+
+Cited by: §5.
+
+Chen et al. (2025)
+X. Chen, J. Xu, T. Liang, Z. He, J. Pang, D. Yu, L. Song, Q. Liu, M. Zhou, Z. Zhang, R. Wang, Z. Tu, H. Mi, and D. Yu
+
+Do NOT think that much for 2+3=? On the overthinking of long reasoning models.
+
+In Proceedings of the 42nd International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 267, pp. 9487–9499.
+
+Cited by: §1.
+
+De Sabbata et al. (2025)
+C. N. De Sabbata, T. R. Sumers, B. AlKhamissi, A. Bosselut, and T. L. Griffiths
+
+Rational metareasoning for large language models.
+
+External Links: 2410.05563
+
+Cited by: §5.
+
+Fang et al. (2025)
+G. Fang, X. Ma, and X. Wang
+
+Thinkless: llm learns when to think.
+
+In Advances in Neural Information Processing Systems,
+
+External Links: 2505.13379
+
+Cited by: §1,
+§5.
+
+Fu et al. (2025)
+Y. Fu, J. Chen, S. Zhu, Z. Fu, Z. Dai, Y. Zhuang, Y. Ma, A. Qiao, T. Rosing, I. Stoica, and H. Zhang
+
+Efficiently scaling LLM reasoning with certaindex.
+
+In Advances in Neural Information Processing Systems,
+
+External Links: 2412.20993
+
+Cited by: §1,
+§3,
+§5.
+
+Han et al. (2025)
+T. Han, Z. Wang, C. Fang, S. Zhao, S. Ma, and Z. Chen
+
+Token-budget-aware llm reasoning.
+
+External Links: 2412.18547
+
+Cited by: §1,
+§5.
+
+Hay et al. (2012)
+N. Hay, S. Russell, D. Tolpin, and S. E. Shimony
+
+Selecting computations: theory and applications.
+
+External Links: 1207.5879
+
+Cited by: §5.
+
+Hendrycks et al. (2021)
+D. Hendrycks, C. Burns, S. Kadavath, A. Arora, S. Basart, E. Tang, D. Song, and J. Steinhardt
+
+Measuring mathematical problem solving with the MATH dataset.
+
+External Links: 2103.03874
+
+Cited by: §3.
+
+Jain et al. (2024)
+N. Jain, K. Han, A. Gu, W. Li, F. Yan, T. Zhang, S. Wang, A. Solar-Lezama, K. Sen, and I. Stoica
+
+LiveCodeBench: holistic and contamination free evaluation of large language models for code.
+
+External Links: 2403.07974
+
+Cited by: §C.3,
+§3.
+
+Jali et al. (2026)
+N. Jali, A. Nayak, and G. Joshi
+
+Not all turns are equally hard: adaptive thinking budgets for efficient multi-turn reasoning in agents.
+
+External Links: 2604.05164
+
+Cited by: §1,
+§5.
+
+Lagoudakis and Parr (2003)
+M. G. Lagoudakis and R. Parr
+
+Reinforcement learning as classification: leveraging modern classifiers.
+
+In Proceedings of the Twentieth International Conference on Machine Learning,
+
+External Links: Link
+
+Cited by: §2.2,
+§5.
+
+Lee et al. (2026)
+J. Lee, S. Hong, S. Lee, J. Seo, J. Son, S. Eo, C. Park, C. Park, H. Moon, and H. Lim
+
+DART: draft-agreement routing for training-free adaptive thinking budgets in hybrid reasoning models.
+
+In Findings of the Association for Computational Linguistics: EMNLP,
+
+External Links: 2606.23181,
+Link
+
+Cited by: §1,
+§5.
+
+Lin et al. (2026)
+J. Lin, X. Zeng, J. Zhu, S. Wang, J. Shun, J. Wu, and D. Zhou
+
+Plan and budget: effective and efficient test-time scaling on large language model reasoning.
+
+In International Conference on Learning Representations,
+
+External Links: 2505.16122
+
+Cited by: §1,
+§3,
+§5.
+
+Liu et al. (2026)
+T. Liu, Z. Wang, J. Miao, I. Hsu, J. Yan, J. Chen, R. Han, F. Xu, Y. Chen, K. Jiang, S. Daruki, Y. Liang, W. Y. Wang, T. Pfister, and C. Lee
+
+Budget-aware tool use enables effective agent scaling.
+
+In Conference on Language Modeling,
+
+External Links: 2511.17006
+
+Cited by: §3,
+§5.
+
+Muennighoff et al. (2025)
+N. Muennighoff, Z. Yang, W. Shi, X. L. Li, L. Fei-Fei, H. Hajishirzi, L. Zettlemoyer, P. Liang, E. Candès, and T. Hashimoto
+
+S1: simple test-time scaling.
+
+In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing,
+
+Suzhou, China, pp. 20275–20321.
+
+External Links: Document
+
+Cited by: §5.
+
+Russell and Wefald (1991)
+S. Russell and E. Wefald
+
+Principles of metareasoning.
+
+Artificial Intelligence 49 (1–3), pp. 361–395.
+
+Cited by: §5.
+
+Shinn et al. (2023)
+N. Shinn, F. Cassano, A. Gopinath, K. Narasimhan, and S. Yao
+
+Reflexion: language agents with verbal reinforcement learning.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 36, pp. 8634–8652.
+
+Cited by: §1.
+
+Snell et al. (2025)
+C. Snell, J. Lee, K. Xu, and A. Kumar
+
+Scaling LLM test-time compute optimally can be more effective than scaling parameters for reasoning.
+
+In International Conference on Learning Representations,
+
+Cited by: §1.
+
+Sui et al. (2025)
+Y. Sui, Y. Chuang, G. Wang, J. Zhang, T. Zhang, J. Yuan, H. Liu, A. Wen, S. Zhong, N. Zou, H. Chen, and X. Hu
+
+Stop overthinking: a survey on efficient reasoning for large language models.
+
+External Links: 2503.16419
+
+Cited by: §1.
+
+Trivedi et al. (2024)
+H. Trivedi, T. Khot, M. Hartmann, R. Manku, V. Dong, E. Li, S. Gupta, A. Sabharwal, and N. Balasubramanian
+
+AppWorld: a controllable world of apps and people for benchmarking interactive coding agents.
+
+In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics,
+
+pp. 16022–16076.
+
+External Links: 2407.18901
+
+Cited by: §1,
+§3,
+§5.
+
+Wang et al. (2025)
+X. Wang, Y. Li, S. Feng, P. Yuan, Y. Zhang, J. Shi, C. Tan, B. Pan, Y. Hu, and K. Li
+
+Every rollout counts: optimal resource allocation for efficient test-time scaling.
+
+In Advances in Neural Information Processing Systems,
+
+External Links: 2506.15707
+
+Cited by: §3,
+§5.
+
+Wei et al. (2022)
+J. Wei, X. Wang, D. Schuurmans, M. Bosma, B. Ichter, F. Xia, E. Chi, Q. V. Le, and D. Zhou
+
+Chain-of-thought prompting elicits reasoning in large language models.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 35, pp. 24824–24837.
+
+Cited by: §1.
+
+Yang et al. (2026)
+J. Yang, B. Hou, W. Wei, Y. Bao, and S. Chang
+
+ARES: adaptive reasoning effort selection for efficient LLM agents.
+
+External Links: 2603.07915
+
+Cited by: §1,
+§5.
+
+Yao et al. (2024)
+S. Yao, N. Shinn, P. Razavi, and K. Narasimhan
+
+ $\tau$ -bench: a benchmark for tool-agent-user interaction in real-world domains.
+
+External Links: 2406.12045
+
+Cited by: §3,
+§5.
+
+Yao et al. (2023)
+S. Yao, J. Zhao, D. Yu, N. Du, I. Shafran, K. Narasimhan, and Y. Cao
+
+ReAct: synergizing reasoning and acting in language models.
+
+In International Conference on Learning Representations,
+
+Cited by: §1,
+§5.
+
+Zabounidis et al. (2026)
+R. Zabounidis, A. Golatkar, M. Kleinman, A. Achille, W. Xia, and S. Soatto
+
+Re-forc: adaptive reward prediction for efficient chain-of-thought reasoning.
+
+In Proceedings of the 43rd International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 306.
+
+External Links: 2511.02130
+
+Cited by: §1,
+§5.
+
+Zhou et al. (2024)
+A. Zhou, K. Yan, M. Shlapentokh-Rothman, H. Wang, and Y. Wang
+
+Language agent tree search unifies reasoning, acting, and planning in language models.
+
+In Proceedings of the 41st International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 235, pp. 62138–62160.
+
+External Links: Link
+
+Cited by: §3,
+§5.
+
+## Appendix A Method Details and Task Recipes
+
+This appendix gives the details behind Section 2: the controller features and parameter counts, the capacity terms and feasible grants, the fitting recipes, the paired collection loop, and the native settings of each task family.
+
+## A.1 Feature construction and parameter accounting
+
+The input is an event tensor of shape $B_{\mathrm{batch}}\times T\times D$ , a visibility mask, and role/status identifiers. Row zero is the task and row one is the evidence plan. Both anchors are visible. The remaining visible events retain their chronological order. Each embedding is L2-normalized with denominator floor $10^{-12}$ , and the encoder output is detached during controller fitting.
+
+Observation events have role identifier 3. Status identifiers 2 and 3 indicate success and failure. The twelve signals, in order, are: task–plan cosine; maximum task–observation and plan–observation cosines; position-weighted task–observation and plan–observation means; task and plan cosines with the last observation; visible dynamic-event count divided by 20 and clipped to $[0,1]$ ; failed and successful observation fractions; and the last observation’s failure and success indicators. Position weights are the event index plus one. Observation-dependent values are zero for an empty observation set. Right padding is masked.
+
+Equation 3 groups these signals by their role. The seven cosine signals form $r(s)$ , and the five progress/status signals form $f(s)$ . Let $v=[r(s);f(s)]\in\mathbb{R}^{12}$ . Separate affine maps project the normalized task and plan embeddings from dimension $D$ to two dimensions each; their concatenation is $\operatorname{proj}_{\phi}$ . Six obligation values $\omega(s)$ , clipped to $[0,1]$ , complete the representation. Its exact instantiation is
+
+ $\displaystyle x_{\phi}(s)=[$ 
+ $\displaystyle v;\,P_{\mathrm{task}}e^{\mathrm{task}}+a_{\mathrm{task}};$ 
+
+(8)
+
+ $\displaystyle P_{\mathrm{plan}}e^{\mathrm{plan}}+a_{\mathrm{plan}};\,\omega(s)]\in\mathbb{R}^{22}.$ 
+
+The dimension is $12+2+2+6=22$ . The two independently parameterized heads are
+
+ $\displaystyle\operatorname{Head}_{h}(x)$ 
+ $\displaystyle=\tanh\!\left(w_{h,2}^{\mathsf{T}}\operatorname{GELU}(z_{h})+a_{h,2}\right),$ 
+
+(9)
+
+ $\displaystyle z_{h}$ 
+ $\displaystyle=W_{h,1}\operatorname{LN}_{h}(x)+a_{h,1},\quad h\in\{Q,G\}.$ 
+
+Both heads use LayerNorm with $\epsilon=10^{-5}$ , an affine map from 22 to 16, exact GELU, an affine map from 16 to one, and $\tanh$ . Each head has $44+368+17=429$ parameters. The two bottlenecks have $4(D+1)$ parameters; adding the two heads and two prices gives $4(D+1)+860$ , or 2,400 for $D=384$ and 4,960 for $D=1024$ .
+
+## A.2 Capacity arithmetic and action boundary
+
+The controller receives six native ledger values encoded as $\log(1+\cdot)$ : total bank $B$ , used budget, remaining bank $b$ , remaining rounds $N$ , short allowance $\kappa_{s}$ , and long allowance $\kappa_{l}$ . They are decoded before use and enter only the pressure features, never the 22-dimensional representation $x_{\phi}$ . With $F_{t}=[N_{t}-1]_{+}$ and $[u]_{+}=\max(u,0)$ , the clipped pressure features are
+
+ $\displaystyle O_{t}$ 
+ $\displaystyle=\operatorname{clip}_{[0,1]}\!\left(\frac{[\kappa_{l}-\kappa_{s}]_{+}}{\max(b_{t},1)}\frac{F_{t}}{\max(N_{t},1)}\right),$ 
+
+(10)
+
+ $\displaystyle H_{t}$ 
+ $\displaystyle=\operatorname{clip}_{[0,1]}\!\left(\frac{[\kappa_{s}F_{t}-[b_{t}-\kappa_{l}]_{+}]_{+}}{\max(B,1)}\right).$ 
+
+Denominator floors of one native unit define the empty-bank boundary. Both features vanish at the final decision. Initial prices are 0.05, implemented by initializing the raw parameters to inverse-softplus(0.05). The utility uses $\lambda=0.05$ .
+
+For interface $j$ , the native phase and allowance rule $\mathcal{F}_{j}$ maps the core proposal to a grant, and $\chi_{j}$ gives the local charge $c_{t}$ :
+
+ $\displaystyle\widetilde{a}_{t}$ 
+ $\displaystyle=\mathbf{1}[U_{\phi}(s_{t},b_{t},N_{t})\geq 0],$ 
+
+(11)
+
+ $\displaystyle\kappa_{t}$ 
+ $\displaystyle=\mathcal{F}_{j}(\widetilde{a}_{t},s_{t},b_{t},N_{t}),$ 
+
+ $\displaystyle b_{t+1}$ 
+ $\displaystyle=b_{t}-c_{t},\quad c_{t}=\chi_{j}(\kappa_{t},\text{realized use}).$ 
+
+The charging rule distinguishes committed allowance from generated-token use. An exhausted legal bank terminates the corresponding action sequence. Native terminal scoring applies to the resulting task outcome. The following recipes specify each interface’s phase rules and execution limits.
+
+## A.3 Fitting recipes
+
+## Application fitting.
+
+The initial collection has twelve paired checkpoints at steps zero and seven from six public-training tasks. Recollection visits six different tasks from the same scenario families and supplies ten decision-observable pairs. The selected updated checkpoint has two quality-informative pairs and eight quality ties. Both fits use 300 full-batch AdamW epochs, learning rate 0.001, weight decay 0.001, and gradient-norm clipping at one; the update initializes from the earlier controller.
+
+The application quality label is the Spend-minus-Preserve difference in terminal success plus 0.25 times the difference in requirement completion. Because both heads end in $\tanh$ , labels whose magnitude exceeds one are fitted toward the saturated output. Processing is normalized by the maximum complete branch cost. The objective combines smooth-L1 quality loss, smooth-L1 processing loss, binary direction loss, and smooth-L1 utility loss with weights 1, 0.25, 0.25, and 0.25. Quality ties have quality-fit weight 0.25; their direction and utility paths detach the quality prediction so processing can receive the cost signal. Direction logits use temperature 0.25. These weights concentrate fitting on the paired quality contrast and the continuation-processing signal.
+
+## Memory fitting.
+
+Each measured memory instance uses 24 synthetic paired fixtures under its local native memory interface, with sixteen fitting and eight selection fixtures. Terminal correctness supplies $q$ , and Eq. 2 supplies $g$ with a one-position floor. The shared loss components are introduced in Eq. 5; the measured memory instance uses the following batched objective:
+
+ $\displaystyle\mathcal{L}={}$ 
+ $\displaystyle\operatorname{MSE}(\widehat{Q},q)+\operatorname{MSE}(\widehat{G},g)$ 
+
+(12)
+
+ $\displaystyle+0.25\operatorname{BCEWithLogits}(U_{\phi}/0.25,d),$ 
+
+ $\displaystyle d={}$ 
+ $\displaystyle\mathbf{1}[q+0.05g>0.02].$ 
+
+AdamW uses learning rate $3\times 10^{-4}$ and weight decay $10^{-4}$ for at most 300 full-batch epochs. The selection score is the sum of quality and processing MSE on the eight selection fixtures; a recorded direction-first variant orders direction accuracy before that sum. The selected vector and recursive-summary fits use epochs 22 and 300. The support study on supervision uses a common 300-epoch refit on all 24 fixtures after its sixteen/eight development comparison. The support refit and main-table recursive-summary checkpoint retain separate source bindings and measured populations.
+
+## A.4 Paired collection and policy refresh
+
+Each checkpoint restores environment state, visible history, external memory, the budget ledger, and random state into isolated namespaces. Complete terminal scores and processing in one declared unit are required for both branches. The iteration loop keeps collection, fitting, and the instance’s selection rule connected to an identified continuation policy. At deployment, Eq. 11 applies the fitted controller through the native interface.
+
+Algorithm 1 Paired Outcome-guided Reasoning Allocation (PORA)
+
+ 0:
+
+  Initial continuation $\rho_{0}$ , iteration count $K$ .
+
+ 1:
+
+  for $k=0,\ldots,K-1$ do
+
+ 2:
+
+   Collect checkpoints under $\rho_{k}$ on the designated collection tasks.
+
+ 3:
+
+   Restore each checkpoint into two isolated branches.
+
+ 4:
+
+   Grant $\kappa_{s}$ and $\kappa_{l}$ ; continue both under $\rho_{k}$ to termination.
+
+ 5:
+
+   Form visible states and paired targets using Eqs. 2 and 3.
+
+ 6:
+
+   Fit the projections, value heads, and capacity prices on the fitting records.
+
+ 7:
+
+   Select $\rho_{k+1}$ using the instance’s declared checkpoint rule.
+
+ 8:
+
+  end for
+
+ 9:
+
+  Deploy $\rho_{K}$ : predict values, price capacity, execute the native grant, and update the history and bank.
+
+## A.5 Application instance
+
+## State and encoder.
+
+AppWorld uses normalized 1,024-dimensional BGE-M3 embeddings. The six obligation slots contain required-source coverage, required-source count divided by eight and clipped at one, pending-write status, execution-failure fraction, last-execution failure, and successful-state-change status. Returned records update these fields before the next allowance.
+
+## Native execution.
+
+The bank is 8,192 committed reasoning tokens; short and long allowances are 128 and 1,024, with at most twenty rounds. Actor temperature is 0.6, top- $p$ is 0.95, context is 32,768, and each decision allows at most 2,048 additional answer tokens. The observation view takes the first 2,500 characters of each normalized response.
+
+The phase becomes repair after an evidence-check rejection, two consecutive recovery-trigger events, or an acquisition with unchanged source coverage below $3/7$ . A pending write, a successful state change, complete source coverage, or at most three remaining rounds selects commit. Other states acquire evidence. Six prior Spend decisions enforce later Preserve decisions. One eligible repair may receive recovery Spend; ordinary spending requires coverage at least $3/7$ . Allowances are constrained by the remaining bank and charged in full.
+
+The evidence-aware executor checks API names, fields, parameters, and the observed support of values. When a generated program has a valid read prefix, it can execute the longest qualifying top-level prefix to obtain evidence for a subsequent revision. The prefix contains an API call and passes the same support checks. AppWorld 0.1.3.post1 and AppWorld.evaluate define the final 417-task population and scorer.
+
+## A.6 Memory instances
+
+## Preparation and state.
+
+Each method completes native prerequisite conversations before answering the mode-specific 155 questions. Key–value memory uses explicit records; vector memory uses bounded topic updates and similarity retrieval; recursive summaries use the official 10,000-character cap. The controller encoder is MiniLM with attention-mask mean pooling, a 512-position tokenizer limit, and embedding dimension 384.
+
+The two anchors are the question and the plan to recover the requested fact through native memory tools. The adapter includes the most recent eighteen visible events. Tool returns have observation role 3; other dynamic events have role 2. The six obligation fields represent observed successful evidence, a source-load value of $1/8$ , a zero pending-write slot, tool-failure fraction, last-tool-failure status, and a zero state-change slot. These local fields feed the common graph in the same order.
+
+## Action and scorer.
+
+The native phase policy permits at most six ordinary Spend decisions and one eligible recovery Spend. Its source-coverage threshold is zero for the memory interface. The common bank is 8,192 with short and long allowances of 128 and 1,024 and at most twenty rounds. The core proposal is translated to the local short or long allowance. If the remaining bank cannot fund the long allowance, the executor attempts a complete short allowance; an insufficient short bank terminates. Granted allowances are charged in full. The official validity field scores every terminal answer. Shared-history scenario sizes are 30, 25, 25, 25, and 50.
+
+## Appendix B Comparisons and Statistical Detail
+
+## B.1 External-method execution
+
+Plan and Budget uses state-dependent decomposition with 1,024 planner tokens in a 4,096 generation cap and a separate 8,192-token action bank on AppWorld. Its realized action thinking is charged and planning is recorded separately. PORA commits granted allowances. Both use the SDK limit of 1,000 requests per code execution. BATS and Forest-of-Thought permit 100 new API requests across a search; DORA permits 100 per trajectory. DORA uses four rollout slots, three rounds, and 256-token increments. Forest-of-Thought uses three trees, branching two, sparse width one, depth three, and three votes. BATS uses budgeted tool use, verification, and selected-state restoration over at most twenty rounds.
+
+Memory comparisons retain their declared planning, search, confidence, or rollout procedures inside the native memory interfaces. The complete additional Certaindex, DORA, and LATS rows use their native preparation and the same 155-question mode populations. Plan and Budget’s complete recursive-summary run uses its released scheduling kernel and same-weight context recovery with 131,072-token context capacity. Its other three Gemma memory rows use the recorded thirty-step allowance. These execution envelopes define the system comparisons in Table 1. LATS on AppWorld is evaluated on 172 of the 417 tasks. The action-adapted LATS run on MATH500 evaluates all 500 problems and obtains 478 correct answers. Fixed Spend on recursive-summary memory evaluates all 155 questions and obtains 130 correct answers.
+
+The vector and recursive-summary Certaindex instances use an action-adapted confidence procedure: a 128-token reasoning cap, 64-token chunks, and two consecutive consistent answer probes. Each probe permits 256 tokens to express a native tool call; the upstream completion interface uses a 20-token probe. This configuration reaches its two-probe stopping check at the second and final chunk, using four physical requests per action and at most thirty action steps per turn. Both populations contain all 155 official outcomes, with 24 vector and 40 recursive-summary answers correct. Budget-exhausted trajectories receive native scoring within the same denominator. The retained-attempt ledger includes probes, recovery work, and native memory preparation.
+
+On MATH500, the action-adapted DORA instance applies its released allocation kernel to three directions and four rollout allocations for one round. Candidate solutions have a 2,048-token cap and temperature 0.2; self-critique uses the visible problem and candidate, and the hidden answer is scored after selection with verify_MATH.grade_answer. The same Gemma actor revision and all 500 problem identities yield 475 correct answers, compared with 477 for PORA. This complete endpoint comparison retains each method’s recorded execution envelope.
+
+## B.2 Paired inference and multiplicity
+
+The main-panel quality differences are AppWorld 3.60 points with grouped interval $[-0.48,7.67]$ , key–value memory 32.90 with $[17.60,46.43]$ , vector memory 31.61 with $[15.20,44.76]$ , and recursive-summary memory 17.42 with $[4.67,28.75]$ .
+
+The bootstrap samples complete dependence groups with replacement and recomputes the task-weighted difference. AppWorld has 139 groups of three tasks; memory has five groups with sizes 30, 25, 25, 25, and 50. Every interval uses 20,000 draws. AppWorld quality uses seed 61006 and processing uses 61007. The main memory comparisons use seed 61008. The supervised-target and fixed-allocation controls use seed 20261006.
+
+The four main quality comparisons have group sign-flip two-sided $p$ values 0.1041, 0.0625, 0.0625, and 0.2500 in table order; their Holm-adjusted values are all 0.25. The five-scenario exact test enumerates all 32 sign patterns, giving a minimum attainable two-sided $p$ of 0.0625. For AppWorld success, the task-level pairs comprise 54 wins, 39 losses, and 324 ties.
+
+For the fixed-allocation family, raw $p$ values are 0.125 and 0.3125, with Holm values 0.25 and 0.3125. For the supervision family, raw $p$ values are 0.6875 and 0.875 and both Holm values are 1.0. The supervision rows yield task-level win/loss/tie counts of 11/7/137 and 13/11/131. The fixed-allocation rows yield 21/5/129 and 18/8/129. Scenario-level resampling preserves the shared preparation history.
+
+## B.3 Readout sensitivity at recorded states
+
+The AppWorld study replays all 6,245 allocation states through the selected 4,960-parameter controller and the original native rules. Removing quality changes 2,951 core proposals and 1,002 final allowances. Removing processing changes 25 proposals and three final allowances. Removing prices changes twelve proposals and three final allowances; doubling prices changes five proposals and zero final allowances. Halving prices changes nine proposals and three final allowances. These measurements identify the contribution to recorded-state decisions at the selected operating point.
+
+## B.4 Additional price and bank interventions
+
+The original support families also vary the price scale and shared bank on complete vector-memory populations. Table 4 retains these comparisons beside their common scenario grouping. With the controller unchanged, a bank of 4,096 or 16,384 tokens gives 79.4% and 75.5%, against 81.3% at the fitted bank of 8,192.
+
+Table 4: Additional vector-memory interventions. Differences are percentage points; adjusted $p$ uses the original price or budget family.
+
+Contrast
+
+Gain
+95% interval
+Adj. $p$ 
+
+Bank 16,384 vs 8,192
+
+ $-5.81$ 
+ $[-14.55,0.80]$ 
+ $0.750$ 
+
+Bank 4,096 vs 8,192
+
+ $-1.94$ 
+ $[-5.00,0.00]$ 
+ $0.750$ 
+
+Price $0.5\times$ vs $2\times$ 
+
+ $-3.23$ 
+ $[-11.11,3.00]$ 
+ $0.750$ 
+
+Price $0.5\times$ vs $1\times$ 
+
+ $-8.39$ 
+ $[-14.29,-4.67]$ 
+ $0.188$ 
+
+Price $1\times$ vs $2\times$ 
+
+ $5.16$ 
+ $[-0.80,9.50]$ 
+ $0.750$ 
+
+## Appendix C Resources and Additional Native Populations
+
+## C.1 Computing infrastructure
+
+All actors and encoders run on a shared cluster of NVIDIA DGX B200 nodes, each with eight B200 GPUs (180 GB memory per GPU). The controllers have 2,400 to 4,960 parameters and are fitted with full-batch AdamW. We report computation as the token and request counts given in this section rather than as GPU hours.
+
+## C.2 Main-panel resources
+
+AppWorld’s evaluated trajectories consume 64,844,347 actor positions and 2,443,846 encoder positions, totaling 67,288,193. Plan and Budget consumes 122,753,680 positions under the matched evaluated-trajectory scope. Dividing by 417 gives means of 161,363 and 294,373. The 45.18% reduction has grouped interval $[41.87,48.28]\%$ . Processing positions count tokenization-dependent model inputs and outputs.
+
+Table 5: PORA memory resources, including prerequisite preparation and retained attempts. Actor and encoder positions use their respective tokenizers. Service time sums request durations; task time sums retained task-attempt durations.
+
+Memory mode
+Actor positions
+Request starts
+Encoder positions
+Service (s)
+Task time (s)
+
+Key–value
+6,760,203
+1,673
+326,149
+4,699.93
+4,891.14
+
+Vector
+3,387,257
+1,028
+1,056,653
+3,117.61
+3,866.24
+
+Recursive summary
+5,483,736
+1,431
+409,287
+15,604.28
+15,917.76
+
+Vector encoder processing comprises 278,609 controller positions and 778,044 memory-backend positions.
+
+## C.3 Native code, retail, and mathematics interfaces
+
+Table 1 includes the complete external quality comparisons for LiveCodeBench, $\tau$ -bench retail, and MATH500. Their native interfaces apply the common controller to executable repair, customer and tool feedback, and exact answer checking. The recipes below define each action and scorer; the following subsections give the matched controls and resource comparisons.
+
+## Code.
+
+The adapter reads the problem, program, public test feedback, and remaining allowance, using 384-dimensional MiniLM features with a 256-position limit per field. Six obligation slots describe public correctness, public-test residual fraction, syntactic validity, repair phase, legal-cap fraction, and available feedback. Deployment starts with a 4,096-token program under an 8,192-token generated-token bank. At each of at most two repair decisions, the same predictor evaluates feasible caps of 512, 2,048, and 4,096 and Preserve with utility zero. The greatest utility selects the action; the smaller cap resolves ties. Generated tokens reduce the bank, and native code-generation metrics score the final program (Jain et al., 2024).
+
+PORA solves 93/126 and BATS solves 92/126, a difference of 0.79 points with contest-grouped interval $[-4.55,5.83]$ over 39 groups. The pairs contain seven wins, six losses, and 113 ties; grouped sign-flip $p=1.0$ . The PORA run records 179 request starts and at least 533,669 actor tokens.
+
+## Retail.
+
+The adapter reads the customer goal, retail policy, conversation prefix, tool feedback, and remaining bank. Its six slots describe successful evidence, pending calls, pending state changes, error rate, last error, and successful modifications. The native evaluator and registered Gemma assertion judge score the forty tasks. The complete selected PORA outcome is 29/40, matching the strongest measured Certaindex and Forest-of-Thought endpoints. Resource collection includes actor, simulator, assertion judge, and retained attempts in its declared scope.
+
+## Mathematics.
+
+The adapter reads the problem, current draft, completion status, boxed-answer obligation, visible draft evidence, and remaining bank. Six obligations describe boxed-answer presence, cap termination, draft length, balanced braces, repair feasibility, and draft-token use. A 1,024-token draft uses a 2,560-token bank; Spend requests a feasible repair capped at 1,536 and Preserve accepts the draft. At this final repair, both future-capacity terms are zero. The fit combines quality and processing squared losses with 0.25 times binary direction loss, with weights 32, 8, and 0.25 for quality-improving, cost-sensitive, and tied strata. AdamW uses learning rate $3\times 10^{-4}$ , weight decay $10^{-4}$ , and gradient clipping one. Native verify_MATH.grade_answer scores all 500 terminal answers. The complete PORA and Plan and Budget outcomes are 477 and 474.
+
+## C.4 Code supervision with shared initial programs
+
+## Matched fitting.
+
+The trained arms use the same 400 earlier programming problems, 2,397 state/allowance pairs, 22-dimensional state, and two 16-wide heads. A 319/81 contest-group split supports development before the all-400 refit. AdamW uses learning rate $3\times 10^{-4}$ , weight decay $10^{-4}$ , clipping one, and 300 epochs. Initialization uses seed 20261006. Positive, negative, and tied quality contrasts receive weights 32, 8, and 0.25, divided by the number of pairs for their problem. Relative targets use quality MSE, processing MSE, and direction BCE with coefficients 1, 1, and 0.25, at $\lambda=0.05$ . Shuffled supervision jointly permutes each quality/processing target pair across the fitting population using seed 20261007. The absolute-utility arm fits $Y_{\textsc{Spend}}-0.05C_{\textsc{Spend}}/Z$ and $Y_{\textsc{Preserve}}-0.05C_{\textsc{Preserve}}/Z$ , using the common per-pair processing normalizer $Z$ , two squared losses, and the same direction loss. Inference subtracts its two outputs and applies the common capacity terms.
+
+## Matched execution.
+
+Each standalone policy receives the same 126 initial programs, exact initial payloads, public cases, repair prompt, Gemma actor, allowance candidates, 8,192-token generated bank, two-repair horizon, extractor, and final public/private scorer. The initial generation contributes 264,591 tokens and 126 request starts once to each arm. Each arm then contributes its own native scoring, controller work, and new requests. Fixed Preserve retains the initial program; feasible fixed Spend requests the largest legal repair allowance at each decision. Table 6 reports the complete terminal outcomes.
+
+Table 6: Code policies with shared initial programs and execution. Actor tokens include inherited initial generation and every new attempt. The absolute-utility token total is a lower bound because one timeout has unresolved usage.
+
+Policy
+Correct /126
+Tokens
+Starts
+
+Paired terminal
+93
+506,398
+173
+
+Shuffled terminal
+83
+286,347
+133
+
+Absolute utility
+92
+ $\geq$ 525,529
+178
+
+Fixed Preserve
+86
+264,591
+126
+
+Feasible fixed Spend
+92
+1,025,266
+371
+
+## Paired inference.
+
+The 39 contest groups are resampled 20,000 times using seed 20261007. Two-sided group sign flips use 100,000 draws with plus-one correction. Holm adjustment covers the shuffled and absolute supervision contrasts. PORA has 11 wins and one loss against shuffled targets, yielding 7.94 points ( $[2.40,14.07]$ ), raw $p=0.01973$ , and adjusted $p=0.03946$ . Against absolute utility it has two wins and one loss, yielding 0.79 points ( $[-1.69,3.54]$ ), adjusted $p=1$ . Fixed Preserve yields eight wins and one loss, 5.56 points ( $[1.52,9.91]$ ), raw $p=0.03918$ ; fixed Spend yields four wins and three losses, 0.79 points ( $[-3.73,5.60]$ ), raw $p=1$ . The fixed-policy probabilities retain their separate descriptive role.
+
+PORA uses 50.61% fewer actor tokens than fixed Spend, with a 95% interval of $[41.68,60.01]\%$ . Physical request starts fall from 371 to 173, a 53.37% reduction with a 95% interval of $[47.18,58.84]\%$ . Both resource intervals use 20,000 paired resamples of the 39 contests with seed 20261007, recomputing one minus the ratio of complete totals for the respective metric on each draw. These controls use their shared initial programs and a paired refit.
+
+## Public-obligation features under separate refitting.
+
+Numerical task-state information improves native code completion in a separately refitted control family (Table 7). We compare the full input with an arm that sets its six numerical obligation features to zero during fitting and native execution. These fields encode public-case success, the public failure fraction, program syntax validity, a repair-history indicator, the allowance-to-remaining-bank ratio, and public-feedback availability. Both arms retain the same visible texts, status encoding, ledger, 2,400-parameter core, and native interface.
+
+Each arm uses the same 400 earlier problems and 2,397 state/allowance pairs, the frozen 319/81 contest split, and a fresh all-400 refit after development selection. AdamW uses learning rate $3\times 10^{-4}$ , weight decay $10^{-4}$ , and clipping one, with at most 600 development epochs and prices $\{0.005,0.05\}$ . The selected full-input fit uses price 0.05 and 350 epochs; the zero-feature fit uses price 0.005 and 51 epochs. Native evaluation shares all 126 retained initial programs, Google Gemma 4 31B IT, temperature zero, the public-feedback repair interface, official LiveCodeBench scoring, an 8,192-token bank, allowances 512/2,048/4,096, and two repair opportunities.
+
+Table 7: Public-obligation input study on all 126 code problems. Both rows are separately refitted, development-selected controllers. The full-input row belongs to this control family; the primary paired-terminal deployment in Table 6 completes 93/126.
+
+Controller input
+
+Correct /126
+Rate (%)
+
+Full public-obligation fields
+
+90
+71.43
+
+Six numerical fields set to zero
+
+82
+65.08
+
+The full-input fit has nine wins, one loss, and 116 ties, giving a 6.35-point paired gain with 95% interval $[1.67,11.19]$ and two-sided Holm-adjusted $p=0.03557$ . The analysis uses 20,000 paired bootstrap draws and 100,000 whole-group sign flips over the 39 contests; adjustment retains the registered single quality contrast. Inference conditions on these development-selected fitted policies. The result supports the numerical public-obligation representation within this complete native refitting comparison.
+
+## C.5 Retail quality and resource comparisons
+
+The selected retail controller and Forest-of-Thought each complete 29/40 tasks. All forty outcomes are paired by native task identity; connected shared customer/order references form 32 dependence groups. The six PORA wins and six losses yield a zero quality difference with a 95% interval of $[-18.18,18.42]$ percentage points. Table 8 reports all-retained-attempt processing across actor, customer simulator, and assertion judge. Controller encoding is recorded separately, and its elapsed time is nested in task time. The resource result concerns the adopted native Forest-of-Thought implementation.
+
+Table 8: Retail resources over forty tasks. Reduction intervals resample the same 32 dependence groups.
+
+Resource
+PORA
+FoT
+Reduction 95% CI
+
+Model tokens
+3,331,003
+98,364,608
+ $[96.31,96.86]\%$ 
+
+Requests
+722
+21,434
+ $[96.40,96.82]\%$ 
+
+Service (s)
+10,421.51
+151,898.33
+ $[92.08,93.95]\%$ 
+
+Task time (s)
+10,748.02
+152,362.67
+ $[91.86,93.78]\%$ 
+
+Matched fixed Preserve and Spend each complete 28/40 in their independently executed conversations. PORA’s 2.50-point gains have intervals $[-10.26,15.63]$ and $[-10.26,15.79]$ , respectively. The three retail quality comparisons jointly receive Holm correction and each has adjusted $p=1$ . Quality bootstraps use seed 20261006; resource bootstraps use seed 20261007, both with 20,000 draws. The fixed controls describe the quality variation around this selected operating point.
+
+Table 9: Additional actors on BFCL memory. Success rates (%) use all 155 questions. Fit/select gives the paired fitting and selection examples. Actor tokens include native memory preparation and evaluation. Within each actor, the fixed policies share its memory interface with PORA.
+
+PORA
+Fixed Preserve
+Fixed Spend
+
+Actor
+Memory
+Fit/select
+Rate
+Tokens
+Rate
+Tokens
+Rate
+Tokens
+
+Mistral Small 3.2 24B
+Key–value
+48 / 24; refit 72
+40.6
+5.84M
+38.1
+5.90M
+36.8
+5.78M
+
+Mistral Small 3.2 24B
+Vector
+160 / 40; refit 200
+52.3
+3.26M
+45.2
+2.01M
+50.3
+2.11M
+
+Mistral Small 3.2 24B
+Recursive
+160 / 40; refit 200
+57.4
+2.53M
+57.4
+2.50M
+60.0
+2.44M
+
+Phi-4 14B
+Key–value
+160 / 40; refit 200
+32.3
+12.40M
+33.5
+12.79M
+34.2
+14.91M
+
+## C.6 Mathematical revision controls
+
+All comparisons use the complete 500 native problem identifiers and verify_MATH.grade_answer. The fixed policies share PORA’s initial solutions, actor, bank, and repair interface. Plan and Budget and Forest-of-Thought retain their separately measured native recipes with the same Gemma actor revision. Paired problem bootstrap uses 20,000 draws and seed 20261006. Exact two-sided McNemar probabilities receive Holm adjustment across the four comparisons in Table 11.
+
+Physical-request reductions use all retained initial and revision attempts on the same 500 problems. Shared initial requests count once in each standalone policy; the physical campaign contains 1,191 unique requests. A separate single-endpoint resource comparison samples the seven whole subjects 20,000 times with seed 20261008 and recomputes $100(1-\sum C_{A}/\sum C_{S})$ . All seven subjects reduce request counts; leaving out any one subject retains reductions of 27.68–34.12%. These estimates condition on the selected policy and observed subjects. Table 10 gives each subject’s complete request counts.
+
+Table 10: Physical model requests by MATH500 subject. PORA and fixed Spend share each initial solution; counts include every retained initial and revision attempt. Savings are $100(1-C_{\mathrm{\textsf{PORA}{}}}/C_{\mathrm{Spend}})$ .
+
+Subject
+Tasks
+PORA
+Spend
+Saved (%)
+
+Algebra
+124
+144
+248
+41.94
+
+Counting & Probability
+38
+62
+76
+18.42
+
+Geometry
+41
+60
+82
+26.83
+
+Intermediate Algebra
+97
+157
+194
+19.07
+
+Number Theory
+62
+78
+124
+37.10
+
+Prealgebra
+82
+106
+165
+35.76
+
+Precalculus
+56
+83
+114
+27.19
+
+All subjects
+500
+690
+1,003
+31.21
+
+Table 11: MATH500 quality relative to PORA’s 477/500. Intervals and differences are percentage points; adjusted probabilities use the complete four-comparison family.
+
+Comparator
+/500
+Gain
+95% interval
+Holm $p$ 
+
+Fixed Preserve
+459
+3.60
+ $[2.00,5.40]$ 
+0.000031
+
+Fixed Spend
+475
+0.40
+ $[-0.40,1.20]$ 
+1.0
+
+Plan and Budget
+474
+0.60
+ $[-0.60,1.80]$ 
+1.0
+
+Forest-of-Thought
+459
+3.60
+ $[1.60,5.60]$ 
+0.00160
+
+The Preserve comparison has 18 PORA wins and zero losses; Spend has three wins and one loss; Plan and Budget has six wins and three losses; Forest-of-Thought has 22 wins and four losses. These complete pair counts connect each terminal-quality difference to its corresponding native comparison.
+
+## C.7 Processing coefficient sensitivity
+
+The mathematics study fixes the fitted controller and scales its processing coefficient by 0.5, 1, and 2. Every setting shares the same initial solutions and generates its own selected repairs through the native interface. A 1,024-token draft and feasible 1,536-token repair use the same 2,560-token bank. At this final repair, the future-capacity terms are zero. All 728 development problems select the coefficient before the 500 native test continuations. Request counts include inherited initial attempts once per standalone policy and every new repair attempt.
+
+## Appendix D Additional Actors on BFCL Memory
+
+We fit separate controllers for two further actors, Mistral Small 3.2 24B (FP8 weights) and Phi-4 14B (BF16 weights), on BFCL memory. The controller architecture (2,400 parameters), the MiniLM encoder, the 8,192-token bank, the 128 and 1,024-token allowances, and the twenty-round limit are unchanged. Each actor uses its own memory instructions and tool serialization, shared by its three allowance policies. Table 9 compares PORA with the fixed-allowance policies of the same actor on all 155 questions.
+
+With Mistral, PORA improves over both fixed policies on key–value memory (40.6% against 38.1% and 36.8%) and vector memory (52.3% against 45.2% and 50.3%). On recursive-summary memory it matches fixed Preserve at 57.4% and is 2.6 points below fixed Spend. With Phi-4 on key–value memory, the three policies are within 1.9 points, and PORA uses the fewest actor tokens. Every policy reaches a lower success rate with these actors than with Gemma, which leaves a narrower range in which allocation can change outcomes.
+
+## Appendix E Native Case Studies and Prompt Templates
+
+The cases below pair PORA with the highest-quality recorded baseline in the corresponding main panel. They illustrate three uses of the same resource decision: repairing an unresolved solution, preserving a sufficient answer, and reserving a finite reasoning bank for a later execution boundary. The full native comparisons quantify performance; the excerpts identify the behavior of these particular tasks.
+
+## E.1 Spending on an unresolved mathematical solution
+
+MATH500: test/prealgebra/874.json (index 240). The task asks for $\angle PQR$ with $PT\parallel QR$ and angle labels $x$ , $2x$ and $128^{\circ}$ . The supplied diagram is represented by its original Asymptote code in the actor input.
+
+LATS
+
+The recorded search runs four candidate generations and four self-evaluations. Its selected answer is 154.
+
+Native readout. Native correctness $=0$ ; 8 model requests; 10416 processed tokens.
+
+PORA: Spend
+
+The initial draft has competing angle interpretations and fails the native answer check. The controller selects one repair; the additional generation finishes with 116.
+
+exchange utility = 0.939213
+
+repair allowance = 1536
+
+final answer = 116
+
+Native readout. Native correctness $=1$ ; 2 model requests; 3,085 processed tokens.
+
+The actor receives the problem, its existing draft, and a fixed checking instruction. The controller decides whether the additional computation is valuable; the native terminal scorer verifies the returned answer. The displayed utility is the recorded controller output, and the token total includes the initial generation and selected repair.
+
+## E.2 Preserving a sufficient answer
+
+MATH500: test/precalculus/807.json (index 0). Convert $(0,3)$ to polar coordinates $(r,\theta)$ with $r>0$ and $0\leq\theta<2\pi$ . The initial answer is $(3,\pi/2)$ .
+
+LATS
+
+The recorded search returns the correct polar coordinates after its candidate/evaluation procedure.
+
+Native readout. Native correctness $=1$ ; 8 model requests; 5206 processed tokens.
+
+PORA: Preserve
+
+The controller retains the initial answer with its existing evidence.
+
+exchange utility = -0.0846272
+
+additional model requests = 0
+
+final answer = (3, pi/2)
+
+Native readout. Native correctness $=1$ ; 1 model request; 403 processed tokens.
+
+This case complements the repair example: a Preserve decision retains terminal quality while saving the additional actor work. The two tasks share the same mathematical generator and checking template.
+
+## E.3 Reserving reasoning for execution closure
+
+AppWorld task 099174d_3. “Place an Amazon order as per my Amazon shopping list note in SimpleNote.” The actor is OpenAI gpt-oss-120b. PORA has an 8,192-token trajectory bank, short/long allowances of 128/1,024, and twenty execution steps.
+
+Plan and Budget
+
+The current-state planner allocates fourteen 128-token steps and three 256-token steps. The resulting episode reaches 5/7 requirements and fails the task.
+
+recorded step allowances:
+
+128 tokens: 14 steps
+
+256 tokens: 3 steps
+
+Native readout. Task success $=0$ ; native requirement score $=5/7$ .
+
+PORA: Preserve / Spend
+
+The runtime uses fifteen short and five long allowances. Early source acquisition preserves the bank; late repair and write/terminal closure receive long allowances.
+
+step 0: Preserve, 128
+
+step 7: Preserve, 128; reads the note
+
+step 16: Spend, 1024; reads cart/state
+
+step 19: Spend, 1024; executes closure
+
+charged bank use: 7043 / 8192
+
+Native readout. Task success $=1$ ; native requirement score $=7/7$ .
+
+The recorded deployment combines the learned residual predictor with the event-conditioned eligibility and reserve policy. The final allowance shown here is the runtime decision after that adaptation. The task demonstrates the narrative role of a finite bank over a long episode; its outcome includes the complete executor and typed schema checks.
+
+## Appendix F Prompt Templates and Message Assembly
+
+Templates below retain their implemented wording. Braced fields denote values supplied by the recorded task or public history. The following blocks specify the message assembly and expected outputs. Historical method identifiers inside quoted templates retain the execution version’s wording.
+
+## F.1 Mathematical initial answer and repair
+
+PORA first sends its initial problem prompt. A Spend action appends the initial assistant draft and the fixed repair user message. Preserve returns the existing answer. Both stages use temperature zero; the recorded caps are 1,024 for the initial answer and 1,536 for repair. The paired LATS prompts below specify its generation and evaluation roles.
+
+MATH500 initial answer
+
+Role: user.
+
+Solve this mathematics problem. Show concise reasoning and finish with the final answer in \boxed{...}.
+
+{problem}
+
+Assembly. Initial cap 1024; temperature 0.
+
+MATH500 repair
+
+Role: user.
+
+Check this solution carefully from the problem statement, correct any mathematical error, and finish with the final answer in \boxed{...}.
+
+Assembly. Conversation: initial user/problem, assistant/draft, then this instruction. Repair cap 1536; temperature 0.
+
+LATS mathematical candidate
+
+Role: user.
+
+{problem}
+
+Solve carefully and put the final mathematical answer in \boxed{...}.
+
+Assembly. Four candidates and their self-evaluations; candidate caps 2048, self-evaluation caps 512; temperatures 0.4, 0.6, 0.8 and 1.0.
+
+LATS mathematical evaluation
+
+Role: user.
+
+Evaluate this solution using the visible problem. Return JSON with score in [0,1] and reflection.
+
+{solution}
+
+Assembly. The previous user message contains the problem and generation instruction.
+
+Plan and Budget current-state planner
+
+Role: system.
+
+Decompose the remaining work of an interactive assistant using only the current conversation and available tools. Return one JSON object with difficulty from 1 to 5 and 2 to 5 ordered steps. Each step has text and positive credit. Credits should sum to 100. The first step must describe the next unresolved decision. Do not solve the task, predict future user messages, or use information absent from the state.
+
+Assembly. The AppWorld baseline supplies its current visible messages, selected tools and remaining/used bank in the planner state.
+
+Plan and Budget state request
+
+Role: user.
+
+Current state:
+
+{state_text}
+
+Return the plan JSON now.
+
+## F.2 A filled mathematical request
+
+The following user messages reproduce the original problem, diagram source and checking request for the Spend case. The assistant draft is placed between them.
+
+Filled MATH500 repair conversation
+
+Role: messages JSON.
+
+[
+
+{
+
+"content": "Solve this mathematics problem. Show concise reasoning and finish with the final answer in \\boxed{...}.\n\nIn the diagram, $PT$ is parallel to $QR.$ What is the measure of $\\angle PQR$ in degrees?\n\n[asy]\ndraw((0,0)--(10,0),black+linewidth(1));\ndraw((0,0)--(10,0),MidArrow);\ndraw((10,0)--(20,0),black+linewidth(1));\ndraw((0,0)--(-7,10)--(7,10)--(10,0),black+linewidth(1));\ndraw((-5,10)--(7,10),MidArrow);\nlabel(\"$x^{\\circ}$\",(-6,10),SE);\nlabel(\"$2x^{\\circ}$\",(7,10),SW);\nlabel(\"$128^{\\circ}$\",(10,0),NE);\nlabel(\"$P$\",(-7,10),N);\nlabel(\"$T$\",(7,10),N);\nlabel(\"$R$\",(10,0),S);\nlabel(\"$Q$\",(0,0),S);\n[/asy]",
+
+"role": "user"
+
+},
+
+{
+
+"content": "Check this solution carefully from the problem statement, correct any mathematical error, and finish with the final answer in \\boxed{...}.",
+
+"role": "user"
+
+}
+
+]
+
+Assembly. Actual request for test/prealgebra/874.json; the complete payload is retained with the case evidence.
+
+## F.3 AppWorld API evidence and planning
+
+The API selector receives Task: followed by the user instruction and Catalog: followed by official API descriptions. Its selected identifiers populate api_evidence; the plan compiler receives the available apps, that evidence and the trusted user instruction. Its generated plan is retained in the actor's plan_context.
+
+Api Selector Sys
+
+Role: source template.
+
+You select task-relevant AppWorld APIs from the official API name and description catalog.
+
+Return at most 18 exact app_name.api_name identifiers, one per line. Cover every information source, set filter,
+
+identity relation, temporal anchor, state change, notification, authentication, and completion obligation in the
+
+task. First decompose the instruction into one retrieval query per noun phrase, restrictive clause, negation,
+
+comparison, and grouped superlative. Select at least one exact source API for every operand before selecting write
+
+APIs. A restrictive predicate must retrieve records of the entity it modifies: liked songs and liked playlists are
+
+different evidence sources. In the construction songs from my playlists that I have liked, liked constrains the
+
+action target songs; the construction songs from my liked playlists constrains playlists. Relative time must be
+
+grounded in the AppWorld clock. A Venmo money transfer requires the direct funding-source evidence supported by
+
+create_transaction. Also preserve producer tools that can establish a missing balance or payment-card precondition
+
+after a grounded execution error. A condition that contacts do not have a Venmo account requires a Venmo user
+
+search in addition to phone contacts. A phrase such as songs from my song library that I have liked requires both
+
+the song library and liked-song sources. A grouped superlative such as the most-played song from each playlist
+
+requires playlist membership and the song detail source containing play_count. Prefer recall when uncertain.
+
+When a playlist must cover a time interval, select playlist membership and the song detail source containing each
+
+song’s duration. The plan must sum observed durations and compare them with the exact task-grounded interval.
+
+When an email says a bill or receipt is attached, select gmail.show_email, gmail.download_attachment,
+
+file_system.login, and file_system.show_file in addition to the email listing API.
+
+Do not invent identifiers and do not add explanations.
+
+Evidence Plan Sys
+
+Role: source template.
+
+You are the evidence-dependency compiler for an AppWorld coding agent. Build a compact,
+
+source-grounded execution graph for the task using the available apps: {apps}.
+
+The following task-conditioned API evidence comes from the official AppWorld documentation. Use its exact names,
+
+parameters, and meanings. If a required source is absent, schedule ApiDocs discovery before depending on it.
+
+{api_evidence}
+
+Use these sections:
+
+1. Semantic binding graph: first produce a span-coverage table. Give every noun phrase, restrictive clause,
+
+negation, comparison, quantifier, and grouped superlative exactly one typed operator and source obligation. Then
+
+identify the target entity, each restrictive predicate and the entity it modifies,
+
+source collections, identity relations, comparisons, temporal phrases, and write arguments. Preserve grammatical
+
+attachment. In a phrase such as songs from playlists that I liked, determine whether liked modifies songs or
+
+playlists from the full task meaning, then retrieve evidence for that exact entity type. Never substitute a related
+
+collection. Treat artist identity, song identity, playlist membership, liked membership, and library membership as
+
+separate typed relations. When both high and low attachment remain possible, enumerate both graphs and prefer the
+
+one where the restrictive predicate qualifies the final action target. Songs from my playlists that I have liked
+
+requires playlist-library membership intersected with liked-song membership. Songs from my liked playlists uses
+
+liked-playlist membership. When the task asks for a new object that is the same as a source object except for an
+
+explicit change, add a copy-except operator. Read every source field that the creation API can preserve, inherit
+
+all of them by default, and override only the explicitly changed field. This includes metadata such as pinned,
+
+tags, visibility, and status in addition to title and content. Prefer structured fields such as artist_id over
+
+broad text-query relevance.
+
+2. Terminal obligations: every answer field, state change, notification, and completion call required by the task.
+
+If the task is an imperative that only requests state changes, complete with answer=None. Return text only when
+
+the task explicitly asks a question or requests information. Never add a work summary as the completion answer.
+
+3. Evidence ledger: for every value used by an obligation, name the exact source app, record field, and observation
+
+that must
+
+establish it. If the exact API semantics have not been observed, mark the source unresolved and put API
+
+discovery before all dependent reads. Do not invent endpoint names or substitute related concepts such as
+
+liked, saved, and library. Compare candidate API names and official descriptions against the task wording,
+
+then select the source with matching semantics. Never guess a number, identity, or membership. For long API
+
+returns, inspect the full value inside the sandbox and print only compact task-relevant fields so the decisive
+
+evidence remains visible in the next observation.
+
+For a value drawn from a conversation, preserve counterpart, direction, timestamp, and message order. When
+
+multiple numbers occur, first identify the message about the task event, then pair it with the counterpart’s
+
+immediately following reply. Bind the value from that answer. Recency alone cannot select the value. A newer
+
+number about another event must remain a separate candidate and be rejected by topic and reply relation.
+
+Keyword search may locate the anchor turn, but it cannot retrieve an answer that omits the keyword. After locating
+
+the anchor, fetch the complete counterpart thread with no query, paginate it, sort it chronologically, and build
+
+directed edges between each turn and the next turn from the other speaker. Reformulate each required value as a
+
+focused question over this speaker-aware thread. Extract the answer span only from a reply connected to the
+
+task-event anchor.
+
+For phone.search_text_messages, use the documented parameters page_index and page_limit. Start with
+
+page_index=0 and page_limit=20. The parameter page does not exist. Continue until a short or empty page proves
+
+coverage before extracting any slot value.
+
+4. Set constraints and candidate proofs: translate inclusion, exclusion, and negative conditions into explicit set
+
+operations. Require observations for every operand before computing an intersection or difference. Define the
+
+proof columns each candidate must satisfy before it can become a write argument. Translate contacts who do not
+
+have an account as relationship_contacts minus exact_account_matches. Search results prove account membership
+
+only when the returned email or phone exactly equals the contact identity. An unrelated fuzzy result is not a
+
+match. Translate songs from my song library that I have liked as song_library intersect liked_songs. For a
+
+superlative from each group, enumerate every group, retrieve the comparison field for every member, and apply
+
+argmax independently within each group before any write.
+
+For capacity-limited migration from an Inbox into a named current-day project, left overs from the current day
+
+are the incomplete tasks already present in that target project. Sum their durations and subtract them from the
+
+schedule capacity before selecting any Inbox task. Inbox due dates do not replace this target-project source.
+
+5. Temporal and identity anchors: resolve relative dates with phone.get_current_date_and_time from AppWorld. Never
+
+use the host clock, Python datetime.now, token expiry, or the newest observed record as the current date. Resolve
+
+roommate, friend, and family relations from the relationship field returned by phone.search_contacts. A text
+
+query alone does not prove a relationship. Keep every restrictive phrase executable. Morning, afternoon, and
+
+evening must filter record timestamps. When a date contains multiple events, cluster records by time,
+
+description, and amount, then retain only the cluster satisfying every task predicate. Relationship and
+
+time-of-day phrases can never be marked descriptive or discarded.
+
+6. Coverage closure: when the task says all, every, across, top, or otherwise ranges over a collection, inspect the
+
+pagination interface and read pages until the end. Track which required sources and pages have been covered.
+
+A collection containing exactly 5 items may be an AppWorld default page. Refetch page 0 with page_limit=20 before
+
+using it. Retain candidates from every fetched page in one accumulator; later pages never replace earlier pages.
+
+When a group of people supplies replies, suggestions, approvals, or other evidence, create one thread obligation
+
+per group member. Paginate every member’s complete thread independently until the target reply is found or a
+
+short or empty page proves the end. Merge the per-member evidence only after every obligation is closed. Evidence
+
+from one member can never discharge another member’s thread obligation.
+
+7. Structural scope: before counting, filtering, or aggregating text records, assign every line or block a region
+
+role: schema, title, legend, instance row, or footer. Define the target instance predicate from the task. Only
+
+instance rows satisfying that predicate may enter the aggregate. A symbol shown in a legend explains the schema;
+
+it is never itself an instance. Print the accepted rows before computing the final value. For repeated records
+
+embedded in a note or file, parse the full content inside the sandbox. If the instruction names a boolean or
+
+categorical predicate such as favorite, completed, accepted, or private, filter on that exact field before
+
+selecting any name or identifier. A raw long note cannot support a predicate-bound write.
+
+For a block-structured schedule keyed by day, keep the full content in a sandbox variable, derive the current
+
+weekday from phone.get_current_date_and_time, select the exact matching block, and parse its labeled scalar.
+
+Never infer a schedule value from a truncated printout or manually restate the block. Preserve source scalar
+
+units unless an observed API contract explicitly requires conversion. If the task names a user-owned library,
+
+candidate search remains inside that library; an empty or apparently infeasible result triggers source and
+
+parsing repair, not expansion to public records.
+
+Treat a literal output template as a field schema. Preserve separators and the exact width and case of every
+
+placeholder. MM/YY uses a two-digit month and two-digit year. MM/YYYY uses a four-digit year. yyyy-mm-dd keeps
+
+lowercase labels and hyphens. Instantiate one exemplar and compare its shape with the instruction before any
+
+write. Never normalize or expand a requested template.
+
+For Amazon records that expose product_id, treat a task phrase naming a product category as a typed predicate.
+
+Call amazon.show_product for each candidate and decide membership from the structured product_type. Product names
+
+provide supporting evidence only and cannot close a category predicate by substring matching alone.
+
+8. Dependency order: list read, transform, and write nodes. A write node may run only after all of its input evidence
+
+is observed. Inspect optional write parameters when their defaults can trigger a precondition such as a funding
+
+source. Homogeneous writes over a fully certified candidate set may share one compact loop that prints one
+
+receipt per candidate. Compile independent reads into obligation packets. Authenticate all planned apps in one
+
+early block using username types from the supplied API evidence. Fetch repeated records with one loop and print
+
+only proof columns. Do not re-query documentation already present in this plan, restate a known list in a new
+
+turn, or recount an observed collection. After all inputs close, execute homogeneous writes in one loop and
+
+complete in the same block after successful receipts. When a relationship determines a target group, retrieve
+
+exact relationship contacts first. Fetch groups from page_index=0 with page_limit=20 and select the group whose
+
+observed members contain the user and every relevant contact. Never infer group identity from its name, return
+
+order, or a partial member match.
+
+For venmo.create_transaction and venmo.approve_payment_request, first read the balance and registered payment
+
+cards. Use the AppWorld clock to reject expired cards. Prefer a valid registered payment_card_id when the target
+
+write accepts it. If a newly observed supervisor card must be registered, bind the returned payment_card_id
+
+directly to the original target write. Do not add money to the Venmo balance when the original target write
+
+accepts payment_card_id. Use add_to_venmo_balance only when the original target write has no direct funding-source
+
+parameter and its observed balance precondition is unmet. If no registered source can satisfy the amount, leave
+
+a runtime repair node unresolved.
+
+For file moves or renames, freeze the candidate set from the initial task-specified source directory. A
+
+destination directory is only a write target and verification source. Never modify a pre-existing destination
+
+object that was absent from the initial source collection.
+
+Before amazon.place_order, construct the exact target product_id-to-quantity map from task evidence. Read the
+
+current cart. For a category-scoped subset such as all weightlifting benches, call amazon.show_product for every
+
+cart product and classify it by the structured product_type; a name substring is only supporting evidence.
+
+Delete every unrelated product, add every missing product, and correct every mismatched quantity.
+
+Read the cart again and require exact equality with the target map before placing the order. Existing cart state
+
+is untrusted task context; never allow an unrelated product to enter the new order.
+
+A cart mutation and amazon.place_order must occur in separate agent turns. After the final cart mutation, end
+
+that turn with amazon.show_cart. Inspect its next observation, print the exact observed map, and only then place
+
+the order in a later turn. A cart observation produced earlier in the same code block cannot certify the write.
+
+Treat a wish list as a read-only candidate source for a single-product purchase. Add the selected product to the
+
+cart while preserving its wish-list entry. When the instruction quantifies over the wish list itself, such as
+
+buying all items or as many items as possible, move every selected entry from the wish list to the cart so the
+
+collection-level state transition is discharged.
+
+Read registered Amazon payment cards and addresses before ordering. Select an observed unexpired card using the
+
+AppWorld clock and an observed address. If a named address is absent from Amazon, read the exact user-owned
+
+address from supervisor, register that observed address in Amazon, and bind the returned address_id. If no
+
+registered Amazon card can satisfy the purchase, read an observed user-owned card from supervisor, register it
+
+in Amazon, and bind the returned payment_card_id. Never guess identifiers or synthesize field values.
+
+9. Runtime repair: an execution failure is a new observation, not permission to guess. Convert its exact unmet
+
+condition into a typed deficit. Search backward for the shortest producer chain whose postcondition satisfies
+
+that deficit. Every producer input must come from a printed, user-owned source. A cross-app repair is admissible
+
+only when the failing target action explicitly requires that resource and the repair changes no unrelated user
+
+intent. Minimize changed model types as well as call count. When the original write accepts a direct source
+
+parameter, a support action may register that source, but it must not create an intermediate balance, transfer,
+
+message, file, or notification. Execute one verified repair path, print its receipt, verify the new state, and
+
+retry the original write once. If no path is certified, continue discovery or stop without speculative identifiers.
+
+10. Closure checks: immediately before each write, state the exact arguments and their observed provenance. At the
+
+end, verify every terminal obligation and then call supervisor.complete_task(answer=<answer or None>).
+
+Include API discovery whenever the exact interface is unknown. Name variables that later steps will need. Respond
+
+only with the structured plan.
+
+## F.4 AppWorld code actor
+
+The first user message is Task: followed by the instruction. Each executed Python block is appended as an assistant message; the next user message is Output: followed by the normalized observation (up to 2,500 characters). The runtime supplies the Preserve/Spend allowance through decoding. The output is one executable Python block per step.
+
+Sys
+
+Role: source template.
+
+You are a coding agent solving a task for your supervisor in AppWorld. You act by writing Python code.
+
+Rules:
+
+- Respond with EXACTLY ONE ‘‘‘python ... ‘‘‘ code block per turn. It runs in a STATEFUL python sandbox where a
+
+global object ‘apis‘ is available. You see its stdout as the next message. PRINT anything you want to observe.
+
+- Available apps: {apps}. Learn an app’s APIs with:
+
+print(apis.api_docs.show_api_descriptions(app_name=’spotify’))
+
+print(apis.api_docs.show_api_doc(app_name=’spotify’, api_name=’login’))
+
+- Your supervisor’s info & credentials:
+
+print(apis.supervisor.show_profile()) # name, email, phone_number
+
+print(apis.supervisor.show_account_passwords()) # passwords to log into the apps
+
+- Store the returned profile and credential records in sandbox variables. Select a credential record by its
+
+account_name and pass its password field directly to login. Never manually retype credential strings or repair
+
+their punctuation.
+
+- Most apps need login first: access_token = apis.spotify.login(username=..., password=...)[’access_token’].
+
+- When done, call: apis.supervisor.complete_task(answer=<concise answer or None if not a question>).
+
+- Work by evidence boundaries. Batch independent logins and homogeneous reads or writes in compact loops. Query
+
+ApiDocs only when the supplied plan lacks the schema or execution reports a schema error.
+
+- Put required source reads and state-changing writes in separate environment turns. A block containing an actual
+
+state change before its required reads close is rejected in full. When an answer-only block places
+
+supervisor.complete_task after unresolved source reads, the runtime may execute only the safe top-level read
+
+prefix and defer completion to the next turn. Keep the final completion call as a separate top-level statement
+
+so this recovery remains available. A task-required transition followed by observation is one closed-loop
+
+certificate: execute the transition, observe the resulting state, and test the exact stop condition before
+
+terminal completion.
+
+- For a value owed as per a text conversation, identify the question matching the exact task event and bind its
+
+immediately following counterpart reply. Carry only the scalar from that reply into the write. A later unrelated
+
+amount or a generic first numeric mention cannot satisfy the event relation.
+
+- Normalize AppWorld calendar dates before comparison. If phone.get_current_date_and_time returns a value such as
+
+Thursday, May 18, 2023, parse it with datetime.strptime(value, "%A, %B %d, %Y").date().isoformat() and compare
+
+that YYYY-MM-DD value with the date prefix of an ISO record timestamp. Never compare the two raw strings.
+
+{plan_context}
+
+## F.5 Memory, code and retail adapters
+
+BFCL appends the official user turns and tool observations after the displayed memory system message. LiveCodeBench sends the public problem/interface text initially and uses the displayed repair request with public execution feedback. Retail appends the official conversation and observations after its system message. The learned controller determines the additional resource allowance at each supported decision.
+
+System
+
+Role: source template.
+
+Operate the official BFCL-v4 memory tools. Use only supplied tools and observed results. During prerequisites, keep stable identity in seven core slots and condense all new episodic facts from one user turn into ONE archival note (at most 2000 characters) under a descriptive snake_case key. Archive has 50 slots. Do not make one entry per fact. If add says full, do not retry. List keys; inspect two related older entries, combine their distinct facts into one concise value with replace, then remove a redundant key only after preserving its content. Add one new note. If no safe compression fits, replace a related note with a combined value rather than discarding a distinct fact. Core values must stay under 300 characters. Use at most fourteen memory calls per turn, then answer the current user. For a question, search, list keys if search scores are zero, retrieve the needed value, and give a short exact answer copied from evidence. Never invent memory contents or hidden answers.
+
+LiveCodeBench repair
+
+Role: user.
+
+Review the current Python solution using the public cases and public execution feedback. Return one complete Python code block.
+
+{problem}
+
+Current code:
+
+{code}
+
+Public cases:
+
+{public_cases_json}
+
+Public execution feedback:
+
+{feedback_json}
+
+Assembly. Initial generation sends the task/interface text as one user message; repair caps are selected from 512, 2048 and 4096 within the 8192-token bank.
+
+Retail actor system
+
+Role: system.
+
+You are the customer-service agent in the official tau3
+
+retail benchmark. Follow the supplied retail policy exactly. In each turn,
+
+return either a user-facing text response or one or more official tool calls,
+
+never both. Never invent tool observations. Tool observations are generated
+
+only by the official tau2 environment.
+
+<retail_policy>
+
+{domain_policy}
+
+</retail_policy>
+
+<method_controller>
+
+Use the COT2 unified Preserve/Spend controller and keep the official Tau3 retail tool protocol.
+
+</method_controller>
+
+Assembly. The retained executor uses the displayed historical controller identifier. PORA supplies the measured residual budget selector; the retail policy is the official task environment policy.
+
+## Appendix G Native Dialogue Simulation and Scoring
+
+Templates below retain their implemented wording. Braced fields denote values supplied by the recorded task or public history. The following blocks specify the message assembly and expected outputs. Historical method identifiers inside quoted templates retain the execution version’s wording.
+
+## G.1 User simulator and terminal judge
+
+The retail actor and controller use the public dialogue. These native auxiliary roles produce the customer continuation and terminal assertion scores. The task scenario fills instructions; persona guidelines populate the displayed marker. The measured actor, simulator and judge calls use the recorded Gemma 4 adapter and retain separate request accounting.
+
+Native retail user simulator
+
+Role: system.
+
+{global_user_sim_guidelines_with_persona}
+
+<scenario>
+
+{instructions}
+
+</scenario>
+
+Assembly. The global guidelines below supply the first field, followed by the task scenario. Public agent messages drive the simulator.
+
+Native retail simulation guidelines
+
+Role: system field.
+
+# User Simulation Guidelines
+
+You are playing the role of a customer contacting a customer service representative. 
+
+Your goal is to simulate realistic customer interactions while following specific scenario instructions.
+
+## Core Principles
+
+- Generate one message at a time, maintaining natural conversation flow.
+
+- Strictly follow the scenario instructions you have received.
+
+- Never make up or hallucinate information not provided in the scenario instructions. Information that is not provided in the scenario instructions should be considered unknown or unavailable.
+
+- Avoid repeating the exact instructions verbatim. Use paraphrasing and natural language to convey the same information
+
+- Disclose information progressively. Wait for the agent to ask for specific information before providing it.
+
+## Task Completion
+
+- The goal is to continue the conversation until the task is complete.
+
+- If the instruction goal is satisified, generate the ’###STOP###’ token to end the conversation.
+
+- If you are transferred to another agent, generate the ’###TRANSFER###’ token to indicate the transfer.
+
+- If you find yourself in a situation in which the scenario does not provide enough information for you to continue the conversation, generate the ’###OUT-OF-SCOPE###’ token to end the conversation.
+
+Remember: The goal is to create realistic, natural conversations while strictly adhering to the provided instructions and maintaining character consistency.
+
+Native retail natural-language judge
+
+Role: system.
+
+TASK
+
+- You will be given a list of expected outcomes and a conversation that was collected during a test case run.
+
+- The conversation is between an agent and a customer.
+
+- Your job is to evaluate whether the agent satisfies each of the expected outcomes.
+
+- Grade each expected outcome individually.
+
+FORMAT
+
+- Your response should be a JSON object with the following fields:
+
+- ‘reasoning‘: a short explanation for your classification
+
+- ‘metExpectation‘: ‘true‘ if the agent satisfies the expected outcomes, ‘false‘ otherwise
+
+- ‘expectedOutcome‘: repeat the expectation from the input that you are grading
+
+Example response structure:
+
+{
+
+"results": [
+
+{
+
+"expectedOutcome": "<one of the expected outcomes from the input>",
+
+"reasoning": "<reasoning trace>",
+
+"metExpectation": <false or true>,
+
+}
+
+]
+
+}
+
+Assembly. A user message supplies conversation and expectedOutcomes. The native parser reads results[].metExpectation and expectedOutcome; environment-effect checks retain their separate native evaluator.
+
+Native retail judge input
+
+Role: user.
+
+conversation:
+
+{trajectory_str}
+
+expectedOutcomes:
+
+{nl_assertions}

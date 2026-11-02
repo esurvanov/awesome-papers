@@ -1,0 +1,1100 @@
+## GRaSP: Latency-Aware Optimization for
+
+Geo-Distributed Retrieval-Augmented GenerationThanks: Accepted at SIGIR-AP 2026, December 13–15, 2026, Singapore.
+The definitive version is available at https://doi.org/10.1145/3848000.3850202.
+
+Hardik Ruparel
+
+Affiliation: Independent Researcher, San Jose, CA, USA
+
+email: hruparel@uci.edu
+
+, 
+Raj Kumar Pandey
+
+Affiliation: The Pennsylvania State University, University Park, PA, USA
+
+email: rzp5412@psu.edu
+
+ and 
+Pramod Kumar
+
+Affiliation: Independent Researcher, Sunnyvale, CA, USA
+
+email: pramodkumar5878@gmail.com
+
+Abstract.
+
+Retrieval-Augmented Generation (RAG) is increasingly served across geo-distributed cloud and edge infrastructures, where wide-area latency, cross-region egress cost, and data-residency rules compete with retrieval quality. Conventional pipelines rank by semantic similarity alone and ignore where content lives, inflating tail latency and cost. We formalize the Geo-RAG Selection Problem (GRaSP), a drop-in re-scoring layer that decays relevance by latency and adds an optional cost penalty under a cardinality budget and per-region caps, with no retraining. We first settle its complexity: the base formulation is a linear objective over a partition matroid, solved optimally by an $O(N\log N)$ greedy algorithm, rather than NP-hard as a knapsack framing suggests, with hardness entering only under an additive egress budget. On a five-node CloudLab testbed emulating a four-region WAN over the Natural Questions corpus (2.68M passages), GRaSP’s benefit is placement-dependent: under uniform placement it cuts fetch latency at negligible quality cost; under topical (residency-like) placement it traces a recall–latency Pareto frontier that dominates relevance-only, nearest- $k$ , and a latency-budgeted baseline. At a moderate latency setting, GRaSP lowers P90 fetch latency by $41\%$ while retaining $78\%$ of relevance-only’s recall, with sub-millisecond selection overhead, stable to 200 queries/s. Findings generalize across four public BEIR benchmarks. In end-to-end question answering, GRaSP reduces context-fetch latency by $43\%$ while remaining within $0.062$ absolute EM of relevance-only retrieval.
+
+Keywords: 
+Retrieval-Augmented Generation, geo-distributed retrieval, latency-aware selection, cost-aware retrieval, data residency, context selection, replica selection, edge and multi-cloud IR
+
+## 1. Introduction
+
+Large language models (LLMs) excel at generating text, but they can hallucinate, and their knowledge can become outdated. Retrieval-Augmented Generation (RAG) helps by retrieving relevant passages at inference time and giving them to the model as additional context (Lewis et al., 2020). RAG is now widely used in enterprise assistants, developer copilots, and analytics systems.
+In practice, the data used by these applications is often spread across multiple cloud regions and edge locations. Organizations do this to reduce client latency, control costs, improve availability, and meet data-residency requirements. This creates a new challenge for RAG: the most relevant passage is not always the best one to fetch. A highly relevant passage may be stored in a distant region, making it slower and more expensive to retrieve. Regional policies may also limit how much content can be fetched from a particular location. As a result, relevance-only top- $k$ selection can increase tail latency, raise egress cost, and behave poorly under regional constraints.
+
+Consider a SaaS assistant whose knowledge base is distributed across eu-central, ap-southeast, and sa-east. A user in Paris is served from eu-central, but several of the most relevant passages for a query are stored in sa-east, roughly 115 ms away. A relevance-only policy will select passages without considering their storage locations, increasing both fetch latency and cross-region egress costs.
+If similar passages are available in Europe, choosing them instead can keep most of the retrieval quality while reducing latency. But if the useful content exists mainly in sa-east, then avoiding the remote fetch will also reduce relevance. In other words, the benefit of location-aware retrieval depends on where relevant content is placed.
+
+We formalize this problem as the Geo-RAG Selection Problem (GRaSP). GRaSP runs after retrieval or re-ranking and before the selected passages are fetched. It re-scores candidates using semantic relevance, network latency, and optional retrieval cost, while also enforcing global and per-region selection limits. Because GRaSP operates only on the candidate pool produced by the existing retriever, it can be added to dense or hybrid RAG pipelines without retraining or re-indexing.
+Although the objective includes latency decay, cost, and regional constraints, the base optimization problem is simple. For a given query, each candidate has a fixed utility. This reduces the problem to a linear selection problem that can be solved exactly using an $O(N\log N)$ greedy algorithm. The problem becomes NP-hard only when we add constraints such as a hard egress budget.
+
+Our evaluation shows that GRaSP’s benefit depends strongly on data placement. When relevant content is spread across regions or well replicated, GRaSP can reduce latency and cost with little loss in retrieval quality. When relevant content is concentrated in a remote region, latency and relevance are in direct tension. In that case, GRaSP provides a tunable trade-off rather than eliminating the cost of remote access.
+
+Replication can reduce this tension. By placing copies of frequently accessed content in a small number of additional regions, the system creates more nearby alternatives for GRaSP to choose from. Our results show that this can recover much of the low-latency behavior seen under uniform placement. The main contribution of this work is therefore not a complex optimization algorithm, but a clear formulation and an empirical study of when geo-aware retrieval helps. Specifically:
+
+• 
+
+We formulate GRaSP as latency-aware relevance maximization with an optional cost penalty, a global top- $k$ limit, and per-region caps (Section 3). GRaSP is a drop-in re-scoring layer and requires no retraining or re-indexing.
+
+• 
+
+We show that the base problem can be solved optimally by an O(NlogN) greedy algorithm, while NP-hardness arises only when additive resource constraints, such as a hard egress budget, are introduced (Section 4).
+
+• 
+
+We build a five-node CloudLab (Duplyakin et al., 2019) testbed that emulates a four-region WAN and evaluate GRaSP on 2.68M Natural Questions passages. We measure retrieval quality, tail latency, egress cost, and optimality against an exact solver (Section 6).
+
+• 
+
+We show that GRaSP’s benefit depends on data placement, and that replication can improve the quality–latency trade-off. We further show that latency ( $\gamma_{q}$ ) and cost ( $\beta$ ) can be tuned independently, that these findings generalize across four BEIR datasets, and that GRaSP incurs only sub-millisecond overhead while remaining stable at query rates of up to 200 queries/s.
+
+## 2. Related Work
+
+RAG and Adaptive Retrieval: RAG research has emphasized retrieval quality and fusion strategies (Lewis et al., 2020), along with graph-structured retrieval (Peng et al., 2025) and, more recently, distributed RAG architectures (Xu et al., 2025). Adaptive and cascaded retrieval methods decide how much to retrieve or when to stop (Jiang et al., 2023), but they optimize over a centralized index and do not treat network location as a selection signal. GRaSP is orthogonal and composable: it re-scores whatever candidate pool an upstream retriever or re-ranker produces.
+
+Geo-distributed Analytics and Storage: A large systems literature optimizes data and task placement across wide-area networks for latency and cost. Iridium (Pu et al., 2015) jointly optimizes data and task placement to reduce wide-area query latency; Uluyol et al. (Uluyol et al., 2020) quantify latency versus cost trade-offs in geo-distributed storage, and transaction chains (Zhang et al., 2013) achieve low-latency serializability. SPANStore (Wu et al., 2013) minimizes the cost of geo-replicated storage placement across multiple clouds. These works decide where to place or how to replicate fixed objects; GRaSP instead decides which objects to fetch at query time given a fixed placement and uncertain relevance, and is complementary to placement optimizers.
+
+Caching and Content Placement: Content caching in CDNs and edge networks decides which content to keep close to users to reduce latency; recent work makes this decision cost-aware, accounting for the external bandwidth and retrieval cost of cache misses rather than hit-ratio alone (Araldo et al., 2014; Wang et al., 2021). In the LLM setting, semantic caches reuse prior responses or retrieved contexts for similar queries to cut inference cost and latency (Bang, 2023; Ruparel and Patel, 2025b), and in multi-tenant RAG, frequency-aware global caches outperform per-tenant partitioning under skewed workloads (Ruparel and Patel, 2025a). These mechanisms operate ahead of a query, provisioning content by predicted popularity; GRaSP instead operates at query time, selecting among already-placed candidates under per-query relevance, latency, and cost. The two are complementary—our replication result (Section 6.4) shows that caching hot content into nearby regions widens the regime in which GRaSP’s selection is near-free.
+
+Replica and Server Selection: Systems such as DONAR (Wendell et al., 2010) and C3 (Suresh et al., 2015) choose which replica of a known object to contact to minimize latency under load. The key distinction is that replica selection assumes the target object is fixed and replicated, whereas GRaSP must jointly decide which documents to include—trading semantic relevance against location—before any replica choice is made. When documents are replicated, GRaSP naturally subsumes best-replica selection as the inner fetch decision (Section 6.4).
+
+Constrained Selection: Algorithmically, GRaSP’s cap-constrained selection is a linear objective over a partition matroid; its budgeted variant relates to the 0–1 knapsack (Karp, 2009; Martello and Toth, 1990). We make this structure explicit in Section 4, which clarifies when exact selection is cheap and when approximation is warranted. GRaSP is also complementary to federated and decentralized knowledge access (Konečnỳ et al., 2016).
+
+## 3. Problem Formulation
+
+Consider a query $q$ originating from a source region $s$ . Let
+ $\mathcal{D}=\{d_{1},\dots,d_{N}\}$ denote the set of candidate documents, where each document
+ $d_{i}$ is physically hosted in some region $r(i)$ . We assume an upstream retriever or re-ranker provides a normalized semantic relevance score $\mathrm{rel}_{i}\in[0,1]$ for each $d_{i}$ . We
+associate two system-level attributes with every candidate:
+
+• 
+
+Network latency $\mathrm{lat}_{i}(s)$ : the estimated round-trip latency (ms)
+from source region $s$ to hosting region $r(i)$ .
+
+• 
+
+Retrieval cost $\mathrm{cost}_{i}\geq 0$ : the per-document egress or metered
+access charge for retrieving $d_{i}$ from its hosting region $r(i)$ to $s$ .
+
+We assume the retrieval index (document embeddings) is available at or near the source region, so scoring all candidates is local and inexpensive; the latency and egress costs we model are incurred only when the content of a selected document is fetched from its hosting region for inclusion in the context window. This models a deployment in which compact index representations are replicated near serving regions while full passage payloads remain regionally partitioned. Consequently, $\mathrm{rel}_{i}$ is known for every document in the candidate
+pool before any selected passage payload is fetched, and GRaSP operates strictly between scoring and fetching: it decides which scored candidates justify their retrieval cost.
+
+We introduce binary decision variables $x_{i}\in\{0,1\}$ , where $x_{i}=1$ means $d_{i}$ is
+selected for the context window. The selection respects a global top- $k$ budget and per-region
+capacity constraints:
+
+(1)
+
+ $\displaystyle\sum_{i=1}^{N}x_{i}$ 
+ $\displaystyle\leq k,$ 
+
+(2)
+
+ $\displaystyle\sum_{i:\,r(i)=r}x_{i}$ 
+ $\displaystyle\leq C_{r}\quad\forall r,$ 
+
+where $k$ is dictated by context-window/token limits and $C_{r}$ encodes regional balance or data-residency limits. Because (1) is an inequality, a selection may include fewer than $k$ documents when further retrievals would not improve the objective.
+
+## 3.1. Latency-decayed utility with cost penalty
+
+GRaSP selects documents to maximize a latency-aware objective while optionally penalizing
+retrieval cost:
+
+(3)
+
+ $\max_{x\in\{0,1\}^{N}}\ \sum_{i=1}^{N}x_{i}\left[\mathrm{rel}_{i}\,e^{-\gamma_{q}\,\mathrm{lat}_{i}(s)}\right]\;-\;\beta\sum_{i=1}^{N}x_{i}\,\mathrm{cost}_{i},$ 
+
+where $\gamma_{q}\geq 0$ is the latency-sensitivity parameter, set globally or per query (larger $\gamma_{q}$ penalizes
+remote content more) and $\beta\geq 0$ is the cost-sensitivity weight. The term
+ $e^{-\gamma_{q}\,\mathrm{lat}_{i}(s)}$ decays a document’s relevance in proportion to its latency
+from $s$ . Writing $u_{i}=\mathrm{rel}_{i}\,e^{-\gamma_{q}\mathrm{lat}_{i}(s)}-\beta\,\mathrm{cost}_{i}$ for each document’s net utility, the objective is $\max_{x}\sum_{i}u_{i}x_{i}$ , linear in the decision variables. We use an exponential decay because it is smooth, monotone, and scale-free in the product $\gamma_{q}\,\mathrm{lat}_{i}(s)$ , and because it keeps each $u_{i}$ a precomputable constant.
+
+## Interpretability
+
+Each parameter has a direct operational meaning: $k$ limits total retrieved documents; $C_{r}$ 
+enforces per-region balance or residency; $\mathrm{rel}_{i}$ is semantic relevance;
+ $\mathrm{lat}_{i}(s)$ is network delay; $\mathrm{cost}_{i}$ is monetary fetch cost; $\gamma_{q}$ tunes
+the latency penalty (higher for interactive chat, lower for batch analytics); and $\beta$ tunes
+the cost penalty. This lets practitioners adapt the model to low-latency chatbots,
+cost-sensitive batch jobs, or compliance-critical deployments.
+
+## Additive latency as a surrogate
+
+Objective (3) penalizes each selected document’s latency
+additively, whereas parallel fetching makes a selection’s realized fetch latency its
+maximum (Eq. 9), not its sum. The separable objective is thus a
+serving-efficient surrogate for the non-separable maximum: penalizing every remote document
+suppresses the worst-case fetch while keeping each coefficient $u_{i}$ precomputable and the problem
+exactly greedy-solvable (Section 4). Section 6.3 shows the
+surrogate tracks measured end-to-end latency closely; directly optimizing $\bar{L}_{\max}$ is also
+polynomial via a latency-threshold sweep, a natural extension.
+
+## 4. Complexity of Geo-RAG Selection
+
+GRaSP may initially appear to be a nonlinear 0–1 optimization problem because relevance is decayed by latency and combined with retrieval cost. In the base formulation, however, each candidate’s utility is fixed before selection, reducing the problem to a linear objective with structured constraints. As a result, it is solvable exactly in polynomial time; NP-hardness appears only under additional constraints such as a hard egress budget.
+
+## 4.1. The base problem is polynomial
+
+For each candidate, define its net utility
+
+(4)
+
+ $u_{i}\;=\;\mathrm{rel}_{i}\,e^{-\gamma_{q}\,\mathrm{lat}_{i}(s)}\;-\;\beta\,\mathrm{cost}_{i}.$ 
+
+For a given query, all terms in $u_{i}$ are known before selection. Thus,
+Eq. (3) becomes linear in
+ $x$ :
+ $\max_{x}\sum_{i}u_{i}x_{i}$ . The exponential term only affects the fixed coefficient
+ $u_{i}$ ; it does not make the optimization nonlinear.
+
+The regional caps in Eq. (2) define a partition matroid because each document
+belongs to exactly one region. The global top- $k$ constraint in Eq. (1) is a
+truncation of that matroid. Therefore, a linear objective can be optimized exactly by greedy
+selection.
+
+Proposition 1. Consider candidates with $u_{i}>0$ and sort them in decreasing order
+of $u_{i}$ . Scan them in that order and select a candidate whenever doing so respects both its
+regional cap $C_{r(i)}$ and the global limit $k$ . Stop once $k$ documents are selected or no
+positive-utility candidate remains. This algorithm is optimal and runs in $O(N\log N)$ time.
+
+The runtime is dominated by sorting; the subsequent scan is linear. Because
+Eq. (1) is an inequality, an optimal solution never includes a candidate with
+ $u_{i}<0$ . GRaSP may therefore select fewer than $k$ documents, or none, when latency and cost make
+all remaining candidates unattractive.
+
+The base GRaSP problem is therefore not NP-hard. It admits a simple exact algorithm suitable for
+the retrieval path, which we validate against an integer-program oracle in
+Section 6.
+
+## 4.2. Where hardness actually enters
+
+Hardness appears when the model includes an additive resource constraint, such as a hard egress
+budget
+
+(5)
+
+ $\sum_{i=1}^{N}x_{i}\,\mathrm{cost}_{i}\;\leq\;B.$ 
+
+This constraint couples candidate choices through their costs. Maximizing
+ $\sum_{i}u_{i}x_{i}$ under Eq. (5) contains 0–1 knapsack as a special case and is
+therefore NP-hard.
+
+More complex compliance rules that introduce dependencies across regions or documents can likewise
+break the matroid structure. Approximation or Lagrangian methods are therefore needed only for
+these harder variants, not for the base GRaSP formulation. In our evaluation, an exact
+integer-program solver serves as an offline oracle for measuring their optimality gap.
+
+## 5. Algorithms
+
+For the base GRaSP problem, Proposition 1 gives an exact $O(N\log N)$ solution: sort candidates by
+net utility and greedily select them while respecting the global and regional caps. We use this
+cap-aware greedy as the default policy. We consider two extensions: a Lagrangian variant
+for harder budgeted or compliance-constrained formulations, and a simpler latency-decay function
+for high-throughput serving.
+
+## 5.1. Lagrangian-greedy for constrained variants
+
+When additional constraints break the matroid structure, we use regional multipliers
+ $\lambda_{r}\geq 0$ and rank candidates by
+
+(6)
+
+ $\Delta_{i}\;=\;\mathrm{rel}_{i}\,e^{-\gamma_{q}\,\mathrm{lat}_{i}(s)}\;-\;\beta\,\mathrm{cost}_{i}\;-\;\lambda_{r(i)}.$ 
+
+Candidates are ranked by $\Delta_{i}$ and selected under the global budget $k$ . The multipliers are
+then updated using a subgradient step: regions that exceed their desired capacity receive a larger
+penalty, while penalties are reduced for under-used regions.
+
+For the base problem, this machinery is unnecessary because the direct greedy algorithm is already
+optimal. We use the Lagrangian form only for extensions with hard budgets or more complex
+compliance constraints, where it provides a lightweight and parallelizable approximation.
+
+## 5.2. Rational decay for fast scoring
+
+For very high-throughput settings, we approximate the exponential latency decay with
+
+(7)
+
+ $e^{-\gamma_{q}\,\mathrm{lat}_{i}(s)}\;\approx\;\frac{1}{1+\gamma_{q}\,\mathrm{lat}_{i}(s)},$ 
+
+which gives the score
+
+(8)
+
+ $\tilde{\Delta}_{i}\;=\;\frac{\mathrm{rel}_{i}}{1+\gamma_{q}\,\mathrm{lat}_{i}(s)}\;-\;\beta\,\mathrm{cost}_{i}.$ 
+
+We then apply the same cap-aware selection procedure using $\tilde{\Delta}_{i}$ . The rational form is
+cheaper to evaluate and slightly under-penalizes large latencies compared with the exponential
+decay. As a result, it tends to preserve slightly more recall at the cost of a somewhat heavier
+latency tail.
+
+## Complexity
+
+Both variants require $O(N\log N)$ time per query when implemented with sorting, or $O(N)$ with
+selection-based implementations. For candidate pools of a few thousand documents, this overhead
+is small relative to retrieval and LLM inference, as shown in Section 6.6.
+
+## 6. Evaluation
+
+Our evaluation answers four questions. (Q1) Does latency-aware selection reduce tail latency and cost, and what retrieval-quality trade-off does it introduce? (Q2) How does this trade-off depend on data placement? (Q3) Can replication recover quality lost to latency awareness? (Q4) Is GRaSP close to optimal while remaining lightweight and stable enough for online serving?
+
+## 6.1. Experimental methodology and assumptions
+
+We first describe the testbed and modeling choices used throughout the evaluation. Several choices—including relevance normalization, pricing, and placement—are not fixed by the GRaSP formulation itself, so we test their sensitivity separately.
+
+Testbed:
+We use a five-node CloudLab (Duplyakin et al., 2019) cluster (Utah m510: 8-core Xeon-D, 64 GB RAM, NVMe, 10 GbE). One node acts as the query coordinator (the source region $s$ ), while four nodes host document payloads in separate logical regions. We emulate wide-area latency using Linux tc netem, with round-trip times of $\{1,90,210,115\}$ ms for the local, eu-central, ap-southeast, and sa-east regions, respectively. These values are consistent with representative public AWS inter-region latency measurements (CloudPing, 2026). We use persistent connections and pin static ARP entries so that connection setup does not perturb the emulated latency matrix.
+
+Corpus and retriever:
+Our main corpus is BEIR Natural Questions (NQ) (Kwiatkowski et al., 2019; Thakur et al., 2021), containing 2,681,468 passages and 3,452 test queries with relevance judgments. To test generalization across domains, we additionally evaluate SciFact, NFCorpus, and ArguAna (Thakur et al., 2021), covering scientific claim verification, biomedical retrieval, and argument retrieval.
+
+Passages are embedded with a sentence-transformer model (Reimers and Gurevych, 2019) and indexed using exact inner-product FAISS (Johnson et al., 2019). Each query produces a top-200 candidate pool, or the full corpus when the dataset is smaller. GRaSP operates only on this supplied candidate pool: it does not change the retriever, embedding model, or index. Stronger upstream retrievers may therefore shift absolute recall, but the selection mechanism itself is retriever-agnostic.
+
+End-task generation:
+Retrieval metrics do not fully capture answer quality, so we also evaluate an end-to-end QA task on NQ. We condition a generator (Chung et al., 2024) on the context selected by each policy and report exact match (EM) and token-level F1 against short gold answers. Gold answers are obtained by joining NQ-Open (Kwiatkowski et al., 2019) with the BEIR NQ queries by question text (Section 6.10).
+
+Relevance normalization:
+GRaSP assumes $\mathrm{rel}_{i}\in[0,1]$ but does not prescribe how raw retriever scores should be mapped into this range. We use per-query min–max normalization by default. Since the latency decay multiplies $\mathrm{rel}_{i}$ , the score distribution affects the numerical meaning of $\gamma_{q}$ . We therefore repeat the main experiment with softmax normalization in Section 6.7.
+
+Cost model:
+We compute per-document retrieval cost as passage size multiplied by a representative regional egress price
+({0.01, 0.02, 0.09, 0.06} USD/GB), consistent with published AWS data-transfer rates (Amazon Web Services, 2026). Costs are normalized within each candidate pool so that $\beta$ operates on a scale comparable to latency-adjusted relevance. Batching discounts and tiered pricing are outside the scope of the model.
+
+In the default price map, distant regions also tend to be more expensive, so latency and cost are correlated. To isolate the effect of $\beta$ from $\gamma_{q}$ , we also evaluate a decorrelated map in which a relatively near region is the most expensive (Section 6.8).
+
+Placement:
+We study two placement regimes. Under uniform placement, documents are hashed across the four regions. Relevant candidates are therefore spread across regions, making nearby alternatives relatively common.
+
+Under topical placement, document embeddings are clustered into four groups using $k$ -means and each cluster is mapped to a region. This approximates deployments in which related content is co-located because of organizational ownership, jurisdiction, or data-residency rules. The average concentration of a query’s top-5 candidates in its dominant region is $0.89$ under topical placement, compared with approximately $0.40$ under uniform placement. Topical placement therefore creates the setting in which the most relevant content is often concentrated in one, potentially remote, region.
+
+Policies:
+We compare Relevance-only, the standard top- $k$ policy; Nearest- $k$ , a latency-only baseline; GRaSP-greedy, the direct cap-aware greedy algorithm from Proposition 1; GRaSP-rational, which uses Eq. (8); and OPT, an exact integer-program solution of Eq. (3) used offline as an optimality oracle. Unless stated otherwise, $k=5$ .
+
+Nearest- $k$ is intentionally simple, so we additionally evaluate Rel@LatencyCap. Given a threshold $L$ , it removes candidates with latency above $L$ and selects the highest-relevance feasible documents among the rest. Sweeping $L$ over the regional latencies gives this baseline its own recall–latency frontier and tests whether GRaSP provides more than a hard latency filter.
+
+Metrics:
+Offline, we report optimality gap relative to OPT, expected worst-case fetch latency, egress cost, recall@5, nDCG@5, and the fraction of queries producing an empty selection. We define the mean per-query maximum fetch latency as
+
+(9)
+
+ $\bar{L}_{\max}\;=\;\frac{1}{|Q|}\sum_{q\in Q}\ \max_{d\in S_{q}}\ \mathrm{lat}\!\big(d,s_{q}\big),$ 
+
+with $\max_{d\in\emptyset}(\cdot)=0$ for an empty selection.
+
+Because selected passages are fetched in parallel over persistent connections, retrieval completes when the slowest selected passage arrives. $\bar{L}_{\max}$ therefore provides a natural offline approximation of fetch latency, although it does not include protocol, scheduling, or response-processing overhead.
+
+For online measurements, we use an open-loop asynchronous load generator with persistent per-region connections and report end-to-end retrieval latency percentiles together with per-query selection overhead.
+
+Threats to validity:
+Our experiments use a single CloudLab cluster with an emulated WAN rather than a live multi-region deployment. The RTT matrix is a point estimate and does not capture burstiness, routing changes, or diurnal variation. Pricing and relevance normalization are also modeling choices rather than properties of GRaSP itself. We address these limitations by testing alternative normalization and cost maps, evaluating both uniform and topical placement, reporting three-seed variation, and repeating the main comparison across four datasets. Our conclusions focus on relative trade-offs and placement dependence rather than absolute latency for a specific cloud deployment. A live multi-region evaluation remains future work.
+
+## 6.2. Q1/Q2: Latency, cost, quality, and placement
+
+We first study how $\gamma_{q}$ changes GRaSP’s behavior under topical placement. Table 1 shows representative points from the sweep. As $\gamma_{q}$ increases, remote documents receive a larger penalty, shifting the selected context toward nearby regions. Latency and egress cost therefore fall, while recall gradually decreases.
+
+At $\gamma_{q}=0.003$ , GRaSP-greedy reduces expected worst-case fetch latency from $122.1$ to $97.4$  ms while retaining recall $0.506$ versus $0.534$ for relevance-only. At $\gamma_{q}=0.010$ , latency falls to $69.5$  ms with recall $0.419$ . At $\gamma_{q}=0.030$ , GRaSP approaches the latency-only extreme, reaching $47.2$  ms with recall $0.331$ . Thus, $\gamma_{q}$ provides a continuous operating knob between relevance and locality.
+
+GRaSP-greedy matches OPT throughout the sweep, confirming Proposition 1 empirically. GRaSP-rational also remains close to optimal at low and moderate $\gamma_{q}$ , but diverges at the largest setting. This matches the approximation’s expected behavior: rational decay penalizes very large latencies less aggressively than the exponential, preserving somewhat more recall but producing a heavier latency tail.
+
+Table 1. Topical placement, $\beta{=}0$ , $k{=}5$ . Optimality gap vs. OPT, expected worst-case
+fetch latency (ms), egress cost ( $\mu$ USD per query), recall@5, and nDCG@5.
+Values are means over 3,452 queries. (Representative rows; full sweep in the artifact.)
+
+ $\gamma_{q}$ 
+Policy
+Gap
+Lat. (ms)
+Cost
+Recall
+nDCG
+
+0.003
+Rel-only
+0.92
+122.1
+0.102
+0.534
+0.400
+
+0.003
+Nearest- $k$ 
+0.76
+42.3
+0.044
+0.292
+0.229
+
+0.003
+GRaSP-greedy
+1.00
+97.4
+0.084
+0.506
+0.384
+
+0.003
+GRaSP-rat.
+1.00
+102.3
+0.088
+0.516
+0.391
+
+0.010
+Rel-only
+0.85
+122.1
+0.102
+0.534
+0.400
+
+0.010
+Nearest- $k$ 
+0.87
+42.3
+0.044
+0.292
+0.229
+
+0.010
+GRaSP-greedy
+1.00
+69.5
+0.065
+0.419
+0.323
+
+0.010
+GRaSP-rat.
+0.98
+83.3
+0.076
+0.466
+0.357
+
+0.030
+Rel-only
+0.59
+122.1
+0.102
+0.534
+0.400
+
+0.030
+Nearest- $k$ 
+0.97
+42.3
+0.044
+0.292
+0.229
+
+0.030
+GRaSP-greedy
+1.00
+47.2
+0.049
+0.331
+0.258
+
+0.030
+GRaSP-rat.
+0.91
+68.5
+0.065
+0.413
+0.320
+
+Absolute egress costs are small per query, but their relative reduction matters at scale. At $\gamma_{q}=0.030$ , for example, GRaSP reduces cost from $0.102$ to $0.049\,\mu$ USD/query, roughly a $2\times$ reduction. At billions of RAG queries per day, differences of this size can accumulate to hundreds or thousands of dollars in daily transfer cost.
+
+Figure 1 contrasts the two placement regimes and captures the paper’s central result. Under uniform placement, the $\gamma_{q}$ sweep remains close to the top-left of the recall–latency plane: latency falls substantially before recall begins to decline. Because relevant documents are distributed across regions, GRaSP can often replace a remote passage with a similarly relevant nearby one.
+
+Under topical placement, the frontier bends outward. A query’s most relevant candidates tend to reside together, so moving toward nearby regions increasingly requires accepting less relevant passages. GRaSP still exposes a smooth recall–latency trade-off, but the gain is no longer free.
+
+Figure 1. Recall@5 versus expected worst-case fetch latency as $\gamma_{q}$ varies
+( $\beta{=}0$ ). Left: uniform placement—GRaSP reduces latency at negligible recall cost. Right:
+topical placement—GRaSP traces a Pareto frontier between retrieval quality and latency.
+
+The lesson is that latency-aware selection can exploit locality only when good nearby alternatives exist. If the relevant content is concentrated in a remote region, no choice of $\gamma_{q}$ can remove the remote fetch without sacrificing quality. This placement dependence is therefore a property of the available candidate set, not a limitation of the optimization algorithm.
+
+A stronger latency-aware baseline:
+Nearest- $k$ represents the latency-only extreme and is intentionally weak. A more realistic practitioner might impose a latency threshold and then maximize relevance within it. Rel@LatencyCap models this approach.
+
+We sweep $L\in\{1,90,115,210\}$  ms under NQ topical placement. At $L=115$  ms, the baseline achieves recall $0.432$ at $79.8$  ms. GRaSP provides nearby operating points with recall $0.419$ at $69.5$  ms and $0.506$ at $97.4$  ms. More generally, its $\gamma_{q}$ sweep produces a better interior trade-off because latency is penalized continuously rather than treated as an all-or-nothing cutoff.
+
+Table 2. Rel@LatencyCap baseline on NQ topical placement: discard candidates with
+ $\mathrm{rtt}>L$ , then select the highest-relevance feasible set.
+
+ $L$ (ms)
+Recall
+nDCG
+Mean max-RTT (ms)
+
+1
+0.000
+0.000
+0.0
+
+90
+0.260
+0.198
+52.4
+
+115
+0.432
+0.324
+79.8
+
+210
+0.534
+0.400
+122.1
+
+The advantage appears in the operating range where tuning is most useful: a hard threshold cannot distinguish a relevant candidate just beyond $L$ from a weak candidate just below it, whereas GRaSP trades relevance and latency jointly for each document.
+
+## 6.3. Online tail latency
+
+We next measure actual end-to-end retrieval latency under topical placement at 20 queries/s. Figure 2 shows that online measurements preserve the offline ordering: relevance-only is slowest, nearest- $k$ is fastest, and GRaSP lies between them, with $\gamma_{q}$ controlling the operating point.
+
+Figure 2. Measured end-to-end retrieval latency (CDF, log- $x$ ) under topical placement at
+20 queries/s. Increasing $\gamma_{q}$ shifts GRaSP’s latency distribution left of relevance-only.
+
+Absolute online latency is higher than the offline $\bar{L}_{\max}$ estimate, and the difference is policy-dependent. The offline metric models only the slowest selected document’s network latency, whereas the online path also includes HTTP request/response handling and coordination across parallel fetches. GRaSP often selects a mixture of near and far documents, making this overhead more visible than for policies whose requests are concentrated in one latency class.
+
+Thus, $\bar{L}_{\max}$ should be treated as a surrogate for comparing policies rather than an exact prediction of serving latency. Importantly, it predicts both the relative ordering and the direction of GRaSP’s improvement. Across three seeds, median latency varies by only $\pm 0.1$ – $0.3$  ms, while P99 varies by approximately $\pm 8$ – $10$  ms. At $\gamma_{q}=0.01$ , GRaSP-greedy reduces median latency by about $20\%$ and P90 by about $41\%$ relative to relevance-only while retaining approximately $78\%$ of its recall. GRaSP-rational behaves similarly near the median but exhibits a heavier P90/P99 tail, consistent with its weaker penalty on distant candidates.
+
+## 6.4. Q3: Replication as a design lever
+
+The topical-placement result exposes a limitation of selection alone: if all highly relevant content is remote, GRaSP must either fetch it or sacrifice relevance. Placement, however, need not remain fixed.
+
+We therefore replicate each document to its topical home plus $R-1$ additional regions and fetch from the lowest-latency replica. Figure 3 shows the resulting frontiers for $R\in\{1,2,3\}$ .
+
+Figure 3. Replication improves GRaSP’s recall–latency frontier under topical placement.
+Higher replication factors move the frontier toward the uniform-placement regime.
+
+As $R$ increases, the frontier moves toward the uniform-placement regime. At comparable retrieval quality, replicating content to two or three regions roughly halves expected fetch latency and egress cost because a relevant document is more likely to have a nearby, cheaper copy.
+
+This suggests a natural co-design rule: replicate frequently accessed content, then let GRaSP exploit whichever copy is most attractive at query time. GRaSP therefore complements caching and placement mechanisms rather than replacing them.
+
+Our replication model is intentionally optimistic: it assumes the lowest-latency replica is always reachable and does not model replica consistency, update traffic, or storage overhead. The resulting curves should therefore be viewed as an upper bound on the achievable latency reduction.
+
+## 6.5. Residency caps
+
+We next activate the per-region constraints by setting $C_{r}=2$ under topical placement. Since relevant content is often concentrated in one region, the cap forces every policy to obtain part of its context from other regions.
+
+Table 3 shows the effect at $\gamma_{q}=0.01$ . For relevance-only, the cap raises expected latency from $122.1$ to $175.3$  ms and reduces recall from $0.534$ to $0.392$ . After exhausting the dominant region, relevance-only simply selects the highest-ranked feasible documents without considering their location.
+
+GRaSP also loses recall and gains latency because the feasible set itself has become worse, but it continues to match OPT. The cap changes what is achievable; GRaSP still finds the best feasible selection under that constraint.
+
+Table 3. Effect of a residency cap ( $C_{r}{=}2$ ) under topical placement, $\gamma_{q}{=}0.01$ ,
+ $\beta{=}0$ . GRaSP tracks the exact optimum.
+
+Setting
+Policy
+Gap
+Lat. (ms)
+Recall
+
+Uncapped
+Rel-only
+0.85
+122.1
+0.534
+
+Uncapped
+GRaSP-greedy
+1.00
+69.5
+0.419
+
+ $C_{r}{=}2$ 
+Rel-only
+0.97
+175.3
+0.392
+
+ $C_{r}{=}2$ 
+GRaSP-greedy
+1.00
+163.3
+0.374
+
+A related behavior appears under strong joint latency and cost pressure. Some candidates can then have negative net utility. Relevance-only and nearest- $k$ may still select them because their policies consider only relevance or locality. GRaSP instead selects fewer than $k$ documents, or none, when another retrieval would lower the objective. This is the abstention behavior described in Section 4.
+
+## 6.6. Q4: Optimality, overhead, and load stability
+
+For GRaSP to be useful on the serving path, the selection benefit must not be offset by optimization overhead. We therefore examine both optimality and performance as query load increases.
+
+GRaSP-greedy achieves an optimality gap of $1.00$ across the evaluated base-problem settings, empirically confirming Proposition 1. GRaSP-rational remains above $0.98$ over the low-to-moderate $\gamma_{q}$ range and diverges only near the aggressive local-only regime. In contrast, solving OPT with a general integer-program solver adds tens of milliseconds per query and is unsuitable for online serving.
+
+Table 4 shows behavior from 20 to 200 queries/s. Median latency rises only modestly with load, and GRaSP remains faster than relevance-only at every tested rate. Selection itself costs only hundreds of microseconds per query, far below the wide-area fetch latency.
+
+Table 4. Load stability under topical placement ( $\gamma_{q}{=}0.01$ , $\beta{=}0$ ). End-to-end
+latency percentiles (ms) and selection overhead ( $\mu$ s), 1,000 queries per point.
+
+QPS
+Policy
+P50
+P90
+P99
+Sel. ( $\mu$ s)
+
+20
+Rel-only
+130.5
+228.3
+247.0
+125
+
+20
+GRaSP-greedy
+105.1
+135.4
+248.4
+425
+
+50
+Rel-only
+131.3
+228.4
+426.9
+125
+
+50
+GRaSP-greedy
+105.8
+139.7
+290.9
+426
+
+100
+Rel-only
+132.9
+229.7
+433.4
+118
+
+100
+GRaSP-greedy
+106.6
+146.7
+425.8
+419
+
+200
+Rel-only
+138.8
+232.6
+444.0
+91
+
+200
+GRaSP-greedy
+111.3
+173.7
+294.1
+271
+
+At 200 queries/s, GRaSP’s P50 remains $111.3$  ms compared with $138.8$  ms for relevance-only, while selection overhead is only $271\,\mu$ s. Even at the highest tested load, serving latency is dominated by the wide-area content fetch rather than the GRaSP layer.
+
+## 6.7. Robustness to relevance normalization
+
+Because $\gamma_{q}$ acts on normalized relevance, its numerical value depends on the score scale. To test whether our conclusions are an artifact of min–max normalization, we repeat the topical-placement sweep using softmax-normalized scores.
+
+Figure 4 shows that normalization shifts the $\gamma_{q}$ value corresponding to a particular operating point, but does not change the qualitative shape of the recall–latency frontier. GRaSP-greedy continues to match OPT, and the same placement-dependent trade-off remains.
+
+Table 5. Decorrelated pricing (near region most expensive), topical placement,
+ $\gamma_{q}{=}0.01$ . Increasing $\beta$ trades latency and relevance for lower egress cost.
+
+ $\beta$ 
+Latency (ms)
+Cost ( $\mu$ USD)
+Recall
+
+0.0
+69.5
+0.095
+0.419
+
+0.5
+70.2
+0.051
+0.339
+
+1.0
+70.8
+0.036
+0.279
+
+2.0
+74.3
+0.024
+0.210
+
+Figure 4. Frontier robustness to relevance normalization under topical placement. Min–max and
+softmax normalization shift individual operating points but preserve the overall recall–latency
+trade-off.
+
+We therefore use min–max normalization as the default, while treating $\gamma_{q}$ as a parameter that should be calibrated to the relevance-score distribution of the deployed retriever.
+
+## 6.8. The cost knob $\beta$ is independent of the latency knob $\gamma_{q}$ 
+
+Under the default price map, distant regions are also relatively expensive. Increasing $\beta$ therefore tends to have the same directional effect as increasing $\gamma_{q}$ , making the two controls difficult to separate.
+
+To isolate the cost effect, we construct a decorrelated price map in which the 90 ms region is the most expensive. We then hold $\gamma_{q}=0.01$ fixed and sweep $\beta$ .
+
+As Table 5 and Figure 5 show, increasing $\beta$ from $0$ to $2$ reduces egress cost from $0.095$ to $0.024\,\mu$ USD/query, a $74\%$ reduction. Latency simultaneously rises from $69.5$ to $74.3$  ms because GRaSP moves away from the nearby but expensive region toward cheaper, more distant documents.
+
+Figure 5. Under decorrelated pricing ( $\gamma_{q}{=}0.01$ ), increasing $\beta$ reduces egress cost
+while latency rises. The latency and cost knobs therefore control distinct trade-offs.
+
+The opposite movement of cost and latency confirms that $\beta$ and $\gamma_{q}$ are genuinely independent controls. Applications can therefore prioritize interactive latency and monetary cost separately.
+
+## 6.9. Generalization across datasets
+
+We repeat the core experiment on SciFact, NFCorpus, and ArguAna. Their average top-5 candidate concentrations under topical placement are $0.83$ , $0.72$ , and $0.92$ , respectively, compared with $0.89$ for NQ. All four datasets therefore exhibit geographic concentration, although its strength varies.
+
+Table 6 reports the main operating point at $\gamma_{q}=0.01$ and $\beta=0$ . Two patterns hold across all datasets. First, GRaSP-greedy achieves an optimality gap of $1.000$ , confirming the exactness of Proposition 1 across domains. Second, recall follows the expected ordering
+relevance-only $\geq$ GRaSP $\geq$ nearest- $k$ , while GRaSP substantially reduces expected fetch latency.
+
+Table 6. Generalization across datasets at $\gamma_{q}{=}0.01$ , $\beta{=}0$ , topical placement.
+GRaSP-greedy matches the exact optimum on every dataset.
+
+Dataset
+Policy
+Gap
+Lat. (ms)
+Recall
+nDCG
+
+NQ
+Rel-only
+0.85
+122.1
+0.534
+0.400
+
+GRaSP-greedy
+1.00
+69.5
+0.419
+0.323
+
+Nearest- $k$ 
+0.87
+42.3
+0.292
+0.229
+
+SciFact
+Rel-only
+0.82
+119.6
+0.738
+0.629
+
+GRaSP-greedy
+1.00
+61.6
+0.560
+0.489
+
+Nearest- $k$ 
+0.85
+13.3
+0.276
+0.240
+
+NFCorpus
+Rel-only
+0.77
+141.4
+0.120
+0.350
+
+GRaSP-greedy
+1.00
+45.4
+0.082
+0.287
+
+Nearest- $k$ 
+0.92
+10.1
+0.051
+0.210
+
+ArguAna
+Rel-only
+0.87
+109.2
+0.575
+0.308
+
+GRaSP-greedy
+1.00
+73.9
+0.459
+0.255
+
+Nearest- $k$ 
+0.80
+30.7
+0.262
+0.150
+
+The exact trade-off varies by corpus because different datasets provide different numbers and qualities of nearby substitutes for remote relevant passages. This variation reinforces the placement result: GRaSP’s benefit depends on the local availability of useful alternatives, not on a particular dataset.
+
+## 6.10. End-task answer quality
+
+Finally, we examine whether the retrieval-quality loss translates into a comparable loss in generated answer quality. We evaluate 500 NQ queries and condition the generator on the passages selected by each policy.
+
+Table 7 shows that GRaSP retains approximately $81\%$ of relevance-only’s EM and $87\%$ of its F1 while reducing context-fetch latency by approximately $43\%$ . It also substantially outperforms nearest- $k$ on both answer-quality metrics.
+
+Table 7. End-task NQ answer quality (500-query subset, $\gamma_{q}{=}0.01$ , $\beta{=}0$ , topical
+placement). GRaSP preserves most answer quality while reducing context-fetch latency.
+
+Policy
+EM
+F1
+Context lat. (ms)
+
+Relevance-only
+0.320
+0.415
+122.1
+
+GRaSP-greedy
+0.258
+0.362
+69.5
+
+Nearest- $k$ 
+0.180
+0.257
+42.3
+
+Interestingly, answer quality falls less than retrieval recall. At this operating point, GRaSP retains about $78\%$ of relevance-only’s recall but $81\%$ of its EM and $87\%$ of its F1. Missing a gold passage therefore does not always prevent the generator from answering correctly; other selected passages may contain sufficient or overlapping evidence. Recall@5 is, if anything, pessimistic about the downstream effect of GRaSP’s retrieval trade-off. Paired bootstrap tests with 10,000 resamples show the differences are statistically significant. Relative to relevance-only, GRaSP’s EM decreases by $0.062$ (95% CI $[0.032,0.092]$ ), while context-fetch latency falls by $53$  ms (CI $[47,60]$ ). Compared with nearest- $k$ , GRaSP improves EM by $0.078$ (CI $[0.052,0.106]$ ) and F1 by $0.104$ (CI $[0.076,0.133]$ ).
+
+Together, these results show that GRaSP’s latency savings persist in the online retrieval path and end-to-end QA setting, while the loss in answer quality is smaller than retrieval recall alone suggests.
+
+## 7. Discussion and Limitations
+
+The optimization itself is deliberately simple; our contribution is to identify and empirically characterize the conditions under which location-aware context selection helps rather than designing a sophisticated solver.
+
+Drop-in adoption:
+GRaSP is designed to fit into an existing RAG pipeline with minimal changes. It requires only a latency estimate for each candidate’s hosting region—from a static RTT table, recent measurements, or a learned predictor—and, optionally, a regional cost map. After an upstream retriever or re-ranker produces a candidate pool, GRaSP re-scores them and enforces the configured global and regional limits before payloads are fetched. It therefore requires no retraining, embedding changes, or re-indexing.
+
+When GRaSP helps:
+Our results show that the value of geo-aware selection depends primarily on where useful alternatives are located. When relevant content is uniformly distributed or replicated across regions, GRaSP can reduce latency and egress cost with little loss in retrieval quality. When relevant content is concentrated in a remote region, as may happen under residency or ownership constraints, locality and relevance are in genuine tension. In this regime, GRaSP does not eliminate the trade-off; instead, it exposes a controllable Pareto frontier through $\gamma_{q}$ and $\beta$ .
+
+This also suggests that placement and query-time selection should be considered together. Replicating frequently accessed content into even a small number of additional regions increases the chance that GRaSP can choose a nearby high-quality passage. Our replication experiments show that this can move the system back toward the regime in which latency and cost reductions are obtained with little quality loss.
+
+Limitations:
+First, the current formulation assumes a point estimate of network latency. Real wide-area networks exhibit burstiness, asymmetry, congestion, and time-dependent behavior. These effects could be incorporated using percentile latency estimates, moving averages, or time-of-day profiles, but we do not evaluate those variants here.
+
+Second, our cost model is additive at the document level. Real cloud pricing may include batching effects, volume discounts, minimum charges, or tiered pricing. Some of these can be incorporated into the objective or added as linear constraints; a tight aggregate budget leads to the budgeted variant discussed in Section 4, where exact greedy selection no longer applies.
+
+Third, our systems evaluation uses an emulated WAN on a single CloudLab cluster rather than a live multi-region deployment. We also use one retrieval setup and one primary large-scale corpus, supplemented by three smaller BEIR datasets. These experiments are sufficient to expose the placement-dependent behavior we study, but they do not capture all production effects, such as routing variation, regional failures, provider-specific networking, or interactions with different retrievers and corpora.
+
+Fourth, the replication experiments model an optimistic setting in which the lowest-latency replica is available and can be selected without additional coordination. We do not account for replica consistency, update propagation, storage overhead, or the cost of maintaining those copies. The measured replication gains should therefore be interpreted as an upper bound on what a production system could achieve.
+
+Outlook:
+Several extensions follow naturally from this work. The parameters $\gamma_{q}$ , $\beta$ , and even $k$ could be chosen dynamically from workload characteristics or learned from user feedback. Placement and replication could also be optimized jointly with query-time selection, allowing the system to decide both where content should live and which copy should serve each request. Finally, the same formulation could be extended beyond independent passage retrieval to account for multi-hop or graph-based reasoning, where the location and cost of one retrieval may influence which document should be fetched next.
+
+## 8. Conclusion
+
+We presented GRaSP, a latency- and cost-aware re-scoring layer for geo-distributed RAG. GRaSP adds location awareness to retrieval without retraining or re-indexing, and its base formulation remains simple: the selection problem is solvable exactly with an $O(N\log N)$ greedy algorithm, while NP-hardness arises only in extensions with hard additive budgets.
+
+Our evaluation on a five-node CloudLab testbed and 2.68M passages shows that the benefit of geo-aware retrieval depends strongly on data placement. When relevant content is uniformly distributed or replicated, GRaSP reduces latency and cost with little loss in retrieval quality. When relevant content is concentrated in remote regions, latency and relevance are in genuine tension, and GRaSP exposes a tunable trade-off between them. Replication provides a practical way to reduce this tension by bringing useful alternatives closer to the serving region.
+
+GRaSP adds sub-millisecond selection overhead, matches the exact solution for the base problem, and remains stable up to 200 queries/s. More broadly, our results show that retrieval quality alone is not sufficient for geo-distributed RAG: where relevant content resides can be just as important as how relevant it is.
+
+## References
+
+Amazon Web Services (2026)
+Amazon Web Services
+
+Amazon EC2 on-demand pricing: data transfer.
+
+Note: https://aws.amazon.com/ec2/pricing/on-demand/Accessed July 2026
+
+Cited by: §6.1.
+
+Araldo et al. (2014)
+A. Araldo, M. Mangili, F. Martignon, and D. Rossi
+
+Cost-aware caching: optimizing cache provisioning and object placement in icn.
+
+In 2014 IEEE Global Communications Conference,
+
+pp. 1108–1113.
+
+Cited by: §2.
+
+Bang (2023)
+F. Bang
+
+Gptcache: an open-source semantic cache for llm applications enabling faster answers and cost savings.
+
+In Proceedings of the 3rd Workshop for Natural Language Processing Open Source Software (NLP-OSS 2023),
+
+pp. 212–218.
+
+Cited by: §2.
+
+Chung et al. (2024)
+H. W. Chung, L. Hou, S. Longpre, B. Zoph, Y. Tay, W. Fedus, Y. Li, X. Wang, M. Dehghani, S. Brahma, et al.
+
+Scaling instruction-finetuned language models.
+
+Journal of Machine Learning Research 25 (70), pp. 1–53.
+
+Cited by: §6.1.
+
+CloudPing (2026)
+CloudPing
+
+AWS inter-region latency monitoring.
+
+Note: https://www.cloudping.co/Accessed July 2026
+
+Cited by: §6.1.
+
+Duplyakin et al. (2019)
+D. Duplyakin, R. Ricci, A. Maricq, G. Wong, J. Duerig, E. Eide, L. Stoller, M. Hibler, D. Johnson, K. Webb, A. Akella, K. Wang, G. Ricart, L. Landweber, C. Elliott, M. Zink, E. Cecchet, S. Kar, and P. Mishra
+
+The design and operation of CloudLab.
+
+In 2019 USENIX Annual Technical Conference (USENIX ATC 19),
+
+Renton, WA, pp. 1–14.
+
+External Links: ISBN 978-1-939133-03-8,
+Link
+
+Cited by: 3rd item,
+§6.1.
+
+Jiang et al. (2023)
+Z. Jiang, F. F. Xu, L. Gao, Z. Sun, Q. Liu, J. Dwivedi-Yu, Y. Yang, J. Callan, and G. Neubig
+
+Active retrieval augmented generation.
+
+In Proceedings of the 2023 conference on empirical methods in natural language processing,
+
+pp. 7969–7992.
+
+Cited by: §2.
+
+Johnson et al. (2019)
+J. Johnson, M. Douze, and H. Jégou
+
+Billion-scale similarity search with gpus.
+
+IEEE transactions on big data 7 (3), pp. 535–547.
+
+Cited by: §6.1.
+
+Karp (2009)
+R. M. Karp
+
+Reducibility among combinatorial problems.
+
+In 50 Years of Integer Programming 1958-2008: from the Early Years to the State-of-the-Art,
+
+pp. 219–241.
+
+Cited by: §2.
+
+Konečnỳ et al. (2016)
+J. Konečnỳ, H. B. McMahan, F. X. Yu, P. Richtárik, A. T. Suresh, and D. Bacon
+
+Federated learning: strategies for improving communication efficiency.
+
+arXiv preprint arXiv:1610.05492.
+
+Cited by: §2.
+
+Kwiatkowski et al. (2019)
+T. Kwiatkowski, J. Palomaki, O. Redfield, M. Collins, A. Parikh, C. Alberti, D. Epstein, I. Polosukhin, J. Devlin, K. Lee, K. Toutanova, L. Jones, M. Kelcey, M. Chang, A. M. Dai, J. Uszkoreit, Q. Le, and S. Petrov
+
+Natural questions: a benchmark for question answering research.
+
+Transactions of the Association for Computational Linguistics 7, pp. 452–466.
+
+External Links: Link,
+Document
+
+Cited by: §6.1,
+§6.1.
+
+Lewis et al. (2020)
+P. Lewis, E. Perez, A. Piktus, F. Petroni, V. Karpukhin, N. Goyal, H. Küttler, M. Lewis, W. Yih, T. Rocktäschel, et al.
+
+Retrieval-augmented generation for knowledge-intensive nlp tasks.
+
+Advances in neural information processing systems 33, pp. 9459–9474.
+
+Cited by: §1,
+§2.
+
+Martello and Toth (1990)
+S. Martello and P. Toth
+
+Knapsack problems: algorithms and computer implementations.
+
+ John Wiley & Sons, Inc..
+
+Cited by: §2.
+
+Peng et al. (2025)
+B. Peng, Y. Zhu, Y. Liu, X. Bo, H. Shi, C. Hong, Y. Zhang, and S. Tang
+
+Graph retrieval-augmented generation: a survey.
+
+ACM Transactions on Information Systems 44 (2), pp. 1–52.
+
+Cited by: §2.
+
+Pu et al. (2015)
+Q. Pu, G. Ananthanarayanan, P. Bodik, S. Kandula, A. Akella, P. Bahl, and I. Stoica
+
+Low latency geo-distributed data analytics.
+
+ACM SIGCOMM Computer Communication Review 45 (4), pp. 421–434.
+
+Cited by: §2.
+
+Reimers and Gurevych (2019)
+N. Reimers and I. Gurevych
+
+Sentence-BERT: sentence embeddings using Siamese BERT-networks.
+
+In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP), K. Inui, J. Jiang, V. Ng, and X. Wan (Eds.),
+
+Hong Kong, China, pp. 3982–3992.
+
+External Links: Link,
+Document
+
+Cited by: §6.1.
+
+Ruparel and Patel (2025a)
+H. Ruparel and T. Patel
+
+Caching at scale: efficiency and fairness analysis in multi-tenant RAG systems.
+
+SN Computer Science 6.
+
+External Links: Document
+
+Cited by: §2.
+
+Ruparel and Patel (2025b)
+H. Ruparel and T. Patel
+
+RAGCacheSim: a discrete-event simulator for evaluating caching strategies in retrieval-augmented generation systems.
+
+Software Impacts 26, pp. 100783.
+
+External Links: ISSN 2665-9638,
+Document,
+Link
+
+Cited by: §2.
+
+Suresh et al. (2015)
+L. Suresh, M. Canini, S. Schmid, and A. Feldmann
+
+C3: cutting tail latency in cloud data stores via adaptive replica selection.
+
+In 12th USENIX Symposium on Networked Systems Design and Implementation (NSDI 15),
+
+pp. 513–527.
+
+Cited by: §2.
+
+Thakur et al. (2021)
+N. Thakur, N. Reimers, A. Rücklé, A. Srivastava, and I. Gurevych
+
+Beir: a heterogenous benchmark for zero-shot evaluation of information retrieval models.
+
+arXiv preprint arXiv:2104.08663.
+
+Cited by: §6.1.
+
+Uluyol et al. (2020)
+M. Uluyol, A. Huang, A. Goel, M. Chowdhury, and H. V. Madhyastha
+
+ $\{$ near-Optimal $\}$ latency versus cost tradeoffs in $\{$ geo-distributed $\}$ storage.
+
+In 17th USENIX Symposium on Networked Systems Design and Implementation (NSDI 20),
+
+pp. 157–180.
+
+Cited by: §2.
+
+Wang et al. (2021)
+Y. Wang, H. Dai, X. Han, P. Wang, Y. Zhang, and C. Xu
+
+Cost-driven data caching in edge-based content delivery networks.
+
+IEEE Transactions on Mobile Computing 22 (3), pp. 1384–1400.
+
+Cited by: §2.
+
+Wendell et al. (2010)
+P. Wendell, J. W. Jiang, M. J. Freedman, and J. Rexford
+
+Donar: decentralized server selection for cloud services.
+
+In Proceedings of the ACM SIGCOMM 2010 conference,
+
+pp. 231–242.
+
+Cited by: §2.
+
+Wu et al. (2013)
+Z. Wu, M. Butkiewicz, D. Perkins, E. Katz-Bassett, and H. V. Madhyastha
+
+Spanstore: cost-effective geo-replicated storage spanning multiple cloud services.
+
+In Proceedings of the Twenty-Fourth ACM Symposium on Operating Systems Principles,
+
+pp. 292–308.
+
+Cited by: §2.
+
+Xu et al. (2025)
+C. Xu, L. Gao, Y. Miao, and X. Zheng
+
+Distributed retrieval-augmented generation.
+
+arXiv preprint arXiv:2505.00443.
+
+Cited by: §2.
+
+Zhang et al. (2013)
+Y. Zhang, R. Power, S. Zhou, Y. Sovran, M. K. Aguilera, and J. Li
+
+Transaction chains: achieving serializability with low latency in geo-distributed storage systems.
+
+In Proceedings of the twenty-fourth ACM symposium on operating systems principles,
+
+pp. 276–291.
+
+Cited by: §2.

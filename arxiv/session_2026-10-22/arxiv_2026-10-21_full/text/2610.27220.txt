@@ -1,0 +1,2161 @@
+1]University of Alberta
+2]Alberta Machine Intelligence Institute (Amii)
+3]Canada CIFAR AI Chair
+4]Instituto de Telecomunicações
+5]Instituto Superior Técnico, Universidade de Lisboa
+6]ELLIS Unit Lisbon
+
+## Sparse RL Relaxation for LLM Reasoning
+
+Jiabin Fan
+
+Matthias Lindemann
+
+Zita Marinho
+
+André FT Martins
+
+Lili Mou
+
+Affiliation: [
+
+Affiliation: [
+
+Affiliation: [
+
+Affiliation: [
+
+Affiliation: [
+
+Affiliation: [
+
+October 19, 2026
+
+Abstract
+
+Recent work has explored continuous representations in place of discrete tokens during Chain-of-Thought (CoT) reasoning, often referred to as soft CoT. This is motivated by the idea that a mixture of token embeddings can represent a superposition of multiple reasoning possibilities within a single step. However, it remains challenging to train large language models to realize this potential.
+Existing work has explored reinforcement learning (RL)-style training for soft CoT. However, these approaches treat soft tokens as actions in a Markov decision process rather than as differentiable intermediate computation steps. Thus, they do not propagate gradients across the soft tokens and miss out on the signal of how the choice of one soft token affects the next. In this paper, we propose a sparse relaxation method for RL (called SpaRLax), which leverages the differentiability of soft-CoT reasoning over time steps and makes training more stable and effective. We adopt an entmax sparsity method that adaptively determines the degree of softness, which truncates long-tail noise at confident steps while retaining multiple plausible candidates when uncertain. Across nine reasoning benchmarks, our method achieves the highest average performance compared with baseline methods. Further analyses validate the effective use of
+soft-token superposition in our approach, and also demonstrate the contribution of adaptive sparsity in our approach.
+
+## 1 Introduction
+
+Chain of Thoughts (Wei et al., 2022, CoT;) improves the reasoning ability of large
+language models (LLMs) by generating intermediate steps before the final answer.
+Despite its effectiveness, CoT produces a single discrete token at each step, collapsing the LLM’s output distribution to one token and discarding alternatives that may be useful later. This has motivated recent work on soft CoT, where intermediate
+reasoning tokens are represented by continuous embeddings (Hao et al., 2025; Wang et al., 2025; Zhang et al., 2025; Wu et al., 2025; Shen et al., 2025; Xu et al., 2025b). Among these approaches, Zhang et al. (2025) construct each CoT token as a probability-weighted mixture of token embeddings, referred to as a soft token, allowing multiple candidate semantics to coexist at a reasoning step.
+Theoretical analyses (Zhu et al., 2025) further show that such continuous representation can represent multiple reasoning paths in superposition and can be more expressive than discrete CoT, suggesting soft CoT as a promising direction for improving LLM reasoning.
+
+However, training LLMs to realize the potential of soft reasoning remains challenging.
+Recent methods struggle to fit soft CoT training into the reinforcement learning (RL) framework, which allows us to learn soft CoT without groundtruth labels. To facilitate RL, researchers have introduced various stochasticity mechanisms to soft CoT, such as Gaussian embedding perturbations (Butt et al., 2026) and Gumbel-softmax sampling (Zheng and Lee, 2025).
+However, such a formulation is problematic, as the output-generating process defines the vocabulary as the action space11
+ 1
+
+ In the standard token-level MDP for autoregressive LLMs, the policy is defined on
+vocabulary tokens $a_{i}\in V$ as $\pi_{\bm{\theta}}(a_{i}|s_{i})$ for some state $s_{i}$ .
+A soft token $\tilde{\bm{e}}_{i}\notin V$ is not in this action space, so a
+policy-gradient objective over soft tokens is ill-defined under standard RL frameworks for LLMs (Ramamurthy et al., 2023).
+but soft
+reasoning considers the embedding as an action. They do not coexist in the same Markov decision process (MDP), making the action space, and thus the entire RL formulation, ill-defined. In addition, such a formulation fails to take advantage of the differentiable nature of soft tokens, as the gradient is not back-propagated across the soft tokens. This misses out on the signal of how the choice of one soft token affects the next.
+
+In this paper, we propose a Sparse RL Relaxation (SpaRLax) method to train soft reasoning for LLMs. For every reasoning step, we sample a mixture probability by Gumbel-softmax (Jang et al., 2017; Maddison et al., 2017), which introduces stochasticity compared with directly using softmax. Different from Zheng and Lee (2025), however, we notice that Gumbel-softmax is differentiable, and with this insight, we restore the cross-step gradient path, allowing gradients to flow backward from each soft token to the one before it.
+Moreover, we notice an additional challenge that the typical large vocabulary size of an LLM dilutes probability mass, causing a loss of reasoning focus. We propose a solution to this problem by using sparse relaxation, which concentrates probability mass on a few candidate tokens, while assigning exactly zero probability to low-scoring tokens. In particular, we apply entmax
+(Peters et al., 2019) on top of the Gumbel reparametrization trick
+when constructing the soft-token distribution, as
+entmax can naturally adapt the degree of softness by the uncertainty of each
+reasoning step.
+
+We conduct experiments on nine benchmarks spanning mathematical,
+knowledge-intensive, and code reasoning. We compare our method against soft-CoT post-training methods under a controlled GRPO framework. The results show that our SpaRLax achieves the strongest weighted-average
+performance under both soft- and hard-CoT inference, demonstrating the benefits
+of cross-step learning in the relaxed reasoning space
+(§4.2).
+We also observe that our approach
+utilizes the superposition encoded by soft tokens more
+than existing methods (§4.3). In addition, we
+analyze the sparsity mechanism across different candidate-set sizes and find
+that entmax outperforms dense softmax, suggesting its effectiveness in
+adaptively suppressing long-tail noise (§4.4).
+
+## 2 Preliminaries
+
+## Classic CoT reasoning.
+
+In classic CoT reasoning (Wei et al., 2022), we generate a sequence of discrete reasoning tokens, typically enclosed by special tokens such as
+ $\langle\mathrm{think}\rangle$ and $\langle/\mathrm{think}\rangle$ , before
+producing the final answer.
+We denote an input prompt by $\bm{x}$ , the reasoning tokens by $\bm{t}_{1:m}=(t_{1},\ldots,t_{m})$ , and the final answer tokens by $\bm{y}_{1:n}=(y_{1},\ldots,y_{n})$ . The LLM’s autoregressive sequence is given by
+
+ $\displaystyle\bm{x}$ 
+ $\displaystyle\rightarrow\langle\mathrm{think}\rangle\>\underbrace{t_{1},\cdots,t_{m}}_{\text{discrete CoT}}\>\langle/\mathrm{think}\rangle\>\underbrace{y_{1},\cdots,y_{n}}_{\text{final answer}}.$ 
+
+(1)
+
+At the $i$ th reasoning step,
+the LLM with its policy $\pi_{\bm{\theta}}(\cdot|\cdot)$ yields a probability vector
+ $\bm{p}_{i}\in\Delta^{|\mathcal{V}|-1}$ over the vocabulary $\mathcal{V}$ 
+and samples a token $t_{i}$ by
+
+ $\displaystyle\bm{p}_{i}$ 
+ $\displaystyle=\pi_{\bm{\theta}}\left(\cdot|\bm{x},\bm{t}_{<i}\right),\qquad t_{i}\sim\mathrm{Categorical}(\bm{p}_{i}).$ 
+
+(2)
+
+Once $t_{i}$ is sampled, its embedding, denoted by $\operatorname{emb}(t_{i})$ , is passed to the next step, while the remaining information in $\bm{p}_{i}$ is not carried forward.
+After $\langle/\mathrm{think}\rangle$ , the LM switches to
+answer generation.
+
+## Soft CoT reasoning.
+
+Zhang et al. (2025) propose soft CoT, which replaces the
+discrete token $t_{i}$ in classic CoT with a continuous soft-token embedding
+to improve CoT expressivity.
+In this paradigm, the model predicts the soft-token distribution
+ $\tilde{\bm{p}}_{i}$ and constructs the soft-token embedding by
+
+ $\displaystyle\tilde{\bm{p}}_{i}$ 
+ $\displaystyle=\pi_{\bm{\theta}}\left(\cdot|\bm{x},\tilde{\bm{e}}_{<i}\right),\qquad\tilde{\bm{e}}_{i}=\sum_{k=1}^{|\mathcal{V}|}\tilde{p}_{i,k}\operatorname{emb}(k),$ 
+
+(3)
+
+where $\tilde{p}_{i,k}$ is the $k$ th element of $\tilde{\bm{p}}$ .
+The resulting $\tilde{\bm{e}}_{i}$ is fed back to the model for the next step until $\langle/\mathrm{think}\rangle$ is generated (details can be seen in Appendix 7.3). Then the LLM generates discrete tokens for the final answer, and the entire autoregressive sequence becomes
+
+ $\displaystyle\bm{x}$ 
+ $\displaystyle\rightarrow\langle\mathrm{think}\rangle\>\underbrace{\tilde{\bm{e}}_{1},\tilde{\bm{e}}_{2},\cdots,\tilde{\bm{e}}_{m}}_{\text{soft CoT}}\>\langle/\mathrm{think}\rangle\>\underbrace{y_{1},y_{2},\cdots,y_{n}}_{\text{(discrete) final answer}}.$ 
+
+(4)
+
+## RL training for LLMs.
+
+LLMs are often post-trained with reinforcement learning (RL) to improve reasoning ability, where the model explores different reasoning trajectories and is rewarded for trajectories that lead to correct answers.
+For a prompt $\bm{x}$ , the model samples a trajectory including CoT
+ $t_{1:m}$ and final answer $y_{1:n}$ . Then, the model receives a scalar reward
+ $R(\bm{x},\bm{y}_{1:n})$ for an entire trajectory, based on the correctness of the final answer for the input, but typically not based on CoT steps.
+RL optimizes the policy parameter $\bm{\theta}$ to maximize the expected reward:
+
+ $\displaystyle J(\bm{\theta})$ 
+ $\displaystyle=\mathbb{E}_{\bm{x}\sim\mathcal{D},\,\bm{t}_{1:m},\bm{y}_{1:n}\sim\pi_{\bm{\theta}}}\left[R(\bm{x},\bm{y}_{1:n})\right],$ 
+
+(5)
+
+where $\mathcal{D}$ denotes the distribution of training prompts.
+
+Because discrete token sampling is non-differentiable, policy-gradient
+methods (Williams, 1992; Sutton et al., 1999) can be used to differentiate
+Eqn. (5):
+
+ $\displaystyle\nabla_{\bm{\theta}}J(\bm{\theta})=\mathop{\mathbb{E}}\limits_{\begin{subarray}{c}\bm{x}\sim\mathcal{D},\\
+\bm{t}_{1:m},\,\bm{y}_{1:n}\sim\pi_{\bm{\theta}}\end{subarray}}\left[R(\bm{x},\bm{y}_{1:n})\left(\sum_{i=1}^{m}\nabla_{\bm{\theta}}\log\pi_{\bm{\theta}}\left(t_{i}|\bm{x},\bm{t}_{<i}\right)+\sum_{j=1}^{n}\nabla_{\bm{\theta}}\log\pi_{\bm{\theta}}\left(y_{j}|\bm{x},\bm{t}_{1:m},\bm{y}_{<j}\right)\right)\right].$ 
+
+(6)
+
+Recent studies extend the likelihood-based formulation
+to soft reasoning.
+Let $\rho_{\bm{\theta}}(\tilde{\bm{e}}_{i}|\bm{x},\tilde{\bm{e}}_{<i})$ denote the likelihood of a sampled soft token by the Gaussian- (Butt et al., 2026) or Gumbel-based (Zheng and Lee, 2025) stochastic
+mechanism. Their policy gradient takes the form
+
+ $\displaystyle\nabla_{\bm{\theta}}J(\bm{\theta})=\mathop{\mathbb{E}}\limits_{\begin{subarray}{c}\bm{x}\sim\mathcal{D},\\
+\tilde{\bm{e}}_{1:m}\sim\rho_{\bm{\theta}},\,\bm{y}_{1:n}\sim\pi_{\bm{\theta}}\end{subarray}}\left[R(\bm{x},\bm{y}_{1:n})\left(\sum_{i=1}^{m}\nabla_{\bm{\theta}}\log\rho_{\bm{\theta}}\left(\tilde{\bm{e}}_{i}|\bm{x},\tilde{\bm{e}}_{<i}\right)+\sum_{j=1}^{n}\nabla_{\bm{\theta}}\log\pi_{\bm{\theta}}\left(y_{j}|\bm{x},\tilde{\bm{e}}_{1:m},\bm{y}_{<j}\right)\right)\right].$ 
+
+(7)
+
+Such methods view the soft token defined by
+Eqn. (3) as a continuous RL action, which is less justified under
+the standard Markov decision process (MDP) framework for autoregressive LLMs. This is because an LLM treats discrete vocabulary tokens as the action space, but it becomes unclear how a soft token embedding is compatible with discrete actions of tokens in the vocabulary. In addition, soft tokens could have been modeled as differentiable variables, but treating them as RL actions breaks this differentiable structure.
+Hence, these methods miss out on the gradient signal of how the choice of one soft token affects the later reasoning steps.
+
+## 3 Our Method: Sparse RL Relaxation (SpaRLax)
+
+In this section, we introduce the proposed SpaRLax approach in detail. In §3.1, we discuss our RL relaxation based on Gumbel-softmax; we also present an efficient approximation for implementation considerations. Then, in §3.2 we introduce sparsity by replacing Gumbel-softmax with Gumbel-entmax, yielding sparse soft tokens whose degree of softness adapts across reasoning steps.
+
+## 3.1 RL Relaxation
+
+Soft CoT naturally forms a differentiable autoregressive computation across reasoning steps. We exploit this structure and propose an RL relaxation method. At reasoning step $i$ , the LLM $f_{\bm{\theta}}$ produces pre-softmax logits
+
+ $\displaystyle\bm{z}_{i}=f_{\bm{\theta}}\left(\bm{x},\tilde{\bm{e}}_{<i}\right)\in\mathbb{R}^{|\mathcal{V}|}.$ 
+
+(8)
+
+To introduce stochastic exploration, we perturb each logit with i.i.d. Gumbel
+noise $\epsilon_{i,k}\sim\mathrm{Gumbel}(0,1)$ .
+By the Gumbel-Max trick (Maddison et al., 2014), the argmax of the perturbed
+logits is an exact categorical sample from
+ $\operatorname{softmax}(\bm{z}_{i})$ . For differentiability, the argmax operation is replaced with softmax, resulting in the Gumbel-softmax operation (Jang et al., 2017; Maddison et al., 2017). For the next step $i+1$ , the input is a soft token embedding, given by
+
+ $\displaystyle\tilde{\bm{p}_{i}}$ 
+ $\displaystyle=\operatorname{softmax}\left(\frac{\bm{z}_{i}+\bm{\epsilon}_{i}}{\tau_{g}}\right),\qquad\tilde{\bm{e}}_{i+1}=\sum_{k=1}^{|\mathcal{V}|}\tilde{p}_{i,k}\operatorname{emb}(k),$ 
+
+(9)
+
+where $\tau_{g}>0$ is the relaxation temperature (Goyal et al., 2017).
+As seen, given sampled $\bm{\epsilon}_{i}$ , the relaxed soft token $\tilde{\bm{e}}_{i}$ remains differentiable with
+respect to $\bm{z}_{i}$ .
+
+Figure 1: 
+Overview of our approach. Black arrows indicate forward propagation, and blue arrows indicate backpropagation. Different from Soft-GRPO (Zheng and Lee, 2025), we only apply policy gradient to output steps, but backpropagate cross-step gradients for reasoning steps.
+
+After the reasoning steps, the LLM generates a discrete output $\bm{y}_{1:n}$ by sampling from its policy. The training objective is to maximize the expected reward:
+
+ $\displaystyle J_{\mathrm{relax}}(\bm{\theta})=\mathbb{E}_{\begin{subarray}{c}\bm{x}\sim\mathcal{D},\,\bm{\epsilon}_{1:m}\sim\operatorname{Gumbel}(0,1)\\
+\bm{y}_{1:n}\sim\pi_{\bm{\theta}}(\cdot|\bm{x},\tilde{\bm{e}}_{1:m})\end{subarray}}\left[R(\bm{x},\bm{y}_{1:n})\right]$ 
+
+(10)
+
+In other words, Gumbel-softmax allows us to sample from unparametrized Gumbel noise, eliminating the parameters underneath the expectation operation. This facilitates backpropagation through the reasoning steps. The
+gradient of Eqn. (10) can be written as
+
+ $\displaystyle\nabla_{\bm{\theta}}J_{\text{relax}}(\bm{\theta})=\mathop{\mathbb{E}}\limits_{\begin{subarray}{c}\bm{x}\sim\mathcal{D},\,\bm{\epsilon}_{1:m}\sim\operatorname{Gumbel}(0,1)\\
+\bm{y}_{1:n}\sim\pi_{\bm{\theta}}\left(\cdot|\bm{x},\tilde{\bm{e}}_{1:m}\right)\end{subarray}}\left[R(\bm{x},\bm{y}_{1:n})\sum_{j=1}^{n}\nabla_{\bm{\theta}}\log\pi_{\bm{\theta}}\left(y_{j}|\bm{x},\tilde{\bm{e}}_{1:m},\bm{y}_{<j}\right)\right],$ 
+
+(11)
+
+where the policy gradient applies to the discrete answer tokens $\bm{y}_{1:m}$ only, which differs from previous work (Zheng and Lee, 2025; Butt et al., 2026) treating soft reasoning tokens as actions. As illustrated in Fig. 1, the reasoning trajectory
+remains differentiable through the relaxed soft-token construction, allowing
+the learning signal to propagate across reasoning steps.
+
+Efficient approximation for implementation considerations.
+Modern RL implementations (Sheng et al., 2025; Fu et al., 2025) adopt a two-pass strategy: (1) The first pass performs roll-out by generating an entire trajectory without backpropagation. This does not require us to store activation values of the neural network and is memory-efficient, but it is slow because tokens are generated autoregressively.
+(2) The second pass takes in the sampled actions for gradient calculation, which is memory-intensive but fast. The two-pass strategy is essential for performing RL on LLMs, as it allows us to perform the roll-out and policy update (of different batches) simultaneously, so as to maximize GPU parallelization (Fu et al., 2025).
+
+However, this presents a challenge for our backpropagation. Note that the sampled soft token embeddings are generated in the first pass, but are fed as input in the second pass, thus detached from the computational graph. Consequently, there is no gradient flow from $\tilde{\bm{e}}_{i}$ to $\tilde{\bm{p}}_{i-1}$ , $\tilde{\bm{z}}_{i-1}$ , and $\tilde{\bm{e}}_{i-1}$ .
+
+Inspired by surrogate-gradient methods
+(Bengio et al., 2013; Wang et al., 2021), we propose a proxy gradient grafting technique that connects the gradient from $\tilde{\bm{e}}_{i}$ to its previous step. The key idea is to preserve the cached rollout values in the forward pass,
+while recomputing each soft-token distribution under the current policy and
+using its gradient in the backward pass.
+
+Let
+ $(\tilde{\bm{p}}_{i}^{\text{roll}},\tilde{\bm{e}}_{i}^{\text{roll}},\bm{\epsilon}_{i})$ 
+denote the soft-token distribution and embedding cached from rollout,
+together with the sampled Gumbel noise $\bm{\epsilon}_{i}$ . In a traditional implementation, the logits $\bm{z}_{i}$ are computed from $\tilde{\bm{e}}_{i}^{\text{roll}}$ . However, we reconstruct it from $\tilde{\bm{e}}_{i-1}^{\text{roll}}$ at one-step earlier:
+
+ $\displaystyle\bm{z}_{i-1}^{\text{proxy}}$ 
+ $\displaystyle=f_{\theta}\left(\bm{x},\tilde{\bm{e}}_{\leq i-1}^{\text{roll}}\right),\qquad\tilde{\bm{p}}_{i-1}^{\text{proxy}}=\operatorname{softmax}\left(\frac{\bm{z}_{i-1}^{\text{proxy}}+\bm{\epsilon}_{i-1}}{\tau_{g}}\right).$ 
+
+(12)
+
+Here, we reuse the same $\bm{\epsilon}_{i-1}$ sampled during rollout, so we have $\bm{z}_{i-1}^{\text{proxy}}=\bm{z}_{i-1}^{\text{roll}}$ . Then, we graft the proxy gradient onto the cached one for calculating the soft-token embedding for the next step.
+
+ $\displaystyle\bar{\bm{p}}_{i-1}$ 
+ $\displaystyle=\operatorname{sg}\left(\tilde{\bm{p}}_{i-1}^{\text{roll}}\right)+\tilde{\bm{p}}_{i-1}^{\text{proxy}}-\operatorname{sg}\left(\tilde{\bm{p}}_{i-1}^{\text{proxy}}\right),\qquad\bar{\bm{e}}_{i}=\sum_{k=1}^{|\mathcal{V}|}\bar{p}_{i-1,k}\operatorname{emb}(k),$ 
+
+(13)
+
+where $\operatorname{sg}(\cdot)$ denotes stop gradient of a variable. Then, $\bar{\bm{e}}_{i}$ replaces $\tilde{\bm{e}}_{i}^{\text{roll}}$ in the standard second pass of the policy update. Note that the cached variable $\tilde{\bm{p}}_{i-1}^{\text{roll}}$ is already detached due to the two-pass implementation, but we explicitly add the $\operatorname{sg}$ operation in the formula for clarity.
+
+With this construction, the forward computation exactly preserves the cached roll-out trajectory, as we always have $\bar{\bm{p}}_{i-1}=\tilde{\bm{p}}_{i-1}^{\text{roll}}$ . However, we can now let the gradient flow from $\bar{\bm{e}}_{i}$ to $\tilde{\bm{p}}_{i-1}^{\text{proxy}}$ by standard backpropagation.
+
+In terms of efficiency, our grafting technique does not have high latency, as we only graft one earlier step. Therefore, Eqns. (12) and (13) can be computed in parallel for all time steps $i$ . However, this grafting trick has a limitation, as the gradient backpropagates to only one earlier step from $\bar{\bm{e}}_{i}$ to $\tilde{\bm{p}}_{i-1}^{\text{proxy}}$ (for each value of $i$ ). That said, all steps can be adequately trained because the attention layers backpropagate gradients to all earlier steps. Moreover, we argue that our cross-step gradient is important even for one step. This is because the nearest step receives the strongest signal, as the gradient tends to vanish as the number of steps increases in recurrent computation (Bengio et al., 1994; Pascanu et al., 2013).
+
+Our method provides meaningful signal on how one soft token should affect the next.
+
+Compatibility with RL post-training objectives.
+Our RL relaxation is independent of the particular policy-optimization rule used
+for RL post-training.
+It modifies how the soft-CoT computation is constructed and differentiated,
+while the RL policy optimization is an outer layer often involving advantage estimation,
+importance weighting, and policy-update mechanism.
+Thus, our RL relaxation can be combined with commonly used post-training
+algorithms such as PPO (Schulman et al., 2017), GRPO
+(Shao et al., 2024), DAPO (Yu et al., 2025), GSPO
+(Zheng et al., 2025), and REINFORCE++ (Hu, 2025).
+
+## 3.2 Sparse RL Relaxation
+
+Prior soft-CoT methods
+(Zhang et al., 2025; Zheng and Lee, 2025; Zhou et al., 2026)
+use softmax to map LLM logits into a soft-token distribution, assigning
+non-zero probability to every vocabulary token. This mixes a long tail of low-probability
+tokens into soft token embeddings, which introduces unnecessary noise aggregated over
+a large vocabulary. A common remedy is top- $k$ truncation, which limits the mixture to a fixed number of highest-scoring tokens. However, a fixed $k$ cannot accommodate the varying uncertainty across reasoning steps. As observed by Fu and Luo (2026), token distributions can be highly concentrated at some steps but much more diffuse at others. Thus, a large fixed $k$ may retain unnecessary noise, while a small $k$ may discard useful alternatives.
+
+To suppress this long-tail noise while retaining multiple candidates
+when necessary, we replace the softmax relaxation in
+Eqn. (9) with $\alpha$ - $\operatorname{entmax}$ 
+(Peters et al., 2019), yielding an adaptive sparse RL Relaxation.
+For logits $\bm{z}\in\mathbb{R}^{|\mathcal{V}|}$ , entmax is defined by
+
+ $\displaystyle\operatorname{entmax}_{\alpha}(\bm{z})_{k}=\left[(\alpha-1)z_{k}-\lambda\right]_{+}^{\frac{1}{\alpha-1}},$ 
+
+(14)
+
+where $\lambda$ normalizes the distribution and $\alpha>1$ controls its sparsity, with
+ $\alpha\to 1$ recovering $\operatorname{softmax}$ and $\alpha=2$ corresponding to $\operatorname{sparsemax}$ (Martins and Astudillo, 2016).
+For $\alpha>1$ , entmax assigns exactly zero probability to sufficiently weak
+tokens, while the number of retained tokens is determined by their relative scores.
+Accordingly, Sparse RL Relaxation constructs the soft-token distribution as
+
+ $\displaystyle\tilde{\bm{p}}_{i}$ 
+ $\displaystyle=\operatorname{entmax}_{\alpha}\left(\frac{\bm{z}_{i}+\bm{\epsilon}_{i}}{\tau_{g}}\right),\qquad\tilde{\bm{e}}_{i+1}=\sum_{k=1}^{|\mathcal{V}|}\tilde{p}_{i,k}\operatorname{emb}(k).$ 
+
+(15)
+
+If only one logit dominates (after Gumbel noise in our scenario), $\operatorname{entmax}$ suppresses the remaining tokens, and the soft token approaches a discrete representation.
+When several candidates have comparable logits, it retains them as a sparse
+mixture.
+Thus, the degree of softness adapts to the uncertainty of each reasoning
+step without requiring a manually specified support size.
+
+The same replacement can be applied when reconstructing
+ $\tilde{\bm{p}}_{i}^{\text{proxy}}$ during proxy gradient grafting.
+Since $\operatorname{entmax}$ remains differentiable on its active support, gradients can propagate
+through the sparse soft-token construction in the same manner as
+in §3.1.
+
+## 4 Experiments
+
+## 4.1 Setup
+
+Math Reasoning
+Knowledge
+Code
+
+Method
+GSM8K
+MATH
+AIME24
+AIME25
+AMC23
+Olym.
+GPQA
+HEval
+MBPP
+W.Avg.
+
+Hard CoT Inference
+
+Initial
+80.08 $\pm$ 0.73
+75.18 $\pm$ 0.96
+15.94 $\pm$ 4.12
+20.94 $\pm$ 2.90
+59.69 $\pm$ 4.95
+26.24 $\pm$ 0.75
+20.55 $\pm$ 2.61
+55.11 $\pm$ 2.19
+58.55 $\pm$ 1.87
+59.58 $\pm$ 0.48
+
+Discrete-GRPO
+84.42 $\pm$ 0.72
+75.97 $\pm$ 0.95
+16.98 $\pm$ 4.26
+21.25 $\pm$ 2.84
+62.11 $\pm$ 5.82
+27.31 $\pm$ 0.74
+21.26 $\pm$ 2.23
+56.23 $\pm$ 2.31
+59.45 $\pm$ 2.14
+61.90 $\pm$ 0.38
+
+Soft-GRPO
+84.29 $\pm$ 0.55
+75.48 $\pm$ 1.38
+15.94 $\pm$ 4.46
+20.94 $\pm$ 3.51
+58.91 $\pm$ 5.35
+26.25 $\pm$ 0.87
+20.15 $\pm$ 1.90
+55.22 $\pm$ 2.84
+57.66 $\pm$ 1.88
+61.24 $\pm$ 0.47
+
+STHT
+80.35 $\pm$ 0.58
+76.49 $\pm$ 1.02
+13.85 $\pm$ 4.65
+22.92 $\pm$ 3.28
+62.11 $\pm$ 5.65
+27.36 $\pm$ 0.75
+22.77 $\pm$ 2.30
+55.16 $\pm$ 2.00
+58.18 $\pm$ 2.04
+60.28 $\pm$ 0.43
+
+LEPO
+83.36 $\pm$ 1.26
+76.98 $\pm$ 1.83
+19.58 $\pm$ 6.07
+21.64 $\pm$ 4.34
+61.22 $\pm$ 7.45
+26.73 $\pm$ 1.34
+22.38 $\pm$ 3.23
+56.62 $\pm$ 4.07
+59.41 $\pm$ 3.45
+61.21 $\pm$ 1.23
+
+SpaRLax (ours)
+85.16 $\pm$ 0.53
+78.24 $\pm$ 1.09
+16.77 $\pm$ 3.92
+22.97 $\pm$ 3.16
+68.83 $\pm$ 4.31
+29.19 $\pm$ 0.76
+27.43 $\pm$ 2.59
+57.28 $\pm$ 2.32
+58.82 $\pm$ 1.89
+63.43 $\pm$ 0.42
+
+Soft CoT Inference
+
+Initial
+80.59 $\pm$ 0.65
+78.92 $\pm$ 1.09
+16.98 $\pm$ 4.96
+24.11 $\pm$ 3.99
+67.97 $\pm$ 5.06
+29.75 $\pm$ 0.80
+32.62 $\pm$ 3.03
+58.38 $\pm$ 2.03
+60.70 $\pm$ 2.40
+62.33 $\pm$ 0.49
+
+Discrete-GRPO
+84.93 $\pm$ 0.69
+79.80 $\pm$ 1.00
+16.35 $\pm$ 4.67
+25.05 $\pm$ 3.24
+68.59 $\pm$ 3.96
+30.61 $\pm$ 0.69
+32.67 $\pm$ 2.76
+59.98 $\pm$ 3.10
+61.52 $\pm$ 1.77
+64.58 $\pm$ 0.46
+
+Soft-GRPO
+84.96 $\pm$ 0.57
+79.15 $\pm$ 1.46
+17.81 $\pm$ 5.26
+23.18 $\pm$ 4.07
+66.56 $\pm$ 4.39
+30.34 $\pm$ 0.66
+33.43 $\pm$ 2.67
+59.78 $\pm$ 2.21
+60.60 $\pm$ 1.64
+64.35 $\pm$ 0.45
+
+STHT
+80.45 $\pm$ 0.73
+79.43 $\pm$ 1.32
+17.19 $\pm$ 4.33
+24.32 $\pm$ 3.85
+68.98 $\pm$ 5.11
+30.63 $\pm$ 0.90
+34.77 $\pm$ 2.31
+59.17 $\pm$ 1.83
+60.35 $\pm$ 2.07
+62.70 $\pm$ 0.41
+
+LEPO
+83.25 $\pm$ 1.65
+76.33 $\pm$ 1.57
+11.88 $\pm$ 8.99
+17.19 $\pm$ 6.48
+61.64 $\pm$ 7.48
+28.99 $\pm$ 1.72
+28.36 $\pm$ 5.89
+56.04 $\pm$ 4.56
+59.03 $\pm$ 3.25
+62.00 $\pm$ 0.71
+
+SpaRLax (ours)
+86.34 $\pm$ 0.72
+80.01 $\pm$ 1.11
+18.33 $\pm$ 4.23
+23.39 $\pm$ 4.55
+69.84 $\pm$ 4.71
+31.20 $\pm$ 0.74
+34.72 $\pm$ 2.98
+59.82 $\pm$ 2.53
+60.83 $\pm$ 1.89
+65.42 $\pm$ 0.51
+
+Table 1: 
+Pass@1 performance (%) under hard and soft chain-of-thought (CoT) inference.
+Results are reported as mean $\pm$ standard deviation.
+Bold and underlined values indicate the best and
+second-best mean performance within each inference setting, respectively.
+
+Math Reasoning
+Knowledge
+Code
+
+Method
+GSM8K
+MATH
+AIME24
+AIME25
+AMC23
+Olym.
+GPQA
+HEval
+MBPP
+W.Avg.
+
+Hard CoT Inference
+
+Initial
+97.50
+91.60
+50.00
+55.00
+87.50
+42.07
+82.32
+83.54
+86.77
+81.22
+
+Discrete-GRPO (Guo et al., 2025)
+97.50
+91.80
+46.67
+58.33
+95.00
+42.96
+82.32
+84.76
+87.16
+81.65
+
+SofT-GRPO (Zheng and Lee, 2025)
+97.35
+91.80
+40.00
+53.33
+90.00
+41.19
+74.75
+81.71
+84.05
+80.14
+
+STHT (Butt et al., 2026)
+97.12
+91.60
+46.67
+56.67
+97.50
+42.37
+85.35
+83.54
+84.82
+81.28
+
+LEPO (Zhou et al., 2026)
+97.19
+92.20
+46.67
+53.33
+95.00
+43.41
+90.40
+82.32
+86.38
+81.90
+
+SpaRLax (ours)
+97.35
+91.80
+50.00
+58.33
+95.00
+44.15
+90.40
+84.15
+85.60
+82.21
+
+Soft CoT Inference
+
+Initial
+97.35
+93.60
+46.67
+60.00
+95.00
+46.52
+96.97
+83.54
+85.99
+83.38
+
+Discrete-GRPO (Guo et al., 2025)
+97.12
+93.00
+50.00
+61.67
+95.00
+46.52
+94.95
+85.37
+87.16
+83.32
+
+SofT-GRPO (Zheng and Lee, 2025)
+97.27
+93.40
+56.67
+58.33
+92.50
+45.33
+96.46
+85.98
+87.55
+83.32
+
+STHT (Butt et al., 2026)
+97.42
+93.60
+46.67
+61.67
+97.50
+45.93
+97.47
+84.76
+85.60
+83.41
+
+LEPO (Zhou et al., 2026)
+97.27
+91.40
+30.00
+48.33
+92.50
+43.41
+92.42
+82.32
+87.55
+81.75
+
+SpaRLax (ours)
+97.35
+93.00
+50.00
+58.33
+95.00
+47.11
+96.46
+84.15
+87.94
+83.56
+
+Table 2: 
+Pass@32 performance (%) under hard and soft chain-of-thought (CoT) inference.
+Bold and underlined values denote the best and
+second-best results within each inference setting, respectively.
+
+Models and datasets.
+We use DeepSeek-R1-Distill-Qwen-1.5B22
+ 2
+
+ https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+as the base LLM for all experiments.
+We perform RL training on
+DAPO-MATH-17k
+(Yu et al., 2025), a collection of mathematical reasoning problems, which is selected to reduce potential overlap with the
+base model’s pretraining corpus, allowing the effect of RL fine-tuning to be
+evaluated cleanly.
+
+We evaluate the trained models on nine benchmarks spanning multiple reasoning
+domains.
+For mathematical reasoning, we use GSM8K (Cobbe et al., 2021),
+MATH (Hendrycks et al., 2021), AIME 2024, AIME 2025, AMC 2023,
+and OlympiadBench (He et al., 2024).
+We further evaluate general knowledge and scientific reasoning on
+GPQA-Diamond (Rein et al., 2024), and code reasoning on
+HumanEval (Chen et al., 2021) and MBPP (Austin et al., 2021). We compute the weighted average
+performance based on the number of data points in each test dataset.
+
+Competing approaches.
+We compare our SpaRLax method against representative discrete- and
+soft-reasoning baselines.
+Initial denotes the base model without training.
+Discrete-GRPO applies standard GRPO
+(Shao et al., 2024) to discrete-token CoT.
+For RL with soft reasoning, we compare against
+SofT-GRPO (Zheng and Lee, 2025),
+STHT (Butt et al., 2026),
+and LEPO (Zhou et al., 2026).
+To ensure a controlled comparison, we implement all methods within the
+same GRPO framework, meaning that
+SofT-GRPO, STHT, LEPO, and our method modify only the components required by their respective soft-CoT learning mechanisms.
+This experimental protocol minimizes performance differences caused by the choice of the underlying RL algorithm and allows the experiments to focus on the
+effectiveness of the soft-CoT stage. Appendix 7.1 provides the pseudo-code of our SpaRLax under the GRPO framework.
+
+Training and evaluation settings.
+During training, our SpaRLax uses soft tokens for reasoning steps, but for the answer steps, hard tokens are generated by top- $p$ sampling (with $p=0.95$ ) in conjunction with top- $k$ tokens ( $k=5$ ), which is standard in previous work (Zheng and Lee, 2025; Zhou et al., 2026).
+After training, our model supports either soft CoT or hard CoT (simply sampling discrete tokens for training steps). More configurations can be found in Appendix 7.2.
+
+For evaluation, we report Pass@1 (single-sample accuracy)
+and Pass@32 (accuracy of whether at least one correct solution is found among 32 sampled responses). They are commonly used in previous literature 
+ (
+ )
+ . To account for the variance of Pass@1 induced by stochastic sampling, we repeat each evaluation four times from the same checkpoint and report the mean and standard deviation.
+
+## 4.2 Main Results
+
+Figure 2: Comparing the hidden states when using the soft token embedding and replacing it with top-1 token embedding. Higher KL and lower cosine indicate a stronger utilization of superposition.
+
+Based on the above setups, we conduct post-training
+from the same initial model, select the checkpoint with the best validation
+performance, and evaluate each model with both hard-CoT and soft-CoT inference. We report Pass@1 and Pass@32 in Tabs. 1–2.
+
+Pass@1. We observe that soft-CoT inference on the initial model already provides a
+notable improvement over hard-CoT inference, consistent with prior
+work (Zhang et al., 2025). This advantage persists after
+post-training, as soft-CoT inference
+generally achieves higher Pass@1 than hard-CoT inference across different post-training methods. Meanwhile,
+soft CoT post-training also brings notable gains under hard-CoT
+inference, consistent with prior observations (Butt et al., 2026).
+
+Our method achieves the strongest Pass@1 under both inference modes, reaching
+ $63.43$ with hard CoT and $65.42$ with soft CoT. Soft
+CoT provides a richer training space and more
+expressive inference representation (Zhu et al., 2025). Our method propagates the gradient of reward across soft tokens, providing a learning signal on how the choice of one soft token affects the next. This enables more effective training for soft
+reasoning in such a richer training space. As a result, SpaRLax achieves strong improvements under both
+soft CoT and hard CoT inference.
+
+Pass@32.
+Pass@32 is much higher than Pass@1 for all methods, which is
+expected as Pass@32 only
+requires one successful solution among 32 stochastic rollouts.
+Soft CoT inference continues to outperform hard CoT
+inference at Pass@32, consistent with observations in prior
+work (Zheng and Lee, 2025; Butt et al., 2026). Although the gain of our method is much smaller than those observed for Pass@1, other
+post-training methods yield even smaller Pass@32 improvements over the initial
+model. This behavior is in line with prior observations that, under moderate RL
+budgets, post-training improves sampling efficiency but does not
+expand large- $k$ solution coverage (Yue et al., 2025; Liu et al., 2025). That being said, our method achieves the largest average improvement over the initial model among all competing methods.
+
+## 4.3 Superposition Utilization
+
+Rizvi-Martel et al. (2026) show that recent soft reasoning methods often collapse their superposed representation toward a single
+token, indicating the observed gain may be associated simply with more greedy reasoning.
+In this subsection, we analyze if our method suffers from the same collapse or actually makes use of the
+multiple alternatives encoded in soft tokens.
+
+Following Rizvi-Martel et al. (2026), we examine whether the
+information beyond the top-1 component of the soft token persists in the model’s hidden states.
+For each data sample and each reasoning step $i$ , we keep all
+preceding soft tokens $\tilde{\bm{e}}_{<i}$ unchanged and perform two forward
+passes that differ only at the current position: one uses the original soft
+token $\tilde{\bm{e}}_{i}$ , while the other replaces it with its top-1 token’s embedding.
+This isolates the effect of the non-top-1 components at a single reasoning
+step. At each Transformer layer, we compare the resulting hidden states using cosine
+similarity and symmetric KL divergence between their Logit-Lens
+distributions.33
+ 3
+
+ We project an intermediate
+hidden state $\bm{h}_{i}^{(\ell)}$ to the vocabulary space as
+ $\bm{p}_{i}^{(\ell)}=\operatorname{softmax}(\bm{U}\bm{h}_{i}^{(\ell)})$ ,
+where $\bm{U}$ is the output unembedding matrix and $\ell$ denotes the index of transformer layer. Then, we compute the symmetric
+KL divergence between the distributions obtained from the soft-token and
+top-1-token forward passes.
+We compute these metrics for every inference step of every sample,
+and then average them across inference steps and data samples for each layer.
+The resulting layerwise averages are plotted in
+Fig. 2.
+Higher KL divergence and lower cosine similarity indicate that the non-top-1
+components have a stronger effect on subsequent computation, indicating a better utilization of the soft tokens in superposition.
+
+As shown in Fig. 2, our method exhibits
+larger KL divergence and lower cosine similarity than SofT-GRPO and discrete-GRPO across decoder
+layers, suggesting stronger utilization of the information retained in the
+soft-token mixture.
+
+## 4.4 Effect of Adaptive Sparsity
+
+Figure 3: Effect of candidate-set size on softmax and entmax training.
+Softmax becomes increasingly sensitive to larger $k$ , whereas entmax
+remains robust as $k$ increases.
+
+Constructing a soft token over a large vocabulary requires aggregating
+all token embeddings, which introduces a huge memory burden and long-tail noise.
+Recent methods apply top- $k$ 
+truncation, retaining only the highest-scoring $k$ tokens before constructing
+the soft-token embedding
+(Zheng and Lee, 2025; Zhou et al., 2026).
+While a small $k$ reduces both computational cost and long-tail noise, it also
+imposes a limit on the number of alternatives retained at every
+reasoning step.
+This can restrict the superposition capability of soft tokens when more
+candidates are useful.
+
+Our intuition is that the degree of softness should be step-dependent.
+As observed in prior work (Fu and Luo, 2026), token distributions are
+concentrated at most reasoning steps but highly uncertain at a
+small fraction of steps.
+Thus, confident steps may require little superposition, whereas
+uncertain steps can benefit from retaining multiple plausible alternatives.
+This motivates adaptive sparsity rather than a fixed top- $k$ truncation.
+
+To examine this hypothesis, we compare softmax and entmax under different
+candidate-set sizes
+ $k\in\{2,4,8,16,32\}$ .
+For each $k$ , we retain the top- $k$ logits and construct the soft token using
+either softmax or entmax.
+Softmax assigns non-zero probability to all retained candidates, whereas
+entmax can further reduce the active support according to their relative
+scores.
+Therefore, $k$ controls the maximum candidate budget, while entmax determines
+the effective degree of softness within this budget.
+We train all variants on GSM8K using the same configuration as the main
+experiments, except that the maximum response length is set to 2,048
+tokens for computational efficiency, and record the mean Pass@1 over 4 rollouts at each validation.
+
+Fig. 3 shows a clear difference between the two schemes.
+With softmax, training becomes increasingly sensitive to $k$ , and larger
+candidate sets lead to substantial performance degradation.
+In contrast, entmax improves the performance considerably as $k$ increases, showing the RL training benefits from a larger candidate pool without forcing all candidates to
+participate in the soft token.
+These results support our hypothesis that soft reasoning benefits from
+adaptive rather than fixed sparsity: a larger candidate set provides
+additional alternatives when needed, while entmax suppresses unnecessary
+components at confident reasoning steps.
+
+## 5 Related Work
+
+RL reasoning for LLMs.
+RL has been shown to be effective for improving LLM reasoning with Chain-of-Thought
+(Shao et al., 2024; Yu et al., 2025; Hu, 2025; Zheng et al., 2025).
+However, exploration through discrete token sampling is inefficient over the
+large space of possible reasoning trajectories
+(Liao et al., 2025).
+This exploration bottleneck can be further exacerbated as RL training
+suppresses valuable low-probability alternatives
+(Huang et al., 2026), which limits the diversity of reasoning trajectories explored by the model
+(Wu et al., 2026a; Zhang et al., 2025).
+
+Soft reasoning.
+Recent studies perform
+reasoning in a continuous representation space so that a single
+reasoning step can preserve information from multiple
+reasoning paths
+(Hao et al., 2025; Xu et al., 2025b; Wu et al., 2025; Shen et al., 2025).
+Theoretical analyses show that continuous reasoning representation can encode
+multiple reasoning paths in superposition and track multiple search frontiers
+in parallel, providing greater representational expressivity and more
+efficient exploration than following a single discrete trajectory
+(Zhu et al., 2025; Gozeten et al., 2026).
+
+Building on this principle, continuous reasoning has been realized in various ways, such as
+through internal hidden representations
+(Hao et al., 2025; Xu et al., 2025b; Wu et al., 2025; Shen et al., 2025) and through mixtures of token embeddings
+(Zhang et al., 2025; Wang et al., 2025; Tang et al., 2026).
+We focus on the latter formulation, which constructs each soft token as a
+mixture of vocabulary-token embeddings, preserving multiple token-level
+alternatives while remaining anchored to the pretrained token embedding
+space.
+Subsequent work extends the simple weighted-average soft-token construction
+through diversified test-time reasoning (Xu et al., 2025a),
+uncertainty-aware activation (Fu and Luo, 2026; Xu et al., 2026), and stochastic
+perturbations that mitigate soft-token collapse
+(Wu et al., 2026b).
+These works indicate the potential of soft-token-based
+continuous reasoning for improving the expressiveness, efficiency, and exploration capability of LLM inference.
+
+RL training with soft CoT.
+While soft CoT improves reasoning at inference time, pretrained LLMs are
+optimized over discrete token sequences and are never trained to
+exploit continuous mixtures of token alternatives
+(Rizvi-Martel et al., 2026), which limits the potential of soft reasoning.
+This motivates post-training methods for soft reasoning.
+Recent approaches introduce stochastic soft tokens through Gaussian
+perturbations or Gumbel-based sampling and optimize them with RL objectives
+(Butt et al., 2026; Zheng and Lee, 2025; Zhou et al., 2026).
+However, such optimization does not propagate reward credit through the differentiable dependence between consecutive
+soft tokens.
+SpaRLax fills this gap by reparameterizing soft-token generation
+and propagating pathwise gradients through the soft-token sequence, allowing
+an earlier soft-token distribution to receive credit according to how it
+affects subsequent reasoning and the final answer.
+
+## 6 Conclusion
+
+We propose Sparse RL Relaxation for post-training soft reasoning with differentiable cross-step gradient propagation.
+Our method further uses $\operatorname{entmax}$ -based adaptive sparsity to retain useful alternatives while suppressing low-probability noise.
+Experiments show consistent gains under both soft- and hard-CoT inference, indicating that improvements learned in the relaxed reasoning space can transfer effectively to discrete decoding.
+Overall, Sparse RL Relaxation provides an effective framework for learning soft reasoning while remaining compatible with standard discrete inference.
+
+## Acknowledgments
+
+This research
+was supported in part by the Natural Sciences and Engineering Research Council of Canada (NSERC), the Amii Fellow Program, the Canada CIFAR AI Chair Program, and the Digital
+Research Alliance of Canada. This work was also supported in part by the project DECOLLAGE (ERC-2022-CoG 101088763) and by FCT/MECI through national funds and when applicable co-funded EU funds under UID/50008: Instituto de Telecomunicações.
+
+## References
+
+Austin et al. (2021)
+J. Austin, A. Odena, M. Nye, M. Bosma, H. Michalewski, D. Dohan, E. Jiang, C. Cai, M. Terry, Q. V. Le, and C. Sutton
+
+Program synthesis with large language models.
+
+arXiv preprint arXiv:2108.07732.
+
+Cited by: §4.1.
+
+Bengio et al. (2013)
+Y. Bengio, N. Léonard, and A. Courville
+
+Estimating or propagating gradients through stochastic neurons for conditional computation.
+
+arXiv preprint arXiv:1308.3432.
+
+Cited by: §3.1.
+
+Bengio et al. (1994)
+Y. Bengio, P. Simard, and P. Frasconi
+
+Learning long-term dependencies with gradient descent is difficult.
+
+IEEE Transactions on Neural Networks, pp. 157–166.
+
+Cited by: §3.1.
+
+Butt et al. (2026)
+N. Butt, A. Kwiatkowski, I. Labiad, J. Kempe, and Y. Ollivier
+
+Soft tokens, hard truths.
+
+In The Fourteenth International Conference on Learning Representations,
+
+Cited by: §1,
+§2,
+§3.1,
+§4.1,
+§4.2,
+§4.2,
+Table 2,
+Table 2,
+§5,
+§7.1,
+§7.2,
+Table 3.
+
+Chen et al. (2021)
+M. Chen, J. Tworek, H. Jun, Q. Yuan, H. P. d. O. Pinto, J. Kaplan, H. Edwards, Y. Burda, N. Joseph, G. Brockman, A. Ray, R. Puri, G. Krueger, M. Petrov, H. Khlaaf, G. Sastry, P. Mishkin, B. Chan, S. Gray, N. Ryder, M. Pavlov, A. Power, L. Kaiser, M. Bavarian, C. Winter, P. Tillet, F. P. Such, D. Cummings, M. Plappert, F. Chantzis, E. Barnes, A. Herbert-Voss, W. H. Guss, A. Nichol, A. Paino, N. Tezak, J. Tang, I. Babuschkin, S. Balaji, S. Jain, W. Saunders, C. Hesse, A. N. Carr, J. Leike, J. Achiam, V. Misra, E. Morikawa, A. Radford, M. Knight, M. Brundage, M. Murati, K. Mayer, P. Welinder, B. McGrew, D. Amodei, S. McCandlish, I. Sutskever, and W. Zaremba
+
+Evaluating large language models trained on code.
+
+arXiv preprint arXiv:2107.03374.
+
+Cited by: §4.1.
+
+Cobbe et al. (2021)
+K. Cobbe, V. Kosaraju, M. Bavarian, M. Chen, H. Jun, L. Kaiser, M. Plappert, J. Tworek, J. Hilton, R. Nakano, C. Hesse, and J. Schulman
+
+Training verifiers to solve math word problems.
+
+arXiv preprint arXiv:2110.14168.
+
+Cited by: §4.1.
+
+Correia et al. (2019)
+G. M. Correia, V. Niculae, and A. F. T. Martins
+
+Adaptively sparse transformers.
+
+In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing
+and the 9th International Joint Conference on Natural Language Processing,
+
+pp. 2174–2184.
+
+Cited by: §7.2.
+
+Fu and Luo (2026)
+R. Fu and G. Luo
+
+SeLaR: selective latent reasoning in large language models.
+
+In Proceedings of the 64th Annual Meeting of the Association for Computational Linguistics
+(Volume 1: Long Papers),
+
+pp. 7073–7087.
+
+Cited by: §3.2,
+§4.4,
+§5.
+
+Fu et al. (2025)
+W. Fu, J. Gao, X. Shen, C. Zhu, Z. Mei, C. He, S. Xu, G. Wei, J. Mei, J. Wang, T. Yang, B. Yuan, and Y. Wu
+
+AReaL: A Large-Scale Asynchronous Reinforcement Learning System for Language Reasoning.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §3.1.
+
+Gonçalves et al. (2025)
+N. Gonçalves, M. V. Treviso, and A. Martins
+
+AdaSplash: adaptive sparse flash attention.
+
+In Proceedings of the 42nd International Conference on Machine Learning,
+
+pp. 19878–19896.
+
+Cited by: §7.2.
+
+Goyal et al. (2017)
+K. Goyal, C. Dyer, and T. Berg-Kirkpatrick
+
+Differentiable scheduled sampling for credit assignment.
+
+In Proceedings of the 55th Annual Meeting of the Association for Computational Linguistics (Volume 2: Short Papers),
+
+pp. 366–371.
+
+Cited by: §3.1.
+
+Gozeten et al. (2026)
+A. Gozeten, M. Ildiz, X. Zhang, H. Harutyunyan, A. S. Rawat, and S. Oymak
+
+Continuous chain of thought enables parallel exploration and reasoning.
+
+In International Conference on Learning Representations,
+
+pp. 82881–82914.
+
+Cited by: §5.
+
+Guo et al. (2025)
+D. Guo, D. Yang, H. Zhang, J. Song, P. Wang, Q. Zhu, R. Xu, R. Zhang, S. Ma, X. Bi, X. Zhang, X. Yu, Y. Wu, Z. F. Wu, Z. Gou, Z. Shao, Z. Li, Z. Gao, A. Liu, B. Xue, B. Wang, B. Wu, B. Feng, C. Lu, C. Zhao, C. Deng, C. Ruan, D. Dai, D. Chen, D. Ji, E. Li, F. Lin, F. Dai, F. Luo, G. Hao, G. Chen, G. Li, H. Zhang, H. Xu, H. Ding, H. Gao, H. Qu, H. Li, J. Guo, J. Li, J. Chen, J. Yuan, J. Tu, J. Qiu, J. Li, J. L. Cai, J. Ni, J. Liang, J. Chen, K. Dong, K. Hu, K. You, K. Gao, K. Guan, K. Huang, K. Yu, L. Wang, L. Zhang, L. Zhao, L. Wang, L. Zhang, L. Xu, L. Xia, M. Zhang, M. Zhang, M. Tang, M. Zhou, M. Li, M. Wang, M. Li, N. Tian, P. Huang, P. Zhang, Q. Wang, Q. Chen, Q. Du, R. Ge, R. Zhang, R. Pan, R. Wang, R. J. Chen, R. L. Jin, R. Chen, S. Lu, S. Zhou, S. Chen, S. Ye, S. Wang, S. Yu, S. Zhou, S. Pan, S. S. Li, S. Zhou, S. Wu, T. Yun, T. Pei, T. Sun, T. Wang, W. Zeng, W. Liu, W. Liang, W. Gao, W. Yu, W. Zhang, W. L. Xiao, W. An, X. Liu, X. Wang, X. Chen, X. Nie, X. Cheng, X. Liu, X. Xie, X. Liu, X. Yang, X. Li, X. Su, X. Lin, X. Q. Li, X. Jin, X. Shen, X. Chen, X. Sun, X. Wang, X. Song, X. Zhou, X. Wang, X. Shan, Y. K. Li, Y. Q. Wang, Y. X. Wei, Y. Zhang, Y. Xu, Y. Li, Y. Zhao, Y. Sun, Y. Wang, Y. Yu, Y. Zhang, Y. Shi, Y. Xiong, Y. He, Y. Piao, Y. Wang, Y. Tan, Y. Ma, Y. Liu, Y. Guo, Y. Ou, Y. Wang, Y. Gong, Y. Zou, Y. He, Y. Xiong, Y. Luo, Y. You, Y. Liu, Y. Zhou, Y. X. Zhu, Y. Huang, Y. Li, Y. Zheng, Y. Zhu, Y. Ma, Y. Tang, Y. Zha, Y. Yan, Z. Z. Ren, Z. Ren, Z. Sha, Z. Fu, Z. Xu, Z. Xie, Z. Zhang, Z. Hao, Z. Ma, Z. Yan, Z. Wu, Z. Gu, Z. Zhu, Z. Liu, Z. Li, Z. Xie, Z. Song, Z. Pan, Z. Huang, Z. Xu, Z. Zhang, and Z. Zhang
+
+DeepSeek-R1 incentivizes reasoning in LLMs through reinforcement learning.
+
+Nature 645 (8081), pp. 633–638.
+
+Cited by: Table 2,
+Table 2,
+Table 3.
+
+Hao et al. (2025)
+S. Hao, S. Sukhbaatar, D. Su, X. Li, Z. Hu, J. E. Weston, and Y. Tian
+
+Training large language models to reason in a continuous latent space.
+
+In Second Conference on Language Modeling,
+
+Cited by: §1,
+§5,
+§5.
+
+He et al. (2024)
+C. He, R. Luo, Y. Bai, S. Hu, Z. Thai, J. Shen, J. Hu, X. Han, Y. Huang, Y. Zhang, J. Liu, L. Qi, Z. Liu, and M. Sun
+
+OlympiadBench: a challenging benchmark for promoting AGI with Olympiad-level bilingual multimodal scientific problems.
+
+In Proceedings of the 62nd Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers),
+
+pp. 3828–3850.
+
+Cited by: §4.1.
+
+Hendrycks et al. (2021)
+D. Hendrycks, C. Burns, S. Kadavath, A. Arora, S. Basart, E. Tang, D. Song, and J. Steinhardt
+
+Measuring mathematical problem solving with the MATH dataset.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §4.1.
+
+Hu (2025)
+J. Hu
+
+REINFORCE++: a simple and efficient approach for aligning large language models.
+
+arXiv preprint arXiv:2501.03262.
+
+Cited by: §3.1,
+§5.
+
+Huang et al. (2026)
+G. Huang, T. Xu, M. Wang, Q. Yi, X. Gong, S. Li, R. Xiong, K. Li, Y. Jiang, and B. Zhou
+
+Low-probability tokens sustain exploration in reinforcement learning with verifiable reward.
+
+In Findings of the Association for Computational Linguistics: ACL 2026,
+
+pp. 24158–24188.
+
+Cited by: §5.
+
+Jang et al. (2017)
+E. Jang, S. Gu, and B. Poole
+
+Categorical reparameterization with Gumbel-softmax.
+
+In International Conference on Learning Representations,
+
+Cited by: §1,
+§3.1.
+
+Liao et al. (2025)
+M. Liao, X. Xi, R. Chen, J. Leng, Y. Hu, K. Zeng, S. Liu, and H. Wan
+
+Enhancing efficiency and exploration in reinforcement learning for LLMs.
+
+In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing,
+
+pp. 1451–1463.
+
+Cited by: §5.
+
+Liu et al. (2025)
+M. Liu, S. Diao, X. Lu, J. Hu, X. Dong, Y. Choi, J. Kautz, and Y. Dong
+
+ProRL: prolonged reinforcement learning expands reasoning boundaries in large language models.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §4.2.
+
+Maddison et al. (2017)
+C. J. Maddison, A. Mnih, and Y. W. Teh
+
+The concrete distribution: a continuous relaxation of discrete random variables.
+
+In International Conference on Learning Representations,
+
+Cited by: §1,
+§3.1.
+
+Maddison et al. (2014)
+C. J. Maddison, D. Tarlow, and T. Minka
+
+A* sampling.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §3.1.
+
+Martins and Astudillo (2016)
+A. F. T. Martins and R. F. Astudillo
+
+From softmax to sparsemax: a sparse model of attention and multi-label classification.
+
+In International Conference on Machine Learning,
+
+pp. 1614–1623.
+
+Cited by: §3.2.
+
+Pascanu et al. (2013)
+R. Pascanu, T. Mikolov, and Y. Bengio
+
+On the difficulty of training recurrent neural networks.
+
+In Proceedings of the 30th International Conference on Machine Learning,
+
+pp. 1310–1318.
+
+Cited by: §3.1.
+
+Peters et al. (2019)
+B. Peters, V. Niculae, and A. F. T. Martins
+
+Sparse sequence-to-sequence models.
+
+In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics,
+
+pp. 1504–1519.
+
+Cited by: §1,
+§3.2,
+§7.2.
+
+Ramamurthy et al. (2023)
+R. Ramamurthy, P. Ammanabrolu, K. Brantley, J. Hessel, R. Sifa, C. Bauckhage, H. Hajishirzi, and Y. Choi
+
+Is reinforcement learning (not) for natural language processing: benchmarks, baselines, and building blocks for natural language policy optimization.
+
+In International Conference on Learning Representations,
+
+Cited by: footnote 1.
+
+Rein et al. (2024)
+D. Rein, B. L. Hou, A. C. Stickland, J. Petty, R. Y. Pang, J. Dirani, J. Michael, and S. R. Bowman
+
+GPQA: a graduate-level google-proof Q&A benchmark.
+
+In First Conference on Language Modeling,
+
+Cited by: §4.1.
+
+Rizvi-Martel et al. (2026)
+M. Rizvi-Martel, G. Rabusseau, and M. Mosbach
+
+The illusion of superposition? A principled analysis of latent thinking in language models.
+
+In Third Conference on Language Modeling,
+
+Cited by: §4.3,
+§4.3,
+§5.
+
+Schulman et al. (2017)
+J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov
+
+Proximal policy optimization algorithms.
+
+arXiv preprint arXiv:1707.06347.
+
+Cited by: §3.1.
+
+Shao et al. (2024)
+Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, X. Bi, H. Zhang, M. Zhang, Y. K. Li, Y. Wu, and D. Guo
+
+DeepSeekMath: pushing the limits of mathematical reasoning in open language models.
+
+arXiv preprint arXiv:2402.03300.
+
+Cited by: §3.1,
+§4.1,
+§5.
+
+Shen et al. (2025)
+Z. Shen, H. Yan, L. Zhang, Z. Hu, Y. Du, and Y. He
+
+CODI: compressing chain-of-thought into continuous space via self-distillation.
+
+In Proceedings of the 2025 Conference on Empirical Methods in
+Natural Language Processing,
+
+pp. 677–693.
+
+Cited by: §1,
+§5,
+§5.
+
+Sheng et al. (2025)
+G. Sheng, C. Zhang, Z. Ye, X. Wu, W. Zhang, R. Zhang, Y. Peng, H. Lin, and C. Wu
+
+HybridFlow: a flexible and efficient RLHF framework.
+
+In Proceedings of the Twentieth European Conference on Computer Systems,
+
+pp. 1279–1297.
+
+Cited by: §3.1.
+
+Sutton et al. (1999)
+R. S. Sutton, D. A. McAllester, S. P. Singh, and Y. Mansour
+
+Policy gradient methods for reinforcement learning with function approximation.
+
+In Advances in Neural Information Processing Systems,
+
+pp. 1057–1063.
+
+Cited by: §2.
+
+Tang et al. (2026)
+Y. Tang, L. Dong, Y. Hao, Q. Dong, F. Wei, and J. Gu
+
+Multiplex thinking: reasoning via token-wise branch-and-merge.
+
+arXiv preprint arXiv:2601.08808.
+
+Cited by: §5.
+
+Tezekbayev et al. (2022)
+M. Tezekbayev, V. Nikoulina, M. Gallé, and Z. Assylbekov
+
+Speeding up entmax.
+
+In Findings of the Association for Computational Linguistics: NAACL 2022,
+
+pp. 1142–1158.
+
+Cited by: §7.2.
+
+Wang et al. (2025)
+K. Wang, X. Duan, and T. Du
+
+Improving latent reasoning in LLMs via soft concept mixing.
+
+arXiv preprint arXiv:2511.16885.
+
+Cited by: §1,
+§5.
+
+Wang et al. (2021)
+Z. Wang, W. Zhang, N. Liu, and J. Wang
+
+Scalable rule-based representation learning for interpretable classification.
+
+In Advances in Neural Information Processing Systems,
+
+pp. 30479–30491.
+
+Cited by: §3.1.
+
+Wei et al. (2022)
+J. Wei, X. Wang, D. Schuurmans, M. Bosma, B. Ichter, F. Xia, E. H. Chi, Q. V. Le, and D. Zhou
+
+Chain-of-thought prompting elicits reasoning in large language models.
+
+In Advances in Neural Information Processing Systems,
+
+pp. 24824–24837.
+
+Cited by: §1,
+§2.
+
+Williams (1992)
+R. J. Williams
+
+Simple statistical gradient-following algorithms for connectionist reinforcement learning.
+
+Machine Learning, pp. 229–256.
+
+Cited by: §2.
+
+Wu et al. (2025)
+H. Wu, Z. Teng, and K. Tu
+
+Parallel continuous chain-of-thought with jacobi iteration.
+
+In Proceedings of the 2025 Conference on Empirical Methods in
+Natural Language Processing,
+
+pp. 914–926.
+
+Cited by: §1,
+§5,
+§5.
+
+Wu et al. (2026a)
+J. Wu, Y. Xiong, X. Li, S. Yu, Z. Hu, T. Yu, R. Wang, X. Chen, J. Shang, and J. McAuley
+
+CTRLS: chain-of-thought reasoning via latent state transition.
+
+In Proceedings of the 29th International Conference on Artificial Intelligence and Statistics,
+
+pp. 2728–2736.
+
+Cited by: §5.
+
+Wu et al. (2026b)
+J. Wu, J. Lu, Z. Ren, G. Hu, Z. Wu, D. Dai, and H. Wu
+
+LLMs are single-threaded reasoners: demystifying the working mechanism of soft thinking.
+
+In The Fourteenth International Conference on Learning Representations,
+
+Cited by: §5.
+
+Xu et al. (2026)
+X. Xu, T. Yu, X. Chen, H. Wang, J. McAuley, and S. Mitra
+
+ThinkRouter: efficient reasoning via routing thinking between latent and discrete spaces.
+
+arXiv preprint arXiv:2602.11683.
+
+Cited by: §5.
+
+Xu et al. (2025a)
+Y. Xu, X. Guo, Z. Zeng, and C. Miao
+
+SoftCoT++: test-time scaling with soft chain-of-thought reasoning.
+
+arXiv preprint arXiv:2505.11484.
+
+Cited by: §5.
+
+Xu et al. (2025b)
+Y. Xu, X. Guo, Z. Zeng, and C. Miao
+
+SoftCoT: soft chain-of-thought for efficient reasoning with LLMs.
+
+In Proceedings of the 63rd Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers),
+
+pp. 23336–23351.
+
+Cited by: §1,
+§5,
+§5.
+
+Yu et al. (2025)
+Q. Yu, Z. Zhang, R. Zhu, Y. Yuan, X. Zuo, Y. Yu, W. Dai, T. Fan, G. Liu, J. Liu, L. Liu, X. Liu, H. Lin, Z. Lin, B. Ma, G. Sheng, Y. Tong, C. Zhang, M. Zhang, R. Zhang, W. Zhang, H. Zhu, J. Zhu, J. Chen, J. Chen, C. Wang, H. Yu, Y. Song, X. Wei, H. Zhou, J. Liu, W. Ma, Y. Zhang, L. Yan, Y. Wu, and M. Wang
+
+DAPO: an open-source LLM reinforcement learning system at scale.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §3.1,
+§4.1,
+§5.
+
+Yue et al. (2025)
+Y. Yue, Z. Chen, R. Lu, A. Zhao, Z. Wang, Y. Yue, S. Song, and G. Huang
+
+Does reinforcement learning really incentivize reasoning capacity in LLMs beyond the base model?.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §4.2.
+
+Zhang et al. (2025)
+Z. Zhang, X. He, W. Yan, A. Shen, C. Zhao, and X. Wang
+
+Soft thinking: unlocking the reasoning potential of LLMs in continuous concept space.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §1,
+§2,
+§3.2,
+§4.2,
+§5,
+§5,
+§7.3.
+
+Zheng et al. (2025)
+C. Zheng, S. Liu, M. Li, X. Chen, B. Yu, C. Gao, K. Dang, Y. Liu, R. Men, A. Yang, J. Zhou, and J. Lin
+
+Group sequence policy optimization.
+
+arXiv preprint arXiv:2507.18071.
+
+Cited by: §3.1,
+§5.
+
+Zheng and Lee (2025)
+Z. Zheng and W. S. Lee
+
+Soft-GRPO: surpassing discrete-token LLM reinforcement learning via Gumbel-reparameterized soft-thinking policy optimization.
+
+arXiv preprint arXiv:2511.06411.
+
+Cited by: §1,
+§1,
+§2,
+Figure 1,
+Figure 1,
+§3.1,
+§3.2,
+§4.1,
+§4.1,
+§4.2,
+§4.4,
+Table 2,
+Table 2,
+§5,
+§7.1,
+§7.2,
+§7.2,
+§7.3,
+Table 3.
+
+Zhou et al. (2026)
+Y. Zhou, J. Yu, H. Dong, Z. Hao, H. Wang, J. Zhang, and Q. Lin
+
+LEPO: latent reasoning policy optimization for large language models.
+
+In Findings of the Association for Computational Linguistics: ACL 2026,
+
+pp. 14416–14427.
+
+Cited by: §3.2,
+§4.1,
+§4.1,
+§4.4,
+Table 2,
+Table 2,
+§5,
+§7.1,
+Table 3.
+
+Zhu et al. (2025)
+H. Zhu, S. Hao, Z. Hu, J. Jiao, S. J. Russell, and Y. Tian
+
+Reasoning by superposition: a theoretical perspective on chain of continuous thought.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §1,
+§4.2,
+§5.
+
+\beginappendix
+
+## 7 Implementation Details
+
+## 7.1 Sparse RL Relaxation with GRPO
+
+We provide two implementations of Sparse RL Relaxation on the GRPO framework.
+The first implements the full relaxation by differentiating through the
+complete soft-CoT trajectory, while the second uses Proxy Gradient Grafting
+for efficient training with decoupled rollout and optimization.
+Both implementations use the Gumbel–entmax soft-token construction in
+Eqn. (15) and differ only in how gradients through the
+soft-token sequence are computed.
+
+For a rollout group with rewards $\{R_{g}\}_{g=1}^{G}$ , the group-relative
+advantage is
+
+ $\displaystyle\widehat{A}_{g}$ 
+ $\displaystyle=\frac{R_{g}-\mu_{R}}{\sigma_{R}+\varepsilon_{A}},\qquad\mu_{R}=\frac{1}{G}\sum_{h=1}^{G}R_{h},\qquad\sigma_{R}=\sqrt{\frac{1}{G}\sum_{h=1}^{G}(R_{h}-\mu_{R})^{2}}.$ 
+
+(16)
+
+Given token-level importance ratios $\{r_{g,j}\}$ , define the shared clipped
+GRPO loss
+
+ $\displaystyle\mathcal{L}_{\mathrm{GRPO}}\left(\{r_{g,j}\},\{\widehat{A}_{g}\}\right):=-\frac{1}{G}\sum_{g=1}^{G}\frac{1}{n_{g}}\sum_{j=1}^{n_{g}}\min\left\{r_{g,j}\widehat{A}_{g},\,\operatorname{clip}\left(r_{g,j},1-\varepsilon_{\mathrm{clip}},1+\varepsilon_{\mathrm{clip}}\right)\widehat{A}_{g}\right\}.$ 
+
+(17)
+
+We instantiate Sparse RL Relaxation on a common GRPO backbone.
+The two implementations below differ only in the construction of the
+current-policy soft-token gradient and the resulting importance ratio.
+
+## Sparse RL Relaxation with GRPO
+
+Algorithm 1 differentiates through the complete
+current-policy soft-CoT trajectory.
+
+Algorithm 1 Full Sparse RL Relaxation with GRPO
+
+ 1:
+
+ prompt batch $\mathcal{B}$ ,
+policy $\pi_{\bm{\theta}}$ ,
+group size $G$ ,
+ $\alpha$ ,
+ $\tau_{g}$ ,
+learning rate $\eta$ 
+
+ 2:
+
+ $\bm{\theta}_{\mathrm{old}}\leftarrow\operatorname{copy}(\bm{\theta})$ 
+
+ 3:
+
+ $\mathcal{L}_{\mathrm{full}}\leftarrow 0$ 
+
+ 4:
+
+ for $\bm{x}\in\mathcal{B}$ do
+
+ 5:
+
+   for $g=1,\ldots,G$ do
+
+ 6:
+
+    for $i=1,\ldots,m$ do
+
+ 7:
+
+       $\bm{\epsilon}_{i}^{(g)}\sim\mathrm{Gumbel}(0,1)^{|\mathcal{V}|}$ 
+
+ 8:
+
+       $\bm{z}_{i}^{\mathrm{old},(g)}\leftarrow f_{\bm{\theta}_{\mathrm{old}}}\left(\bm{x},\tilde{\bm{e}}_{<i}^{\mathrm{old},(g)}\right)$ 
+
+ 9:
+
+       $\tilde{\bm{p}}_{i}^{\mathrm{old},(g)}\leftarrow\operatorname{entmax}_{\alpha}\left(\frac{\bm{z}_{i}^{\mathrm{old},(g)}+\bm{\epsilon}_{i}^{(g)}}{\tau_{g}}\right)$ 
+
+ 10:
+
+       $\tilde{\bm{e}}_{i}^{\mathrm{old},(g)}\leftarrow\displaystyle\sum_{k=1}^{|\mathcal{V}|}\tilde{p}_{i,k}^{\mathrm{old},(g)}\bm{e}_{k}$ 
+
+ 11:
+
+    end for
+
+ 12:
+
+     $\bm{y}_{1:n_{g}}^{(g)}\sim\pi_{\bm{\theta}_{\mathrm{old}}}\left(\cdot\mid\bm{x},\tilde{\bm{e}}_{1:m}^{\mathrm{old},(g)}\right)$ 
+
+ 13:
+
+     $R_{g}\leftarrow R\left(\bm{x},\bm{y}_{1:n_{g}}^{(g)}\right)$ 
+
+ 14:
+
+     $\ell_{g,j}^{\mathrm{old}}\leftarrow\log\pi_{\bm{\theta}_{\mathrm{old}}}\left(y_{j}^{(g)}\mid\bm{x},\tilde{\bm{e}}_{1:m}^{\mathrm{old},(g)},\bm{y}_{<j}^{(g)}\right),\quad j=1,\ldots,n_{g}$ 
+
+ 15:
+
+   end for
+
+ 16:
+
+    $\widehat{A}_{g}\leftarrow\text{Eqn.~(\ref{eq:impl_grpo_advantage})},\quad g=1,\ldots,G$ 
+
+ 17:
+
+   for $g=1,\ldots,G$ do
+
+ 18:
+
+    for $i=1,\ldots,m$ do
+
+ 19:
+
+       $\bm{z}_{i}^{\bm{\theta},(g)}\leftarrow f_{\bm{\theta}}\left(\bm{x},\tilde{\bm{e}}_{<i}^{\bm{\theta},(g)}\right)$ 
+
+ 20:
+
+       $\tilde{\bm{p}}_{i}^{\bm{\theta},(g)}\leftarrow\operatorname{entmax}_{\alpha}\left(\frac{\bm{z}_{i}^{\bm{\theta},(g)}+\bm{\epsilon}_{i}^{(g)}}{\tau_{g}}\right)$ 
+
+ 21:
+
+       $\tilde{\bm{e}}_{i}^{\bm{\theta},(g)}\leftarrow\displaystyle\sum_{k=1}^{|\mathcal{V}|}\tilde{p}_{i,k}^{\bm{\theta},(g)}\bm{e}_{k}$ 
+
+ 22:
+
+    end for
+
+ 23:
+
+     $\ell_{g,j}^{\bm{\theta}}\leftarrow\log\pi_{\bm{\theta}}\left(y_{j}^{(g)}\mid\bm{x},\tilde{\bm{e}}_{1:m}^{\bm{\theta},(g)},\bm{y}_{<j}^{(g)}\right),\quad j=1,\ldots,n_{g}$ 
+
+ 24:
+
+     $r_{g,j}^{\mathrm{full}}\leftarrow\exp\left(\ell_{g,j}^{\bm{\theta}}-\ell_{g,j}^{\mathrm{old}}\right),\quad j=1,\ldots,n_{g}$ 
+
+ 25:
+
+   end for
+
+ 26:
+
+    $\mathcal{L}_{\mathrm{full}}\leftarrow\mathcal{L}_{\mathrm{full}}+\frac{1}{|\mathcal{B}|}\mathcal{L}_{\mathrm{GRPO}}\left(\{r_{g,j}^{\mathrm{full}}\},\{\widehat{A}_{g}\}\right)$ 
+
+ 27:
+
+ end for
+
+ 28:
+
+ $\bm{\theta}\leftarrow\operatorname{OptimizerStep}\left(\bm{\theta},\nabla_{\bm{\theta}}\mathcal{L}_{\mathrm{full}};\eta\right)$ 
+
+## Efficient Sparse RL Relaxation with Proxy Gradient Grafting
+
+Algorithm 2 replaces the full recursive gradient
+with Proxy Gradient Grafting.
+
+Algorithm 2 Efficient Sparse RL Relaxation with Proxy Gradient Grafting
+
+ 1:
+
+ prompt batch $\mathcal{B}$ ,
+policy $\pi_{\bm{\theta}}$ ,
+group size $G$ ,
+ $\alpha$ ,
+ $\tau_{g}$ ,
+learning rate $\eta$ 
+
+ 2:
+
+ $\bm{\theta}_{\mathrm{old}}\leftarrow\operatorname{copy}(\bm{\theta})$ 
+
+ 3:
+
+ $\mathcal{L}_{\mathrm{proxy}}\leftarrow 0$ 
+
+ 4:
+
+ for $\bm{x}\in\mathcal{B}$ do
+
+ 5:
+
+   for $g=1,\ldots,G$ do
+
+ 6:
+
+    for $i=1,\ldots,m$ do
+
+ 7:
+
+       $\bm{\epsilon}_{i}^{(g)}\sim\mathrm{Gumbel}(0,1)^{|\mathcal{V}|}$ 
+
+ 8:
+
+       $\bm{z}_{i}^{\mathrm{roll},(g)}\leftarrow f_{\bm{\theta}_{\mathrm{old}}}\left(\bm{x},\tilde{\bm{e}}_{<i}^{\mathrm{roll},(g)}\right)$ 
+
+ 9:
+
+       $\tilde{\bm{p}}_{i}^{\mathrm{roll},(g)}\leftarrow\operatorname{entmax}_{\alpha}\left(\frac{\bm{z}_{i}^{\mathrm{roll},(g)}+\bm{\epsilon}_{i}^{(g)}}{\tau_{g}}\right)$ 
+
+ 10:
+
+       $\tilde{\bm{e}}_{i}^{\mathrm{roll},(g)}\leftarrow\displaystyle\sum_{k=1}^{|\mathcal{V}|}\tilde{p}_{i,k}^{\mathrm{roll},(g)}\bm{e}_{k}$ 
+
+ 11:
+
+    end for
+
+ 12:
+
+     $\bm{y}_{1:n_{g}}^{(g)}\sim\pi_{\bm{\theta}_{\mathrm{old}}}\left(\cdot\mid\bm{x},\tilde{\bm{e}}_{1:m}^{\mathrm{roll},(g)}\right)$ 
+
+ 13:
+
+     $R_{g}\leftarrow R\left(\bm{x},\bm{y}_{1:n_{g}}^{(g)}\right)$ 
+
+ 14:
+
+     $\ell_{g,j}^{\mathrm{old}}\leftarrow\log\pi_{\bm{\theta}_{\mathrm{old}}}\left(y_{j}^{(g)}\mid\bm{x},\tilde{\bm{e}}_{1:m}^{\mathrm{roll},(g)},\bm{y}_{<j}^{(g)}\right),\quad j=1,\ldots,n_{g}$ 
+
+ 15:
+
+   end for
+
+ 16:
+
+    $\widehat{A}_{g}\leftarrow\text{Eqn.~(\ref{eq:impl_grpo_advantage})},\quad g=1,\ldots,G$ 
+
+ 17:
+
+   for $g=1,\ldots,G$ do
+
+ 18:
+
+    for $i=1,\ldots,m$ do
+
+ 19:
+
+       $\bm{z}_{i}^{\mathrm{proxy},(g)}\leftarrow f_{\bm{\theta}}\left(\bm{x},\operatorname{sg}\left(\tilde{\bm{e}}_{<i}^{\mathrm{roll},(g)}\right)\right)$ 
+
+ 20:
+
+       $\tilde{\bm{p}}_{i}^{\mathrm{proxy},(g)}\leftarrow\operatorname{entmax}_{\alpha}\left(\frac{\bm{z}_{i}^{\mathrm{proxy},(g)}+\bm{\epsilon}_{i}^{(g)}}{\tau_{g}}\right)$ 
+
+ 21:
+
+       $\bar{\bm{p}}_{i}^{(g)}\leftarrow\operatorname{sg}\left(\tilde{\bm{p}}_{i}^{\mathrm{roll},(g)}\right)+\tilde{\bm{p}}_{i}^{\mathrm{proxy},(g)}-\operatorname{sg}\left(\tilde{\bm{p}}_{i}^{\mathrm{proxy},(g)}\right)$ 
+
+ 22:
+
+       $\bar{\bm{e}}_{i}^{(g)}\leftarrow\displaystyle\sum_{k=1}^{|\mathcal{V}|}\bar{p}_{i,k}^{(g)}\bm{e}_{k}$ 
+
+ 23:
+
+    end for
+
+ 24:
+
+     $\bar{\ell}_{g,j}^{\bm{\theta}}\leftarrow\log\pi_{\bm{\theta}}\left(y_{j}^{(g)}\mid\bm{x},\bar{\bm{e}}_{1:m}^{(g)},\bm{y}_{<j}^{(g)}\right),\quad j=1,\ldots,n_{g}$ 
+
+ 25:
+
+     $r_{g,j}^{\mathrm{proxy}}\leftarrow\exp\left(\bar{\ell}_{g,j}^{\bm{\theta}}-\ell_{g,j}^{\mathrm{old}}\right),\quad j=1,\ldots,n_{g}$ 
+
+ 26:
+
+   end for
+
+ 27:
+
+    $\mathcal{L}_{\mathrm{proxy}}\leftarrow\mathcal{L}_{\mathrm{proxy}}+\frac{1}{|\mathcal{B}|}\mathcal{L}_{\mathrm{GRPO}}\left(\{r_{g,j}^{\mathrm{proxy}}\},\{\widehat{A}_{g}\}\right)$ 
+
+ 28:
+
+ end for
+
+ 29:
+
+ $\bm{\theta}\leftarrow\operatorname{OptimizerStep}\left(\bm{\theta},\nabla_{\bm{\theta}}\mathcal{L}_{\mathrm{proxy}};\eta\right)$ 
+
+For clarity, Algorithms 1 and
+2 present the full-vocabulary formulation and
+omit optimizer-specific and shared GRPO regularization details. In practice, this may result in heavy memory burden. Thus, recent methods (Zheng and Lee, 2025; Zhou et al., 2026; Butt et al., 2026) typically select only top- $k$ candidate logits for soft token construction.
+More details of hyperparameter of the implementation can be found in the next subsection.
+
+## 7.2 Implementation Configuration and Hyperparameters
+
+To ensure a controlled comparison, we use a unified training configuration
+across all methods and keep all shared components fixed whenever applicable.
+Our setup closely follows SofT-GRPO (Zheng and Lee, 2025), including the
+GRPO backbone, rollout configuration, optimization settings, and training
+budget. Competing methods differ only in hyperparameters required by their
+respective soft-CoT mechanisms. Full configurations are reported in
+Table 3.
+
+For SpaRLax, we set the entmax parameter to $\alpha=1.5$ .
+This is a commonly used choice in prior entmax-related papers
+(Peters et al., 2019; Correia et al., 2019; Tezekbayev et al., 2022),
+providing an intermediate level of sparsity between softmax
+( $\alpha=1$ ) and sparsemax ( $\alpha=2$ ).
+Importantly, $\alpha=1.5$ also admits a specialized exact algorithm,
+making it particularly convenient to implement and with lower latency compared
+with general values of $\alpha$ , which typically require iterative
+computation (Peters et al., 2019; Tezekbayev et al., 2022).
+
+In addition, we use a candidate-set size of $k=32$ for SpaRLax for lower memory usage; future work can consider implementations with fused kernels (Gonçalves et al., 2025).
+Unlike softmax, entmax can adaptively reduce its effective support by
+assigning exactly zero probability to unnecessary candidates.
+This allows us to expose the model to a larger candidate pool without
+forcing all retained candidates to participate in the soft-token mixture.
+As shown in §4.4, softmax becomes increasingly
+sensitive to large $k$ (which may be the reason why other methods (Zheng and Lee, 2025; Butt et al., 2026) select a modest $k$ in their work), whereas entmax remains substantially more robust
+and can benefit from a larger candidate budget.
+We therefore use $k=32$ for SpaRLax while retaining the smaller candidate
+sets used by the softmax-based baselines.
+
+Apart from these method-specific choices, all
+shared training configurations are held fixed across methods.
+
+Parameter
+
+Discrete GRPO
+(Guo et al., 2025)
+
+SofT-GRPO
+(Zheng and Lee, 2025)
+
+SpaRLax
+(ours)
+
+STHT
+(Butt et al., 2026)
+
+LEPO
+(Zhou et al., 2026)
+
+Batch configuration
+
+Fine-tuning
+Full-parameter fine-tuning
+
+Filter overlong prompts
+Enabled
+Enabled
+Enabled
+Enabled
+Enabled
+
+Prompt batch size
+32
+32
+32
+32
+16
+
+Responses per prompt
+(group size)
+
+8
+8
+8
+8
+8
+
+Global rollout batch
+(trajectories)
+
+256
+256
+256
+256
+128
+
+Effective PPO minibatch
+(trajectories)
+
+256
+256
+256
+256
+128
+
+Microbatch per GPU
+(trajectories)
+
+1
+1
+1
+1
+1
+
+Gradient accumulation steps
+64
+64
+64
+64
+64
+
+Optimization and regularization
+
+Optimizer
+AdamW
+AdamW
+AdamW
+AdamW
+AdamW
+
+Learning rate
+ $10^{-6}$ 
+ $10^{-6}$ 
+ $10^{-6}$ 
+ $10^{-6}$ 
+ $10^{-6}$ 
+
+Adam $(\beta_{1},\beta_{2})$ 
+ $(0.9,0.999)$ 
+
+Weight decay
+0.01
+0.01
+0.01
+0.01
+0.01
+
+LR schedule / warmup steps
+Constant / 0
+
+PPO epochs per rollout
+1
+1
+1
+1
+2
+
+PPO clipping interval
+ $[0.8,1.2]$ 
+
+Dual-clip coefficient
+3.0
+3.0
+3.0
+3.0
+3.0
+
+Gradient-norm clipping
+1.0
+1.0
+1.0
+1.0
+0.5
+
+Group-standard-deviation
+normalization
+
+Enabled
+Enabled
+Enabled
+Enabled
+Enabled
+
+Entropy bonus coefficient
+0
+0
+0
+0
+0
+
+Actor KL coefficient
+ $10^{-3}$ 
+ $10^{-3}$ 
+ $10^{-3}$ 
+ $10^{-3}$ 
+ $10^{-3}$ 
+
+LEPO KL estimator
+–
+–
+–
+–
+ $1$ 
+
+Max training steps
+(outer iterations)
+
+ $3,000$ 
+ $3,000$ 
+ $3,000$ 
+ $3,000$ 
+ $3,000$ 
+
+Training-time generation and method configuration
+
+Soft thinking
+Disabled
+Enabled
+Enabled
+Enabled
+Enabled
+
+Soft-token transform
+–
+Softmax
+Entmax
+Softmax
+Softmax
+
+Soft candidate count
+–
+5
+32
+5
+30
+
+Entmax $\alpha$ 
+–
+–
+1.5
+–
+–
+
+Relaxation temperature
+–
+0.1
+1.0
+1.0
+0.5
+
+Gumbel-noise multiplier
+–
+1.0
+1.0
+1.0
+1.0
+
+Categorical sampling
+temperature
+
+1.0
+1.0
+1.0
+1.0
+1.0
+
+Categorical top- $k$ 
+/ top- $p$ 
+
+5 / 0.95
+5 / 0.95
+5 / 0.95
+5 / 0.95
+5 / 0.95
+
+Direct PG positions
+All
+All
+answer phase
+All
+answer phase
+
+LEPO maximum latent steps
+–
+–
+–
+–
+64
+
+STHT density scale $\sigma$ 
+–
+–
+–
+ $0.33\,\mathrm{RMS}(E)$ 
+–
+
+STHT log-score range
+–
+–
+–
+ $[-50,0]$ 
+–
+
+Precision and parallelism
+
+Forward precision
+BF16
+BF16
+BF16
+BF16
+BF16
+
+GPUs
+4 NVIDIA H100 GPUs
+
+Actor sharding
+FSDP1
+FSDP1
+FSDP1
+FSDP1
+FSDP1
+
+Sequence / rollout tensor
+parallel size
+
+1 / 1
+1 / 1
+1 / 1
+1 / 1
+1 / 1
+
+Gradient checkpointing
+Enabled
+Enabled
+Enabled
+Enabled
+Enabled
+
+Parameter / optimizer
+offload
+
+Enabled
+Enabled
+Enabled
+Enabled
+Enabled
+
+Table 3: Training hyperparameters. The first four columns retain the supplied GSM8K settings; LEPO reports launcher defaults, which use DeepScaleR training data. Batch sizes distinguish prompt groups from generated trajectories.
+
+## 7.3 Stopping Criterion for Soft Reasoning
+
+We follow the stopping criterion used in prior soft-thinking methods
+(Zhang et al., 2025; Zheng and Lee, 2025) to determine when to
+transition from soft reasoning back to standard discrete decoding.
+At each reasoning step $i$ , after constructing the soft-token distribution
+ $\tilde{\bm{p}}_{i}$ , we identify its most probable vocabulary token as
+
+ $\displaystyle t_{i}^{\star}=\arg\max_{k\in\mathcal{V}}\tilde{p}_{i,k}.$ 
+
+(18)
+
+Soft reasoning continues while
+ $t_{i}^{\star}\neq\langle/\mathrm{think}\rangle$ .
+Once the end-of-thinking token becomes the most probable token, i.e.,
+ $t_{i}^{\star}=\langle/\mathrm{think}\rangle$ , we terminate the soft reasoning
+phase and switch to standard autoregressive decoding for the final answer.
+All subsequent answer tokens are discrete and sampled from the
+model’s vocabulary in the usual manner.
+
+This stopping rule is applied during both rollout and inference and does
+not introduce an additional learned stopping module or a method-specific
+stopping criterion.
+
+## 8 Limitations and Future Work
+
+## Superposition utilization.
+
+Our analysis in §4.3 provides evidence that
+the non-top-1 components of a soft token have a measurable effect on
+downstream model computation, as our SpaRLax exhibits a stronger effect than the
+competing methods.
+This intervention provides an indirect measure of superposition
+utilization, as it does not fully show that multiple trajectories are truly used during exploration. In future work, we are interested in exploring how such superposition can help search tasks, such as the Traveling Salesperson Problem.
+
+## Scale and generalization.
+
+Although we evaluate the trained models across nine benchmarks spanning
+mathematical, knowledge-intensive, and code reasoning, our post-training
+experiments are conducted with one base model and one RL training
+corpus. However, we cannot afford more experiments using assorted LLMs and corpora. Nevertheless, we have carefully designed the experiments by isolating the effect of the proposed learning mechanism from the underlying model, training
+data, and RL algorithm, as the configurations are fixed across all competing
+methods. Moreover, the consistent improvements observed across multiple
+reasoning domains suggest that the benefit is not confined to a specific setup.
+We leave the scaling of this study to large technology companies.

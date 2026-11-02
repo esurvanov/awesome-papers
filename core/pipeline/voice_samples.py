@@ -14,9 +14,10 @@ from voice import ENGINES, CLEAN, stress  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 
-SILERO = [("silero_xenia", "silero", "v4_ru", "xenia", False), ("silero_baya", "silero", "v4_ru", "baya", False),
+SILERO = [("silero_xenia", "silero", "v4_ru", "xenia", False), ("silero_baya", "silero", "v4_ru", "baya", False), ("silero_kseniya", "silero", "v4_ru", "kseniya", False),
           ("silero_aidar", "silero", "v4_ru", "aidar", False), ("silero_eugene", "silero", "v4_ru", "eugene", False)]
-OPENAI = [("openai_realtime_cedar", "realtime", "gpt-realtime-2.1", "cedar", True),
+OPENAI = [("openai_realtime_verse", "realtime", "gpt-realtime-2.1", "verse", False),  # голос по умолчанию
+          ("openai_realtime_cedar", "realtime", "gpt-realtime-2.1", "cedar", True),
           ("openai_chat_marin", "chat", "gpt-audio-1.5", "marin", True),
           ("openai_tts_cedar", "speech", "gpt-4o-mini-tts-2025-03-20", "cedar", True)]
 

@@ -1,0 +1,1233 @@
+## Fix, Not Just Resample: Bounded Compiler-Guided Repair in Lean 4
+
+Haotian Deng
+
+Chris Farber
+
+Sonal Narasimha
+
+Samskrithi Sivakumar
+
+Yexiang Xue
+
+Abstract
+
+Automated theorem provers often rely on sampling language
+models, but proof assistants like Lean reject each failed step with a precise
+error message — information that pure sampling discards. To overcome this,
+we introduce a bounded, online step-level repair module. Our search samples
+ $K$ candidate tactics at each step and repairs a failed tactic at most $R$ 
+times. Instead of discarding failed tactics, we feed the compiler’s error
+message to a pretrained repair model to fix individual rejected steps in
+place. This approach improves the solve rate over a sampling-only baseline
+across all tested candidate budgets ( $K\in\{1,3,5,8\}$ ), achieving up to a
+ $32\%$ relative gain and solving $82$ additional theorems on a
+ $1{,}990$ -theorem subset of the LeanDojo benchmark. Repair is not free: it
+trades extra runtime for reachable proofs. But the trade is predictable:
+repair pays most when sampling is constrained; its return is front-loaded,
+with the first repair attempt capturing $84\text{--}96\%$ of the total gain;
+and the gain comes almost entirely from shallow tactic-execution failures
+rather than structural errors such as type mismatches. This targeted repair
+successfully replicates on a second benchmark (Lean Workbook), nearly
+doubling the solve rate with zero regressions.
+
+1Purdue University
+
+{deng254, cfarber, narasim9, sivaku17, yexiang}@purdue.edu
+
+## 1 Introduction
+
+A growing share of AI systems produce output that a machine can check for
+correctness automatically: generated code can be run against a test suite
+(Chen et al. 2021), and a generated math proof can be checked step by
+step by a proof assistant. Because checking is cheap and automatic, the standard
+way to solve a hard problem with such a system is simply to have the model
+guess many times and keep whichever guess the checker accepts. This works, but
+it runs into a wall: every guess is drawn from the same fixed model, so guesses
+cluster around what that model already tends to produce, and solutions that lie
+outside its distribution are hard to discover no matter how many times you
+sample (Brown et al. 2024). Within any realistic budget, many problems the
+model could in principle solve
+go unsolved, because a correct candidate is never drawn.
+
+We study this problem in neural theorem proving, where an AI model tries to
+prove a formal math statement using the Lean proof assistant. A typical proof
+in Lean consists of tactics — single proof steps, similar to lines of
+code. The Lean compiler steps through the proof one tactic at a time: for each
+tactic the model proposes, it either accepts it, moving the proof forward, or
+rejects it with a precise error message, much like a compiler error. Today’s
+neural provers in the ReProver family, built on
+LeanDojo (Yang et al. 2023), handle a rejected tactic exactly like
+the guessing strategy above: they discard it and simply propose a new one. That
+hits the same wall — guessing more tactics has rapidly diminishing returns, so
+many provable theorems are missed simply because the prover never happens to
+guess the tactic that works.
+
+A rejected tactic, however, is not a dead end: it comes back with Lean’s error
+message, which states exactly what went wrong. Instead of discarding that
+message and guessing blindly again, we hand the failed tactic and its error
+message to a second, already-trained model whose only job is to repair
+it — to propose a fixed version of that one step. Repair is thus not a
+cheaper substitute for sampling but a complement to it: a second,
+error-conditioned source of candidates. This differs from prior
+systems that also use compiler feedback. Those systems, detailed below, wait
+until an entire proof attempt has already failed, then run the whole
+broken proof through a separate, heavyweight pipeline — a multi-agent loop, a
+symbolic rule engine, or extra training — to patch it after the fact. We
+instead repair a single broken step immediately, in the middle of the
+search, using an existing repair model with no extra training. This lets us
+ask a precise allocation question no prior work answers: the moment one
+tactic fails, is it worth more to fix that tactic or to just try guessing
+again?
+
+Concretely: APOLLO (Ospanov, Farnia, and Yousefzadeh 2025) takes a proof attempt that has
+already failed end-to-end, breaks it into sub-lemmas with a multi-agent loop,
+and re-solves the failing pieces with auxiliary solvers. PALM
+(Lu, Delaware, and Zhang 2024) first generates a complete proof, then patches its
+low-level errors afterward with symbolic, rule-based methods. APRIL
+(Wang et al. 2026) trains a dedicated repair model on 260,000
+supervised (failure, diagnostic, fix) tuples, but likewise applies it to whole
+finished proofs, not to individual steps mid-search. In each case, existing
+systems apply it to a whole failed proof after search has finished and embed
+it in enough surrounding machinery that repair’s own contribution is hard to
+isolate. We reuse APRIL’s pretrained repair model
+exactly as released — no extra training, no agent orchestration, no symbolic
+solver — and directly measure that allocation question.
+
+We integrate a bounded repair loop into tree search, with two budgets: $K$ , how
+many fresh tactics are sampled at a state, and $R$ , how many times a failed
+tactic may be repaired before it is abandoned. Setting $R{=}0$ recovers the
+pure-sampling baseline exactly, since no failed tactic is ever repaired. Our
+findings are:
+
+• 
+
+Repair reliably expands what the prover can solve. At every
+candidate budget $K$ we test, enabling repair recovers proofs that
+same-budget sampling does not reach, lifting Pass@1 — the
+percentage of theorems proved within the search budget — by 2.3–4.1
+percentage points, up to a 32% relative gain at the tightest budget, and
+solving up to 82 additional theorems on our LeanDojo subset.
+
+• 
+
+This coverage comes at a cost, measured fairly. The repair
+model is slower than the tactic generator, so repair buys reachable
+proofs in exchange for wall-clock, and at large sampling budgets that same
+time could instead buy more samples. Comparing repair-on and repair-off at
+the same $K$ would hand repair extra compute for free, so we instead read
+every configuration against pure-sampling ones of similar wall-clock —
+an iso-runtime comparison.
+
+• 
+
+The benefit is front-loaded and narrowly sourced. A single
+repair attempt ( $R{=}0\to 1$ ) captures 84–96% of everything repair ever
+provides, while further repairs saturate quickly; it is most valuable in
+the sample-constrained regime, where drawing more samples is not an
+option, and it comes almost entirely from a narrow, identifiable slice of
+failures — shallow tactic-execution errors, not structural ones like
+type mismatches.
+
+• 
+
+The effect generalizes. A second, retrieval-free benchmark
+(Lean Workbook), with a weaker generator and an untuned budget, reproduces
+the same pattern, nearly doubling the solve rate with zero regressions,
+so the effect is not an artifact of one generator or search
+configuration.
+
+Together these turn repair from an all-or-nothing feature into a cheap,
+well-scoped policy: add one targeted repair step to a generation-first
+prover, and lean on it hardest when the sampling budget is scarce.
+
+## 2 Background: Tactic-Based Theorem Proving
+
+Lean checks proofs with a small trusted kernel: a theorem is a typed statement
+and a proof is a term of that type. Rather than write the term directly, users
+work in tactic mode, issuing tactics that transform the proof state (§Introduction) until all goals close. An invalid tactic is rejected with a
+diagnostic—a type mismatch, unknown identifier, unsolved goal, or timeout.
+The repair model consumes exactly this diagnostic. Neural provers turn the
+interaction into search: at each state a model proposes candidate tactics and
+search continues from accepted successors. Our question is how to split a fixed
+runtime between sampling fresh tactics and repairing rejected ones.
+
+## 3 Related Work
+
+## 3.1 Generation-First Provers and Retrieval
+
+LeanDojo (Yang et al. 2023) established the now-standard
+retrieval-augmented Lean proving setup, and ReProver-style systems spend their
+budget on sampling more tactics and filtering them with the compiler.
+REAL-Prover (Shen et al. 2025) extends that pattern with a dedicated
+retrieval stack for harder algebraic benchmarks. LeanNavigator
+(Yin and Gao 2025) pushes the same breadth-first logic at the data layer
+by generating millions of synthetic theorems and proofs. CARTS
+(Yang et al. 2025) addresses another breadth-side bottleneck by calibrating
+tactic diversity and confidence so tree search does not waste budget on
+redundant proof paths. These systems increase the number, diversity, or quality
+of fresh attempts, but they do not refine failed tactics during search.
+
+## 3.2 Scaling via Reinforcement Learning and Heavy Compute
+
+Recent systems spend compute through larger search and training loops
+instead: AlphaProof (Hubert et al. 2025)
+combines large-scale reinforcement learning with test-time search;
+InternLM2.5-StepProver (Wu et al. 2025) guides search with a critic
+model and expert iteration; POETRY
+(Wang et al. 2024) decomposes
+proofs into sketch and subproof stages; ProofAug (Liu et al. 2025)
+turns proposals into compatible semi-proofs for tree search; Aristotle
+(Achim et al. 2025) and Seed-Prover (Chen et al. 2025) add
+informal lemma generation, a geometry solver, or deep test-time reasoning; and
+AxProverBase (Requena et al. 2026) iteratively refines a minimal agent,
+reporting diminishing returns as iterations increase. None of these isolate
+whether proof repair is a better use of a fixed compute budget than
+additional sampling; our study measures that allocation decision directly,
+treating repair as a policy choice rather than a feature that is simply
+always on.
+
+## 3.3 Compiler-Feedback Repair
+
+APOLLO (Ospanov, Farnia, and Yousefzadeh 2025), PALM (Lu, Delaware, and Zhang 2024), and APRIL
+(Wang et al. 2026) — the closest repair systems, discussed above —
+all act on a whole failed proof outside the search, whereas we treat repair
+as a bounded operator inside search. Lean Copilot (Song, Yang, and Anandkumar 2025) integrates
+language-model assistance into the interactive Lean workflow rather than
+automated search. A complementary line prevents errors before they occur:
+type-constrained decoding (Mündler et al. 2025) and ChopChop
+(Nagy et al. 2026) constrain generation so invalid tactics
+are never produced, whereas our setting repairs after the compiler rejects a
+tactic.
+
+Iterative Tactic Repair Module — Our Contribution
+
+Proof State
+Queue
+
+Neural
+Tactic
+Generator
+
+Lean
+Compiler
+
+Proof State
+Queue
+
+Proof
+Complete
+
+Check
+Repair
+Budget
+
+Repair
+Model
+StateCandidate TacticValid (push new state)Goal SolvedError (ours: repair)Error (baseline: drop)State + Tactic + ErrorFixed TacticBudget ExceededNext Iteration
+
+Figure 1: Architecture of the bounded iterative repair system. Solid arrows show
+the main proof-search pipeline; the dashed baseline path shows tactics dropped
+without repair; bold orange arrows highlight the novel repair module.
+ $K$ tactics are sampled per state; each failed tactic triggers at most $R$ 
+repair attempts before being abandoned.
+
+## 4 Methodology
+
+We define a bounded iterative repair loop integrated into a priority-queue search
+algorithm.
+
+## 4.1 Baseline Search Architecture
+
+The baseline prover maintains a priority queue of proof states. At each step, it:
+
+1. 
+
+Dequeues the state $s$ with the highest priority.
+
+2. 
+
+Uses a premise retriever to find relevant lemmas $\mathcal{P}$ .
+
+3. 
+
+Queries a tactic generator to produce $K$ candidate tactics $\{t_{1},\dots,t_{K}\}$ .
+
+4. 
+
+Evaluates each tactic in the Lean 4 environment.
+
+## 4.2 Iterative Repair Module
+
+When a tactic $t_{i}$ fails, the Lean compiler returns an error message $e_{i}$ . Our repair module $M_{R}$ takes the tuple $(s,t_{i},e_{i})$ and generates a corrected tactic $t^{\prime}_{i}$ .
+
+## Formal Parameters: K and R
+
+To prevent the search from being dominated by repair attempts on a single unviable branch, we enforce two bounds:
+
+• 
+
+K (Candidate Budget): The number of unique tactics initially sampled for each state.
+
+• 
+
+R (Repair Budget): The maximum number of times a specific tactic attempt can be iteratively repaired before it is abandoned.
+
+Total tactic attempts per state are bounded by $K\times(1+R)$ . This bound
+turns repair into an explicit depth budget rather than an unbounded retry loop.
+When $R=0$ , the system reduces to pure sampling. As $R$ increases, the search
+spends more compute on refining existing failed tactics and less of a fixed
+runtime budget on exploring fresh samples.
+
+## The Repair Loop
+
+The full algorithm is described in Algorithm 1, and Figure 1
+illustrates the overall system architecture.
+
+Algorithm 1 Priority-Queue Search with Bounded Iterative Repair
+
+ 1:
+
+   $Q\leftarrow\{s_{init}\}$ 
+
+ 2:
+
+  while $Q\neq\emptyset$ and not timeout do
+
+ 3:
+
+    $s\leftarrow\text{pop\_best}(Q)$ 
+
+ 4:
+
+    $\text{Candidates}\leftarrow\text{SampleTactics}(s,K)$ 
+
+ 5:
+
+   for all $t\in\text{Candidates}$ do
+
+ 6:
+
+     $r\leftarrow 0$ 
+
+ 7:
+
+    while $r\leq R$ do
+
+ 8:
+
+      $(\text{success},\text{result},e)\leftarrow\text{LeanEval}(s,t)$ 
+
+ 9:
+
+     if success then
+
+ 10:
+
+      if result is solved return proof
+
+ 11:
+
+       $Q\leftarrow Q\cup\text{result}$ 
+
+ 12:
+
+      break
+
+ 13:
+
+     else
+
+ 14:
+
+      if $r=R$ then
+
+ 15:
+
+       break
+
+ 16:
+
+      end if
+
+ 17:
+
+       $t\leftarrow\text{Repair}(s,t,e)$ 
+
+ 18:
+
+       $r\leftarrow r+1$ 
+
+ 19:
+
+     end if
+
+ 20:
+
+    end while
+
+ 21:
+
+   end for
+
+ 22:
+
+  end while
+
+## 4.3 The Repair Prompt
+
+When a tactic fails, the repair model $M_{R}$ is queried with a fixed chat
+template that supplies exactly three pieces of information from the failure: the
+Lean proof state (infoview) at the failing position, the failed tactic itself,
+and Lean’s verbatim error message. Because the repair model is a supervised,
+instruction-tuned model (Wang et al. 2026), we query it through the same
+chat template it was fine-tuned on—a system role and a user role holding the
+three slots above—rather than a bare feature string; the roles are the model’s
+trained interface, not optional scaffolding. It returns a corrected proof,
+sometimes prefixed by a short natural-language explanation; we keep only the
+final lean block and execute it as a tactic from the failing proof
+state, not as a replacement for the whole proof, so repair remains a per-node,
+in-search operator (Algorithm 1). If the extracted block is not a valid tactic
+sequence for that state, Lean rejects it and the repair simply fails.
+Figure 2 shows the template with a minimal example
+substituted into the slots.
+
+[system] You are a Lean 4 programmer diagnosing a single failing
+proof. Assume you only see the incorrect proof text, the infoview state near
+the failure, and Lean’s error message.
+
+[user] Provide the full corrected Lean 4 theorem/proof in a single
+lean code block.
+
+Incorrect proof: rw [add_comm]
+
+Infoview state: n : Nat $\vdash$ n + 0 = n
+
+Line at error: rw [add_comm]
+
+Lean error: tactic ’rewrite’ failed, motive is not type correct …
+
+[model output] ‘‘‘lean rw [Nat.add_zero] ‘‘‘
+
+Figure 2: The repair prompt actually sent to $M_{R}$ : a system role, a user role
+with the three failure slots (proof state, failed tactic, Lean error), and the
+model’s returned correction. Italicized text marks the per-failure values; here
+a minimal example is substituted.
+
+## 5 Experimental Setup
+
+Our experimental design aims to quantify the search-time impact of iterative tactic repair across different branching factors ( $K$ ) and repair depths ( $R$ ).
+
+## 5.1 Benchmarks
+
+We evaluate our system on the LeanDojo Benchmark
+(Yang et al. 2023), specifically a randomly sampled subset of
+2,000 theorems. This benchmark provides a diverse set of formal mathematical
+statements and their ground-truth proofs in Lean 4. The subset was sampled to
+avoid data leakage with the repair model’s training set.
+
+To test whether the repair effect is specific to this one benchmark, we also
+evaluate on a second, harder benchmark: Lean Workbook (Ying et al. 2024), a
+corpus of natural-language competition-style math problems formalized into
+Lean 4. We generate a 98-theorem validation split and an 89-theorem held-out
+test split (187 of 200 sampled dataset rows compile as valid Lean 4
+statements; the rest are dropped) using a separate, retrieval-free generator
+configuration described next.
+
+## 5.2 Model Configurations
+
+We use the public ReProver byt5-small tactic generator and its premise
+retriever (Yang et al. 2023) as the baseline prover. For the repair
+module, we employ the gAPRIL-wo-exp model (Wang et al. 2026), a
+4-billion parameter model trained on supervised proof-repair traces. We do not
+train or fine-tune either model; the training-free claim refers to integrating a
+pretrained repair module into search.
+
+Implementation and determinism.
+
+The generator decodes with beam search (beam width and number of returned
+tactics both equal to $K$ ); the repair model decodes greedily. Both are
+deterministic—no sampling and no random seeds—so the entire search is
+reproducible and each reported number comes from a single run that reproduces
+exactly (there is no run-to-run variance to average over). Input/output lengths
+are capped at 2048/512 tokens. All source code (the prover, the repair
+integration, and the analysis scripts that produce every table and figure) and
+the run manifests will be released, with library versions pinned.
+
+We perform a grid sweep over the following parameters:
+
+• 
+
+K (Candidates): $\{1,3,5,8\}$ 
+
+• 
+
+R (Repairs): $\{0,1,2,3\}$ 
+
+The $R=0$ configuration serves as the vanilla ReProver baseline for each $K$ .
+In the figures and run labels, a configuration with $K$ candidates is written
+tac $K$ (e.g. tac5 denotes $K{=}5$ ).
+
+Lean Workbook configuration.
+
+For the Lean Workbook generalization experiment (§6.1) we pair
+the same gAPRIL-wo-exp repair model with a deliberately harder
+generator configuration: the same priority-queue (best-first) search, but with
+the premise retriever removed and a single fixed candidate budget $K{=}5$ ,
+swept over $R\in\{0,1,2\}$ . Removing retrieval makes the generator strictly
+weaker than the LeanDojo configuration above, so this run tests repair against
+a lower, retrieval-free baseline rather than reusing the retrieval-augmented
+setup.
+
+Common theorem set.
+
+A small number of theorems are discarded by at least one $K\times R$ 
+configuration (e.g. tracing failures or non-theorem statements), so every
+table reports the common set of theorems present in every configuration’s run
+export, rather than the full 2,000 sampled theorems, so that all
+configurations are scored on identical problems.
+
+## 5.3 Metrics
+
+We evaluate performance along four axes:
+
+1. 
+
+Pass@1: the percentage of theorems successfully proved
+within the search budget, reported for every $K\times R$ configuration in
+Table 1 and, on a second benchmark, in
+Table 2.
+
+2. 
+
+Measured mean wall-clock per theorem: the primary cost
+axis. Because repair spends extra time, comparing repair-on and
+repair-off at the same $K$ is unfair; we instead read configurations
+against pure-sampling ones of similar wall-clock (an iso-runtime,
+or equal-runtime, comparison). This is reported as a single number per
+configuration in Table 1’s $T(s)$ column and, as a
+full budget-vs-coverage curve, in Figure 4.
+
+3. 
+
+Net Delta: the number of theorems gained by repair
+relative to the no-repair baseline at the same $K$ , minus the baseline
+solves lost by that repair configuration. Reported cumulatively (from
+ $R{=}0$ ) in Table 1 and Figure 3,
+and broken down step by step (the marginal gain of each individual
+repair attempt) in Table 3.
+
+4. 
+
+Generalization: whether the repair effect holds on an
+independent, out-of-distribution benchmark, rather than being an artifact
+of one benchmark/generator/search combination. Tested by repeating the
+same $K$ -vs- $R$ comparison on Lean Workbook with a different,
+retrieval-free generator (§6.1,
+Table 2).
+
+Beyond these quantitative metrics, we complement the results with two
+qualitative analyses: a breakdown of repair’s fix rate by failure category
+(Table 4), showing which kinds of rejected tactics
+repair actually recovers, and a search-tree visualization of a single repair
+recovering a proof that pure sampling misses
+(Figure 5).
+
+## 5.4 Hardware and Budget
+
+All experiments run on a single NVIDIA Tesla V100-PCIE (32 GB) GPU
+(CUDA 12.6, driver 575.57) hosted on a 24-core Intel Xeon Gold 6126 with
+754 GB RAM, under Rocky Linux 9.6. The software stack is Python 3.11,
+PyTorch 2.9.1, HuggingFace Transformers 4.56, and LeanDojo driving Lean 4; all
+package versions are pinned in the released code. We enforce
+a wall-clock timeout of 600 seconds per theorem to ensure a fair comparison that
+accounts for the computational cost of the repair module.
+
+## 5.5 External Validity
+
+The exact fix rates and crossover points depend on the benchmark, tactic
+generator, repair model, and hardware, so we do not present the LeanDojo sweep
+as a universal constant. A second benchmark with a different generator and a
+fixed, untuned budget reproduces the same qualitative pattern
+(§6.1), so the transferable claim is the recipe itself: a
+lightweight in-search repair step improves on the generation-first baseline,
+its benefit is front-loaded in the first attempt, and the same iso-runtime
+analysis lets any prover combining stochastic tactic generation with compiler
+feedback decide when repair is worth invoking.
+
+## 6 Results
+
+The central result is that a bounded in-search repair step improves on the
+generation-first baseline at every budget. In Table 1 the
+ $R{=}0$ column is a pure-sampling, LeanDojo/ReProver-style prover, and enabling
+repair lifts Pass@1 above it for all four candidate budgets – by 2.3–4.1 percentage points
+and 45–82 net theorems on the shared 1,990-theorem set (the Fix and Net
+columns count the proofs repair uniquely unlocks). The gain is also cheap,
+because it is front-loaded: the first repair attempt ( $R{=}0\to 1$ ) captures the
+large majority of the benefit repair ever provides, and every attempt after it
+buys only marginal further solves at rising wall-clock cost. We read each cell by
+its measured wall-clock so repair is compared against pure sampling of similar
+cost, not given extra compute for free.
+
+Every cell is computed over a single common set of 1,990 theorems attempted
+under all $K\times R$ configurations, so all rates are directly comparable
+across budgets. The Net Delta column exposes unique repair-only unlocks even
+when average pass rates are close, and the rare negative regime where repair
+wastes runtime on failed refinements better spent sampling. Because decoding is
+deterministic, the per-theorem outcomes are paired and allow an exact
+significance test: a McNemar test on the Fix/Brk discordant pairs rejects the
+no-effect null at every budget ( $R{=}1$ vs. $R{=}0$ ; $p<10^{-11}$ for all
+ $K$ ).
+
+ $K$ 
+ $R$ 
+Atmp.
+T(s)
+P@1
+Fix
+Brk
+Net
+
+1
+0
+1990
+29.7
+7.1
+0
+0
+ $+$ 0
+
+1
+30.3
+9.0
+38
+0
+ $+$ 38
+
+2
+31.8
+9.4
+45
+0
+ $+$ 45
+
+3
+33.0
+9.4
+45
+0
+ $+$ 45
+
+3
+0
+1990
+54.9
+20.9
+0
+0
+ $+$ 0
+
+1
+83.9
+23.8
+57
+0
+ $+$ 57
+
+2
+98.0
+24.3
+67
+0
+ $+$ 67
+
+3
+97.1
+24.3
+68
+0
+ $+$ 68
+
+5
+0
+1990
+116.0
+29.9
+0
+0
+ $+$ 0
+
+1
+191.6
+33.5
+72
+1
+ $+$ 71
+
+2
+221.9
+33.9
+81
+1
+ $+$ 80
+
+3
+236.7
+34.0
+83
+1
+ $+$ 82
+
+8
+0
+1990
+200.5
+34.8
+0
+0
+ $+$ 0
+
+1
+367.3
+38.7
+83
+6
+ $+$ 77
+
+2
+450.0
+38.8
+84
+5
+ $+$ 79
+
+3
+485.7
+38.8
+85
+5
+ $+$ 80
+
+Table 1: LeanDojo results across all $K\times R$ configurations. The $R{=}0$ row of
+each $K$ block is the pure-sampling (LeanDojo/ReProver-style) baseline;
+repair ( $R>0$ ) is measured against it.
+Atmp. = theorems attempted;
+T(s) = measured mean wall-clock per theorem (seconds);
+P@1 = Pass@1 (%);
+Fix/Brk = theorems newly solved / regressed vs. the baseline;
+Net = signed change in theorems solved.
+At every $K$ , the $R{=}0{\to}1$ step accounts for 84–96% of the total
+Net gain reached by $R{=}3$ (see below); Fix/Net
+are the most precise readout of this saturation where the rounded
+P@1 column loses resolution (e.g. $K{=}3$ , $R{=}2$ vs. $R{=}3$ ).
+
+This improvement is also cheap, because it is front-loaded.
+Figure 3 shows Net Delta rising sharply from $R{=}0$ 
+to $R{=}1$ at every $K$ , then flattening into a visible elbow, and
+Table 3 breaks the same pattern down step by step: the
+first repair attempt alone accounts for the 84–96% of the total $R{=}3$ gain
+noted above. Under a fixed repair budget, spending it on a single repair attempt
+is worth far more than spending it on a second or third, so essentially all of
+the gain is available at $R{=}1$ .
+
+Figure 3: Net Delta versus repair depth $R$ for each candidate budget $K$ .
+Every panel shows the same shape: a large gain from $R{=}0$ to $R{=}1$ ,
+followed by a flat or near-flat plateau.
+
+The elbow is sharpest at $K{=}8$ , where the $R{=}1\to 2$ step adds only 2.5% of
+the total three-repair gain, and weakest at $K{=}1$ , where that same step still
+adds 15.6%. We report this rather than smooth it over: at the smallest,
+most sample-constrained budget, a second repair attempt still recovers a small
+but non-trivial number of additional proofs, even though the dominant effect
+at every $K$ remains the jump from $R{=}0$ to $R{=}1$ . The pattern is therefore
+best read as “diminishing,” not “vanishing,” returns beyond the first repair.
+
+The $K\times R$ grid can also be read through a breadth-vs-depth lens: at a
+fixed wall-clock budget, is the next unit of compute better spent on a repair or
+on another sample? A fair comparison must cap each theorem’s wall-clock equally,
+since comparing configurations at their mean runtime is misleading—the
+mean is inflated by timed-out theorems. Figure 4 plots
+coverage—the fraction of
+theorems solved within a per-theorem budget $T$ —for $K\in\{1,3,5,8\}$ with and
+without repair. Under this matched-time comparison, adding one repair
+improves coverage at essentially every budget for every $K$ shown, and the
+margin widens with $T$ for the three largest budgets (e.g. at $K{=}8$ , from
+ $+0.6$ points at $100$  s to $+2.8$ at $600$  s); the sole exception is a
+tight ${\sim}50$  s budget, where repair’s per-state overhead delays some
+solves past the deadline. At $K{=}1$ the gain is
+present but flat rather than widening ( $+2.0$ points at $100$  s, $+1.9$ at
+ $600$  s): mean per-theorem runtime at this budget is only tens of seconds
+(Table 1), so coverage has already saturated well before
+ $100$  s and the extra budget adds nothing further. Because the per-theorem
+time budget is held
+fixed, this gain reflects genuinely broader coverage, not the extra compute an
+equal- $K$ comparison would give to repair. (Per-theorem wall-clock carries some
+concurrency noise, so we read the curves as a trend.)
+
+Figure 4: Iso-runtime coverage: theorems solved within a per-theorem
+wall-clock budget $T$ (log scale), for $K\in\{1,3,5,8\}$ with (solid) and
+without (dashed) one repair. Repair lifts coverage at matched wall-clock
+across the range at every $K$ shown, the gap widening as the budget grows
+(flat at $K{=}1$ , whose short runtime saturates coverage early).
+
+## 6.1 Generalization to Lean Workbook
+
+The LeanDojo sweep uses one benchmark, one generator, and one search
+configuration, so Table 1 alone cannot rule out that the
+repair effect is an artifact of that particular combination. Lean Workbook
+tests this with a different benchmark (harder, natural-language-formalized
+competition problems), a weaker generator (no premise retrieval), and a fixed,
+untuned budget ( $K{=}5$ ), evaluated on both a validation and a held-out test
+split.
+
+Split
+ $R$ 
+Proved
+P@1
+Fix
+Brk
+
+val (98)
+0
+21
+21.4%
+–
+–
+
+1
+39
+39.8%
+18
+0
+
+2
+42
+42.9%
+21
+0
+
+test (89)
+0
+17
+19.1%
+–
+–
+
+1
+27
+30.3%
+10
+0
+
+2
+28
+31.5%
+11
+0
+
+Table 2: Lean Workbook, $K{=}5$ , retrieval-free generator, best-first search.
+Fix/Brk are theorems newly solved/regressed vs. the
+ $R{=}0$ baseline on that split; both splits show Brk = 0 at every
+ $R$ .
+
+Three findings replicate the LeanDojo sweep on this independent benchmark.
+First, repair produces a large gain with a weaker, retrieval-free generator:
+two repairs take val Pass@1 from 21.4% to 42.9%, almost exactly double,
+and test Pass@1 from 19.1% to 31.5%, a 65% relative gain. Second, the gain
+is strictly additive on both splits – Brk = 0 at every $R$ , so every
+baseline proof survives and every new proof is a repair-only unlock, the
+cleanest version of the Fix-over-Brk pattern in the paper (the LeanDojo sweep
+has small Brk at $K{=}5,8$ ; Table 1). Third, the
+front-loading result replicates quantitatively: the first repair ( $R{=}0\to 1$ )
+already captures 18 of the 21 val theorems ( $85.7\%$ ) and 10 of the 11 test
+theorems ( $90.9\%$ ) that two repairs ever unlock – squarely inside the
+84–96% range measured on the LeanDojo sweep. The cost also matches the
+earlier characterization: repair is slower than sampling, with a mean latency
+of 44.9 s per repaired proof at val $R{=}2$ (89.5 s on test, whose
+theorems are individually harder), bounded by the shared 600 s timeout.
+
+## 6.2 Qualitative Analysis
+
+(a) $R{=}0$ (b) $R{=}1$ LegendGeneratorRepairProof stateSolvedFailed
+
+Figure 5: Visualization of search-tree traces for Set.not_subsingleton_iff
+at $K{=}3$ , from the raw run logs. Nodes are proof states, encoded by shape
+and color: blue circles are open states, red diamonds are failed states, and
+the green star is the solved state. Solid black edges are generator tactics;
+dashed blue edges are repair attempts. Without repair (a) every path
+dead-ends in a failed state; a single repair attempt (b) recovers a
+failed tactic and reaches the solved state.
+
+Table 1 and Figure 3 show the
+cumulative effect of repair, counted from $R{=}0$ . Table 3
+instead isolates the marginal cost and gain of each individual repair
+attempt—how much wall-clock the step from $R{=}r$ to $R{=}r{+}1$ adds, and how
+many additional theorems it buys, as successive differences of
+Table 1’s $T(s)$ and Net columns—and divides the two into
+an efficiency figure (theorems gained per added second) so the collapse from the
+first repair to later ones is visible directly, rather than requiring the reader
+to subtract Table 1’s rows by hand.
+
+ $K$ 
+Step
+ $\Delta T$ (s)
+ $\Delta$ Net
+Eff.
+
+1
+ $R{=}0\to 1$ 
+0.6
+38
+63.33
+
+ $R{=}1\to 2$ 
+1.5
+7
+4.67
+
+ $R{=}2\to 3$ 
+1.2
+0
+0.00
+
+3
+ $R{=}0\to 1$ 
+29.0
+57
+1.97
+
+ $R{=}1\to 2$ 
+14.1
+10
+0.71
+
+ $R{=}2\to 3$ 
+ $-$ 0.9
+1
+†–
+
+5
+ $R{=}0\to 1$ 
+75.6
+71
+0.94
+
+ $R{=}1\to 2$ 
+30.3
+9
+0.30
+
+ $R{=}2\to 3$ 
+14.8
+2
+0.14
+
+8
+ $R{=}0\to 1$ 
+166.8
+77
+0.46
+
+ $R{=}1\to 2$ 
+82.6
+2
+0.02
+
+ $R{=}2\to 3$ 
+35.7
+1
+0.03
+
+Table 3: Marginal cost and gain of each additional repair attempt, by $K$ 
+(successive differences of Table 1’s $T(s)$ and Net
+columns; not cumulative). Eff. $=\Delta$ Net $/\Delta T$ , theorems gained per
+added second of mean cost. †At $K{=}3$ , $R{=}2\to 3$ , $\Delta T$ is
+within measurement noise (Table 1’s $T(s)$ is nearly flat
+there), so efficiency is not meaningfully defined.
+
+The $R{=}0\to 1$ step is the only one where $\Delta$ Net is large at every $K$ ;
+every later step adds a small, and at $K{=}8$ nearly negligible, number of solves
+at rising cost. The Eff. column makes this concrete: at $K{=}8$ the first
+repair buys roughly 0.46 more solved theorems per added second of mean cost,
+the second and third only 0.02–0.03 – a more than fifteen-fold collapse in
+marginal efficiency, at every $K$ we tested.
+
+Failure category
+Fail
+Fix
+Rate
+
+No progress / simp
+10,110
+1,476
+14.6%
+
+Apply/exact failed
+1,600
+212
+13.2%
+
+Rfl failed
+8,847
+976
+11.0%
+
+Unknown identifier
+7,164
+386
+5.4%
+
+Rewrite failed
+16,141
+760
+4.7%
+
+Typeclass / synthesis
+4,712
+95
+2.0%
+
+Syntax / parse
+3,731
+76
+2.0%
+
+Type mismatch
+17,839
+328
+1.8%
+
+Unsolved / timeout
+2,391
+20
+0.8%
+
+Other
+17,099
+1,214
+7.1%
+
+Total
+89,634
+5,543
+6.2%
+
+Table 4: Repair fix rate by failure category, for the $K{=}8$ , $R{=}1$ run.
+Fail counts rejected generator tactics of each type; Fix
+counts those a single repair turned into a valid successor proof state;
+Rate = Fix/Fail. Ordered by rate; computed from the run logs.
+
+Table 4 suggests why. Of the 89,634 rejected tactics
+in the $K{=}8$ , $R{=}1$ run, a single repair recovers only 6.2% into a valid
+successor state – a narrow slice (note the unit: rejected tactics, not
+theorems as in Table 1). Repair succeeds mainly on shallow,
+local tactic-execution failures — no progress, a mis-applied
+apply/exact, or a non-closing rfl — where a small
+edit suffices. It rarely helps structural or semantic failures such as type
+mismatches, typeclass synthesis, or timeouts, which need a different proof
+strategy, not a localized fix; missing premises (unknown identifier)
+fall in between. Because only a small, mostly-shallow fraction of failures is
+repairable in principle, one repair exhausts most of the available gain,
+consistent with the elbow at $R{=}1$ holding across every $K$ ; the exact rates
+will shift with stronger generators, repair models, and theorem distributions,
+but the recipe transfers: weigh unlocks, regressions, and runtime against pure
+sampling, and budget at most one or two repairs.
+
+## 6.3 Limitations
+
+The main cost of repair is wall-clock time. Every repair invokes a separate
+4-billion-parameter repair model – heavier than the byt5-small
+generator – so a repair step costs more than a fresh sample, and the overhead
+compounds with breadth: enabling repair raises the mean per-theorem time from
+200.5 to 485.7 s at $K{=}8$ (a $2.4\times$ increase), with the first repair
+alone adding 166.8 s. Its coverage advantage does survive a
+matched per-theorem budget (Figure 4), but at a very tight
+budget the added per-state overhead can delay solves past the deadline, and the
+higher latency counts against repair wherever per-theorem time, not solve rate,
+is the binding constraint. The overhead also interacts with the
+fixed 600 s timeout: the baseline regressions we observe (Brk) appear only at
+the slowest configurations ( $K{=}5,8$ ), where repair’s added latency exhausts
+the budget on theorems the faster baseline solved in time.
+
+## 7 Conclusion
+
+This paper shows that a bounded, training-free repair step, added inside proof
+search, improves on the generation-first paradigm that LeanDojo and
+ReProver-style provers embody: sample many candidate tactics, keep whichever
+the compiler accepts, and discard the rest. Prior work treats repair as a
+heavyweight standalone pipeline and has not isolated this in-search question;
+we do, and at every candidate budget $K$ tested it recovers proofs pure
+sampling never finds – up to 82 net theorems and a 4.1-percentage-point
+Pass@1 gain – while remaining cheap and well-scoped: a single attempt
+captures 84–96% of the total benefit, the advantage is largest when
+sampling is constrained, and it comes almost entirely from a narrow,
+identifiable slice of repairable failures. The practical recipe is therefore
+simple: add one repair step to a generation-first prover, lean on it hardest
+when sampling is scarce, and treat further repairs, especially at large
+branching factors, as rarely worth the added wall-clock.
+
+## References
+
+Achim et al. (2025)
+
+Achim, T.; Best, A.; Bietti, A.; Der, K.; Fédérico, M.; Gukov, S.; Halpern-Leistner, D.; Henningsgard, K.; Kudryashov, Y.; Meiburg, A.; Michelsen, M.; Patterson, R.; Rodriguez, E.; Scharff, L.; Shanker, V.; Sicca, V.; Sowrirajan, H.; Swope, A.; Tamas, M.; Tenev, V.; Thomm, J.; Williams, H.; and Wu, L. 2025.
+
+Aristotle: IMO-level Automated Theorem Proving.
+
+arXiv:2510.01346.
+
+Brown et al. (2024)
+
+Brown, B.; Juravsky, J.; Ehrlich, R.; Clark, R.; Le, Q. V.; Ré, C.; and Mirhoseini, A. 2024.
+
+Large Language Monkeys: Scaling Inference Compute with Repeated Sampling.
+
+arXiv:2407.21787.
+
+Chen et al. (2025)
+
+Chen, L.; Gu, J.; Huang, L.; Huang, W.; Jiang, Z.; Jie, A.; Jin, X.; Jin, X.; Li, C.; Ma, K.; Ren, C.; Shen, J.; Shi, W.; Sun, T.; Sun, H.; Wang, J.; Wang, S.; Wang, Z.; Wei, C.; Wei, S.; Wu, Y.; Wu, Y.; Xia, Y.; Xin, H.; Yang, F.; Ying, H.; Yuan, H.; Yuan, Z.; Zhan, T.; Zhang, C.; Zhang, Y.; Zhang, G.; Zhao, T.; Zhao, J.; Zhou, Y.; and Zhu, T. H. 2025.
+
+Seed-Prover: Deep and Broad Reasoning for Automated Theorem Proving.
+
+arXiv:2507.23726.
+
+Chen et al. (2021)
+
+Chen, M.; Tworek, J.; Jun, H.; Yuan, Q.; Pinto, H. P. d. O.; Kaplan, J.; Edwards, H.; Burda, Y.; Joseph, N.; Brockman, G.; Ray, A.; Puri, R.; Krueger, G.; Petrov, M.; Khlaaf, H.; Sastry, G.; Mishkin, P.; Chan, B.; Gray, S.; Ryder, N.; Pavlov, M.; Power, A.; Kaiser, L.; Bavarian, M.; Winter, C.; Tillet, P.; Such, F. P.; Cummings, D.; Plappert, M.; Chantzis, F.; Barnes, E.; Herbert-Voss, A.; Guss, W. H.; Nichol, A.; Paino, A.; Tezak, N.; Tang, J.; Babuschkin, I.; Balaji, S.; Jain, S.; Saunders, W.; Hesse, C.; Carr, A. N.; Leike, J.; Achiam, J.; Misra, V.; Morikawa, E.; Radford, A.; Knight, M.; Brundage, M.; Murati, M.; Mayer, K.; Welinder, P.; McGrew, B.; Amodei, D.; McCandlish, S.; Sutskever, I.; and Zaremba, W. 2021.
+
+Evaluating Large Language Models Trained on Code.
+
+arXiv:2107.03374.
+
+Hubert et al. (2025)
+
+Hubert, T.; Mehta, R.; Sartran, L.; Horváth, M. Z.; Žužić, G.; Wieser, E.; Huang, A.; Schrittwieser, J.; Schroecker, Y.; Masoom, H.; Bertolli, O.; Zahavy, T.; Mandhane, A.; Yung, J.; Beloshapka, I.; Ibarz, B.; Veeriah, V.; Yu, L.; Nash, O.; Lezeau, P.; Mercuri, S.; Sönne, C.; Mehta, B.; Davies, A.; Zheng, D.; Pedregosa, F.; Li, Y.; Von Glehn, I.; Rowland, M.; Albanie, S.; Velingker, A.; Schmitt, S.; Lockhart, E.; Hughes, E.; Michalewski, H.; Sonnerat, N.; Hassabis, D.; Kohli, P.; and Silver, D. 2025.
+
+Olympiad-Level Formal Mathematical Reasoning with Reinforcement Learning.
+
+Nature.
+
+Liu et al. (2025)
+
+Liu, H.; Sun, J.; Li, Z.; and Yao, A. C. 2025.
+
+ProofAug: Efficient Neural Theorem Proving via Fine-grained Proof Structure Analysis.
+
+arXiv:2501.18310.
+
+Lu, Delaware, and Zhang (2024)
+
+Lu, M.; Delaware, B.; and Zhang, T. 2024.
+
+Proof Automation with Large Language Models.
+
+arXiv:2409.14274.
+
+Mündler et al. (2025)
+
+Mündler, N.; He, J.; Wang, H.; Sen, K.; Song, D.; and Vechev, M. 2025.
+
+Type-Constrained Code Generation with Language Models.
+
+Reproduction Package for article "Type-Constrained Code Generation with Language Models", 9(PLDI): 171:601–171:626.
+
+Nagy et al. (2026)
+
+Nagy, S.; Zhou, T.; Polikarpova, N.; and D’Antoni, L. 2026.
+
+ChopChop: A Programmable Framework for Semantically Constraining the Output of Language Models.
+
+ChopChop Artifact, 10(POPL): 66:1905–66:1932.
+
+Ospanov, Farnia, and Yousefzadeh (2025)
+
+Ospanov, A.; Farnia, F.; and Yousefzadeh, R. 2025.
+
+APOLLO: Automated LLM and Lean Collaboration for Advanced Formal Reasoning.
+
+arXiv:2505.05758.
+
+Requena et al. (2026)
+
+Requena, B.; Letson, A.; Nowakowski, K.; Beltran-Ferreiro, I.; and Sarra, L. 2026.
+
+A Minimal Agent for Automated Theorem Proving.
+
+Accepted for publication at ICML 2026, arXiv:2602.24273.
+
+Shen et al. (2025)
+
+Shen, Z.; Huang, N.; Yang, F.; Wang, Y.; Gao, G.; Xu, T.; Jiang, J.; He, W.; Yang, P.; Sun, M.; Ju, H.; Wu, P.; Dai, B.; and Dong, B. 2025.
+
+REAL-Prover: Retrieval Augmented Lean Prover for Mathematical Reasoning.
+
+arXiv:2505.20613.
+
+Song, Yang, and Anandkumar (2025)
+
+Song, P.; Yang, K.; and Anandkumar, A. 2025.
+
+Lean Copilot: Large Language Models as Copilots for Theorem Proving in Lean.
+
+arXiv:2404.12534.
+
+Wang et al. (2026)
+
+Wang, E.; Chess, S.; Lee, D.; Ge, S.; Mallavarapu, A.; and Ilin, V. 2026.
+
+Learning to Repair Lean Proofs from Compiler Feedback.
+
+arXiv:2602.02990.
+
+Wang et al. (2024)
+
+Wang, H.; Xin, H.; Liu, Z.; Li, W.; Huang, Y.; Lu, J.; Yang, Z.; Tang, J.; Yin, J.; Li, Z.; and Liang, X. 2024.
+
+Proving Theorems Recursively.
+
+In Proceedings of the 38th International Conference on Neural Information Processing Systems, volume 37 of NIPS ’24, 86720–86748. Red Hook, NY, USA: Curran Associates Inc.
+
+ISBN 979-8-3313-1438-5.
+
+Wu et al. (2025)
+
+Wu, Z.; Huang, S.; Zhou, Z.; Ying, H.; Yuan, Z.; Zhang, W.; Lin, D.; and Chen, K. 2025.
+
+InternLM2.5-StepProver: Advancing Automated Theorem Proving via Critic-Guided Search.
+
+arXiv:2410.15700.
+
+Yang et al. (2023)
+
+Yang, K.; Swope, A. M.; Gu, A.; Chalamala, R.; Song, P.; Yu, S.; Godil, S.; Prenger, R.; and Anandkumar, A. 2023.
+
+LeanDojo: Theorem Proving with Retrieval-Augmented Language Models.
+
+NeurIPS 2023.
+
+Yang et al. (2025)
+
+Yang, X.-W.; Zhou, Z.; Wang, H.; Li, A.; Wei, W.-D.; Jin, H.; Li, Z.; and Li, Y.-F. 2025.
+
+CARTS: Advancing Neural Theorem Proving with Diversified Tactic Calibration and Bias-Resistant Tree Search.
+
+In The Thirteenth International Conference on Learning Representations.
+
+ICLR 2025 poster.
+
+Yin and Gao (2025)
+
+Yin, D.; and Gao, J. 2025.
+
+Generating Millions Of Lean Theorems With Proofs By Exploring State Transition Graphs.
+
+arXiv:2503.04772.
+
+Ying et al. (2024)
+
+Ying, H.; Wu, Z.; Geng, Y.; Yuan, Z.; Lin, D.; and Chen, K. 2024.
+
+Lean Workbook: A Large-Scale Lean Problem Set Formalized from Natural Language Math Problems.
+
+arXiv:2406.03847.

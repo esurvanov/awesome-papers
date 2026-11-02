@@ -1,0 +1,1073 @@
+## PW-PRUNING: PHASE-AWARE EXPERT SELECTION
+
+FOR SPEECH-CENTRIC OMNI-MODAL MODELS
+
+Junjie Cao, Fengping Tian, Wenjie Zhou
+
+Xuanfan Ni, Chenyang Lyu, Siyou Liu, Longyue Wang, Weihua Luo
+
+††thanks: *Corresponding author: Chenyang Lyu.
+
+Abstract
+
+Sparse routing reduces per-token computation but leaves the full expert bank
+resident in memory. We study expert pruning for speech-centric omni-modal
+models, where pooling calibration statistics can obscure the different expert
+demands of acoustic-input processing and text-answer generation. We propose
+PW-Pruning, a phase-aware extension of DO-ACP that constructs separate
+importance-weighted kernels for acoustic-prefill and teacher-forced answer
+tokens, then combines phase-weighted log-determinant marginal gains to select one
+static expert bank. On Qwen3-Omni, retaining 32 of 128 experts per layer
+improves MMAU-mini and MMSU accuracy over matched pooled selection by
+ $3.20$ and $4.38$ percentage points, respectively, after supervised fine-tuning,
+averaged over three runs. Single-phase and shuffled-label controls on this
+public backbone suggest that semantic phase information contributes to these
+gains. Experiments on a non-public Qwen3.5-Omni backbone and English-only
+zero-shot evaluation of Nemotron provide complementary evidence.
+Across the tested Qwen budgets, AU gains are larger under stronger pruning,
+without inference-time mask switching.
+
+Index Terms: 
+
+expert pruning, mixture of experts, omni-modal models, audio understanding
+
+††address: 1Alibaba, Hangzhou, China   2University of Macau
+
+## 1 Introduction
+
+Expert pruning reduces the resident memory of mixture-of-experts (MoE)
+models [9, 12]: sparse routing lowers per-token
+computation but retains the full expert bank [6, 8].
+Multimodal applications span speech/music generation [27, 7, 2],
+human animation [13], and video protection [3, 14].
+Omni-modal deployments such as speech assistants and translation may
+prioritize speech-centric capabilities [26, 18],
+motivating a smaller shared expert bank that preserves them.
+
+Existing approaches use task-specific selection [4],
+output reconstruction [15], or expert importance: PS ranks
+routing mass [9], while REAP incorporates router-weighted
+output norms [12]. DO-ACP additionally accounts for redundancy
+among selected experts through activation-weighted log-determinant selection
+ [9]. Yet pooling calibration statistics can obscure
+where expert value arises, even within one task. We distinguish two
+token regions, or phases, within a speech request: listening comprises
+acoustic-prefill input positions that process audio evidence, while answering
+comprises response positions that produce output text. Calibration uses
+teacher-forced answers as a proxy for generation. An expert redundant in one
+phase may complement the retained bank in the other; pooling before selection
+can hide this distinction even with task-specific calibration.
+
+On Qwen3-Omni, the phases’ high-frequency expert sets have mean Jaccard
+overlap $.179$ at E32 and $.342$ at E64 (Fig. 1a).
+Jaccard measures intersection over union: zero denotes disjoint sets and one
+identical sets. Weak overlap also appears within tasks, motivating our
+hypothesis that preserving phase identity during selection better represents
+complementary demands than pooling statistics first. Our contributions are
+threefold: (i) we characterize this cross-phase routing disagreement;
+(ii) we propose PW-Pruning, whose PW-DO-ACP selector constructs one
+importance-weighted Gram kernel per phase and greedily combines
+log-determinant marginal gains, retaining one static expert bank
+without runtime mask switching; and (iii) we evaluate capability retention
+through zero-shot pruning, matched recovery, and semantic controls on
+Qwen3-Omni, with complementary evidence from Qwen3.5-Omni and Nemotron.
+
+(a) Phase-specific routingAudio–answer JaccardE64: .342E32: .179E64 ref .333E32 ref .1430.2.4.60.51last 8Normalized model depth(b) Selected-mask coverageE32 assignment coverage (%)PooledPWaudioanswer26.03%34.03%45.37%41.63%
+
+More coverage of the
+less-represented phase
+
+Same census and budget
+(c) Preserve phases, select one maskPooled DO-ACP $\mathcal{T}$ : phase statistics $\mathcal{T}_{\rm pre}$ $\mathcal{T}_{\rm ans}$ 
+
+pool
+stats
+ $\bar{K}$ 
+
+one
+log-det
+
+static mask
+Pooling precedes kernel constructionPW-Pruning (PW-DO-ACP) $\mathcal{T}_{\rm pre}$ $\mathcal{T}_{\rm ans}$ $K^{\rm pre}$ $K^{\rm ans}$ 
+
+sum gains
+ $\sum_{p}\alpha_{p}\Delta_{p}(e\mid S)$ 
+
+static mask $S$ 
+Same routing; no mask switching
+
+Figure 1: From phase demand to one static mask. Qwen3-Omni:
+(a) audio-prefill/teacher-forced-answer frequency-mask Jaccard. Legends: means;
+shading: last eight layers; dotted: $B/(2E-B)$ cardinality guides.
+(b) Actual E32 mask assignment coverage, task/layer macro-averaged on calibration.
+(c) Phase-wise selection. E: experts per MoE layer; normalized depth.
+
+## 2 Method
+
+## 2.1 Problem formulation
+
+Let $\theta$ be a pretrained omni model and
+ $S_{\ell}\subseteq[E_{\ell}]$ the experts retained in layer $\ell$ .
+The masks $\mathcal{S}=\{S_{\ell}\}_{\ell}$ define $\theta_{\mathcal{S}}$ , inheriting
+surviving weights and native routing fan-in. For task distributions $\mathcal{D}_{g}$ with nonnegative
+weights $\pi_{g}$ summing to one, we express capability retention through the
+reference loss $\mathcal{L}(\theta;x,y)=-\log p_{\theta}(y\mid x)/|y|$ , with
+reference length $|y|$ :
+
+ $\displaystyle\underset{\mathcal{S}}{\operatorname{minimize}}$ 
+ $\displaystyle\sum_{g}\pi_{g}\,\mathbb{E}_{\mathcal{D}_{g}}\bigl[\mathcal{L}(\theta_{\mathcal{S}};x,y)\bigr]$ 
+
+(1)
+
+ $\displaystyle\text{subject to}$ 
+ $\displaystyle S_{\ell}\subseteq[E_{\ell}],\quad|S_{\ell}|=B_{\ell},\quad\forall\ell.$ 
+
+Here $(x,y)$ is an input–reference pair. We fix $B_{\ell}=E_{\ell}/R$ above the
+routing fan-in to compare selectors without changing layerwise capacity.
+Cross-layer loss optimization is costly. We instead test the assumption that
+retaining complementary phase-conditioned features improves capability retention,
+using a layerwise log-det surrogate rather than a bound on Eq. 1.
+Below we suppress $\ell$ , writing $E$ and $B$ .
+
+## 2.2 From pooled importance to phase-wise coverage
+
+For token $t$ , let $z_{e}(t)$ indicate whether the original router selects
+expert $e$ , $q_{e}(t)$ be its full-bank softmax probability before top- $k$ 
+selection, and $\mathbf{f}_{e}(t)$ its ungated output. Acoustic-prefill and
+teacher-forced-answer tokens define phases $p\in\{\mathrm{pre},\mathrm{ans}\}$ .
+The operator $\mathbb{E}_{p}$ averages tokens within each task group and then
+weights nonempty groups equally. Applying DO-ACP [9] within
+each phase gives conditional routing confidence and an output Gram matrix:
+
+ $\displaystyle c_{e}^{p}$ 
+ $\displaystyle=\frac{\mathbb{E}_{p}[z_{e}q_{e}]}{\mathbb{E}_{p}[z_{e}]},$ 
+
+(2)
+
+ $\displaystyle G_{ij}^{p}$ 
+ $\displaystyle=\mathbb{E}_{p}\bigl[\langle\mathbf{f}_{i},\mathbf{f}_{j}\rangle\bigr].$ 
+
+Set $c_{e}^{p}=0$ for an expert never selected in that phase. ACP importance
+ $u_{e}^{p}=c_{e}^{p}\sqrt{G_{ee}^{p}}$ combines conditional confidence with root-mean-square
+output magnitude. With $D^{p}=\operatorname{Diag}(\sqrt{\mathbf{u}^{p}})$ , the
+importance-weighted kernel is
+
+ $K^{p}=D^{p}G^{p}D^{p}\succeq 0.$ 
+
+(3)
+
+Thus $K^{p}_{ee}=c_{e}^{p}(G^{p}_{ee})^{3/2}$ : the amplitude exponent is inherited from
+DO-ACP, not derived from optimal design. Our contribution separates phases
+while retaining this weighting. For nonnegative phase weights
+ $\alpha_{p}$ summing to one and regularization $\lambda_{p}>0$ , define
+
+ $\displaystyle F(S)$ 
+ $\displaystyle=\sum_{p}\alpha_{p}\log\det\left(I+\frac{K^{p}[S,S]}{\lambda_{p}}\right),$ 
+
+(4)
+
+ $\displaystyle S^{\star}$ 
+ $\displaystyle\in\underset{S\subseteq[E],\,|S|=B}{\arg\max}\;F(S).$ 
+
+Here $K^{p}[S,S]$ is a principal submatrix and $I$ the matching identity.
+This regularized feature-volume objective connects DPP diversity with
+information-based sensor selection [11, 10].
+For an auxiliary Gaussian covariance $K^{p}$ and noise $\lambda_{p}I$ , each
+utility equals twice the information gain [23], not the
+language model’s Fisher information. We use $\alpha_{p}=1/2$ to
+balance phases, not to reproduce their token frequencies. Setting
+ $\lambda_{p}=\operatorname{tr}(K^{p})/(BE)$ makes each utility invariant to
+positive global kernel rescaling, while preserving relative expert energies.
+Zero kernels use a positive floor. These are design choices, not optimality claims.
+
+Pooled DO-ACP instead forms
+
+ $\bar{c}_{e}=\frac{\sum_{p}\alpha_{p}\mathbb{E}_{p}[z_{e}q_{e}]}{\sum_{p}\alpha_{p}\mathbb{E}_{p}[z_{e}]},\qquad\bar{G}=\sum_{p}\alpha_{p}G^{p},$ 
+
+(5)
+
+then constructs one kernel and ridge by the same rule. Conditional ratios,
+kernel construction, and log-determinants do not commute with averaging, so generally
+ $F_{\rm pool}(S)\neq F(S)$ even with matched weights. PW changes
+when phase information is discarded, not the budget or routing.
+
+## 2.3 Greedy selection and deployment
+
+Starting from $S=\varnothing$ , maintain each phase’s Cholesky factor
+ $L_{p}L_{p}^{\top}=K^{p}_{SS}+\lambda_{p}I$ , where subscripts denote matrix blocks.
+A candidate $e\notin S$ contributes the Schur residual
+
+ $v_{p}(e\mid S)=K^{p}_{ee}-\bigl\|L_{p}^{-1}K^{p}_{Se}\bigr\|_{2}^{2},$ 
+
+(6)
+
+with the second term zero for empty $S$ . It measures what the current subset
+does not explain in phase $p$ . The block determinant identity gives
+
+ $\Delta(e\mid S)=\sum_{p}\alpha_{p}\log\left(1+\frac{v_{p}(e\mid S)}{\lambda_{p}}\right).$ 
+
+(7)
+
+We choose the largest $\Delta$ until $|S|=B$ , evaluating $L_{p}^{-1}K^{p}_{Se}$ 
+by triangular solves rather than explicit inversion. Monotone submodularity
+gives greedy a $1-1/e$ approximation for $F$ [17],
+not a guarantee on language loss or benchmark accuracy.
+The final subset serves both phases; subsequent recovery keeps its membership
+fixed. Inference needs neither phase labels nor mask switching.
+
+## 3 Experiment
+
+In this section, we evaluate PW-Pruning through zero-shot pruning, matched
+recovery, semantic ablations, and cross-model transfer. These experiments test
+our central hypothesis: retaining listening and answering as distinct selection
+objectives improves capability preservation within a fixed expert budget.
+
+Table 1: Speech-centric pruning on Qwen3-Omni. CV-W/CV-C:
+Common Voice en+fr micro-WER / yue+zh micro-CER; LS: LibriSpeech WER;
+OCP: OpenCpop CER (%); AU: accuracy (%). E: retained experts.
+SFT: mean $\pm$ s.d.; bold: better Pooled/PW mean.
+
+Budget
+Selector
+CV-W $\downarrow$ 
+CV-C $\downarrow$ 
+LS $\downarrow$ 
+OCP $\downarrow$ 
+BLEU $\uparrow$ 
+MMAU $\uparrow$ 
+MMAR $\uparrow$ 
+MMSU $\uparrow$ 
+
+E128
+Teacher
+6.17
+6.42
+2.11
+1.49
+29.34
+78.00
+70.30
+71.04
+
+Zero-shot
+
+E64
+Pooled
+10.6
+9.0
+3.1
+2.9
+18.4
+72.2
+64.6
+67.8
+
+E64
+PW
+11.3
+9.9
+3.2
+2.2
+18.4
+73.4
+63.9
+67.5
+
+E64
+PS
+23.3
+6.9
+3.0
+2.7
+17.7
+71.6
+64.3
+66.0
+
+E64
+REAP
+22.2
+10.7
+3.2
+3.9
+15.2
+72.2
+63.5
+66.7
+
+E32
+Pooled
+27.0
+30.7
+7.7
+5.8
+5.9
+60.2
+49.4
+51.5
+
+E32
+PW
+18.3
+26.1
+6.3
+6.1
+6.6
+62.3
+49.5
+52.0
+
+E32
+PS
+79.0
+16.4
+7.7
+6.3
+3.3
+62.2
+51.4
+49.8
+
+E32
+REAP
+42.2
+28.1
+6.7
+6.8
+5.2
+62.2
+50.8
+51.0
+
+Supervised fine-tuning (SFT)
+
+E64
+Pooled
+9.88 $\pm$ .16
+8.89 $\pm$ .11
+2.92 $\pm$ .06
+1.91 $\pm$ .12
+24.63 $\pm$ .15
+72.27 $\pm$ .06
+66.40 $\pm$ .44
+67.92 $\pm$ .14
+
+E64
+PW
+9.81 $\pm$ .05
+8.86 $\pm$ .15
+2.95 $\pm$ .02
+2.05 $\pm$ .06
+24.88 $\pm$ .44
+74.35 $\pm$ .12
+67.20 $\pm$ .15
+69.73 $\pm$ .12
+
+E32
+Pooled
+14.80 $\pm$ .04
+13.45 $\pm$ .86
+5.21 $\pm$ .05
+4.39 $\pm$ .32
+11.12 $\pm$ .04
+63.03 $\pm$ .49
+51.87 $\pm$ .67
+53.38 $\pm$ .40
+
+E32
+PW
+14.17 $\pm$ .36
+14.25 $\pm$ .73
+5.14 $\pm$ .01
+5.05 $\pm$ .10
+12.69 $\pm$ .09
+66.23 $\pm$ .42
+52.73 $\pm$ .06
+57.76 $\pm$ .26
+
+E32
+PS
+19.23 $\pm$ .12
+16.34 $\pm$ .56
+7.12 $\pm$ .43
+6.17 $\pm$ .62
+10.91 $\pm$ .25
+63.30 $\pm$ .74
+51.48 $\pm$ .65
+54.15 $\pm$ .06
+
+E32
+REAP
+18.77 $\pm$ .33
+17.65 $\pm$ .31
+6.55 $\pm$ .39
+6.48 $\pm$ .22
+11.56 $\pm$ .34
+62.79 $\pm$ .58
+52.10 $\pm$ .73
+53.11 $\pm$ .44
+
+Knowledge distillation (KD)
+
+E64
+Pooled
+9.31
+8.10
+2.89
+2.25
+24.11
+76.20
+69.30
+68.86
+
+E64
+PW
+9.59
+7.57
+2.93
+2.06
+24.22
+77.50
+68.60
+69.42
+
+E32
+Pooled
+15.08
+12.84
+4.74
+4.50
+13.93
+60.90
+52.50
+55.70
+
+E32
+PW
+14.28
+12.42
+4.35
+5.12
+14.44
+62.40
+52.50
+56.26
+
+PW-PruningPooledShuffled-PWAudio-onlyAnswer-onlyMMAU-mini54627005121024MMAR42495605121024MMSU50556005121024SFT step (Qwen3-Omni E32); accuracy (%) $\uparrow$ 
+
+Figure 2: Phase-semantics recovery on Qwen3-Omni, E32.
+All methods use the same expert budget and SFT schedule. Final Pooled/PW
+error bars show three-run sample s.d. (Table 1); mean control
+endpoints are listed in Table 2.
+
+Table 2: Phase-semantics ablation. Mean AU accuracy (%)
+across recovery runs at SFT step 1,024. Qwen3-Omni E32 Pooled/PW:
+Table 1; Qwen3.5-Omni $4\times$ Pooled/PW:
+same means as Table 3.
+Bold: highest mean per column in the Qwen3.5-Omni block.
+
+Selector
+MMAU $\uparrow$ 
+MMAR $\uparrow$ 
+MMSU $\uparrow$ 
+
+Qwen3-Omni, E32 (Fig. 2)
+
+Shuffled-PW
+63.21
+50.20
+53.20
+
+Audio-only
+64.72
+50.95
+53.36
+
+Answer-only
+61.96
+52.95
+53.59
+
+Qwen3.5-Omni, $4\times$ reduction
+
+Pooled
+70.40
+62.60
+66.02
+
+Audio-only
+72.60
+61.10
+65.96
+
+Answer-only
+69.80
+62.80
+66.24
+
+Shuffled-PW
+71.20
+60.20
+65.76
+
+PW
+72.50
+63.05
+66.45
+
+Table 3: Transfer to Qwen3.5-Omni. A non-public research backbone;
+budgets are relative to the unpruned model. Matched SFT recovery:
+mean $\pm$ sample s.d. across repeated runs.
+Metrics follow Table 1. Bold: better mean within each Pooled/PW pair.
+
+ $R$ 
+Selector
+CV-W $\downarrow$ 
+CV-C $\downarrow$ 
+LS $\downarrow$ 
+OCP $\downarrow$ 
+BLEU $\uparrow$ 
+MMAU $\uparrow$ 
+MMAR $\uparrow$ 
+MMSU $\uparrow$ 
+
+ $1\times$ 
+Teacher
+5.68
+5.70
+2.26
+1.06
+30.72
+78.50
+73.60
+71.10
+
+ $2\!\times$ 
+Pooled
+9.67 $\pm$ .04
+8.77 $\pm$ .28
+3.01 $\pm$ .00
+2.10 $\pm$ .03
+26.14 $\pm$ .25
+75.70 $\pm$ .36
+70.40 $\pm$ .26
+69.83 $\pm$ .21
+
+ $2\!\times$ 
+PW
+9.96 $\pm$ .15
+8.76 $\pm$ .48
+3.05 $\pm$ .03
+2.64 $\pm$ .57
+25.89 $\pm$ .03
+76.20 $\pm$ .62
+70.17 $\pm$ .71
+69.49 $\pm$ .44
+
+ $4\!\times$ 
+Pooled
+16.48 $\pm$ .22
+14.75 $\pm$ .20
+5.04 $\pm$ .11
+5.22 $\pm$ .77
+12.81 $\pm$ .23
+70.40 $\pm$ .14
+62.60 $\pm$ .57
+66.02 $\pm$ .42
+
+ $4\!\times$ 
+PW
+14.34 $\pm$ .48
+14.73 $\pm$ 1.08
+4.66 $\pm$ .08
+4.52 $\pm$ .41
+13.65 $\pm$ .24
+72.50 $\pm$ .71
+63.05 $\pm$ 1.06
+66.45 $\pm$ .47
+
+Table 4: Zero-shot Nemotron transfer.
+English-subset public ASR WER and AU accuracy (%);
+E: retained experts. No recovery; bold: better Pooled/PW score.
+
+Budget
+Selector
+En-WER $\downarrow$ 
+MMAU $\uparrow$ 
+MMAR $\uparrow$ 
+MMSU $\uparrow$ 
+
+E128
+Teacher
+3.378
+77.60
+60.70
+62.60
+
+E64
+Pooled
+4.173
+75.00
+58.50
+60.00
+
+E64
+PW
+4.002
+74.30
+59.10
+61.08
+
+E32
+Pooled
+5.535
+69.50
+52.10
+50.58
+
+E32
+PW
+4.797
+69.50
+52.50
+52.54
+
+## 3.1 Experimental protocol
+
+Models and census. We evaluate text responses from
+Qwen3-Omni-30B-A3B-Instruct [26] (Thinker: approximately
+30B total/3B active parameters, 48 layers, 128 experts per layer, top-8
+routing [21]). Pruning to
+E64/E32 removes expert tensors and router rows, preserving top-8 routing,
+perception, and attention. Transfer uses Nemotron
+3 Nano Omni-30B-A3B-Reasoning [18] at E64/E32, and a
+non-public Qwen3.5-Omni backbone at $2\times/4\times$ expert-bank reduction.
+Both Qwen censuses share 2,048 training-source requests balanced across ASR,
+speech-to-text translation (S2TT), and audio understanding (AU). We count
+acoustic-prefill and teacher-forced answers separately, excluding
+instruction/special tokens. Stratified $1/64$ sampling estimates ungated Grams
+for all experts. Nemotron uses English calibration and public English-ASR/AU only.
+
+Baselines. We compare with Pooled DO-ACP, which builds one
+kernel from pooled statistics;
+PS [9] ranks routed probability mass; REAP
+ [12] ranks conditional router-weighted output norms from
+its all-token census. Pooled shares PW’s calibration, task/phase weights,
+budget, regularization rule, and greedy solver.
+
+Ablation. Audio-only and Answer-only select from one phase’s statistics
+at the same budget. Shuffled-PW preserves two kernels and phase counts but
+permutes labels within each request, testing the value of semantic grouping.
+We apply these controls to both Qwen backbones under matched selection and
+recovery settings; Table 2 reports mean endpoint accuracies
+over repeated recovery runs.
+
+Recovery. All matched selectors use fixed sources of 6,638 ASR,
+11,894 S2TT, and 16,758 AU examples with transcription, translation, and
+audio-response supervision. Mixing targets equal expected supervised-answer-token
+exposure per task. SFT uses 1,024 cross-entropy steps, global batch 32,
+learning rate $2\cdot 10^{-6}$ , 5% warmup, sequence cap 2,048, and no packing.
+Retained language-model weights are tuned; perception encoders stay frozen.
+KD uses reference-prefix KL at temperature 1, renormalized on
+the teacher’s top-64 vocabulary support, without CE mixing or student rollout.
+
+Public benchmarks. Selectors share datasets and scoring within each
+backbone. ASR comprises 54,494 examples from Common
+Voice en/fr/yue/zh [1], LibriSpeech
+clean/other [19], and OpenCpop [25]. We retain native WER/CER families.
+S2TT uses 1,104 FLEURS-derived examples in 234 directions [5]
+with macro-direction SacreBLEU [20].
+AU uses 1,000 MMAU-mini, 1,000 MMAR, and 5,000 MMSU multiple-choice questions
+ [22, 16, 24]. Greedy decoding uses
+ASR/S2TT/AU caps of 512/256/128 tokens. Failures count as errors; metrics
+are reported separately by task.
+
+## 3.2 Phase conditioning reallocates scarce capacity
+
+We first examine retained demand through routing preferences and selected
+masks (Fig. 1). Qwen3-Omni phase-mask Jaccard averages $.179$ 
+at E32 and $.342$ at E64, falling to $.031$ and $.223$ in the final
+eight layers. Within-task overlap is also low for ASR, S2TT, and AU
+( $J=.262$ , $.232$ , $.113$ at E32). Task mixture alone therefore does not
+explain the disagreement; Jaccard does not establish within-phase stability.
+The selected masks show the allocation change: at the same E32 budget,
+audio routing coverage rises from $26.03\%$ to $34.03\%$ , while answer
+coverage falls from $45.37\%$ to $41.63\%$ (Fig. 1b).
+The gap narrows from $19.34$ to $7.60$ points, showing that PW reallocates
+capacity toward underrepresented audio demand rather than raising both coverages.
+Downstream tests assess whether this redistribution preserves capability.
+
+(a) Relative GPU memory(b) Real-time factor $\downarrow$ 0.51.0 $1\!\times$ $2\!\times$ $4\!\times$ 0.51.0 $1\!\times$ $2\!\times$ $4\!\times$ 1.000.563.3441.034.632.423Routed-expert reduction
+
+Figure 3: Deployment savings. H20, batch 1:
+(a) peak memory relative to the unpruned model; (b) real-time factor.
+Savings reflect expert budget, not PW-specific speedups.
+
+## 3.3 Phase-aware selection improves capability retention
+
+We evaluate selection before and after adaptation through zero-shot,
+SFT, and KD comparisons (Table 1). At E32, PW lowers zero-shot
+CV-WER from $27.0\%$ to $18.3\%$ and improves all three AU scores over
+Pooled: the benefit is already present before recovery.
+
+With matched SFT, PW improves six of eight means over Pooled. AU gains
+are largest on MMAU-mini ( $+3.20$ points) and MMSU ( $+4.38$ points),
+while MMAR changes more modestly. CV-C and OpenCpop CER remain higher
+than Pooled ( $14.25\%$ vs. $13.45\%$ and $5.05\%$ vs. $4.39\%$ ,
+respectively); the OpenCpop gap also appears in the E32 zero-shot and
+KD comparisons.
+Crucially, Pooled already models importance and redundancy, using the same
+expert budget and recovery resources. PW’s advantage supports
+retaining where an expert contributes,
+rather than assessing its pooled value alone. PW also outperforms PS and
+REAP on all eight SFT metrics, reducing CV-WER by $26.3\%$ and $24.5\%$ ,
+respectively. The E32 KD comparison likewise favors PW on six metrics.
+Thus, adapting surviving weights does not eliminate the importance of
+phase-aware subset selection.
+
+The AU gains become larger at tighter expert budgets. From E64 to
+E32, the SFT PW–Pooled gap grows from $2.08$ to $3.20$ points on
+MMAU-mini and from $1.81$ to $4.38$ on MMSU. These larger gains support
+the hypothesis that phase-specific functions become harder to replace as
+spare capacity shrinks, making their preservation more valuable.
+
+## 3.4 Semantic phases preserve complementary capabilities
+
+To test phase semantics, Shuffled-PW preserves two kernels and phase counts
+under matched budgets and recovery (Table 2). Qwen3-Omni PW
+exceeds it on MMAU-mini and MMSU at all six reported checkpoints
+(Fig. 2), gaining $3.02$ and $4.56$ points at step 1,024.
+Qwen3.5-Omni gains $1.30$ , $2.85$ , and $.69$ points across the three
+benchmarks, supporting semantic rather than arbitrary grouping.
+
+Among single-phase controls, Audio-only leads MMAU-mini and Answer-only
+MMAR on both backbones. Against the better single-phase control, Qwen3-Omni
+PW gains $1.51$ and $4.17$ points on MMAU-mini and MMSU but loses $.22$ 
+on MMAR. Qwen3.5-Omni PW gains $.25$ and $.21$ on MMAR and MMSU but
+loses $.10$ on MMAU-mini. These complementary preferences support joint
+phase preservation; the private-backbone differences remain small.
+
+## 3.5 Phase-aware selection transfers across backbones
+
+To assess transfer, we evaluate Nemotron before recovery and Qwen3.5-Omni
+after SFT. On Nemotron, PW improves public English
+ASR, MMAR, and MMSU at both budgets (Table 4). At E32,
+WER falls by $13.3\%$ and MMSU rises by $1.96$ points relative to Pooled,
+with MMAU-mini unchanged. With no retraining,
+these gains demonstrate transfer of the selection benefit independently of recovery.
+
+On Qwen3.5-Omni, PW improves all eight reported means at $4\times$ 
+expert-bank reduction (Table 3): CV-WER falls by $13.0\%$ ,
+BLEU rises by $6.6\%$ , and all three AU accuracies improve. Gains across
+transcription, translation, and understanding after matched adaptation
+complement Nemotron’s zero-shot results, supporting the phase-allocation
+principle across backbones and recovery settings.
+
+One static bank retains deployment savings. Finally, H20 batch-1
+profiles (64 ASR inputs, eight warmups, three repeats) show $65.6\%$ lower
+peak memory and RTF $1.034\to.423$ at $4\times$ (Fig. 3).
+These savings address the deployment motivation: PW retains one physically
+pruned bank, without phase-dependent mask switching. The efficiency gain
+comes from pruning; PW improves how the remaining capacity is allocated.
+
+## 4 Conclusion
+
+In this paper, we propose PW-Pruning to prune omni-modal models for
+speech-centric deployment. Phase-wise log-determinant gains preserve
+listening and answering demands within one static mask. Zero-shot, recovery,
+and semantic-control experiments support phase-aware capability retention,
+especially at tighter budgets. Results on Qwen3-Omni, Qwen3.5-Omni, and
+English-only Nemotron further demonstrate cross-model transfer.
+
+Limitations and future work. Fixed budgets cannot exploit
+depth-dependent phase overlap, while fixed weights and masks limit workload
+adaptation. Future work could combine depth-aware allocation, workload-aware
+weighting, and dynamic masks, subject to switching and memory costs.
+
+## References
+
+[1]
+R. Ardila, M. Branson, K. Davis, M. Henretty, M. Kohler, J. Meyer, R. Morais, L. Saunders, F. M. Tyers, and G. Weber (2020)
+
+Common voice: a massively-multilingual speech corpus.
+
+In Proc. LREC,
+
+pp. 4218–4222.
+
+Cited by: §3.1.
+
+[2]
+J. Cao, Y. Han, R. Zhang, X. Hao, H. Li, S. Zhao, Y. Liu, and X. Zhang (2025)
+
+Comprehend and talk: text to speech synthesis via dual language modeling.
+
+arXiv preprint arXiv:2509.22062.
+
+External Links: Link
+
+Cited by: §1.
+
+[3]
+J. Cao, K. Li, X. Yu, H. Li, and X. Zhang (2025)
+
+VideoGuard: protecting video content from unauthorized editing.
+
+arXiv preprint arXiv:2508.03480.
+
+External Links: Link
+
+Cited by: §1.
+
+[4]
+T. Chen, S. Huang, Y. Xie, B. Jiao, D. Jiang, H. Zhou, J. Li, and F. Wei (2022)
+
+Task-specific expert pruning for sparse mixture-of-experts.
+
+arXiv preprint arXiv:2206.00277.
+
+Cited by: §1.
+
+[5]
+A. Conneau, M. Ma, S. Khanuja, Y. Zhang, V. Axelrod, S. Dalmia, J. Riesa, and C. Rivera (2023)
+
+FLEURS: few-shot learning evaluation of universal representations of speech.
+
+In Proc. IEEE Spoken Language Technology Workshop,
+
+External Links: Document
+
+Cited by: §3.1.
+
+[6]
+W. Fedus, B. Zoph, and N. Shazeer (2022)
+
+Switch transformers: scaling to trillion parameter models with simple and efficient sparsity.
+
+Journal of Machine Learning Research 23 (120), pp. 1–39.
+
+Cited by: §1.
+
+[7]
+Y. Han, X. Hao, K. Chen, W. Xiong, J. He, et al. (2025)
+
+Quantize more, lose less: autoregressive generation from residually quantized speech representations.
+
+arXiv preprint arXiv:2507.12197.
+
+External Links: Link
+
+Cited by: §1.
+
+[8]
+A. Q. Jiang, A. Sablayrolles, A. Roux, A. Mensch, B. Savary, et al. (2024)
+
+Mixtral of experts.
+
+arXiv preprint arXiv:2401.04088.
+
+Cited by: §1.
+
+[9]
+J. Kim, J. Yun, H. Kim, G. Kim, J. Bae, and J. Cho (2026)
+
+Pruning and distilling mixture-of-experts into dense language models.
+
+arXiv preprint arXiv:2605.28207.
+
+Cited by: §1,
+§1,
+§2.2,
+§3.1.
+
+[10]
+A. Krause, A. Singh, and C. Guestrin (2008)
+
+Near-optimal sensor placements in gaussian processes: theory, efficient algorithms and empirical studies.
+
+Journal of Machine Learning Research 9, pp. 235–284.
+
+Cited by: §2.2.
+
+[11]
+A. Kulesza and B. Taskar (2012)
+
+Determinantal point processes for machine learning.
+
+Foundations and Trends in Machine Learning 5 (2–3), pp. 123–286.
+
+External Links: Document
+
+Cited by: §2.2.
+
+[12]
+M. Lasby, I. Lazarevich, N. Sinnadurai, S. Lie, Y. Ioannou, and V. Thangarasa (2025)
+
+REAP the experts: why pruning prevails for one-shot MoE compression.
+
+arXiv preprint arXiv:2510.13999.
+
+Cited by: §1,
+§1,
+§3.1.
+
+[13]
+H. Li, Y. Li, Y. Yang, J. Cao, Z. Zhu, X. Cheng, and L. Chen (2025)
+
+DisPose: disentangling pose guidance for controllable human image animation.
+
+In Proc. ICLR,
+
+External Links: Link
+
+Cited by: §1.
+
+[14]
+K. Li, J. Gu, X. Yu, J. Cao, Y. Tang, and X. Zhang (2024)
+
+UVCG: leveraging temporal consistency for universal video protection.
+
+arXiv preprint arXiv:2411.17746.
+
+External Links: Link
+
+Cited by: §1.
+
+[15]
+X. Lu, Q. Liu, Y. Xu, A. Zhou, S. Huang, B. Zhang, J. Yan, and H. Li (2024)
+
+Not all experts are equal: efficient expert pruning and skipping for mixture-of-experts large language models.
+
+In Proc. ACL,
+
+pp. 6159–6172.
+
+External Links: Document
+
+Cited by: §1.
+
+[16]
+Z. Ma, Y. Ma, Y. Zhu, C. Yang, Y. Chao, R. Xu, et al. (2025)
+
+MMAR: a challenging benchmark for deep reasoning in speech, audio, music, and their mix.
+
+arXiv preprint arXiv:2505.13032.
+
+Cited by: §3.1.
+
+[17]
+G. L. Nemhauser, L. A. Wolsey, and M. L. Fisher (1978)
+
+An analysis of approximations for maximizing submodular set functions—I.
+
+Mathematical Programming 14, pp. 265–294.
+
+External Links: Document
+
+Cited by: §2.3.
+
+[18]
+NVIDIA (2026)
+
+Nemotron 3 nano omni: efficient and open multimodal intelligence.
+
+arXiv preprint arXiv:2604.24954.
+
+Cited by: §1,
+§3.1.
+
+[19]
+V. Panayotov, G. Chen, D. Povey, and S. Khudanpur (2015)
+
+LibriSpeech: an ASR corpus based on public domain audio books.
+
+In Proc. ICASSP,
+
+pp. 5206–5210.
+
+External Links: Document
+
+Cited by: §3.1.
+
+[20]
+M. Post (2018)
+
+A call for clarity in reporting BLEU scores.
+
+In Proc. WMT,
+
+pp. 186–191.
+
+Cited by: §3.1.
+
+[21]
+Qwen Team (2025)
+
+Qwen3-Omni-30B-A3B-Instruct: released model configuration.
+
+Note: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/config.json
+
+Cited by: §3.1.
+
+[22]
+S. Sakshi, U. Tyagi, S. Kumar, A. Seth, R. Selvakumar, O. Nieto, R. Duraiswami, S. Ghosh, and D. Manocha (2024)
+
+MMAU: a massive multi-task audio understanding and reasoning benchmark.
+
+arXiv preprint arXiv:2410.19168.
+
+Cited by: §3.1.
+
+[23]
+N. Srinivas, A. Krause, S. Kakade, and M. Seeger (2010)
+
+Gaussian process optimization in the bandit setting: no regret and experimental design.
+
+In Proc. ICML,
+
+pp. 1015–1022.
+
+Cited by: §2.2.
+
+[24]
+D. Wang, J. Li, J. Wu, D. Yang, X. Chen, T. Zhang, and H. Meng (2026)
+
+MMSU: a massive multi-task spoken language understanding and reasoning benchmark.
+
+In Proc. ICLR,
+
+Cited by: §3.1.
+
+[25]
+Y. Wang, X. Wang, P. Zhu, J. Wu, H. Li, H. Xue, Y. Liao, and Z. Wu (2022)
+
+OpenCpop: a high-quality open source chinese popular song corpus for singing voice synthesis.
+
+In Proc. Interspeech,
+
+pp. 4242–4246.
+
+External Links: Document
+
+Cited by: §3.1.
+
+[26]
+J. Xu, Z. Guo, H. Hu, Y. Chu, X. Wang, et al. (2025)
+
+Qwen3-Omni Technical Report.
+
+arXiv preprint arXiv:2509.17765.
+
+Cited by: §1,
+§3.1.
+
+[27]
+D. Yang, Y. Xie, Y. Yin, Z. Wang, X. Yi, et al. (2026)
+
+HeartMuLa: a family of open sourced music foundation models.
+
+arXiv preprint arXiv:2601.10547.
+
+External Links: Link
+
+Cited by: §1.

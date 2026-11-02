@@ -1,0 +1,1852 @@
+## Correcting Attribution Patching with a Few Exact Measurements
+
+Luyang Zhang
+††thanks: Equal contribution.
+Affiliation: Carnegie Mellon University
+
+Minxing Zheng11footnotemark: 
+ 1
+
+Affiliation: Carnegie Mellon University
+
+Jialu Wang
+
+Affiliation: University of California, Santa Cruz
+
+Abstract
+
+Mechanistic interpretability asks which language model components matter for a behavior, and activation patching answers by changing one component’s activation and measuring its effect, at a cost growing with components and prompts. Attribution patching estimates these effects from one gradient pass, but its estimates can be far off, and verifying each one restores the cost. Can the structure of these errors reduce this cost? We propose Guided-AP, which uses a few exact measurements to reveal attribution patching’s errors and correct unmeasured estimates. On a single prompt, many components’ errors share one sign, so a small exact sample yields one correction for the rest. Over many prompts of one task, components are misestimated similarly, so a few measured prompts show what to verify and how to correct each component’s average effect. Our analysis shows that choosing what to verify needs error size, while correction also needs sign. On a single prompt, the correction lowers error by up to 26% across three behaviors at the compute of verifying the largest estimates and also on larger models. Over many prompts, learned corrections cut the error of average effects on factual completion by 75% to 79%, repaying their cost in long analyses.
+
+## 1 Introduction
+
+Mechanistic interpretability seeks to explain how a language model’s internal computations produce its behavior. To study behaviors such as resolving a reference or recalling a fact, researchers measure how internal components, such as attention heads or MLP neurons, influence the model’s prediction. One widely used approach for measuring this influence is activation patching (AP) (Wang et al., 2023; Zhang and Nanda, 2024). It replaces a component’s activation with one from a contrasting input and measures the resulting change in a prediction score, such as the logit difference between two answers.
+
+Figure 1: Guided-AP learns shared attribution errors. Within a prompt, a small exact sample corrects unmeasured estimates; across prompts, learned error profiles choose what to verify and correct remaining estimates and average effects. Final estimates are exact where verified and corrected elsewhere.
+
+However, AP is expensive across many components and prompts, because each measurement is a separate intervention. To reduce this cost, attribution patching (AtP) approximates the same effects using gradients from a single backward pass (Nanda, 2023; Syed et al., 2024). This efficiency comes at the cost of accuracy, because its estimates can be far from the measured effects (Zhang and Wang, 2026). Verifying every estimate with AP would remove the error but restore the original cost, so the challenge is to improve the estimates without exhaustive measurement. Under a limited budget, verifying the components with the largest estimated effects is a strong baseline, but a large effect does not mean a large error. Errors can concentrate in a few components and recur across prompts, as illustrated in Figure 2. Errors can also persist when estimates are averaged across prompts. The central question of this paper is whether knowing the structure of these errors makes attribution analysis more effective and more efficient.
+
+Our answer builds on the fact that an exact measurement reveals both a component’s true effect and the error of its cheap estimate. When such errors are similar across estimates, a few measurements can repair estimates that were never measured. Each measurement therefore improves more than one estimate. It replaces its own estimate with the true effect, and the error it reveals improves the estimates left unmeasured. Each error belongs to one component on one prompt, so we can look at the errors from two perspectives (Figure 1). Our method, Guided-AP, applies the same estimator in both settings. On a single prompt, the errors of many components share one sign, so one shift improves many estimates at once. We measure a small, representative sample and shift every unmeasured estimate by the median of the sampled
+errors, the shift with the lowest mean absolute error on the sample. The rest of the budget verifies the largest estimated effects. Over many prompts, each component’s error tends to recur. A few measured prompts give each component an error profile. Later prompts reuse it to choose verifications and correct each component’s average effect. Guided-AP learns from exact AP measurements.
+
+On a single prompt, the correction needs summary statistics of the error distribution (e.g., its median), and a small exact sample on that prompt estimates them. Centering estimates without measuring their errors does not reproduce this gain. With the exact sample, the correction lowers error by up to 26% at the same compute. Over many prompts, the errors left after averaging mostly share one sign, so a few calibration prompts can estimate each component’s average error. A correction learned from exact measurements cuts the error of these averages on factual completion by 75% to 79% relative to uncorrected averages, with no measurement on the analyzed prompts. Using the same measurements directly as average effects is 6 to 15 times worse, so the gain comes from modeling the errors. Choosing what to verify needs only the size of each error. In our cost projections, the correction pays for itself within a few thousand prompts, and learned selection needs longer analyses, up to tens of thousands of prompts. The single-prompt gains carry to larger models and finer components, up to a 32B model with tens of thousands of components per layer, and on some tasks the correction reaches a fixed accuracy target several times faster than verification alone.
+
+We make three contributions.
+
+• 
+
+A framework of budgeted attribution analysis. We study attribution analysis under a fixed budget of exact measurements that must serve both verification and correction, and we compare methods by the error left at equal compute.
+
+• 
+
+Analysis of error structures. We show that attribution errors are shared within a single prompt and recur over many prompts, and which error statistic selection and correction each need.
+
+• 
+
+Scalability to finer components and larger models. We show that a fixed budget of exact measurements remains useful as models grow larger and their components finer, where each measurement must go further.
+
+## 2 Related Work
+
+## Causal attribution and circuit discovery.
+
+Activation patching localizes behavior through interventions whose results depend on corruption, component definitions, and output metrics (Wang et al., 2023; Zhang and Nanda, 2024). Automated circuit discovery reduces search costs (Conmy et al., 2023; Syed et al., 2024); benchmarks and a shared task evaluate localization across tasks (Mueller et al., 2025; Arad et al., 2025; Hanna et al., 2024), and feature-level methods reach tens of thousands of components (Marks et al., 2025). We estimate isolated component effects and their dataset means; low effect-vector error does not imply faithfulness of a jointly intervened circuit.
+
+## Correcting attribution estimates.
+
+Attribution patching linearizes the intervention (Nanda, 2023). Existing methods correct estimates within a prompt. AtP∗ targets specific failure modes (Kramár et al., 2024), relevance patching replaces gradients with propagation coefficients (Jafari et al., 2025), interaction-aware backpropagation fixes gradient flow through softmax and normalization (Edin et al., 2025), path-based attribution integrates along the intervention (Sundararajan et al., 2017; Janizek et al., 2021), and second-order patching correction expands effects at the endpoint (Zhang and Wang, 2026). We learn error structure from exact measurements and reuse it across components within a prompt or across prompts for a component. Our base estimate is AtP.
+
+## Efficient error estimation.
+
+Randomized diagonal estimators approximate the diagonal of a matrix from matrix-vector products (Hutchinson, 1989; Bekas et al., 2007; Baston and Nakatsukasa, 2022; Epperly et al., 2024), and Hessian-vector products make this cheap for neural networks (Pearlmutter, 1994; Yao et al., 2021); we use such sketches only as a comparison label source. Allocating exact measurements to unreliable estimates follows active learning (Cohn et al., 1994; Lewis and Gale, 1994) and selective prediction (Geifman and El-Yaniv, 2017); influence estimation at scale similarly uses cheap curvature approximations (Koh and Liang, 2017; Grosse et al., 2023). We test whether reusing attribution errors within or across prompts improves accuracy after charging acquisition, fitting, and verification costs.
+
+## 3 Proposed Method
+
+## 3.1 Preliminaries
+
+Consider a language model with $N$ candidate components, a clean prompt $x$ , and a contrasting prompt $x^{\prime}$ . Write $a_{i}$ and $a_{i}^{\prime}$ for component $i$ ’s activations on the two prompts and $\delta_{i}=a_{i}^{\prime}-a_{i}$ for its patch direction. These activations may be scalars or vectors. Let $F(t)$ , for $t\in\mathbb{R}^{N}$ , be the prediction metric on $x$ when each component receives the additive shift $t_{i}\delta_{i}$ and later layers are recomputed; $F(0)$ is the clean run.
+
+To isolate the effect of each component, let $v_{i}\in\mathbb{R}^{N}$ denote the coordinate unit vector with $i$ th entry $1$ and $0$ elsewhere, and define the isolated AP effect of component $i$ , denoted $\Delta_{i}$ , and its AtP approximation $g_{i}$ as
+
+ $\Delta_{i}=F(v_{i})-F(0),\qquad g_{i}=\partial_{i}F(0).$ 
+
+We call $e_{i}=\Delta_{i}-g_{i}$ the AtP residual, and evaluate an estimate $\widehat{\Delta}$ of $(\Delta_{1},\ldots,\Delta_{N})$ by its mean absolute error, $\operatorname{MAE}(\widehat{\Delta})=N^{-1}\sum_{i=1}^{N}|\Delta_{i}-\widehat{\Delta}_{i}|$ .
+
+Though accurate, exact AP requires $N$ separate interventions per prompt, with a cost linear in both the number of components and the number of prompts. In comparison, AtP estimates all $N$ effects from one backward pass, but its linear approximation misses the curvature of a finite patch, so its residuals can be large (Zhang and Wang, 2026).
+
+## 3.2 Learning Shared Attribution Errors
+
+Given these two limitations, we seek a framework that balances estimation accuracy and computation. Our key observation is that AtP residuals follow structured patterns. First, a few components carry most of the error. Second, on a single prompt, the residuals are biased away from zero. Third, each component’s residual is consistent across prompts of the same task. Figure 2 demonstrates these patterns with a toy example on GPT-2.
+
+Figure 2: AtP errors on GPT-2. (a) The top four components ( $\blacktriangledown$ ) carry 80% of the test error. (b) Calibration versus test error for each component, with the top four highlighted. The two errors are strongly correlated and consistently biased away from zero. 
+
+Motivated by these patterns, we propose to measure only a few well-chosen components exactly, which removes most of the AtP error, and to use their residuals to correct the remaining unmeasured components. Specifically, given a budget of $B$ exact AP measurements per prompt, we aim to find a subset $S$ of the $N$ components with $|S|=B$ and construct the estimator
+
+ $\widehat{\Delta}_{i}=\begin{cases}\Delta_{i},&i\in S,\\
+g_{i}+c_{i},&i\notin S,\end{cases}$ 
+
+(1)
+
+where $c_{i}$ is learned from exact measurements. Since measured components are exact, choosing $S$ and $c$ to minimize the MAE of $\widehat{\Delta}$ gives
+
+ $\displaystyle\min_{S,\,c}$ 
+ $\displaystyle\sum_{i=1}^{N}|\widehat{\Delta}_{i}-\Delta_{i}|=\sum_{i\notin S}|g_{i}+c_{i}-\Delta_{i}|$ 
+
+(2)
+
+ $\displaystyle\text{s.t.}$ 
+ $\displaystyle S\subseteq\{1,\ldots,N\},\ |S|=B.$ 
+
+Equation 2 requires the unknown residuals $\Delta_{i}-g_{i}$ for $i\notin S$ . The patterns above, however, can make these residuals predictable from measured ones. Within a prompt, measured components reveal the shared offset of the rest; across prompts, a component’s residual on earlier prompts predicts its residual on new ones. We therefore learn the corrections and the measured set from calibration data $\mathcal{D}=\{(\Delta_{pi},g_{pi})\}$ , the exact AP measurements and AtP estimates of component $i$ on prompt $p$ available for fitting, from earlier prompts or from the test prompt itself, with residuals $e_{pi}=\Delta_{pi}-g_{pi}$ . We fit the residual, and then the size of what the fitted correction leaves, by absolute loss over $\mathcal{D}$ ,
+
+ $\displaystyle\widehat{f}$ 
+ $\displaystyle=\arg\min_{f}\|e-f\|_{1},$ 
+
+(3)
+
+ $\displaystyle\widehat{h}$ 
+ $\displaystyle=\arg\min_{h}\big\||e-\widehat{f}|-h\big\|_{1},$ 
+
+where $f$ and $h$ are evaluated at $(g_{pi},i)$ and may belong to any model class, such as a constant, a linear regression, or a neural network; in this paper $f$ is a constant and $h$ a log-linear model (Appendix A). At test time, for a test prompt $p^{\prime}$ , each component $i$ receives a correction and a selection score,
+
+ $\widehat{c}_{p^{\prime}i}=\widehat{f}(g_{p^{\prime}i},i),\qquad s_{p^{\prime}i}=\widehat{h}(g_{p^{\prime}i},i).$ 
+
+(4)
+
+The budget goes to the components with the highest scores, and the rest receive corrections $g_{p^{\prime}i}+\widehat{c}_{p^{\prime}i}$ . We call this procedure Guided-AP.
+
+The performance of Guided-AP depends on what can be learned from measured residuals, since a measured residual helps unmeasured components only insofar as it reveals an error pattern they share. The patterns in Figure 2 suggest two axes of sharing: across components within one prompt, and across prompts of the same task for a given component. These lead to two learning settings, which we call within-prompt learning and across-prompt learning, respectively. The former learns a prompt-specific offset from other components measured on that prompt; the latter learns component-specific error patterns from earlier prompts, informing both correction and verification on later prompts.
+Within-prompt learning needs no prior labels, whereas across-prompt learning requires measurements from earlier prompts. We describe each setting’s labels, correction $\widehat{c}$ , and selection score $s$ below; Algorithm 1 summarizes both.
+
+## Within-prompt learning.
+
+This setting learns a prompt-specific offset from a few components measured on the same prompt, so it needs no prior labels but pays for its own. The budget is split into a pilot set $S_{1}$ that supplies the labels and a verification set $S_{2}$ , with $|S_{1}|+|S_{2}|=B$ . The pilot should represent the typical component, since the offset it estimates will be applied to all unmeasured ones. Because residual size varies with attribution, we stratify by $|g_{p^{\prime}i}|$ , dividing the components into $K$ equal groups $G_{1},\ldots,G_{K}$ by attribution rank and drawing the pilot equally from each,
+
+ $S_{1}=\bigcup_{k=1}^{K}U_{k},\qquad U_{k}\subseteq G_{k},$ 
+
+(5)
+
+giving labels $\mathcal{D}=\{(\Delta_{p^{\prime}j},g_{p^{\prime}j})\}_{j\in S_{1}}$ . The correction is this offset, estimated by the pilot median, which minimizes the absolute error (Koenker and Bassett, 1978) and is insensitive to its few large residuals,
+
+ $\widehat{c}_{p^{\prime}i}=\operatorname{median}_{j\in S_{1}}e_{p^{\prime}j}\quad\text{for all }i.$ 
+
+(6)
+
+With at most one label per component, no component-specific size model can be fit, so the selection score is $s_{p^{\prime}i}=|g_{p^{\prime}i}|$ , the only available proxy for residual size, and the remaining budget verifies the highest scores outside $S_{1}$ . The pilot corrects the bulk; verification handles the tail.
+
+Algorithm 1 Guided-AP
+
+ 1:
+
+ test prompt $p^{\prime}$ , budget $B$ , calibration data $\mathcal{D}$ (possibly empty)
+
+ 2:
+
+ $g_{p^{\prime}i}\leftarrow\partial_{i}F_{p^{\prime}}(0)$ for all $i$ 
+
+ 3:
+
+ if $\mathcal{D}=\varnothing$ then $\triangleright$ within-prompt learning
+
+ 4:
+
+    $S_{1}\leftarrow$ stratified sample by $|g_{p^{\prime}i}|$ $\triangleright$ Eq. 5
+
+ 5:
+
+    $\mathcal{D}\leftarrow\{(\Delta_{p^{\prime}i},g_{p^{\prime}i})\}_{i\in S_{1}}$ 
+
+ 6:
+
+    $\widehat{f}\leftarrow$ pilot median, $\widehat{h}\leftarrow|g_{p^{\prime}i}|$ $\triangleright$ Eq. 6
+
+ 7:
+
+ else $\triangleright$ across-prompt learning
+
+ 8:
+
+    $S_{1}\leftarrow\varnothing$ 
+
+ 9:
+
+    $\widehat{f},\widehat{h}\leftarrow$ fit on $\mathcal{D}$ $\triangleright$ Eq. 3
+
+ 10:
+
+ $\widehat{c}_{p^{\prime}i}\leftarrow\widehat{f}(g_{p^{\prime}i},i)$ , $s_{p^{\prime}i}\leftarrow\widehat{h}(g_{p^{\prime}i},i)$ for all $i$ $\triangleright$ Eq. 4
+
+ 11:
+
+ $S_{2}\leftarrow$ top $B-|S_{1}|$ of $s_{p^{\prime}i}$ outside $S_{1}$ 
+
+ 12:
+
+ $S\leftarrow S_{1}\cup S_{2}$ 
+
+ 13:
+
+ return $\widehat{\Delta}_{p^{\prime}i}$ with estimated $\widehat{c}_{p^{\prime}i}$ $\triangleright$ Eq. 1
+
+## Across-prompt learning.
+
+This setting learns from earlier prompts of the same task, so it needs labels but spends the whole test-time budget on verification. When a component’s residual recurs across prompts, as in Figure 2, its residual on a new prompt can be predicted from earlier ones.
+From these labels, $\widehat{f}$ in Equation 3 learns a per-component correction, and $\widehat{h}$ learns, from the component’s attribution and identity, the size of the residual that correction leaves. Every component receives its correction $\widehat{c}_{p^{\prime}i}$ and selection score $s_{p^{\prime}i}$ , and the $B$ components with the highest scores are measured exactly. The correction helps only when its labels are representative, meaning that each corrected component has enough labels measured uniformly across prompts. Otherwise the correction can mislead and raise the error, and we set $\widehat{f}=0$ in this case. For a component’s average effect over many test prompts, we can correct the averaged AtP estimate by adding the component’s mean labeled residual, with no exact measurement on these prompts. Further details are in Appendix A.
+
+## 3.3 Theoretical Analysis
+
+We ask when each setting beats verification alone and why selection needs its own model. All results assume exact AP measurements; proofs are in Appendix C. Within a prompt, the pilot buys a shared correction at the price of displaced verification. Let $U$ be the unmeasured components, $A_{U}(c)=\sum_{i\in U}|e_{i}-c|$ their error after a shift $c$ , and $m_{U}$ their median, the best shift; let $H_{U}=A_{U}(0)-A_{U}(m_{U})$ be the gain of that shift, $E_{U}=A_{U}(\widehat{c})-A_{U}(m_{U})$ the estimation cost of the pilot median $\widehat{c}$ , and $C$ the error removed by displaced verification.
+
+Theorem 1 (Within-prompt gain).
+
+Let $\widehat{\Delta}$ be the within-prompt estimate with a stratified pilot of $n$ labels, $n/K$ from each of $K$ equal-size strata, and $\widehat{\Delta}^{0}$ the estimate that spends the same budget verifying the largest $|g_{i}|$ with no correction (verify-more, Section 4.1). Then
+
+ $N\big(\operatorname{MAE}(\widehat{\Delta}^{0})-\operatorname{MAE}(\widehat{\Delta})\big)=H_{U}-E_{U}-C,$ 
+
+(7)
+
+and, over the pilot draw, for all $t\in(0,\tfrac{1}{2})$ , with probability at least $1-2e^{-2nt^{2}}$ , $E_{U}\leq\varepsilon_{U}(t)=\max\{A_{U}(q(\tfrac{1}{2}-t)),A_{U}(q(\tfrac{1}{2}+t))\}-A_{U}(m_{U})$ , where $q$ is the quantile function of all $N$ residuals.
+
+The pilot pays when the unmeasured residuals share a sign, so $H_{U}$ is large, and cluster near their median, so $E_{U}$ is small, by more than $C$ . We first analyze a component-specific median correction learned from representative calibration labels. This result concerns absolute error on individual prompts. Correcting dataset averages instead requires estimating the mean residual. For independent prompt residuals with quantile function $q$ and median $m$ , let $R(c)=\mathbb{E}|e-c|$ and $\Gamma=R(0)-R(m)$ be the best shift’s gain.
+
+Theorem 2 (Median correction from representative labels).
+
+Let $\widehat{c}$ be the median of $n$ labels drawn independently from the component’s residual law, and assume $\mathbb{E}|e|<\infty$ . For any $t\in(0,\tfrac{1}{2})$ , with probability at least $1-2e^{-2nt^{2}}$ ,
+
+ $R(\widehat{c})\leq R(0)-\Gamma+2t\,w(t),$ 
+
+(8)
+
+where $w(t)=q(\tfrac{1}{2}+t)-q(\tfrac{1}{2}-t)$ .
+
+The bound explains when recurring residual bias makes a median correction useful. Magnitude-guided acquisition need not satisfy its sampling assumption. For dataset-average correction, an offset improves a component’s estimate when it has the same sign as the average residual and less than twice its magnitude (Appendix C.4). Selection asks a different question. Equation 2 verifies the components whose error after correction is largest, so a score must predict that error’s size. Fix the corrections and let $r_{i}=\mathbb{E}|e_{i}-\widehat{c}_{i}|$ be component $i$ ’s expected remaining error given what is known before measurement.
+
+Proposition 1 (Selection needs size).
+
+If $\max_{i}|s_{i}-r_{i}|\leq\epsilon$ , selecting the $B$ highest scores costs at most $2B\epsilon$ extra expected error over the $B$ highest $r_{i}$ .
+
+Scores must track the expected size of the remaining error, not the size of the expected error. A component whose residual is large but changes sign has $\widehat{f}$ near zero and large $r_{i}$ . This is why $h$ is fit separately from $f$ in Equation 3, and why a single prompt, which cannot fit $h$ , falls back to $|g|$ .
+
+## 4 Experiments
+
+## 4.1 Experimental Setup
+
+Figure 3: Warm runtime and relative AP error for within-prompt Guided-AP and the baselines. Square size denotes the measurement budget $B$ ; hollow derivative markers denote larger MS-HVP and IG settings. Appendix D.3 gives the timing details.
+
+## Models, tasks, and prompts.
+
+For within-prompt Guided-AP (Section 4.2), we study MLP neurons of Gemma-2-9B (Gemma Team, 2024), Qwen3-14B, and Qwen3-32B (Yang et al., 2025). For across-prompt Guided-AP (Section 4.3), we study attention heads of Qwen3-8B and Qwen2.5-7B-Instruct (Qwen et al., 2025). Tasks: indirect-object identification (IOI), factual completion, and subject-verb agreement (SVA). Score: logit difference between correct and counterfactual tokens. Evaluation prompts are held out; across-prompt calibration uses separate prompts in one prespecified evaluation. Figure 2 uses separate exact effects from GPT-2.
+
+## Methods and baselines.
+
+Within-prompt Guided-AP uses 256 exact measurements per layer. Across-prompt Guided-AP verifies $B\in\{16,32,64,128\}$ heads per prompt and separately corrects dataset averages without measuring the evaluation prompts. Our main baseline, verify-more, spends the same cost on exact measurements of the components with the largest AtP magnitudes and leaves the rest uncorrected. Across-prompt labels are acquired on large attributions, so verification sets $\widehat{f}=0$ (Section 3.2) and its comparison with verify-more isolates selection. An alternative calibration signal, ProbeCal, replaces the exact calibration labels with curvature-probe sketches, randomized estimates of the Hessian diagonal (Bekas et al., 2007), and fits the size model and average correction from them (Appendix B). On Gemma-2-9B, we also compare with verify-more on AtP∗ estimates, selective HVP, MS-HVP, singleton IG, and exhaustive AP (Appendices D.3 and F). All costs include pilot, calibration, and fitting. We report measured warm runtime per layer within prompts, and calibration plus projected deployment cost across prompts.
+
+## Metrics and uncertainty.
+
+Primary: per-prompt effect-vector MAE against exact FP32 AP (Section 3.1). Additional metrics: relative AP error (summed absolute error over summed absolute effects), dataset-average error, and recall of the ten largest effects. Error reduction: one minus the ratio of mean errors. Intervals: paired group bootstraps, adjusted over the prespecified across-prompt comparison family and descriptive within prompts (Appendices D, F, and I).
+
+## 4.2 Within-Prompt Learning
+
+Within-prompt Guided-AP lowers Gemma-2-9B MAE by 17% to 26% across all three tasks at the same measured runtime as verify-more, without earlier calibration prompts (Table 1). Top-ten recall remains nearly perfect for both methods.
+
+Task
+Groups
+
+Lower
+MAE
+
+Relative
+AP error
+
+Warm time
+(s/layer)
+
+Gemma-2-9B
+
+IOI
+100
+17.4%
+0.94%
+2.08
+
+Factual
+100
+26.2%
+1.20%
+1.30
+
+SVA
+100
+19.9%
+0.71%
+1.25
+
+Qwen3-14B
+
+IOI
+52
+24.0%
+1.34%
+2.95
+
+Factual
+56
+12.3%
+0.57%
+1.67
+
+SVA
+53
+10.9%
+0.58%
+1.64
+
+Qwen3-32B
+
+IOI
+10
+17.3%
+1.09%
+6.52
+
+Factual
+31
+17.5%
+1.09%
+3.54
+
+SVA
+40
+13.7%
+0.66%
+3.55
+
+Table 1: Within-prompt Guided-AP accuracy and warm runtime. MAE reductions compare with runtime-matched verify-more. Groups is the number of evaluation prompts scored on all three tested MLP layers (Appendix D).
+
+## Correction mechanism.
+
+Correcting unmeasured estimates drives the gain. The fitted shift captures 96% to 97% of the best common shift’s benefit, outweighing displaced verification (Theorem 1; Appendix D.5). Gains persist at equal measurement counts (Appendix D). FP64 readout rescoring of the same estimates retains 10% to 23% lower Gemma MAE and positive intervals on every larger-model task (Appendix D.5).
+
+Figure 4: Within-prompt Guided-AP ablations on Gemma-2-9B at 256 measurements: pilot size (left) and mean versus median (right). Values show MAE reductions versus verification alone. Cohorts: Appendix D.4.
+
+## Controls and ablations.
+
+Measurements chosen for verification need not represent unmeasured errors. Shifting the remaining estimates by the median residual of those measurements raises MAE in eight of nine settings. The pilot lowers Gemma MAE by 17% to 24% relative to the better of this control and verification alone (Table 2).
+
+Task
+Verify only
+Verify + shift
+Guided-AP
+
+IOI
+1.00
+1.93
+0.83
+
+Factual
+1.00
+0.97
+0.74
+
+SVA
+1.00
+1.80
+0.81
+
+Table 2: Within-prompt Guided-AP controls on Gemma-2-9B at the same 256-measurement budget. MAE is relative to verification alone; lower is better.
+
+On Gemma, Guided-AP lowers group-averaged MAE against runtime-matched verify-more in 96 of 100 IOI groups, 97 of 100 factual groups, and 98 of 100 SVA groups (Appendix D.5).
+
+A modest pilot captures most gains. Pilots of 32 or 64 improve on 16, and 128 adds no consistent gain (Figure 4a; Appendix Table 10). Every tested pilot size lowers MAE on all three Gemma tasks, leaving flexibility in how the budget is divided between pilot measurements and exact verification. The median beats the mean on identical labels in all nine settings; uniform and magnitude-stratified samples are similar on Gemma (Figure 4b; Appendix D.4).
+
+## 4.3 Across-Prompt Learning
+
+We compare across-prompt Guided-AP with ProbeCal (Section 4.1). We assess verification against verify-more at matched total cost, and dataset-average correction against uncorrected AtP, without evaluation measurements for the latter.
+
+## Verification allocation.
+
+Allocation needs transfer and reuse. On Qwen3 IOI, Guided-AP lowers MAE by 12% against verify-more at matched projected total cost, calibration included (Table 3).
+
+Task
+Method
+Qwen3-8B
+Qwen2.5-7B
+
+ $B=16$ 
+ $B=128$ 
+ $B=16$ 
+ $B=128$ 
+
+IOI
+Guided-AP
+12%
+7%
+ $-$ 29%
+12%
+
+ProbeCal
+17%
+19%
+ $-$ 39%
+15%
+
+Factual
+Guided-AP
+ $-$ 20%
+2%
+ $-$ 18%
+ $-$ 2%
+
+ProbeCal
+ $-$ 17%
+31%
+ $-$ 5%
+35%
+
+SVA
+Guided-AP
+3%
+4%
+2%
+3%
+
+ProbeCal
+2%
+12%
+1%
+19%
+
+Table 3: Across-prompt MAE reductions relative to verify-more at matched projected total cost, calibration included, for 10,000 prompts. Bold and italic mark adjusted significant improvements and harms.
+
+Where learning pays, projected break-even at the smallest budget ranges from 1,900 to 24,000 prompts across the two calibration signals. Shorter analyses favor additional verification; verify-more also remains strong on factual completion at small budgets and on Qwen2.5 IOI (Appendices G and I).
+
+## Dataset-average correction.
+
+Persistent average errors can be corrected without measuring each new prompt. On factual completion, Guided-AP lowers dataset-average MAE by 75% to 79% on both models relative to uncorrected AtP (Figure 5; Appendix Table 15). Post hoc cost comparisons give projected payback of 500 to 2,700 prompts where correction helps; shorter analyses favor verify-more (Appendix H).
+
+Learning residuals makes better use of calibration measurements. Directly averaging the same AP effects produces 5.8 to 14.9 times more error than residual correction in every setting (Appendix H). On factual completion, Guided-AP labels cover 13% to 18% of heads; the rest retain their AtP averages.
+
+Signed error transfer can fail. Guided-AP raises Qwen2.5 IOI dataset-average MAE by 52%, consistent with selection bias (Appendix C.4). SVA has no established correction gain, and neither correction establishes a dataset-average recall gain.
+
+## Calibration signals.
+
+ProbeCal helps allocation where exact-label learning is less effective, lowering factual MAE by 31% to 35% against verify-more at matched projected total cost (Table 3). Its factual average correction reduces MAE by 46% against uncorrected AtP, less than Guided-AP (Figure 5); it helps Qwen2.5 IOI averages where Guided-AP harms them (Appendix Table 15).
+
+## Error structure and recall.
+
+Verification and average correction require different error information. Factual errors recur (Appendix E), yet learned selection can lose at small budgets because magnitude ranking already captures the largest residuals. SVA improves verification without an established mean-correction gain. Lower MAE also need not improve top-ten recall (Appendix G).
+
+Figure 5: Dataset-average correction on the two models. Ratios are uncorrected over corrected MAE, with adjusted intervals; the dotted line denotes equality.
+
+## 4.4 Scalability and Efficiency
+
+We separate accuracy gains at a fixed measurement budget from runtime savings at an error target.
+
+## Component count and accuracy.
+
+With the measurement budget fixed, the benefit persists at every tested component count across all three Gemma tasks, up to 14,336 neurons (Appendix D.6).
+
+Runtime savings depend on the required accuracy. At a 1% mean relative AP error target, Guided-AP is 7.9 times faster than verify-more on Gemma IOI in measured warm runtime. This runtime includes attribution, pilot measurements, and fitting on the same prompt; the gain requires no reuse across prompts. Verification is cheaper on SVA, and Guided-AP misses the factual target (Table 4; Appendix D.2).
+
+Guided-AP
+Verification to 1%
+
+Task
+Error
+s/layer
+Checks
+s/layer
+
+IOI
+0.94%
+2.08
+2,416
+16.37
+
+Factual
+1.20%
+1.30
+5,664
+21.84
+
+SVA
+0.71%
+1.25
+32
+0.43
+
+Table 4: Warm cost at a 1% mean relative AP error target on Gemma-2-9B. Italic errors exceed the target; checks count magnitude-ranked AP measurements.
+
+## Model size.
+
+The same budget yields 11% to 24% lower MAE on Qwen3-14B and 14% to 18% on Qwen3-32B at matched runtime, measuring only 1% of the latter’s neurons (Table 1; Figure 6a). At Guided-AP’s achieved error, a post hoc comparison finds verify-more takes 5.9 to 14.7 times longer in warm runtime across the three 32B tasks (Figure 6b; Appendix Table 6). This frontier comparison uses the same prompts and matches the correction’s observed error, separately from the prespecified targets.
+
+## Comparison with derivative corrections.
+
+On the 30-group Gemma comparison set, Guided-AP has lower MAE than selective HVP, MS-HVP, and singleton IG at their tested settings, taking about one to three warm seconds per layer (Figure 3; Appendix D.3). AtP remains fastest; exhaustive AP removes approximation error at greater cost.
+
+Figure 6: Scaling of the fixed budget. Left, SVA MAE reductions at matched cost with descriptive intervals. Right, measured 32B verification curves for factual completion and SVA (lines), within-prompt Guided-AP (stars), and verification at the same error (open circles), on the same complete groups; IOI: Appendix Table 6.
+
+## 5 Conclusion and Limitations
+
+Attribution patching trades the accuracy of activation patching for speed. Guided-AP uses a few exact measurements to improve estimates beyond the ones it verifies. On a single prompt, the median error of a small exact sample corrects the unmeasured estimates, as long as enough budget remains to verify the largest ones. Over many prompts of one task, a few measured prompts reveal each component’s recurring error. Its size guides verification on later prompts, and its direction corrects average effects, which repays the cost of learning in long analyses. Future work could combine the two settings and test them on sparse features, where activation patching is most costly.
+
+Our evaluation focuses on transformer language models and controlled language tasks. Further evaluation on other architectures, component representations, and open-ended language behaviors would clarify its broader applicability. Accuracy and computational costs depend on the task, measurement budget, hardware, and implementation. Activation patching measures effects relative to a chosen intervention and output metric. These estimates describe individual components and can inform mechanistic explanations alongside tests of how components work together.
+
+## References
+
+Arad et al. (2025)
+D. Arad, Y. Belinkov, H. Chen, N. Kim, H. Mohebbi, A. Mueller, G. Sarti, and M. Tutek
+
+Findings of the BlackboxNLP 2025 shared task: localizing circuits and causal variables in language models.
+
+In Proceedings of the 8th BlackboxNLP Workshop: Analyzing and Interpreting Neural Networks for NLP, Y. Belinkov, A. Mueller, N. Kim, H. Mohebbi, H. Chen, D. Arad, and G. Sarti (Eds.),
+
+Suzhou, China, pp. 543–552.
+
+External Links: Link,
+Document,
+ISBN 979-8-89176-346-3
+
+Cited by: §2.
+
+Baston and Nakatsukasa (2022)
+R. A. Baston and Y. Nakatsukasa
+
+Stochastic diagonal estimation: probabilistic bounds and an improved algorithm.
+
+External Links: 2201.10684,
+Link
+
+Cited by: §2.
+
+Bekas et al. (2007)
+C. Bekas, E. Kokiopoulou, and Y. Saad
+
+An estimator for the diagonal of a matrix.
+
+Applied Numerical Mathematics 57 (11-12), pp. 1214–1229.
+
+External Links: ISSN 0168-9274,
+Link,
+Document
+
+Cited by: Appendix B,
+Appendix B,
+§2,
+§4.1.
+
+Cohn et al. (1994)
+D. Cohn, L. Atlas, and R. Ladner
+
+Improving generalization with active learning.
+
+Machine Learning 15 (2), pp. 201–221.
+
+External Links: ISSN 1573-0565,
+Link,
+Document
+
+Cited by: §2.
+
+Conmy et al. (2023)
+A. Conmy, A. Mavor-Parker, A. Lynch, S. Heimersheim, and A. Garriga-Alonso
+
+Towards automated circuit discovery for mechanistic interpretability.
+
+In Advances in Neural Information Processing Systems, A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine (Eds.),
+
+Vol. 36, pp. 16318–16352.
+
+External Links: Document,
+Link
+
+Cited by: §2.
+
+Edin et al. (2025)
+J. Edin, C. L. Christensen, R. Csordás, T. Ruotsalo, Z. Wu, M. Maistro, J. Huang, and L. Maaløe
+
+Correcting gradient-based circuit localization via interaction-aware backpropagation.
+
+External Links: 2505.17630,
+Link
+
+Cited by: §2.
+
+Epperly et al. (2024)
+E. N. Epperly, J. A. Tropp, and R. J. Webber
+
+XTrace: making the most of every sample in stochastic trace estimation.
+
+SIAM Journal on Matrix Analysis and Applications 45 (1), pp. 1–23.
+
+External Links: ISSN 1095-7162,
+Link,
+Document
+
+Cited by: §2.
+
+Geifman and El-Yaniv (2017)
+Y. Geifman and R. El-Yaniv
+
+Selective classification for deep neural networks.
+
+In Advances in Neural Information Processing Systems, I. Guyon, U. V. Luxburg, S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett (Eds.),
+
+Vol. 30, pp. 4878–4887.
+
+External Links: Link
+
+Cited by: §2.
+
+Gemma Team (2024)
+Gemma Team
+
+Gemma 2: improving open language models at a practical size.
+
+External Links: 2408.00118,
+Link
+
+Cited by: §4.1.
+
+Grosse et al. (2023)
+R. Grosse, J. Bae, C. Anil, N. Elhage, A. Tamkin, A. Tajdini, B. Steiner, D. Li, E. Durmus, E. Perez, E. Hubinger, K. Lukošiūtė, K. Nguyen, N. Joseph, S. McCandlish, J. Kaplan, and S. R. Bowman
+
+Studying large language model generalization with influence functions.
+
+External Links: 2308.03296,
+Link
+
+Cited by: §2.
+
+Hanna et al. (2024)
+M. Hanna, S. Pezzelle, and Y. Belinkov
+
+Have faith in faithfulness: going beyond circuit overlap when finding model mechanisms.
+
+In First Conference on Language Modeling,
+
+External Links: Link
+
+Cited by: §2.
+
+Hoeffding (1963)
+W. Hoeffding
+
+Probability inequalities for sums of bounded random variables.
+
+Journal of the American Statistical Association 58 (301), pp. 13–30.
+
+External Links: Document
+
+Cited by: §C.1.
+
+Hutchinson (1989)
+M.F. Hutchinson
+
+A stochastic estimator of the trace of the influence matrix for Laplacian smoothing splines.
+
+Communications in Statistics - Simulation and Computation 18 (3), pp. 1059–1076.
+
+External Links: ISSN 1532-4141,
+Link,
+Document
+
+Cited by: §2.
+
+Jafari et al. (2025)
+F. R. Jafari, O. Eberle, A. Khakzar, and N. Nanda
+
+RelP: faithful and efficient circuit discovery in language models via relevance patching.
+
+Note: NeurIPS 2025 Mechanistic Interpretability Workshop
+
+External Links: 2508.21258,
+Link
+
+Cited by: §2.
+
+Janizek et al. (2021)
+J. D. Janizek, P. Sturmfels, and S. Lee
+
+Explaining explanations: axiomatic feature interactions for deep networks.
+
+Journal of Machine Learning Research 22 (104), pp. 1–54.
+
+External Links: Link
+
+Cited by: §2.
+
+Koenker and Bassett (1978)
+R. Koenker and G. Bassett
+
+Regression quantiles.
+
+Econometrica 46 (1), pp. 33–50.
+
+External Links: ISSN 0012-9682,
+Link,
+Document
+
+Cited by: §3.2.
+
+Koh and Liang (2017)
+P. W. Koh and P. Liang
+
+Understanding black-box predictions via influence functions.
+
+In Proceedings of the 34th International Conference on Machine Learning, D. Precup and Y. W. Teh (Eds.),
+
+Proceedings of Machine Learning Research, Vol. 70, pp. 1885–1894.
+
+External Links: Link
+
+Cited by: §2.
+
+Kramár et al. (2024)
+J. Kramár, T. Lieberum, R. Shah, and N. Nanda
+
+AtP*: an efficient and scalable method for localizing LLM behaviour to components.
+
+External Links: 2403.00745,
+Link
+
+Cited by: §2.
+
+Lewis and Gale (1994)
+D. D. Lewis and W. A. Gale
+
+A sequential algorithm for training text classifiers.
+
+In SIGIR ’94: Proceedings of the Seventeenth Annual International ACM-SIGIR Conference on Research and Development in Information Retrieval, W. B. Croft and C. J. van Rijsbergen (Eds.),
+
+pp. 3–12.
+
+External Links: ISBN 9781447120995,
+Link,
+Document
+
+Cited by: §2.
+
+Marks et al. (2025)
+S. Marks, C. Rager, E. J. Michaud, Y. Belinkov, D. Bau, and A. Mueller
+
+Sparse feature circuits: discovering and editing interpretable causal graphs in language models.
+
+In The Thirteenth International Conference on Learning Representations,
+
+pp. 23888–23923.
+
+External Links: Link
+
+Cited by: §2.
+
+Mueller et al. (2025)
+A. Mueller, A. Geiger, S. Wiegreffe, D. Arad, I. Arcuschin, A. Belfki, Y. S. Chan, J. F. Fiotto-Kaufman, T. Haklay, M. Hanna, J. Huang, R. Gupta, Y. Nikankin, H. Orgad, N. Prakash, A. Reusch, A. Sankaranarayanan, S. Shao, A. Stolfo, M. Tutek, A. Zur, D. Bau, and Y. Belinkov
+
+MIB: a mechanistic interpretability benchmark.
+
+In Proceedings of the 42nd International Conference on Machine Learning, A. Singh, M. Fazel, D. Hsu, S. Lacoste-Julien, F. Berkenkamp, T. Maharaj, K. Wagstaff, and J. Zhu (Eds.),
+
+Proceedings of Machine Learning Research, Vol. 267, pp. 45069–45108.
+
+External Links: Link
+
+Cited by: §2.
+
+Nanda (2023)
+N. Nanda
+
+Attribution patching: activation patching at industrial scale.
+
+Note: https://www.neelnanda.io/mechanistic-interpretability/attribution-patching
+
+Cited by: §1,
+§2.
+
+Pearlmutter (1994)
+B. A. Pearlmutter
+
+Fast exact multiplication by the Hessian.
+
+Neural Computation 6 (1), pp. 147–160.
+
+External Links: ISSN 1530-888X,
+Link,
+Document
+
+Cited by: Appendix B,
+§2.
+
+Qwen et al. (2025)
+Qwen, A. Yang, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu, C. Li, D. Liu, F. Huang, H. Wei, H. Lin, J. Yang, J. Tu, J. Zhang, J. Yang, J. Yang, J. Zhou, J. Lin, K. Dang, K. Lu, K. Bao, K. Yang, L. Yu, M. Li, M. Xue, P. Zhang, Q. Zhu, R. Men, R. Lin, T. Li, T. Tang, T. Xia, X. Ren, X. Ren, Y. Fan, Y. Su, Y. Zhang, Y. Wan, Y. Liu, Z. Cui, Z. Zhang, and Z. Qiu
+
+Qwen2.5 technical report.
+
+External Links: 2412.15115,
+Link
+
+Cited by: Appendix F,
+§4.1.
+
+Sundararajan et al. (2017)
+M. Sundararajan, A. Taly, and Q. Yan
+
+Axiomatic attribution for deep networks.
+
+In Proceedings of the 34th International Conference on Machine Learning, D. Precup and Y. W. Teh (Eds.),
+
+Proceedings of Machine Learning Research, Vol. 70, pp. 3319–3328.
+
+External Links: Link
+
+Cited by: §2.
+
+Syed et al. (2024)
+A. Syed, C. Rager, and A. Conmy
+
+Attribution patching outperforms automated circuit discovery.
+
+In Proceedings of the 7th BlackboxNLP Workshop: Analyzing and Interpreting Neural Networks for NLP, Y. Belinkov, N. Kim, J. Jumelet, H. Mohebbi, A. Mueller, and H. Chen (Eds.),
+
+Miami, Florida, US, pp. 407–416.
+
+External Links: Link,
+Document
+
+Cited by: §1,
+§2.
+
+Wang et al. (2023)
+K. Wang, A. Variengien, A. Conmy, B. Shlegeris, and J. Steinhardt
+
+Interpretability in the wild: a circuit for indirect object identification in GPT-2 small.
+
+In The Eleventh International Conference on Learning Representations,
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Yang et al. (2025)
+A. Yang, A. Li, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu, C. Gao, C. Huang, C. Lv, C. Zheng, D. Liu, F. Zhou, F. Huang, F. Hu, H. Ge, H. Wei, H. Lin, J. Tang, J. Yang, J. Tu, J. Zhang, J. Yang, J. Yang, J. Zhou, J. Zhou, J. Lin, K. Dang, K. Bao, K. Yang, L. Yu, L. Deng, M. Li, M. Xue, M. Li, P. Zhang, P. Wang, Q. Zhu, R. Men, R. Gao, S. Liu, S. Luo, T. Li, T. Tang, W. Yin, X. Ren, X. Wang, X. Zhang, X. Ren, Y. Fan, Y. Su, Y. Zhang, Y. Zhang, Y. Wan, Y. Liu, Z. Wang, Z. Cui, Z. Zhang, Z. Zhou, and Z. Qiu
+
+Qwen3 technical report.
+
+External Links: 2505.09388,
+Link
+
+Cited by: Appendix F,
+§4.1.
+
+Yao et al. (2021)
+Z. Yao, A. Gholami, S. Shen, M. Mustafa, K. Keutzer, and M. Mahoney
+
+ADAHESSIAN: an adaptive second order optimizer for machine learning.
+
+Proceedings of the AAAI Conference on Artificial Intelligence 35 (12), pp. 10665–10673.
+
+External Links: ISSN 2159-5399,
+Link,
+Document
+
+Cited by: §2.
+
+Zhang and Nanda (2024)
+F. Zhang and N. Nanda
+
+Towards best practices of activation patching in language models: metrics and methods.
+
+In The Twelfth International Conference on Learning Representations,
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Zhang and Wang (2026)
+L. Zhang and J. Wang
+
+When attribution patching lies: diagnosis and a second-order correction.
+
+In Advances in Neural Information Processing Systems,
+
+External Links: Link
+
+Cited by: §1,
+§2,
+§3.1.
+
+## Appendix A Label Acquisition and Fits
+
+This appendix specifies label acquisition and the fitted correction $\widehat{f}$ and size model $\widehat{h}$ . Acquired AP values and residuals are written $\widetilde{\Delta}_{i}$ and $\widetilde{e}_{i}=\widetilde{\Delta}_{i}-g_{i}$ . They equal the scoring reference $\Delta_{i}$ and residual $e_{i}$ in the primary analysis; Appendix D.5 distinguishes them for FP64 rescoring.
+
+## A.1 Within-Prompt Learning
+
+Pilot. Sort components by increasing $|g_{i}|$ , breaking ties by component order, and partition them into $K=8$ equal-sized rank strata. Independently permute each stratum and take one component per stratum in round-robin order until the pilot is full (Equation 5). All evaluated populations are divisible by eight.
+
+Correction and selection. Fit one offset, the median acquired pilot residual (Equation 6). Set $\widehat{h}=|g_{p^{\prime}i}|$ and use the remaining $B-|S_{1}|$ measurements on the largest magnitudes outside the pilot. Runtime includes both measurement sets, selection, fitting, and estimate assembly.
+
+## A.2 Across-Prompt Learning
+
+Label acquisition. On each calibration prompt, sort components by decreasing $|g|$ . Visit prompts in fixed round-robin order, taking the next unacquired component until the label budget is exhausted.
+
+Size model $\widehat{h}$ . Each acquired label supplies $x=\log(|g|+\eta)$ and $y=\log(|\widetilde{e}-\widehat{c}_{i}|+\eta)$ with $\eta=10^{-12}$ , where $\widehat{c}_{i}$ is the correction fit below; with $\widehat{f}=0$ , as in our experiments, $y=\log(|\widetilde{e}|+\eta)$ . A pooled least-squares fit gives slope $a$ and intercept $\beta$ ; component $i$ then receives its own intercept $\beta_{i}=\beta+w_{i}(\operatorname{mean}_{i}[y-ax]-\beta)$ with $w_{i}=n_{i}/(n_{i}+5)$ , where $n_{i}$ is its number of labels, and the pooled intercept when it has none. The score is
+
+ $\widehat{h}(g,i)=\exp\big(a\log(|g|+\eta)+\beta_{i}\big),$ 
+
+a log-linear model fit by least squares in log space as a surrogate for the absolute-loss objective of Equation 3. The score approximates expected remaining error $r_{i}$ , the target of Proposition 1.
+
+Correction $\widehat{f}$ . Equation 3 restricted to one constant per component is minimized by the median of each component’s acquired residuals. Our verification experiments set $\widehat{f}=0$ (Section 4.1).
+
+Dataset averages. Let $\mathcal{C}_{i}$ be the calibration prompts on which component $i$ was measured. Its average correction is the mean acquired residual,
+
+ $\bar{c}_{i}=\begin{cases}|\mathcal{C}_{i}|^{-1}\sum_{p\in\mathcal{C}_{i}}e_{pi},&|\mathcal{C}_{i}|>0,\\
+0,&|\mathcal{C}_{i}|=0,\end{cases}$ 
+
+(9)
+
+with no shrinkage, and the corrected average is $\bar{g}_{i}+\bar{c}_{i}$ . The target is the average residual over prompts, so it is estimated by an average; Lemma 2 states when such a correction helps. For probes, Equation 10 plays the same role.
+
+## Appendix B Curvature-Probe Calibration
+
+ProbeCal supplies an alternative learning signal through shared curvature probes. When $F_{p}$ is twice differentiable at the baseline, let $G_{p}=\nabla^{2}F_{p}(0)$ be its Hessian in intervention coordinates for calibration prompt $p$ . With independent random sign vectors $z_{pr}\in\{-1,1\}^{N}$ , its sketch is
+
+ $d_{pi}=\frac{1}{R}\sum_{r=1}^{R}z_{pr,i}(G_{p}z_{pr})_{i}.$ 
+
+The randomized diagonal estimator of Bekas et al. (2007) is computed with Hessian-vector products (Pearlmutter, 1994). Its expectation is baseline curvature; Equation 11 gives its interaction-dependent noise, and Equation 12 distinguishes curvature from the finite AP residual. For $J$ calibration prompts with $R$ probes each, the signed average correction is
+
+ $\bar{c}_{i}^{\rm probe}=\frac{1}{2J}\sum_{p=1}^{J}d_{pi},$ 
+
+(10)
+
+and the corrected average is $\bar{g}_{i}+\bar{c}_{i}^{\rm probe}$ . Averaging retains the signs; a sketch estimates baseline curvature, not the complete finite-AP residual.
+ProbeCal uses the sketches as labels for the size model. Every component-prompt pair supplies $x_{pi}=\log(|g_{pi}|+\eta)$ and $y_{pi}=\log(|d_{pi}|+\eta)$ , where $d_{pi}$ averages the signed probes before the magnitude is taken. A pooled least-squares fit gives $(a,\beta)$ ; a component with varying log attribution across prompts also receives its own pair $(a_{i},\beta_{i})$ , shrunk toward the pooled values, and its score is $\widehat{h}(g,i)=\exp(a_{i}\log(|g|+\eta)+\beta_{i})$ . A capacity-matched AP-only control, fit the same way on exact labels, separates the label source from the model class. Probes are computed only on calibration prompts; no probe is run on evaluation prompts.
+
+## Probe noise and the finite-intervention remainder.
+
+For a fixed Hessian $G$ and independent sign vectors, $z_{i}(Gz)_{i}=G_{ii}+\sum_{j\neq i}G_{ij}z_{i}z_{j}$ , so conditional on $G$ (Bekas et al., 2007)
+
+ $\mathbb{E}[d_{i}\mid G]=G_{ii},\qquad\operatorname{Var}(d_{i}\mid G)=\frac{1}{R}\sum_{j\neq i}G_{ij}^{2},$ 
+
+(11)
+
+and $\operatorname{Cov}(d_{i},d_{k}\mid G)=G_{ik}^{2}/R$ for $i\neq k$ . Interactions between components set the noise of each sketch and correlate sketches across components, so they are not independent samples. The sketch also targets only the curvature term of the residual. For a twice differentiable path $f_{i}(t)=F(tv_{i})$ , Taylor’s theorem gives
+
+ $\displaystyle e_{i}$ 
+ $\displaystyle=\tfrac{1}{2}G_{ii}+\rho_{i},$ 
+
+(12)
+
+ $\displaystyle\rho_{i}$ 
+ $\displaystyle=\int_{0}^{1}(1-t)\{f_{i}^{\prime\prime}(t)-f_{i}^{\prime\prime}(0)\}\,dt,$ 
+
+Thus the sketches supply a curvature-based learning signal rather than exact finite-intervention residual labels.
+
+## Appendix C Mathematical Details
+
+## C.1 Proof of Theorem 1
+
+We extend the identity to the runtime-matched baseline of the experiments, which may measure $B_{0}\neq B$ components, and acquired AP values $\widetilde{\Delta}_{i}$ that may differ from the reference $\Delta_{i}$ . Fix $g$ and $\Delta$ and let $e=\Delta-g$ . The method measures $S$ with $|S|=B$ and shifts the unmeasured set $U$ by $\widehat{c}$ ; the baseline measures $V_{B_{0}}$ , the $B_{0}$ largest $|g_{i}|$ , and leaves the rest at $g_{i}$ . Let $D_{\rm acq}=\sum_{i\in S}|\widetilde{\Delta}_{i}-\Delta_{i}|-\sum_{i\in V_{B_{0}}}|\widetilde{\Delta}^{0}_{i}-\Delta_{i}|$ be the difference in acquisition error, and $C=\sum_{i\in V_{B_{0}}}|e_{i}|-\sum_{i\in S}|e_{i}|$ the verification opportunity cost. For the decomposition reported in Appendix D, $C$ splits into an allocation term and a count term,
+
+ $\displaystyle C_{\rm alloc}$ 
+ $\displaystyle=\sum_{i\in V_{B}}|e_{i}|-\sum_{i\in S}|e_{i}|,$ 
+
+ $\displaystyle C_{\rm count}$ 
+ $\displaystyle=\sum_{i\in V_{B_{0}}}|e_{i}|-\sum_{i\in V_{B}}|e_{i}|,$ 
+
+which isolate the change in which $B$ components are measured and the extra or fewer measurements affordable at matched runtime.
+
+The identity. The summed errors of the two estimates are
+
+ $\displaystyle L_{0}$ 
+ $\displaystyle=\sum_{i\notin V_{B_{0}}}|e_{i}|+\sum_{i\in V_{B_{0}}}|\widetilde{\Delta}^{0}_{i}-\Delta_{i}|,$ 
+
+ $\displaystyle L_{1}$ 
+ $\displaystyle=A_{U}(\widehat{c})+\sum_{i\in S}|\widetilde{\Delta}_{i}-\Delta_{i}|.$ 
+
+Subtracting, $L_{0}-L_{1}=A_{U}(0)-A_{U}(\widehat{c})-C-D_{\rm acq}$ , and adding and subtracting $A_{U}(m_{U})$ gives
+
+ $N(\operatorname{MAE}_{0}-\operatorname{MAE}_{1})=H_{U}-E_{U}-C-D_{\rm acq}.$ 
+
+Since $A_{U}$ is convex with a minimum at any median, $H_{U},E_{U}\geq 0$ . When acquired values equal the reference, $D_{\rm acq}=0$ and Equation 7 follows. $\square$ 
+
+The estimation cost. The bound on $E_{U}$ uses one fact about convex functions.
+
+Lemma 1. If $\widehat{c}\in[a,b]$ , then $A_{U}(\widehat{c})\leq\max\{A_{U}(a),A_{U}(b)\}$ .
+
+Proof. $A_{U}$ is convex, and every point of $[a,b]$ is a convex combination of its endpoints. $\square$ 
+
+Let $q$ be the quantile function of the $N$ residuals and $n$ the pilot size. The pilot is drawn without replacement, equally from $K$ equal-sized strata (Equation 5), with independent draws across strata, so the number of pilot residuals below $q(\tfrac{1}{2}-t)$ is a sum over strata of independent without-replacement counts with mean at most $n(\tfrac{1}{2}-t)$ . Hoeffding’s inequality holds for sampling without replacement and for independent sums of such counts (Hoeffding, 1963), so the pilot median falls below $q(\tfrac{1}{2}-t)$ with probability at most $e^{-2nt^{2}}$ , and symmetrically above $q(\tfrac{1}{2}+t)$ . On the complementary event, Lemma 1 with $[a,b]=[q(\tfrac{1}{2}-t),q(\tfrac{1}{2}+t)]$ gives
+
+ $E_{U}\leq\max\{A_{U}(a),A_{U}(b)\}-A_{U}(m_{U})\eqqcolon\varepsilon_{U}(t),$ 
+
+the excess error of the worst shift in the band. The probability statement concerns only the pilot median against the quantiles of all $N$ residuals; Lemma 1 then applies to whichever unmeasured set $U$ the pilot and verification leave. $\square$ 
+
+## C.2 Proof of Theorem 2
+
+The theorem assumes $n$ independent labels from the component’s residual law and $\mathbb{E}|e|<\infty$ . Labels acquired by attribution magnitude need not satisfy this, and the band is undefined for $t\geq\tfrac{1}{2}$ . Let $e_{1},\ldots,e_{n}$ be the labels and $\widehat{c}$ their median.
+
+Step 1: sample median in the central band. If $\widehat{c}<q(\tfrac{1}{2}-t)$ , at least $n/2$ labels fall below $q(\tfrac{1}{2}-t)$ . Their number is binomial with success probability at most $\tfrac{1}{2}-t$ , so Hoeffding’s inequality bounds this event by $e^{-2nt^{2}}$ ; similarly for $\widehat{c}>q(\tfrac{1}{2}+t)$ .
+
+Step 2: excess error inside the band. $R(c)=\mathbb{E}|e-c|$ is convex with derivative $2\Phi(c)-1$ almost everywhere, where $\Phi$ is the distribution function of $e$ , so for $\widehat{c}\geq m$ ,
+
+ $\displaystyle R(\widehat{c})-R(m)$ 
+ $\displaystyle=\int_{m}^{\widehat{c}}\bigl(2\Phi(u)-1\bigr)\,du$ 
+
+ $\displaystyle\leq 2t\,(\widehat{c}-m)\leq 2t\,w(t),$ 
+
+since $\tfrac{1}{2}\leq\Phi(u)\leq\tfrac{1}{2}+t$ on the band. The case $\widehat{c}<m$ is symmetric.
+
+Step 3. Since $R(m)=R(0)-\Gamma$ , the two steps give Equation 8. A union bound extends the event to all $N$ components with probability at least $1-2Ne^{-2nt^{2}}$ . $\square$ 
+
+## C.3 Proof of Proposition 1
+
+Let $T$ be the $B$ components with the largest $r_{i}$ and $S$ the $B$ with the largest scores $s_{i}$ . The expected error left by $S$ exceeds that left by $T$ by $\sum_{i\in T}r_{i}-\sum_{i\in S}r_{i}$ . Since $r_{i}\leq s_{i}+\epsilon$ on $T$ and $r_{i}\geq s_{i}-\epsilon$ on $S$ ,
+
+ $\sum_{i\in T}r_{i}-\sum_{i\in S}r_{i}\leq\sum_{i\in T}s_{i}-\sum_{i\in S}s_{i}+2B\epsilon\leq 2B\epsilon,$ 
+
+because $S$ maximizes the score sum over sets of size $B$ . $\square$ 
+
+The oracle knows expected remaining errors before measurement. A residual that changes sign can have a small fitted correction but large expected absolute error, so a correction alone need not provide a useful selection score.
+
+## C.4 Dataset Averages: Sign Condition and Selected Labels
+
+Lemma 2 (Sign condition). For an averaged residual $\bar{e}_{i}$ and correction $\bar{c}_{i}$ , $|\bar{e}_{i}-\bar{c}_{i}|<|\bar{e}_{i}|$ if and only if $\bar{c}_{i}\bar{e}_{i}>0$ and $|\bar{c}_{i}|<2|\bar{e}_{i}|$ .
+
+Proof. Squaring, the inequality is equivalent to $\bar{c}_{i}^{2}<2\bar{c}_{i}\bar{e}_{i}$ , which requires $\bar{c}_{i}\bar{e}_{i}>0$ and then reduces to $|\bar{c}_{i}|<2|\bar{e}_{i}|$ . $\square$ 
+
+Dataset averages require the mean residual, whereas per-prompt absolute loss is minimized by a median. Acquisition can bias the mean. If $A_{i}$ indicates measurement of component $i$ , the acquired-label mean targets $\mathbb{E}[e_{i}\mid A_{i}=1]$ rather than $\mathbb{E}[e_{i}]$ . Section 4.3 evaluates whether the acquired residuals transfer to dataset averages.
+
+## Appendix D Within-Prompt Evaluation and Controls
+
+## D.1 Cohort, Acquisition, and Aggregation
+
+Within-prompt evaluation comprises 1,662 layer evaluations and 542 complete model-task-prompt groups, with a fixed $P=64$ pilot inside $B=256$ measurements. We intervene on all MLP neurons in a layer. Gemma-2-9B has 14,336 neurons (layers 10, 20, 30), Qwen3-14B has 17,408 (9, 19, 29), and Qwen3-32B has 25,600 (15, 31, 47). Each task has 100 prompt groups. Summaries include groups with all three layers; Gemma is complete, and available Qwen counts appear in Table 1.
+
+Relative AP error divides summed absolute estimation error by summed absolute reference effects for each vector. MAE, dataset-average error, and top-ten recall retain their definitions in Section 3.1.
+
+We average three fixed pilot repetitions within each layer, then layers within each prompt group, then groups. Error reduction is one minus the ratio of mean MAEs. Descriptive 95% intervals use 20,000 paired group-bootstrap draws (seed 20261010), holding fits and measured costs fixed; across-prompt multiplicity adjustment is separate. Gemma intervals are 14.7% to 20.1% (IOI), 23.5% to 28.9% (factual), and 17.4% to 22.5% (SVA).
+
+The method and baseline acquire separate AP measurements in the same allocation. Warm runtime includes attribution, acquisition, selection, fitting, and assembly, excluding loading, numerical validation, and reference collection. The baseline uses the largest executed magnitude-ranked batch prefix affordable at the method’s runtime; equal-count comparisons are separate. Gemma, Qwen3-14B, and Qwen3-32B use one, two, and four L40S GPUs, respectively, with timings matched within each hardware configuration.
+
+## D.2 Measured Cost at Specified Accuracy
+
+The prespecified targets are 0.5%, 1%, and 2% mean relative AP error. On the main cohorts (Table 1), each measured magnitude-ranked AP prefix retains its error and warm runtime, including attribution setup. At the exhaustive endpoint, we use the cheaper separately measured full-AP time, which omits attribution.
+
+For each target, select the cheapest measured prefix whose group-averaged error meets it, applying the same count to all included layers and groups. Compare with fixed $P=64$ , $B=256$ Guided-AP only when both meet the target. Aggregation follows Appendix D; targets constrain the cohort mean rather than every prompt.
+
+Guided-AP
+Cheapest measured verification prefix: checks / s per layer
+
+Model
+Task
+Groups
+Error
+s/layer
+2% target
+1% target
+0.5% target
+
+Gemma-2-9B
+IOI
+100
+0.94%
+2.08
+0 / 0.27
+2,416 / 16.37
+8,128 / 54.16
+
+Gemma-2-9B
+Factual
+100
+1.20%
+1.30
+0 / 0.25
+5,664 / 21.84
+9,904 / 38.00
+
+Gemma-2-9B
+SVA
+100
+0.71%
+1.25
+0 / 0.25
+32 / 0.43
+5,472 / 20.25
+
+Qwen3-14B
+IOI
+52
+1.34%
+2.95
+16 / 0.76
+8,016 / 73.12
+12,608 / 114.56
+
+Qwen3-14B
+Factual
+56
+0.57%
+1.67
+0 / 0.42
+0 / 0.42
+2,144 / 10.29
+
+Qwen3-14B
+SVA
+53
+0.58%
+1.64
+0 / 0.39
+16 / 0.54
+1,936 / 9.30
+
+Qwen3-32B
+IOI
+10
+1.09%
+6.52
+0 / 0.87
+6,016 / 126.55
+15,552 / 324.93
+
+Qwen3-32B
+Factual
+31
+1.09%
+3.54
+16 / 1.15
+6,736 / 67.22
+15,920 / 157.58
+
+Qwen3-32B
+SVA
+40
+0.66%
+3.55
+0 / 0.84
+16 / 1.16
+6,672 / 66.88
+
+Table 5: Warm cost at all specified targets. Zero checks denotes ordinary AtP.
+
+Table 5 reports every target and setting; a cost advantage requires both methods to meet the same target.
+
+Fixed-estimate FP64 rescoring retains Gemma IOI error below 1% (0.95%); verify-more needs 2,064 checks and 14.05 seconds, giving a 6.74 time ratio with unchanged execution and timings.
+
+## Matching the correction’s achieved error.
+
+This post hoc comparison matches Guided-AP’s achieved mean relative AP error rather than a prespecified target. For each 32B task and reference, select the cheapest measured verification prefix attaining that error on the same complete groups, using one prefix count throughout (Table 6).
+
+Primary reference
+FP64 reference
+
+Task
+Groups
+Error
+
+Guided-AP
+(s/layer)
+
+Verify-more
+(s/layer)
+
+Ratio
+Error
+Ratio
+
+IOI
+10
+1.093%
+6.52
+91.16
+14.0
+1.110%
+16.3
+
+Factual
+31
+1.088%
+3.54
+51.95
+14.7
+1.099%
+11.8
+
+SVA
+40
+0.664%
+3.55
+21.06
+5.9
+0.658%
+2.6
+
+Table 6: Post hoc 32B accuracy and warm runtime at Guided-AP’s achieved error. Ratios divide verify-more time by Guided-AP time. FP64 rescoring keeps the estimates and measured runtimes fixed.
+
+Each paired group-bootstrap draw recomputes the method’s mean error and the cheapest matching prefix (20,000 draws, seed 20261010). Descriptive time-ratio intervals are 7.9 to 19.5, 10.9 to 18.2, and 4.2 to 8.1 for IOI, factual completion, and SVA; fixed-estimate FP64 intervals are 9.1 to 21.3, 5.4 to 17.8, and 1.5 to 4.7. Cohorts match Table 1.
+
+Relative error normalizes each vector before group averaging, so its prompt weighting differs from unnormalized MAE. Matching achieved relative error is distinct from matching runtime or a prespecified accuracy target.
+
+## D.3 Measured Comparisons with Other Correction Methods
+
+The comparison with other correction methods uses 30 complete prompt groups per Gemma task, each scored on all three layers, totaling 270 layer comparisons. These groups overlap the main 100-group sets (Table 7).
+
+All selective methods use 256 components or AP measurements; Guided-AP includes its 64-label pilot. AtP∗ verification includes gradient-drop ranking. HVP and MS-HVP correct magnitude-selected components; MS-HVP uses four or five steps. Singleton IG uses four or eight Gauss-Legendre points on isolated component paths. Unselected components retain AtP. No-pilot centering shifts them by the negative median attribution. Runtimes include ranking, operators, and assembly on the same hardware; reference collection is separate.
+
+IOI
+Factual
+SVA
+
+Method
+Error
+Seconds
+Error
+Seconds
+Error
+Seconds
+
+AtP
+1.474%
+0.29
+1.828%
+0.28
+1.404%
+0.29
+
+Verify-more
+1.292%
+2.61
+1.725%
+1.29
+0.909%
+1.67
+
+AtP* + AP
+1.286%
+3.46
+1.721%
+2.69
+0.898%
+2.62
+
+No-pilot centering
+1.320%
+2.61
+1.722%
+1.29
+0.942%
+1.67
+
+Selective HVP
+1.321%
+18.69
+1.758%
+18.70
+1.029%
+18.76
+
+MS-HVP (4)
+1.314%
+131.52
+1.757%
+131.57
+0.930%
+132.01
+
+MS-HVP (5)
+1.313%
+169.23
+1.757%
+169.15
+0.928%
+169.68
+
+Singleton IG (4)
+1.313%
+73.76
+1.757%
+73.31
+0.924%
+73.33
+
+Singleton IG (8)
+1.313%
+147.10
+1.757%
+146.56
+0.924%
+146.10
+
+Guided-AP
+0.952%
+2.69
+1.230%
+1.30
+0.723%
+1.64
+
+Exhaustive AP
+0.000%
+125.24
+0.000%
+53.43
+0.000%
+69.23
+
+Table 7: Measured comparator accuracy and warm seconds per layer on the complete Gemma comparator groups. Error is relative AP error. Parentheses identify MS-HVP steps or IG quadrature points.
+
+Against runtime-matched verify-more, Guided-AP lowers MAE by 16.0%, 26.3%, and 19.7% on IOI, factual completion, and SVA in this comparator cohort. Table 7 gives all methods’ measured errors and runtimes.
+
+Figure 3 uses fixed budget-frontier cohorts: nine IOI, eight factual, and nine SVA Gemma groups, plus 45 SVA groups for 32B. Gemma $B=512$ points reuse the first 512 measurements from $B=1024$ sequences with the same pilot; time combines the measured acquisition time of those prefixes with the $B=256$ setup, fit, and assembly overhead. Derivative budgets are 64 and 256. Hollow Gemma markers denote five-step MS-HVP and eight-point IG; 32B uses endpoint HVP, four-step MS-HVP, and four-point IG.
+
+## D.4 Within-Prompt Controls and Ablations
+
+Verification-plus-shift fits a median residual from the same 256 magnitude-ranked AP measurements as verification alone, then shifts unmeasured estimates. Guided-AP uses a 64-label representative pilot inside that budget. Mean-versus-median fits share labels. Uniform and stratified sampling are replayed from measured AP tables, counting all selected measurements. These controls use the main cohorts; the acquired pilot-size study uses a separate cohort.
+
+Figure 7: Within-prompt Guided-AP ablations on Gemma-2-9B at 256 measurements. Panels (a) to (c) report MAE reductions relative to verification alone. Panel (d) shows factual absolute-error distributions before and after the common shift, scaled by the original root mean square error.
+
+Model
+Task
+Groups
+
+Guided-AP vs
+verification (%)
+
+Guided-AP vs
+verification + shift (%)
+
+FP64: Guided-AP vs
+verification + shift (%)
+
+Gemma-9B
+IOI
+100
+17.3 [14.7, 20.0]
+57.2 [53.9, 60.1]
+56.4 [53.0, 59.6]
+
+Gemma-9B
+Factual
+100
+26.2 [23.4, 28.9]
+23.6 [17.4, 30.3]
+22.9 [16.4, 30.0]
+
+Gemma-9B
+SVA
+100
+19.1 [16.7, 21.5]
+55.1 [48.0, 61.8]
+55.1 [47.9, 61.8]
+
+Qwen3-14B
+IOI
+52
+24.0 [19.2, 28.5]
+45.8 [40.7, 50.3]
+45.4 [40.1, 50.1]
+
+Qwen3-14B
+Factual
+56
+12.2 [9.6, 15.0]
+75.9 [71.0, 79.3]
+75.7 [70.7, 79.2]
+
+Qwen3-14B
+SVA
+53
+10.9 [7.9, 14.1]
+75.3 [70.9, 78.8]
+75.2 [70.8, 78.6]
+
+Qwen3-32B
+IOI
+10
+16.8 [10.8, 22.3]
+71.6 [60.2, 78.1]
+71.1 [59.6, 77.6]
+
+Qwen3-32B
+Factual
+31
+17.5 [13.7, 21.3]
+70.1 [62.2, 75.5]
+70.1 [62.1, 75.4]
+
+Qwen3-32B
+SVA
+40
+13.7 [10.6, 16.6]
+78.0 [73.4, 81.2]
+78.4 [73.9, 81.5]
+
+Table 8: Within-prompt Guided-AP MAE reductions at equal measurement counts. Intervals are descriptive paired-group 95% intervals. FP64 scoring keeps the deployed FP32 estimates fixed.
+
+Task
+Pilot
+
+Stratified
+median
+
+Uniform
+median
+
+Stratified
+mean
+
+IOI
+16
+16.7
+16.5
+7.0
+
+IOI
+32
+17.6
+17.5
+8.2
+
+IOI
+64
+17.3
+17.3
+5.0
+
+IOI
+128
+15.3
+15.3
+5.9
+
+Factual
+16
+24.2
+24.1
+23.9
+
+Factual
+32
+25.6
+25.7
+25.3
+
+Factual
+64
+26.2
+26.2
+25.6
+
+Factual
+128
+26.1
+26.1
+25.7
+
+SVA
+16
+18.1
+17.7
+1.8
+
+SVA
+32
+19.2
+19.1
+9.8
+
+SVA
+64
+19.2
+19.2
+10.4
+
+SVA
+128
+17.4
+17.4
+9.7
+
+Table 9: Gemma Guided-AP pilot ablations with replayed samples. Entries give percent lower MAE than verification alone at 256 total measurements.
+
+Figure 7a and Table 10 use the acquired pilot-size cohort below. Panel (b) uses the measured pilot labels from 100 Gemma groups per task; panel (c) and Table 9 replay samples on those groups. All use the layer/group aggregation above and descriptive uncertainty.
+
+The acquired pilot-size study uses 20 groups per task, all three layers, four pilot sizes, and three sampling seeds. The same complete groups enter every size. Pilots of 32 or 64 measurements capture most of the benefit (Table 10).
+
+Task
+Groups
+ $P=16$ 
+ $P=32$ 
+ $P=64$ 
+ $P=128$ 
+
+IOI
+20
+17.0
+18.2
+18.0
+15.8
+
+Factual
+20
+25.4
+26.7
+27.3
+27.1
+
+SVA
+20
+19.4
+20.2
+20.1
+18.5
+
+Table 10: Acquired pilot-size ablation on Gemma-2-9B. Entries are MAE reductions relative to verification alone, in percent, at 256 total measurements. The same complete groups enter each pilot size.
+
+At $P=64$ , 10,000 paired group-bootstrap draws give descriptive 95% intervals of 11.4% to 24.6% (IOI), 22.2% to 32.1% (factual), and 14.5% to 25.9% (SVA). Group wins are 19/20, 20/20, and 19/20; the main results use the separate 100-group cohorts.
+
+Figure 7d pools factual residuals on their original RMS scale. Fractions within 0.5, 1, and 2 RMS use exact histogram bin boundaries. The shifted distribution applies the pilot offset before exact replacements. At least three quarters of residuals share a strict sign in 43%, 51%, and 47% of Gemma IOI, factual, and SVA prompt-layer cases, respectively, measured from their quartiles.
+
+## D.5 Mechanism and Precision Checks
+
+After predictions and selected sets are fixed, reference residuals supply the diagnostic best common shift on the unmeasured set. Its realized correction benefit is $H_{U}-E_{U}$ . $C_{\rm alloc}$ compares the method with the equal-count magnitude prefix $V_{B}$ ; $C_{\rm count}$ accounts for the runtime-matched prefix $V_{B_{0}}$ . Table 11 normalizes terms by mean matched-baseline MAE.
+
+Task
+ $H_{U}$ 
+ $E_{U}$ 
+ $C_{\rm alloc}$ 
+ $C_{\rm count}$ 
+Gain
+
+IOI
+19.76
+0.72
+1.74
+ $-$ 0.13
+17.42
+
+Factual
+27.37
+0.83
+0.36
+ $-$ 0.02
+26.21
+
+SVA
+21.07
+0.82
+1.36
+ $-$ 1.04
+19.92
+
+Table 11: Theorem 1’s decomposition on Gemma, in percentage points of matched-baseline MAE. Negative count cost means fewer baseline checks.
+
+Primary acquisition discrepancy is $D_{\rm acq}=0$ . The fitted median retains 96.4%, 97.0%, and 96.1% of the best shift’s benefit on IOI, factual completion, and SVA. On SVA, runtime matching contributes 1.04 percentage points and displaced verification costs 1.36; the equal-count gain is 19.1%. Group-averaged wins are 96/100, 97/100, and 98/100.
+
+FP64 readout checks retain the FP32 model body, hidden states, attribution vector, and runtime match. Fixed scores deployed FP32 estimates against the FP64 reference; refit also uses FP64 acquired values for the pilot shift and measured coordinates. Neither runs a full-FP64 model (Table 12).
+
+Model
+Task
+Primary
+Fixed
+Refit
+
+Gemma-9B
+IOI
+17.4
+10.1
+16.3
+
+Factual
+26.2
+23.4
+25.4
+
+SVA
+19.9
+15.4
+20.4
+
+Qwen3-14B
+IOI
+24.0
+21.0
+24.5
+
+Factual
+12.3
+10.4
+12.8
+
+SVA
+10.9
+4.1
+9.5
+
+Qwen3-32B
+IOI
+17.3
+13.6
+16.9
+
+Factual
+17.5
+8.2
+14.2
+
+SVA
+13.7
+8.0
+14.2
+
+Table 12: Percent lower MAE under the primary reference and two FP64 sensitivity checks. Fixed estimates and FP64-acquired refits keep the budget match.
+
+Fixed-estimate 95% intervals are 7.2% to 13.1%, 20.5% to 26.3%, and 12.6% to 18.3% on Gemma IOI, factual, and SVA. Qwen3-14B SVA is 4.1% (0.5% to 8.1%). For 32B, fixed-estimate intervals are 8.1% to 17.7%, 3.2% to 13.1%, and 4.4% to 11.8%; primary intervals are 11.6% to 22.7%, 13.6% to 21.2%, and 10.7% to 16.7%. Primary group wins are 9/10, 30/31, and 39/40, on the same cohorts as Table 1.
+
+## D.6 Fixed Budget across Component Populations
+
+Nested populations contain 1,024, 4,096, or all neurons in a predetermined random order. Each receives $P=64$ , $B=256$ on the same groups, layers, and seeds as the full-population study, with its own runtime-matched verification prefix. Population sizes are dependent views of each prompt group (Table 13).
+
+Model
+Task
+ $N=1,024$ 
+ $N=4,096$ 
+Full
+
+Gemma-9B
+IOI
+22.7%
+19.4%
+17.4%
+
+Factual
+27.8%
+26.8%
+26.2%
+
+SVA
+22.6%
+20.9%
+19.9%
+
+Qwen3-14B
+IOI
+27.4%
+25.7%
+24.0%
+
+Factual
+16.2%
+13.9%
+12.3%
+
+SVA
+19.2%
+14.4%
+10.9%
+
+Qwen3-32B
+IOI
+23.7%
+20.1%
+17.3%
+
+Factual
+22.4%
+19.6%
+17.5%
+
+SVA
+19.6%
+16.7%
+13.7%
+
+Table 13: MAE reduction against runtime-matched verify-more at three predetermined component populations. Full populations are 14,336, 17,408, and 25,600 neurons for the three models.
+
+## Appendix E Error-Structure Diagnostics
+
+## Probe noise grows with interactions.
+
+Define $\kappa_{i}=\sqrt{\sum_{j\neq i}G_{ij}^{2}}/\max(|G_{ii}|,10^{-30})$ , the ratio of off-diagonal to diagonal curvature that sets the sketch noise in Equation 11. Its median rises from 5.8 to 77.2 over $N=32$ to $1{,}152$ heads in Qwen3-8B IOI (Figure 8). Separately, 41 $N/R$ settings on ten held-out IOI prompts give a median observed-to-predicted sketch-MSE ratio of 1.003 (range 0.945 to 1.042). Each point averages row-level MSE ratios, and settings are dependent.
+
+Figure 8: Sketch-noise diagnostics. Left: median coupling across six model-task settings. Right: 41 $N/R$ means on Qwen3-8B IOI; dashed line denotes equality and red line the median. Points are dependent, not confidence intervals.
+
+Table 14 compares fixed calibration halves. AP error correlations use heads measured in both halves; probe correlations use all heads. Top-16 overlap scores the model fitted on all 50 calibration groups separately on each half. These describe calibration stability rather than held-out allocation performance.
+
+Model
+Task
+AP error $\rho$ 
+Probe $\rho$ 
+Top-16 kept
+
+Qwen3
+IOI
+0.69
+0.97
+16 / 16
+
+Qwen3
+Factual
+0.80
+0.97
+15 / 16
+
+Qwen3
+SVA
+0.57
+0.95
+14 / 16
+
+Qwen2.5
+IOI
+0.69
+0.95
+13 / 14
+
+Qwen2.5
+Factual
+0.81
+0.97
+15 / 15
+
+Qwen2.5
+SVA
+0.62
+0.95
+12 / 15
+
+Table 14: Stability between fixed calibration halves. AP error $\rho$ uses heads measured in both halves (87 to 137 per setting); probe $\rho$ uses all heads. Top-16 kept reports overlap for the Guided-AP / ProbeCal model fitted on all 50 calibration groups, scored on each half.
+
+For the dataset-average effects, the absolute mean signed error across heads is 81% to 96% of the mean absolute error. Equivalently, with $\bar{g}_{i}$ and $\bar{\Delta}_{i}$ denoting the estimated and reference mean effects, the diagnostic is $|\sum_{i}(\bar{g}_{i}-\bar{\Delta}_{i})|/\sum_{i}|\bar{g}_{i}-\bar{\Delta}_{i}|$ . It describes agreement in error sign across heads after averaging prompts.
+
+## Appendix F Confirmation Protocol
+
+Across-prompt evaluation uses 50 calibration and 100 evaluation groups in each of six model-task cells. All 1,152 Qwen3-8B heads (revision b968826d) and 784 Qwen2.5-7B-Instruct heads (a09a3545) are included (Yang et al., 2025; Qwen et al., 2025). Collection uses H100, PyTorch 2.9.1, Transformers 4.57.1, CUDA 12.6, FP32 eager attention, and disabled TF32. Groups shared across models remain linked. IOI equally mixes matched and template/entity-shifted groups; exact and reversed contrasts do not overlap across splits.
+
+Arms comprise AtP ranking (verify-more), random ranking, Guided-AP, a cost-matched guided prefix, ProbeCal, and a capacity-matched AP-only learner. The reference-error oracle is a diagnostic ceiling. The five nonbaseline arms, six cells, four budgets, and three horizons define 360 comparisons. AtP∗ is evaluated within prompts (Appendix D.3); all across-prompt arms use AtP estimates.
+
+Guided-AP acquires 1,600 labels per cell by magnitude-guided round robin. ProbeCal uses eight Rademacher probes per calibration group, totaling 400 HVPs. Fits and the capacity-matched control follow Appendices A and B.
+
+The output metric is the final-position logit difference between correct and counterfactual tokens, relative to the clean baseline. Per-prompt MAE is computed after $B\in\{16,32,64,128\}$ verifications. Dataset-mean error averages effects over the 100 held-out groups before taking absolute error; it is not average per-prompt MAE. Recall uses the ten largest absolute reference effects.
+
+Primary verification and scoring share a measured full AP table; separately acquired AP checks at $B=16$ and $B=32$ , with their cost included, confirm this shared table. Total costs include calibration, fitting, transfer, model loading, attribution, and verification. Analysis lengths of 100, 1,000, and 10,000 prompts project measured costs and observed errors; they are not additional evaluation samples.
+
+We use 20,000 paired group-bootstrap draws with the prescribed groups and strata. Two-sided Bonferroni percentile intervals use tail probability $0.05/(2\cdot 360)$ , about 1.39 draws per tail, and condition on the fitted calibration and measured costs.
+
+## F.1 Across-Prompt Result Summaries
+
+Table 3 reports allocation at matched projected total cost, including calibration. Table 15 gives dataset-average error ratios against uncorrected AtP and calibration coverage.
+
+Error ratio
+Guided-AP labels
+
+Model
+Task
+Guided-AP
+ProbeCal
+Heads
+Coverage
+
+Qwen3
+IOI
+0.95
+1.49
+121/1,152
+10.5%
+
+Qwen3
+Factual
+3.98
+1.87
+145/1,152
+12.6%
+
+Qwen3
+SVA
+1.23
+1.14
+265/1,152
+23.0%
+
+Qwen2.5
+IOI
+0.66
+1.09
+163/784
+20.8%
+
+Qwen2.5
+Factual
+4.78
+1.86
+141/784
+18.0%
+
+Qwen2.5
+SVA
+1.34
+0.99
+217/784
+27.7%
+
+Table 15: Dataset-average correction. Error ratio is uncorrected divided by corrected MAE. Bold and italic mark adjusted significant improvements and harms. Heads and coverage refer to Guided-AP calibration.
+
+## Appendix G Cost Frontiers for All Cells
+
+Figures 9, 10, and 11 cover all six across-prompt cells, budgets, and projected analysis lengths.
+
+Figure 9: Across-prompt evaluation on Qwen3 IOI. Error against projected total cost at three analysis lengths, with markers for verification budgets and dotted curves for verify-more, followed by the dataset-mean correction ratios for all six cells with adjusted intervals.
+
+Calibration cost favors verify-more at 100 prompts throughout the grid. At 1,000 prompts, 108 of 120 adjusted comparisons favor verify-more and none favors learning. At 10,000 prompts, the useful cells and budgets depend on the signal. Guided-AP improves Qwen3 IOI and both SVA cells at $B=16$ ; ProbeCal also improves factual allocation at $B\geq 64$ . The figures retain the remaining comparisons and controls.
+
+Lower MAE need not improve recall. One Qwen3 IOI ProbeCal setting reduces MAE by 11% while top-ten recall falls from 99.2% to 97.0%.
+
+Projected break-even ranges from 1,900 to 24,000 prompts at $B=16$ and 900 to 15,500 at $B=128$ . Recall intervals usually include no change; some IOI $B=16$ settings reduce recall by 0.03 to 0.07.
+
+Figure 10: Cost-error frontiers for three more cells at 100, 1,000, and 10,000 prompts. Conventions follow Figure 9.
+
+Figure 11: Cost-error frontiers for the remaining two cells. Conventions as in Figure 9.
+
+## Appendix H Additional Controls on the Confirmation Cells
+
+These post hoc controls use the same six cells and 20,000 paired bootstrap draws, with their analysis protocol fixed before computation.
+
+## Dataset correction at matched total cost.
+
+Verify-more uses the largest affordable magnitude-ranked AP prefix. It wins in all settings at 100 prompts and in ten of twelve at 1,000 prompts. At 10,000 prompts it affords no additional checks, so the comparison is with uncorrected AtP. Where correction improves that baseline, projected break-even is 527 to 2,744 prompts. The IOI exceptions appear in Table 15.
+
+## Learning residuals versus averaging measurements.
+
+Using the same 1,600 queries directly as component-average effects produces 5.8 to 14.9 times more error than residual correction (Equation 9) in all six cells, with every adjusted interval above one, and is worse than uncorrected AtP.
+
+## Independently acquired verification.
+
+Separate AP forwards at $B=16$ and $B=32$ reproduce the primary values exactly in all six cells and six arms; all 75 testable prespecified comparisons retain their direction.
+
+## Appendix I Cost Accounting and Numerical Scope
+
+For method $m$ under a fixed loading and batching schedule, projected total cost is
+
+ $C_{m}(T,B)=C_{m}^{\rm init}+Tc_{m}(B),$ 
+
+(13)
+
+where $C_{m}^{\rm init}$ includes calibration, fitting, and the specified initialization costs. The per-prompt term $c_{m}(B)$ includes attribution, ranking, activation handling, transfer, and verification. $T$ is a projected analysis length, not the number of evaluation prompts over which dataset averages are measured. The prespecified analysis lengths are 100, 1,000, and 10,000 prompts, and the allocation budgets are $B\in\{16,32,64,128\}$ .
+
+For an across-prompt policy with $B$ verifications, the matched verify-more budget is
+
+ $\displaystyle b_{m}(T,B)$ 
+ $\displaystyle=\max_{b\in\{0,\ldots,N\}}b$ 
+
+ $\displaystyle\text{subject to }C_{0}(T,b)\leq C_{m}(T,B),$ 
+
+Here $C_{0}$ includes attribution and magnitude-ranked verification. Measured batch padding and overhead determine the integer budget; unused compute is retained. Within-prompt matching uses measured runtime without prior calibration. Dense curves are descriptive; adjusted inference uses the prespecified budgets and horizons.
+
+Equation 13 assumes one initialization. Break-even horizons project measured cost components.
+
+On Qwen3 factual completion, 1,600 AP labels at batch size 16 took 13.98 seconds (0.009 seconds/check); 400 serial HVPs took 51.77 seconds (0.13 seconds/HVP). At these rates, one HVP costs about 15 exact checks. Full calibration costs, including probes, fitting, transfer, and model loading, range from 384 to 1,050 seconds per cell and are included in the comparisons.
+
+Deployment includes initialization, calibration, fitting, model loading, gradients, activation handling, transfer, and verification; reference collection is separate. Rates are specific to the measured hardware configuration.
+
+Interventions add directions to live activations, preserving upstream propagation. Derivatives and references use FP32 eager execution; same-hidden-state FP64 readouts assess numerical sensitivity.

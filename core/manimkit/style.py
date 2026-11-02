@@ -12,8 +12,8 @@ def tx(s, size=30, color=WHITE):
     """Текст. Степени пишутся как x^6, t^−1 — выводятся верхним индексом (LaTeX не нужен)."""
     if "^" in s:
         import re
-        return MarkupText(re.sub(r"\^([−\-0-9]+)", r"<sup>\1</sup>", s), font=FONT, font_size=size, color=color)
-    return Text(s, font=FONT, font_size=size, color=color)
+        return MarkupText(re.sub(r"\^([−\-0-9]+)", r"<sup>\1</sup>", s), font=FONT, font_size=size).set_color(color)
+    return Text(s, font=FONT, font_size=size).set_color(color)  # аргумент color= текст ManimGL молча игнорирует
 
 
 def title(s):

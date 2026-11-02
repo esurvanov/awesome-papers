@@ -1,0 +1,2190 @@
+## Discrete Neural Interlingua for Ontology-Agnostic EHR Modeling
+
+Tong Ding  Caiwei Tian  Dongmin Bang  Ming Y. Lu  Sophia J. Wagner
+
+Affiliation: Mass General Brigham AI Institute
+
+Affiliation: Harvard University
+
+Andrew Zhang  Rowland Pettit  Long Phi Le  Faisal Mahmood
+
+Affiliation: Mass General Brigham AI Institute
+
+Affiliation: Harvard University
+
+Affiliation: Massachusetts Institute of Technology
+
+Abstract
+
+EHR foundation models promise scalable clinical prediction across health systems, yet their deployment is constrained by a tokenization bottleneck. The same clinical concept can appear as different ontology codes, local identifiers, synonyms, or free-text descriptions, which standard EHR tokenizers treat as unrelated symbols. A model trained on MIMIC-III with a closed-vocabulary tokenizer can use only 13% of eICU events. We introduce Mediator, a discrete ontology-agnostic tokenizer that maps any clinical concept expressed as text into a shared vector-quantized codebook, turning EHR harmonization into open-vocabulary tokenization without manual mappings or a fixed vocabulary. Trained with synonym supervision and guided by enriched concept descriptions, code co-occurrence, and relation graphs, Mediator collapses equivalent expressions while organizing distinct concepts in a medically meaningful discrete space. Used as the token interface of an EHR Transformer, Mediator improves mean AUPRC over the strongest prior tokenizer by 4.0 points (8% relative) on 20 MIMIC-III tasks and by 8.6 points (29% relative) in zero-shot transfer to 14 eICU tasks, where it uses all events. The transfer gain combines coverage and representation, as Mediator remains the best tokenizer under identical inputs (+1.0 and +1.9 points on operational and subcohort-mortality tasks). Same-encoder controls show that the text encoder drives in-domain accuracy, while the learned objectives of Mediator drive transfer robustness and entity-linking quality. Mediator also enables transferable attribution across hospitals.
+
+$\dagger$$\dagger$footnotetext: Equal contribution.
+
+## 1 Introduction
+
+Electronic health records (EHRs) are central to clinical prediction, real-world evidence generation, cohort construction, and decision support. Transformer-based EHR models have achieved strong results by learning from longitudinal sequences of diagnoses, procedures, medications, laboratory events, and other clinical observations (Shmatko et al., 2025; Waxler et al., 2025; Li et al., 2020; Wornow et al., 2023a; Steinberg et al., 2021). These models promise to support multi-institutional learning and deployment across health systems. Yet this promise is constrained by a representation problem. Clinical concepts are recorded differently across coding systems, ontology versions, local institutional practice, and free-text documentation. A model trained on MIMIC-III (Johnson et al., 2016) with a closed-vocabulary tokenizer can use only 13% of eICU events (Pollard et al., 2019), since the rest use other codes or free text. As a result, many EHR models learn from an input space that is fragmented, redundant, and difficult to transfer across settings (Figure 1).
+
+Figure 1: Motivation for Mediator.
+a. The vocabularies of Hospital A (light blue) and Hospital B (orange) only partly overlap, so models trained at A fail on B-specific codes and drop free text.
+b. Mediator maps equivalent surface forms from both hospitals, colored by source hospital, to one shared vector-quantized (VQ) token (dark blue).
+c. Shared tokens let one EHR model transfer across hospitals, with predictions and attributions defined over the same tokens.
+
+Most existing EHR foundation models tokenize structured data by treating each medical code as an independent symbol with a learned embedding (Wornow et al., 2023b). This design scales poorly to large, heavy-tailed clinical vocabularies and fails to share statistical strength across related concepts (Su et al., 2025). Code-level tokens also discard informative structure. Each code is defined by a textual description, belongs to an ontology hierarchy, and is linked to many synonyms and near-synonyms across other coding systems (Johnson et al., 2026). Ignoring these semantics leads to inefficient vocabularies and fragmented representations, especially for rare or institution-specific codes. This brittleness is most visible across institutions. Hospitals differ in the ontologies they use, which versions they deploy, and how they encode local variants of common concepts. When a model is trained with one hospital’s code vocabulary, deploying it elsewhere typically requires manual code mapping, vocabulary alignment, and coverage audits. Such mapping is expensive, error-prone, and often incomplete in the long tail. As a result, most models avoid clinical text entirely (Wornow et al., 2023b) and restrict modeling to a narrow subset of structured data such as diagnostic codes, labs, and medications, sacrificing clinical signal for modeling convenience.
+
+Previous studies have attempted to address this heterogeneity from several complementary angles. Ontology-normalization approaches map events to a common vocabulary such as the Unified Medical Language System (UMLS) (Bodenreider, 2004; Wu et al., 2026a); representation-learning approaches enrich fixed code vocabularies with text descriptions and medical knowledge graphs, and LLM-generated definitions (Su et al., 2025; Kim et al., 2026); text-based embedding methods represent codes directly in continuous semantic space (Hur et al., 2022); and multi-institutional harmonization frameworks align site-specific vocabularies using EHR summary statistics, biomedical graphs, and language-model semantics (Zhou et al., 2026). These efforts improve semantic coverage and reduce reliance on manual pairwise code mapping, but they do not fully address the modeling interface required for scalable EHR sequence modeling. First, UMLS defines a massive and evolving vocabulary. It aggregates multiple source vocabularies, introducing redundancy and fine-grained distinctions that are often unnecessary for downstream prediction. Consequently, using UMLS identifiers directly as tokens reintroduces the problems of scale, sparsity, and redundancy inherent in raw code vocabularies (Su et al., 2025). Fixed-vocabulary code embeddings remain closed over a prespecified set of structured codes, and site-alignment methods generally must be rerun when a new hospital, ontology, or local code system is introduced. Continuous embeddings are more flexible, but they do not provide the stable discrete interface used by standard masked-token and autoregressive EHR Transformers, which also complicate event-level inspection, attribution, caching, and generative trajectory modeling. A useful EHR tokenizer should therefore be both discrete and open-vocabulary. It should accept any medical concept expressed as text and map it into a shared, reusable code space.
+
+To this end, we introduce MEDical InterlinguA TokenizeR (Mediator), a discrete and ontology-agnostic concept space that serves as a neural interlingua. Mediator takes as input any clinical concept expressible as text (including ontology code descriptions, local code descriptions, and uncoded text entries) and maps it to a discrete index from a fixed-size vector-quantized (VQ) codebook, in which each code is a semantic prototype with an embedding.
+Leveraging strong pretrained text encoders, we learn this mapping from large-scale cross-ontology synonym supervision, treating each underlying concept as an equivalence class of surface forms.
+To better shape the representation geometry, we further guide codebook learning with three complementary sources of medical knowledge including enriched concept descriptions, empirical code co-occurrence, and curated relation-graph structure. The resulting codebook defines a compact, reusable clinical vocabulary that can be used as a drop-in token interface for standard EHR Transformers, improving interoperability and interpretability while avoiding fragile ontology-specific tokenization and manual code mapping.
+
+We show that Mediator is effective in settings that stress current EHR modeling. As the token interface of an EHR Transformer, Mediator improves mean AUPRC over the strongest prior tokenizer by 4.0 points (8% relative) on 20 MIMIC-III tasks and by 8.6 points (29% relative) in zero-shot transfer to 14 eICU tasks without manual vocabulary alignment, and remains the best tokenizer when input coverage is matched to closed-vocabulary baselines. Controlled analyses decompose these gains. The transfer gain combines broader input coverage with better representations, the pretrained text encoder drives in-domain accuracy, and the learned objectives of Mediator drive transfer robustness and entity-linking quality. Finally, the shared discrete space supports transferable interpretability across hospitals through common concept tokens.
+
+## 2 Related work
+
+EHR models. Transformer-based EHR models adapt the language-modeling paradigm to longitudinal sequences of structured clinical events. Bidirectional embedding models learn patient representations with masked-event or contextual prediction objectives, starting from diagnosis-focused token sequences and later expanding to medications, procedures, temporal features, and discretized numeric observations (Li et al., 2020; Rasmy et al., 2021; Pang et al., 2021; Wornow et al., 2023a), and graph-based variants model intra-visit structure (Poulain and Beheshti, 2024). Autoregressive and encoder–decoder models use generative objectives to model patient trajectories and support forecasting, time-to-event prediction, and generative medical-event modeling (Steinberg et al., 2021; Steinberg et al., 2024; Kraljevic et al., 2024; Shmatko et al., 2025; Waxler et al., 2025; Yang et al., 2023), and toolkits such as PyHealth 2.0 improve their reproducibility (Wu et al., 2026b). These studies underline the importance of tokenized EHR data, but concept embeddings learned from scratch or initialized from external resources remain tied to a closed vocabulary and transfer poorly across institutions.
+
+Cross-hospital transfer. Improving transfer across hospitals requires resolving vocabulary mismatch from different ontologies, local code systems, and documentation practices. One strategy is to normalize structured events to a shared vocabulary before model training, such as UMLS (Bodenreider, 2004; Wu et al., 2026a) or the standard concepts of the OMOP common data model maintained by OHDSI (Overhage et al., 2012; Hripcsak et al., 2015), which are largely mapped by hand. This inherits the scale, redundancy, and incomplete coverage of the target vocabulary and requires ongoing curation. A second strategy learns continuous code representations from textual descriptions, or enriches a fixed structured vocabulary with biomedical knowledge graphs and LLM-generated concept descriptions (Hur et al., 2022; Su et al., 2025; Kim et al., 2026). These representations improve semantic sharing among known codes, but they remain tied to a prespecified vocabulary or yield continuous event vectors that lack a discrete token interface. A third strategy aligns vocabularies across institutions using site-level summary statistics, biomedical graphs, and language-model semantics (Zhou et al., 2026). However, the alignment is specific to the participating institutions and must be recomputed for new hospitals or unseen code systems. Mediator learns an open-vocabulary text-to-token mapping that complements manual OMOP mapping. Any clinical concept expressible as text can be mapped into a shared discrete codebook and then reused by standard EHR sequence models.
+
+Vector-quantized tokenization. Vector-quantized autoencoders such as VQ-VAE (van den Oord et al., 2017) learn a finite codebook of latent prototypes and discretize inputs by nearest-neighbor assignment. Such tokenizers now link perceptual encoders and sequence models in vision, audio, and multimodal learning (Esser et al., 2021; Zeghidour et al., 2022; Du et al., 2024). In healthcare, VQ-based discretization has been used for time-series tokenization and ontology-aware token learning over structured medical codes (Lee et al., 2024; Su et al., 2025), but these tokenizers are trained on a closed set of observed codes. Mediator provides an open-vocabulary text-to-token interface that maps unseen code descriptions or free-text concept expressions into the same discrete interlingua.
+
+## 3 Methods
+
+## 3.1 Problem definition
+
+Let $\mathcal{C}$ be a universe of underlying clinical concepts. Each concept
+ $c\in\mathcal{C}$ can be expressed by multiple textual descriptions, including
+ontology descriptions, local code descriptions, synonyms, and uncoded text
+entries. We model these views as $\mathcal{X}_{c}=\{x_{c,1},\ldots,x_{c,|\mathcal{X}_{c}|}\}\subset\mathcal{X}$ , where $\mathcal{X}$ is the space of text strings. Our goal is to learn a
+discrete tokenizer $T:\mathcal{X}\to[K]=\{1,\ldots,K\}$ such that descriptions of the same concept map to the same discrete code, while
+different concepts remain separated as much as possible. Figure 2 gives an overview of the tokenizer (middle panel), its training signals (bottom panel), and the medical knowledge that guides training (top panel).
+
+Figure 2: Mediator architecture. A text encoder maps any clinical concept description to a dense embedding, a trainable adaptor projects it into the quantization space, and the result is assigned to a learned VQ codebook. Training combines same-concept contrastive objectives before and after quantization, multi-view assignment agreement, semantic teachers from enriched descriptions, code co-occurrence, and relation graphs, and reconstruction to the encoder embedding space.
+
+## 3.2 Vector-quantized tokenization
+
+Given $x\in\mathcal{X}$ , a text encoder produces a semantic embedding
+ $h=f_{\eta}(x)\in\mathbb{R}^{d_{e}}$ , and a projection head maps it to the
+quantization space $z=p_{\theta}(h)\in\mathbb{R}^{d}$ . We maintain a codebook
+ $\mathbf{E}=\{e_{k}\}_{k=1}^{K}$ with $e_{k}\in\mathbb{R}^{d}$ . Using cosine
+similarity, the assigned code is
+
+ $k^{\star}(z)=\arg\max_{k\in[K]}\cos(z,e_{k}),\qquad q(z)=e_{k^{\star}(z)}.$ 
+
+(1)
+
+The tokenizer output is the discrete index
+ $T(x)=k^{\star}(p_{\theta}(f_{\eta}(x)))$ .
+
+We update codebook statistics using exponential moving averages (EMA), following
+standard VQ practice (van den Oord et al., 2017; Razavi et al., 2019). Let $n_{k}$ be
+the number of assignments to code $k$ in a minibatch and
+ $m_{k}=\sum_{i:k^{\star}(z_{i})=k}z_{i}$ be the sum of assigned vectors. We maintain EMA statistics $(N_{k},M_{k})$ and update
+
+ $N_{k}\leftarrow\gamma N_{k}+(1-\gamma)n_{k},\qquad M_{k}\leftarrow\gamma M_{k}+(1-\gamma)m_{k},\qquad e_{k}\leftarrow M_{k}/(N_{k}+\varepsilon),$ 
+
+(2)
+
+with decay $\gamma\in(0,1)$ and small $\varepsilon>0$ . We use the commitment
+objective $\mathcal{L}_{\mathrm{vq}}=\frac{1}{N}\sum_{i=1}^{N}\|z_{i}-\mathrm{sg}(q(z_{i}))\|_{2}^{2}$ , where $\mathrm{sg}(\cdot)$ stops gradients.
+
+To avoid permanent
+codebook death, we periodically reinitialize under-used codes from the empirical
+distribution of current encoder outputs, following dead-code revival in neural
+audio tokenization (Zeghidour et al., 2022). For losses applied after
+quantization, we use the rotation trick (Fifty et al., 2025). Let $\hat{z}$ denote the surrogate
+quantized representation used for backpropagation. Its forward value is
+ $q(z)$ , while its approximate Jacobian rotates gradients as
+
+ $\frac{\partial\hat{z}}{\partial z}\approx\alpha R(z,q(z)),\qquad\nabla_{z}\mathcal{L}\approx\alpha R(z,q(z))^{\top}\nabla_{\hat{z}}\mathcal{L},$ 
+
+(3)
+
+where $R(\cdot,\cdot)$ is an orthonormal map from the direction of $z$ to
+ $q(z)$ and $\alpha>0$ rescales magnitudes.
+
+Finally, a decoder $g_{\phi}$ reconstructs the encoder embedding with $\mathcal{L}_{\mathrm{rec}}=1-\frac{1}{N}\sum_{i=1}^{N}\cos(g_{\phi}(\hat{z}_{i}),h_{i})$ to preserve clinically relevant semantics while
+discouraging code collapse (Qu et al., 2025).
+
+## 3.3 Equivalence supervision from multiple views
+
+The primary supervision signal is concept equivalence. All views of the same
+underlying concept should be interchangeable at the tokenizer interface. Given
+a minibatch of $N$ views with concept labels $c_{i}$ , let
+ $\mathcal{P}(i)=\{j\neq i:c_{j}=c_{i}\}$ 
+be the set of other views of the same concept. For a representation $r_{i}$ ,
+define
+
+ $\pi_{ij}(r)=\frac{\exp(\cos(r_{i},r_{j})/\tau)}{\sum_{\ell\neq i}\exp(\cos(r_{i},r_{\ell})/\tau)}.$ 
+
+(4)
+
+We use a multi-positive contrastive loss
+
+ $\mathcal{L}_{\mathrm{eq}}(r)=-\frac{1}{|\mathcal{I}|}\sum_{i\in\mathcal{I}}\log\sum_{j\in\mathcal{P}(i)}\pi_{ij}(r),$ 
+
+(5)
+
+where $\mathcal{I}=\{i:|\mathcal{P}(i)|>0\}$ . This loss is applied before
+VQ to organize the continuous space, $\mathcal{L}_{\mathrm{eq}}^{\mathrm{pre}}=\mathcal{L}_{\mathrm{eq}}(\psi_{\mathrm{pre}}(z))$ , and after quantization to act directly on the discrete interface, $\mathcal{L}_{\mathrm{eq}}^{\mathrm{post}}=\mathcal{L}_{\mathrm{eq}}(\psi_{\mathrm{post}}(\hat{z}))$ .
+
+We further align the assignment distributions of views from the same concept.
+Let $p_{i}(k)=\exp(\cos(z_{i},e_{k})/\tau_{a})/\sum_{\ell=1}^{K}\exp(\cos(z_{i},e_{\ell})/\tau_{a})$ 
+be the soft code-assignment distribution. For concept $c$ in a minibatch, let
+ $\mathcal{V}_{c}=\{i:c_{i}=c\}$ and
+ $\bar{p}_{c}=\frac{1}{|\mathcal{V}_{c}|}\sum_{i\in\mathcal{V}_{c}}p_{i}.$ 
+The assignment-agreement loss, a generalized Jensen–Shannon objective over code assignments, is
+
+ $\mathcal{L}_{\mathrm{agree}}=\frac{1}{|\mathcal{C}_{B}|}\sum_{c\in\mathcal{C}_{B}}\frac{1}{|\mathcal{V}_{c}|}\sum_{i\in\mathcal{V}_{c}}\mathrm{KL}(p_{i}\,\|\,\bar{p}_{c}),$ 
+
+(6)
+
+where $\mathcal{C}_{B}$ is the set of concepts represented in the minibatch.
+
+## 3.4 Medical knowledge as semantic teachers
+
+The discrete tokenizer is the desired interface, but learning a high-quality
+codebook benefits from a well-structured representation space before the VQ
+bottleneck. We therefore use medical knowledge to define soft semantic teachers
+over non-equivalent concepts.
+
+We use three categories of medical knowledge. First, LLM-generated enriched
+descriptions provide definitional
+knowledge about what a concept means. Let $y_{c}$ denote an enriched description
+for concept $c$ and let
+ $u_{c}=\rho(y_{c})/\|\rho(y_{c})\|_{2}$ be its normalized embedding. We define
+
+ $A_{\mathrm{desc}}(c_{i},c_{j})=\exp\!\left(\frac{\max(0,u_{c_{i}}^{\top}u_{c_{j}})}{\tau_{\mathrm{desc}}}\right)-1.$ 
+
+(7)
+
+Second, code co-occurrence provides real-world evidence about which
+concepts appear in similar clinical contexts. We define co-occurrence over a
+set of contexts, where each context corresponds to a patient and a fixed-width
+time window. Let $B\in\{0,1\}^{D\times|\mathcal{C}|}$ be the binary
+context–concept matrix, where $B_{tc}=1$ if concept $c$ appears in context
+ $t$ . The sparse co-occurrence matrix is $C=B^{\top}B$ , and the marginal context count for concept $i$ is $n_{i}=C_{ii}$ . We form a raw
+positive pointwise mutual information (PPMI) matrix
+
+ $M_{ij}=\begin{cases}\max\!\left(\log_{2}\frac{D\,C_{ij}}{n_{i}n_{j}},\,0\right),&C_{ij}>0,\\
+0,&C_{ij}=0.\end{cases}$ 
+
+(8)
+
+We define $A_{\mathrm{co}}(c_{i},c_{j})=\log(1+M_{c_{i}c_{j}})/\tau_{\mathrm{co}}$ , which preserves empirical usage evidence while damping very large PPMI values. Third, the relation graph captures curated medical relations. Given a graph $G_{\mathrm{rel}}$ over
+concepts and shortest-path distance $d_{\mathrm{rel}}$ , we define
+
+ $A_{\mathrm{rel}}(c_{i},c_{j})=\begin{cases}\exp(-d_{\mathrm{rel}}(c_{i},c_{j})/\tau_{\mathrm{rel}}),&d_{\mathrm{rel}}(c_{i},c_{j})\leq R,\\
+0,&\text{otherwise}.\end{cases}$ 
+
+(9)
+
+Let $\mathcal{M}=\{\mathrm{desc},\mathrm{co},\mathrm{rel}\}$ . For each teacher
+ $m\in\mathcal{M}$ , we convert affinities in a minibatch into a row-normalized
+target distribution over non-equivalent concepts
+
+ $\tilde{w}_{ij}^{(m)}=\frac{\mathbf{1}[c_{i}\neq c_{j}]A_{m}(c_{i},c_{j})}{\sum_{\ell\neq i}\mathbf{1}[c_{i}\neq c_{\ell}]A_{m}(c_{i},c_{\ell})}.$ 
+
+(10)
+
+Rows with zero total affinity are omitted, and sparse teachers keep only the
+largest affinities per row. With
+ $\pi_{ij}^{\mathrm{pre}}=\pi_{ij}(\psi_{\mathrm{pre}}(z))$ , the teacher loss is
+
+ $\mathcal{L}_{m}=-\frac{1}{|\mathcal{I}_{m}|}\sum_{i\in\mathcal{I}_{m}}\sum_{j\neq i}\tilde{w}_{ij}^{(m)}\log\pi_{ij}^{\mathrm{pre}}.$ 
+
+(11)
+
+Same-concept objectives determine what must collapse, and the semantic teachers determine how distinct concepts should be arranged before quantization.
+
+## 3.5 Training objective and inference
+
+The final objective, combining vector quantization, semantic reconstruction,
+same-concept equivalence, assignment agreement, and the semantic teachers, is
+
+ $\mathcal{L}=\lambda_{\mathrm{pre}}\mathcal{L}_{\mathrm{eq}}^{\mathrm{pre}}+\lambda_{\mathrm{post}}\mathcal{L}_{\mathrm{eq}}^{\mathrm{post}}+\lambda_{\mathrm{vq}}\mathcal{L}_{\mathrm{vq}}+\lambda_{\mathrm{rec}}\mathcal{L}_{\mathrm{rec}}+\lambda_{\mathrm{agree}}\mathcal{L}_{\mathrm{agree}}+\sum_{m\in\mathcal{M}}\lambda_{m}\mathcal{L}_{m}.$ 
+
+(12)
+
+At inference time, Mediator is applied as an offline preprocessing step to unique clinical entity strings, and the resulting
+discrete token IDs $T(x)$ are cached and reused for all patient sequences. After this one-time tokenization step, downstream EHR models operate on discrete token IDs in the same way as standard code-embedding models. Because the codebook is fixed, new code systems such as ICD-11 can be tokenized without retraining, as in our eICU and entity-linking experiments (Appendix J); novel clinical distinctions remain untested.
+
+## 4 Experiments
+
+Figure 3: UMAP visualization of the Mediator codebook.
+Each point is a source concept, shown by its assigned VQ code embedding projected with UMAP. Colors indicate independent ontology-derived categories for (a) diagnosis codes, (b) measurements, (c) SNOMED clinical concepts, and (d) procedures. Dashed boxes mark example categories. Full category legends are in Appendix E.
+
+Table 1: EHR prediction performance on MIMIC-III, reported as mean (std) AUPRC across folds. Across the 20 tasks, Mediator improves over MedTok (one-sided Wilcoxon signed-rank test, $p=9.5\times 10^{-7}$ ). Patient-level bootstrap tests (5,000 resamples) show significant gains ( $p<0.05$ ) on 7/20 tasks over MedTok and 17/20 tasks over Code Emb.
+
+Task
+Code Emb
+ClinVec
+MedTok
+ $\text{MedTok}_{\text{text}}$ -top5
+ $\text{MedTok}_{\text{text}}$ -top1
+Mediator
+
+Operational tasks
+
+LOS $<$ 7
+0.819(0.012)
+0.807(0.004)
+0.827(0.007)
+0.830(0.005)
+0.762(0.011)
+0.829(0.007)
+
+ICU Mortality
+0.571(0.015)
+0.484(0.006)
+0.556(0.008)
+0.563(0.007)
+0.418(0.014)
+0.573(0.010)
+
+Readmission
+0.336(0.026)
+0.342(0.018)
+0.366(0.021)
+0.347(0.021)
+0.336(0.022)
+0.374(0.023)
+
+Mean
+0.576
+0.544
+0.583
+0.580
+0.505
+0.592
+
+Subcohort mortality tasks
+
+Acute Kidney Injury
+0.563(0.032)
+0.513(0.025)
+0.573(0.014)
+0.572(0.024)
+0.436(0.013)
+0.587(0.013)
+
+Acute MI
+0.376(0.071)
+0.397(0.037)
+0.412(0.021)
+0.404(0.045)
+0.337(0.035)
+0.467(0.056)
+
+Acute Pancreatitis
+0.263(0.053)
+0.307(0.084)
+0.359(0.074)
+0.311(0.054)
+0.234(0.061)
+0.396(0.082)
+
+Atrial Fibrillation
+0.489(0.025)
+0.416(0.027)
+0.473(0.041)
+0.482(0.023)
+0.383(0.051)
+0.497(0.012)
+
+ARF/ARDS
+0.542(0.028)
+0.520(0.025)
+0.585(0.005)
+0.586(0.018)
+0.497(0.027)
+0.603(0.030)
+
+Cirrhosis
+0.291(0.072)
+0.355(0.135)
+0.358(0.150)
+0.224(0.098)
+0.195(0.044)
+0.444(0.120)
+
+Heart Failure
+0.426(0.026)
+0.362(0.031)
+0.403(0.030)
+0.430(0.026)
+0.305(0.023)
+0.447(0.050)
+
+Liver Failure
+0.564(0.055)
+0.577(0.061)
+0.599(0.029)
+0.566(0.083)
+0.470(0.073)
+0.615(0.024)
+
+GI Bleeding
+0.350(0.052)
+0.398(0.049)
+0.470(0.085)
+0.430(0.049)
+0.298(0.035)
+0.479(0.032)
+
+Severe Sepsis/Septic Shock
+0.581(0.035)
+0.593(0.018)
+0.640(0.012)
+0.634(0.019)
+0.514(0.029)
+0.676(0.034)
+
+Cerebrovascular Disease
+0.514(0.049)
+0.539(0.057)
+0.577(0.014)
+0.561(0.031)
+0.525(0.017)
+0.631(0.038)
+
+Subarachnoid Hemorrhage
+0.296(0.064)
+0.317(0.135)
+0.394(0.161)
+0.360(0.070)
+0.362(0.119)
+0.556(0.155)
+
+Mean
+0.438
+0.441
+0.487
+0.463
+0.380
+0.533
+
+Survival tasks
+
+Liver Cancer
+0.609(0.058)
+0.611(0.077)
+0.681(0.133)
+0.625(0.052)
+0.642(0.062)
+0.719(0.068)
+
+Prostate Cancer
+0.460(0.179)
+0.501(0.131)
+0.557(0.185)
+0.371(0.121)
+0.472(0.181)
+0.584(0.149)
+
+Brain Cancer
+0.607(0.055)
+0.558(0.048)
+0.550(0.081)
+0.586(0.087)
+0.533(0.101)
+0.650(0.109)
+
+Myeloid Leukemia
+0.570(0.119)
+0.586(0.095)
+0.595(0.109)
+0.589(0.085)
+0.531(0.058)
+0.595(0.056)
+
+Lymphoid Leukemia
+0.542(0.144)
+0.547(0.089)
+0.580(0.141)
+0.503(0.114)
+0.614(0.056)
+0.646(0.039)
+
+Mean
+0.557
+0.561
+0.593
+0.535
+0.558
+0.639
+
+Mediator pretraining dataset.
+We pretrain Mediator on a concept-view corpus derived from UMLS 2025AB (Bodenreider, 2004). We first merge CUIs linked by synonym relations into concept groups. All English, unsuppressed names and source descriptions within a group are positive views of the same concept. The corpus spans the International Classification of Diseases (ICD-9 (World Health Organization, 1988) and ICD-10 (World Health Organization, 2016)), SNOMED CT US (SNOMED International, 2025), LOINC (Forrey et al., 1996), RxNorm (National Library of Medicine, 2025), CPT (American Medical Association, 2026), HCPCS (Centers for Medicare & Medicaid Services, 2026), CVX (Centers for Disease Control and Prevention, 2026), ATC (WHO Collaborating Centre for Drug Statistics
+Methodology, 2026), and MeSH (National Library of Medicine, 2026). We also align LLM-enriched descriptions, a PPMI matrix from claims-derived code co-occurrence, and a medical relation KG to the same concept groups.
+Details are in Appendix B.1.
+
+Biomedical entity linking (BEL) benchmarks.
+We use three curated BEL datasets, NCBI Disease (Doğan et al., 2014), MedMentions (Mohan and Li, 2019), and COMETA (Basaldella et al., 2020), which map medical mentions from scientific text and social media to ontology concepts and are standard benchmarks for synonym alignment (Liu et al., 2021). We tokenize each mention and report pairwise consistency, which measures whether synonymous strings collapse to the same code, code purity, which measures semantic coherence within each code, and their harmonic mean $\mathrm{F1}=2\,\mathrm{Consistency}\cdot\mathrm{Purity}/(\mathrm{Consistency}+\mathrm{Purity})$ .
+
+EHR benchmark (in-domain).
+We evaluate whether Mediator serves as a better tokenizer for downstream EHR sequence modeling on MIMIC-III (Johnson et al., 2016). We build patient timelines from diagnoses, procedures, medications, and other coded events, restricting inputs to events timestamped at or before the prediction time (diagnoses and procedures, which MIMIC-III records only at discharge, enter only discharge-time tasks; Appendix D.1), train the same BEHRT-style Transformer from scratch for each task and tokenizer, and report five-fold mean AUPRC on operational, disease-specific mortality, and survival tasks.
+
+Zero-shot cross-dataset generalization.
+We apply models trained on MIMIC-III directly to the eICU Collaborative Research Database (Pollard et al., 2019), whose ontologies differ and whose events are partly free text. Mediator tokenizes both structured code descriptions and free-text event strings without manual vocabulary alignment.
+
+Table 2: EHR prediction performance on eICU, reported as mean (std) AUPRC across folds. Across the 14 tasks, Mediator improves over MedTok (one-sided Wilcoxon signed-rank test, $p=6.1\times 10^{-5}$ ). Patient-level bootstrap tests (5,000 resamples) show significant gains ( $p<0.05$ ) on 12/14 tasks over MedTok and 14/14 tasks over Code Emb.
+
+Task
+Code Emb
+ClinVec
+MedTok
+ $\text{MedTok}_{\text{text}}$ -top5
+ $\text{MedTok}_{\text{text}}$ -top1
+Mediator
+
+Operational tasks
+
+LOS $<$ 7
+0.933(0.003)
+0.939(0.002)
+0.934(0.001)
+0.941(0.026)
+0.939(0.001)
+0.942(0.004)
+
+ICU Mortality
+0.259(0.018)
+0.211(0.010)
+0.282(0.009)
+0.162(0.066)
+0.145(0.048)
+0.349(0.005)
+
+Mean
+0.596
+0.575
+0.608
+0.552
+0.542
+0.645
+
+Subcohort mortality tasks
+
+Acute Kidney Injury
+0.318(0.032)
+0.237(0.019)
+0.347(0.013)
+0.233(0.031)
+0.213(0.002)
+0.408(0.011)
+
+Acute MI
+0.241(0.032)
+0.191(0.015)
+0.227(0.049)
+0.110(0.011)
+0.119(0.006)
+0.325(0.024)
+
+Acute Pancreatitis
+0.110(0.034)
+0.121(0.015)
+0.140(0.064)
+0.073(0.015)
+0.077(0.000)
+0.178(0.049)
+
+Atrial Fibrillation
+0.200(0.027)
+0.169(0.018)
+0.214(0.019)
+0.125(0.020)
+0.095(0.002)
+0.290(0.012)
+
+ARF/ARDS
+0.285(0.025)
+0.253(0.014)
+0.363(0.022)
+0.250(0.034)
+0.254(0.004)
+0.397(0.020)
+
+Cirrhosis
+0.239(0.020)
+0.284(0.073)
+0.290(0.082)
+0.208(0.011)
+0.194(0.001)
+0.325(0.062)
+
+Heart Failure
+0.177(0.016)
+0.140(0.003)
+0.196(0.011)
+0.136(0.011)
+0.125(0.003)
+0.247(0.013)
+
+Liver Failure
+0.323(0.027)
+0.372(0.022)
+0.375(0.027)
+0.326(0.001)
+0.353(0.002)
+0.487(0.028)
+
+GI Bleeding
+0.153(0.027)
+0.164(0.009)
+0.226(0.013)
+0.134(0.038)
+0.132(0.005)
+0.331(0.025)
+
+Severe Sepsis/Septic Shock
+0.286(0.018)
+0.300(0.014)
+0.287(0.017)
+0.279(0.054)
+0.274(0.000)
+0.403(0.013)
+
+Cerebrovascular Disease
+0.136(0.027)
+0.147(0.033)
+0.105(0.011)
+0.123(0.021)
+0.104(0.000)
+0.294(0.010)
+
+Subarachnoid Hemorrhage
+0.191(0.027)
+0.199(0.016)
+0.189(0.021)
+0.222(0.043)
+0.199(0.004)
+0.401(0.099)
+
+Mean
+0.222
+0.215
+0.247
+0.185
+0.178
+0.340
+
+Baselines.
+On BEL benchmarks, we compare with a $k$ -means tokenizer on frozen Qwen3-Embedding-8B embeddings (Zhang et al., 2025), which clusters UMLS training embeddings into $k{=}100{,}000$ centroids and assigns each text to its nearest centroid, and with the text branch of MedTok (Su et al., 2025), a state-of-the-art medical tokenizer that learns a VQ codebook with separate text and knowledge-graph branches. The top-5 variant (MedTok’s default) represents each input by its five nearest codes, and we treat each unique 5-code combination as a token ( $\text{MedTok}_{\text{text}}$ -top5). The top-1 variant uses only the nearest code ( $\text{MedTok}_{\text{text}}$ -top1), which makes it directly comparable to Mediator. For EHR prediction, we additionally compare against Code Emb, which treats each medical code as a separate token, ClinVec (Johnson et al., 2026), a pretrained knowledge graph embedding, and full MedTok. Under zero-shot transfer, the closed-vocabulary baselines (Code Emb, ClinVec, full MedTok) drop free text and codes outside the source vocabulary.
+
+Implementation details.
+We use frozen Qwen3-Embedding-8B (Zhang et al., 2025) with precomputed instruction-conditioned embeddings, a codebook of 100,000 entries in a 512-dimensional VQ space, and four views per concept during training. Enriched descriptions are generated with MedGemma-1.5-4B, PPMI is built from a private health system of 7.1 million patients (a public alternative is evaluated in Section 4.5), and the relation graph uses UMLS medical relations. Once trained, Mediator is applied offline to unique clinical strings, and the cached token IDs feed the downstream models (Appendix C.1).
+
+Table 3: Direct open-vocabulary tokenization evaluation.
+Tests whether each tokenizer maps unseen mentions and their ground-truth concept
+descriptions to one code while preserving purity.
+
+NCBI
+MedMentions
+COMETA
+
+Model
+Acc.
+Pur.
+F1
+Acc.
+Pur.
+F1
+Acc.
+Pur.
+F1
+
+Qwen3-8B + $k$ -means
+0.487
+0.928
+0.639
+0.450
+0.543
+0.492
+0.648
+0.807
+0.718
+
+MedToktext-top5
+0.195
+0.986
+0.326
+0.045
+0.885
+0.085
+0.231
+0.913
+0.368
+
+MedToktext-top1
+0.269
+0.360
+0.308
+0.131
+0.082
+0.101
+0.384
+0.101
+0.160
+
+Mediator
+0.524
+0.907
+0.664
+0.471
+0.516
+0.493
+0.682
+0.794
+0.734
+
+## 4.1 Mediator is a discrete neural interlingua
+
+We first test whether Mediator functions as a discrete neural interlingua, where synonymous surface forms should collapse to the same token, while each token should remain semantically coherent. As shown in Table 3, Mediator achieves the highest F1 on every dataset across domains.
+
+The Mediator codebook should also provide a meaningful embedding space for downstream EHR models. We assess this qualitatively by tokenizing concepts from major medical vocabularies, retrieving their assigned VQ code embeddings, and projecting them with UMAP (McInnes et al., 2018). As shown in Figure 3, concepts cluster by ontology-derived categories that are not used as direct classification targets, including ICD disease chapters, LOINC measurement classes, SNOMED semantic groups, and procedure body-system categories. The resulting organization suggests that medical knowledge-guided training shapes the codebook into a clinically structured discrete space.
+
+## 4.2 Mediator improves in-domain EHR modeling
+
+Table 1 reports AUPRC on 20 MIMIC-III tasks spanning operations, subcohort mortality, and survival. Mediator achieves the strongest mean performance in all three task families, improving over MedTok by 0.9, 4.6, and 4.6, respectively. Gains are most pronounced on clinically specific endpoints, including subarachnoid hemorrhage (+16.2), brain cancer (+10.0), cirrhosis (+8.6), and lymphoid leukemia (+6.6), suggesting that the shared semantic codebook improves statistical sharing across related codes. Mediator also remains the best tokenizer with two stronger downstream backbones, GT-BEHRT (Poulain and Beheshti, 2024) and TransformEHR (Yang et al., 2023) (Appendix H).
+
+## 4.3 Mediator improves zero-shot transfer to eICU
+
+Table 2 tests MIMIC-III-trained models directly on eICU. Of 3,578,036 eICU events, closed-vocabulary baselines retain only 466,408 (787 unique items), whereas Mediator retains all of them, mapped to 4,102 distinct codes. Mediator achieves the best transfer in both task families, improving over MedTok by 3.7 points on operational tasks and 9.3 points (38% relative) on subcohort mortality, with large gains on subarachnoid hemorrhage (+21.2), cerebrovascular disease (+18.9), severe sepsis/septic shock (+11.6), and liver failure (+11.2). The open-vocabulary tokenizer is thus more robust to ontology shift and free-text documentation.
+
+Matched input coverage. Part of this gain is from coverage, the intended benefit of an open-vocabulary tokenizer. To isolate representation quality, we restrict all models to codes available to closed-vocabulary baselines (Table A.9, Appendix I). Mediator remains the best on both task-family means, improving over MedTok by 1.0 (operational) and 1.9 (subcohort mortality). Coverage explains most of the full-input margin, and representation adds a consistent gain.
+
+## 4.4 Mediator enables transferable interpretability
+
+Figure 4: Transferable attribution. Top-15 tokens by IG attribution to cirrhosis mortality on MIMIC-III (left) and zero-shot eICU (right). Shared VQ indices are blue, others gray.
+
+Because Mediator maps structured codes and free text into a shared token space, attributions are comparable across datasets. Figure 4 shows population-level integrated gradients (IG) (Sundararajan et al., 2017) for cirrhosis mortality trained on MIMIC-III and transferred to eICU. Across shared codes, attribution scores are strongly rank-correlated between datasets (Spearman $\rho=0.92$ , $p=4\times 10^{-26}$ ), so the importance profile transfers despite distribution shift. Six of the top 15 tokens appear in both datasets, against an expected 0.46 under a frequency-matched null over codes passing the attribution filter ( $\geq$ 5% of patients; permutation $p=5\times 10^{-6}$ ), and overlap is also significant at top-10 and top-20. The shared tokens cover sepsis, shock, acute kidney and respiratory failure, and vasopressors, which match known mortality risk factors in decompensated cirrhosis. At $K{=}100$ k, a token can also merge closely related concepts, such as the vasopressors phenylephrine and norepinephrine (token 54924), a granularity trade-off that code purity quantifies (Table 3). These attributions describe predictive associations only.
+
+## 4.5 Ablation experiments
+
+Table 4: Leave-one-out ablation. Mean AUPRC $\pm$ std over all tasks.
+
+Variant
+MIMIC-III
+eICU
+
+ $-\mathcal{L}_{\mathrm{agree}}$ 
+0.554 $\pm$ 0.003
+0.378 $\pm$ 0.008
+
+ $-\mathcal{L}_{\mathrm{co}}$ (PPMI)
+0.562 $\pm$ 0.008
+0.370 $\pm$ 0.011
+
+ $-\mathcal{L}_{\mathrm{rel}}$ 
+0.564 $\pm$ 0.010
+0.375 $\pm$ 0.009
+
+ $-\mathcal{L}_{\mathrm{desc}}$ 
+0.561 $\pm$ 0.018
+0.380 $\pm$ 0.006
+
+Mediator full
+0.568 $\pm$ 0.011
+0.384 $\pm$ 0.007
+
+Table 5: PPMI teacher source. Mean AUPRC over all tasks.
+
+PPMI teacher
+MIMIC-III
+eICU
+
+Private (default)
+0.568
+0.384
+
+Public (COHD + GoM)
+0.565
+0.384
+
+None
+0.562
+0.370
+
+Table 5 reports leave-one-out ablations over all tasks, with per-family and additive results in Appendix G. Removing the agreement loss causes the largest overall drop, and removing PPMI a substantial drop, particularly on eICU. These two dominate downstream prediction and transfer, while enriched descriptions and relation-graph supervision give smaller, task-dependent gains. Against the mean of the four ablated variants, the full objective improves AUPRC by 0.008 (95% CI [0.001, 0.014]; better on 24 of 34 tasks; Wilcoxon $p=0.011$ ) and has the best mean rank (Friedman $p=0.049$ ). In the additive ablation (Table A.6), the description and graph teachers mainly help in-domain, improving MIMIC-III operational AUPRC from 0.586 to 0.592 over the baseline with $\mathcal{L}_{\mathrm{agree}}$ and PPMI, while eICU results are comparable.
+
+To separate the frozen encoder from the tokenizer objectives, we compare Mediator with same-encoder controls that keep the Qwen3-Embedding-8B embeddings, BEHRT model, and input coverage fixed and form tokens by $k$ -means on the 4096-dimensional embeddings or on 512-dimensional PCA projections matching our quantization space (Table A.7 in Appendix G, which also varies the frozen encoder). While $k$ -means achieves performance close to Mediator on MIMIC-III, both controls trail it on zero-shot eICU, where the downstream model cannot relearn task-specific token mappings. Strong text embeddings and full coverage thus drive in-domain performance, while the objectives of Mediator add transfer robustness and open-vocabulary mapping quality.
+
+Finally, we rebuild the PPMI teacher from public sources. We compute PPMI matrices from Columbia Open Health Data (COHD) concept co-occurrence counts (Ta et al., 2018) and from Stanford Graph of Medicine (GoM) co-occurrence statistics (Finlayson et al., 2014), map both to our concept groups, and average them (Appendix B.1). The public teacher performs nearly identically to the private one (Table 5), so the reported gains do not depend on private co-occurrence data.
+
+## 5 Conclusion
+
+Ontology-specific token interfaces hinder the transfer of EHR models across institutions and exclude much clinically relevant text. Mediator reframes EHR harmonization as open-vocabulary discrete tokenization, mapping any clinical concept expressible as text into a shared VQ codebook. Across codebook analysis, entity linking, in-domain prediction, zero-shot transfer, and attribution, Mediator provides a compact, reusable token interface for standard EHR Transformers, and on eICU it uses every event where closed-vocabulary tokenizers use 13%. Open-vocabulary tokenization may also help other domains where many identifiers denote one entity, such as genes or financial securities.
+
+Limitations. Mediator inherits noise and omissions from its supervision sources, and a systematic error such as an incorrect synonym group affects every use of that concept, so clinically critical mappings should be validated before high-stakes use. The default co-occurrence teacher uses private data, though a public one performs nearly identically. Transfer gains partly reflect a coverage asymmetry, since Mediator ingests events that closed-vocabulary baselines must discard. Mediator tokenizes each concept description without context, so it cannot resolve short-form polysemy in ambiguous abbreviations, and it is trained on English sources only. Our downstream models are trained per task, and pretrained generative backbones and more hospitals and languages remain future work.
+
+## References
+
+American Medical Association [2026]
+
+American Medical Association.
+
+CPT® code set overview.
+
+https://www.ama-assn.org/practice-management/cpt/cpt-code-set-overview,
+2026.
+
+Accessed: 2026-01-25.
+
+Basaldella et al. [2020]
+
+Marco Basaldella, Fangyu Liu, Ehsan Shareghi, and Nigel Collier.
+
+COMETA: A corpus for medical entity linking in the social media.
+
+In Proceedings of the 2020 Conference on Empirical Methods in
+Natural Language Processing (EMNLP), pages 3122–3137, Online, November
+2020. Association for Computational Linguistics.
+
+doi: 10.18653/v1/2020.emnlp-main.253.
+
+URL https://aclanthology.org/2020.emnlp-main.253/.
+
+Bodenreider [2004]
+
+Olivier Bodenreider.
+
+The unified medical language system (UMLS): integrating biomedical
+terminology.
+
+Nucleic acids research, 32(suppl_1):D267–D270, 2004.
+
+Centers for Disease Control and Prevention [2026]
+
+Centers for Disease Control and Prevention.
+
+IIS: Code Sets: CVX – Vaccines Administered.
+
+https://www2a.cdc.gov/vaccines/iis/iisstandards/vaccines.asp?rpt=cvx,
+2026.
+
+Accessed: 2026-05-06.
+
+Centers for Medicare & Medicaid Services [2026]
+
+Centers for Medicare & Medicaid Services.
+
+Healthcare Common Procedure Coding System (HCPCS).
+
+https://www.cms.gov/medicare/coding-billing/healthcare-common-procedure-system,
+2026.
+
+Accessed: 2026-10-16.
+
+Doğan et al. [2014]
+
+Rezarta Islamaj Doğan, Robert Leaman, and Zhiyong Lu.
+
+NCBI disease corpus: A resource for disease name recognition and
+concept normalization.
+
+Journal of Biomedical Informatics, 47:1–10, 2014.
+
+ISSN 1532-0464.
+
+doi: https://doi.org/10.1016/j.jbi.2013.12.006.
+
+URL
+https://www.sciencedirect.com/science/article/pii/S1532046413001974.
+
+Du et al. [2024]
+
+Tianqi Du, Yifei Wang, and Yisen Wang.
+
+On the role of discrete tokenization in visual representation
+learning.
+
+In The Twelfth International Conference on Learning
+Representations, 2024.
+
+URL https://openreview.net/forum?id=WNLAkjUm19.
+
+Esser et al. [2021]
+
+Patrick Esser, Robin Rombach, and Bjorn Ommer.
+
+Taming transformers for high-resolution image synthesis.
+
+In Proceedings of the IEEE/CVF conference on computer vision
+and pattern recognition, pages 12873–12883, 2021.
+
+Fifty et al. [2025]
+
+Christopher Fifty, Ronald Guenther Junkins, Dennis Duan, Aniketh Iyengar,
+Jerry Weihong Liu, Ehsan Amid, Sebastian Thrun, and Christopher Re.
+
+Restructuring vector quantization with the rotation trick.
+
+In The Thirteenth International Conference on Learning
+Representations, 2025.
+
+URL https://openreview.net/forum?id=GMwRl2e9Y1.
+
+Finlayson et al. [2014]
+
+Samuel G. Finlayson, Paea LePendu, and Nigam H. Shah.
+
+Building the graph of medicine from millions of clinical narratives.
+
+Scientific Data, 1:140032, 2014.
+
+doi: 10.1038/sdata.2014.32.
+
+Forrey et al. [1996]
+
+Arden W Forrey, Clement J Mcdonald, Georges DeMoor, Stanley M Huff, Dennis
+Leavelle, Diane Leland, Tom Fiers, Linda Charles, Brian Griffin, Frank
+Stalling, et al.
+
+Logical observation identifier names and codes (LOINC) database: a
+public use set of codes and names for electronic reporting of clinical
+laboratory test results.
+
+Clinical chemistry, 42(1):81–90, 1996.
+
+Hripcsak et al. [2015]
+
+George Hripcsak, Jon D. Duke, Nigam H. Shah, Christian G. Reich, Vojtech Huser,
+Martijn J. Schuemie, Marc A. Suchard, Rae Woong Park, Ian Chi Kei Wong,
+Peter R. Rijnbeek, et al.
+
+Observational health data sciences and informatics (OHDSI):
+Opportunities for observational researchers.
+
+Studies in Health Technology and Informatics, 216:574–578, 2015.
+
+doi: 10.3233/978-1-61499-564-7-574.
+
+Hur et al. [2022]
+
+Kyunghoon Hur, Jiyoung Lee, Jungwoo Oh, Wesley Price, Younghak Kim, and Edward
+Choi.
+
+Unifying heterogeneous electronic health records systems via
+text-based code embedding.
+
+In Gerardo Flores, George H Chen, Tom Pollard, Joyce C Ho, and
+Tristan Naumann, editors, Proceedings of the Conference on Health,
+Inference, and Learning, volume 174 of Proceedings of Machine Learning
+Research, pages 183–203. PMLR, 07–08 Apr 2022.
+
+URL https://proceedings.mlr.press/v174/hur22a.html.
+
+Johnson et al. [2016]
+
+Alistair Johnson, Tom Pollard, and Roger Mark.
+
+MIMIC-III Clinical Database.
+
+PhysioNet, September 2016.
+
+doi: 10.13026/C2XW26.
+
+URL https://doi.org/10.13026/C2XW26.
+
+Version 1.4.
+
+Johnson et al. [2026]
+
+Ruth Johnson, Uri Gottlieb, Galit Shaham, Lihi Eisen, Jacob Waxman, Stav
+Devons-Sberro, Curtis R Ginder, Peter Hong, Raheel Sayeed, Xiaorui Su, et al.
+
+Embeddings of clinical codes enable knowledge-grounded ai in
+medicine.
+
+npj Digital Medicine, 2026.
+
+Kim et al. [2026]
+
+Junmo Kim, Namkyeong Lee, Jiwon Kim, and Kwangsoo Kim.
+
+Medrep: medical concept representations for general electronic health
+record foundation models.
+
+Journal of the American Medical Informatics Association,
+33(6):1089–1099, 06 2026.
+
+ISSN 1527-974X.
+
+doi: 10.1093/jamia/ocag032.
+
+URL https://doi.org/10.1093/jamia/ocag032.
+
+Kraljevic et al. [2024]
+
+Zeljko Kraljevic, Dan Bean, Anthony Shek, Rebecca Bendayan, Harry Hemingway,
+Joshua Au Yeung, Alexander Deng, Alfred Balston, Jack Ross, Esther Idowu,
+James T Teo, and Richard J B Dobson.
+
+Foresight—a generative pretrained transformer for modelling of
+patient timelines using electronic health records: A retrospective modelling
+study.
+
+The Lancet Digital Health, 6(4):e281–e290, April 2024.
+
+ISSN 25897500.
+
+doi: 10.1016/S2589-7500(24)00025-6.
+
+Lee et al. [2024]
+
+Yoonhyung Lee, Younhyung Chae, and Kyomin Jung.
+
+Leveraging VQ-VAE tokenization for autoregressive modeling of
+medical time series.
+
+Artificial Intelligence in Medicine, 154:102925,
+2024.
+
+Li et al. [2020]
+
+Yikuan Li, Shishir Rao, Jose R. A. Solares, Abdelaali Hassaine, Rema
+Ramakrishnan, Dexter Canoy, Yajie Zhu, Kazem Rahimi, and Gholamreza
+Salimi-Khorshidi.
+
+BEHRT: Transformer for electronic health records.
+
+Scientific Reports, 10:7155, 2020.
+
+doi: 10.1038/s41598-020-62922-y.
+
+Liu et al. [2021]
+
+Fangyu Liu, Ehsan Shareghi, Zaiqiao Meng, Marco Basaldella, and Nigel Collier.
+
+Self-alignment pretraining for biomedical entity representations.
+
+In Proceedings of the 2021 Conference of the North American
+Chapter of the Association for Computational Linguistics: Human Language
+Technologies, pages 4228–4238, Online, June 2021. Association for
+Computational Linguistics.
+
+doi: 10.18653/v1/2021.naacl-main.334.
+
+URL https://aclanthology.org/2021.naacl-main.334/.
+
+McInnes et al. [2018]
+
+Leland McInnes, John Healy, Nathaniel Saul, and Lukas Großberger.
+
+UMAP: Uniform manifold approximation and projection.
+
+Journal of Open Source Software, 3(29):861, 2018.
+
+doi: 10.21105/joss.00861.
+
+URL https://doi.org/10.21105/joss.00861.
+
+Mohan and Li [2019]
+
+Sunil Mohan and Donghui Li.
+
+Medmentions: A large biomedical corpus annotated with umls concepts,
+2019.
+
+URL https://arxiv.org/abs/1902.09476.
+
+National Library of Medicine [2025]
+
+National Library of Medicine.
+
+RxNorm.
+
+https://www.nlm.nih.gov/research/umls/rxnorm/, 2025.
+
+National Library of Medicine [2026]
+
+National Library of Medicine.
+
+Medical Subject Headings.
+
+https://www.nlm.nih.gov/mesh/meshhome.html, 2026.
+
+Accessed: 2026-05-06.
+
+Overhage et al. [2012]
+
+J. Marc Overhage, Patrick B. Ryan, Christian G. Reich, Abraham G. Hartzema, and
+Paul E. Stang.
+
+Validation of a common data model for active safety surveillance
+research.
+
+Journal of the American Medical Informatics Association,
+19(1):54–60, 2012.
+
+doi: 10.1136/amiajnl-2011-000376.
+
+Pang et al. [2021]
+
+Chao Pang, Xinzhuo Jiang, Krishna S. Kalluri, Matthew Spotnitz, RuiJun Chen,
+Adler Perotte, and Karthik Natarajan.
+
+CEHR-BERT: Incorporating temporal information from structured
+EHR data to improve prediction tasks.
+
+In Proceedings of Machine Learning for Health, pages
+239–260. PMLR, November 2021.
+
+Pollard et al. [2019]
+
+Tom Pollard, Alistair Johnson, Jesse Raffa, Leo Anthony Celi, Omar Badawi, and
+Roger Mark.
+
+eICU Collaborative Research Database.
+
+PhysioNet, April 2019.
+
+doi: 10.13026/C2WM1R.
+
+URL https://doi.org/10.13026/C2WM1R.
+
+Version 2.0.
+
+Poulain and Beheshti [2024]
+
+Raphael Poulain and Rahmatollah Beheshti.
+
+Graph transformers on EHRs: Better representation improves
+downstream performance.
+
+In The Twelfth International Conference on Learning
+Representations, 2024.
+
+Qu et al. [2025]
+
+Liao Qu, Huichao Zhang, Yiheng Liu, Xu Wang, Yi Jiang, Yiming Gao, Hu Ye,
+Daniel K Du, Zehuan Yuan, and Xinglong Wu.
+
+TokenFlow: Unified image tokenizer for multimodal understanding and
+generation.
+
+In Proceedings of the Computer Vision and Pattern Recognition
+Conference, pages 2545–2555, 2025.
+
+Qwen Team [2026]
+
+Qwen Team.
+
+Qwen3.5: Towards native multimodal agents, February 2026.
+
+URL https://qwen.ai/blog?id=qwen3.5.
+
+Rasmy et al. [2021]
+
+Laila Rasmy, Yang Xiang, Ziqian Xie, Cui Tao, and Degui Zhi.
+
+Med-BERT: Pretrained contextualized embeddings on large-scale
+structured electronic health records for disease prediction.
+
+npj Digital Medicine, 4(1):1–13, May
+2021.
+
+ISSN 2398-6352.
+
+doi: 10.1038/s41746-021-00455-y.
+
+Razavi et al. [2019]
+
+Ali Razavi, Aaron Van den Oord, and Oriol Vinyals.
+
+Generating diverse high-fidelity images with VQ-VAE-2.
+
+Advances in neural information processing systems, 32, 2019.
+
+Remy et al. [2024]
+
+François Remy, Kris Demuynck, and Thomas Demeester.
+
+BioLORD-2023: semantic textual representations fusing large
+language models and clinical knowledge graph insights.
+
+Journal of the American Medical Informatics Association,
+31(9):1844–1855, 2024.
+
+doi: 10.1093/jamia/ocae029.
+
+Sellergren et al. [2026]
+
+Andrew Sellergren, Chufan Gao, Fereshteh Mahvar, Timo Kohlberger, Fayaz Jamil,
+Madeleine Traverse, Alberto Tono, Bashir Sadjad, Lin Yang, Charles Lau,
+et al.
+
+MedGemma 1.5 technical report.
+
+arXiv preprint arXiv:2604.05081, 2026.
+
+Shmatko et al. [2025]
+
+Artem Shmatko, Alexander Wolfgang Jung, Kumar Gaurav, Søren Brunak,
+Laust Hvas Mortensen, Ewan Birney, Tom Fitzgerald, and Moritz Gerstung.
+
+Learning the natural history of human disease with generative
+transformers.
+
+Nature, 647(8088):248–256, November 2025.
+
+ISSN 1476-4687.
+
+doi: 10.1038/s41586-025-09529-3.
+
+SNOMED International [2025]
+
+SNOMED International.
+
+SNOMED CT US Edition, 2025.
+
+URL https://www.nlm.nih.gov/healthit/snomedct/us_edition.html.
+
+Steinberg et al. [2021]
+
+Ethan Steinberg, Ken Jung, Jason A Fries, Conor K Corbin, Stephen R Pfohl, and
+Nigam H Shah.
+
+Language models are an effective representation learning technique
+for electronic health record data.
+
+Journal of biomedical informatics, 113:103637, 2021.
+
+Steinberg et al. [2024]
+
+Ethan Steinberg, Jason Alan Fries, Yizhe Xu, and Nigam Shah.
+
+MOTOR: A time-to-event foundation model for structured medical
+records.
+
+In The Twelfth International Conference on Learning
+Representations, 2024.
+
+URL https://openreview.net/forum?id=NialiwI2V6.
+
+Su et al. [2025]
+
+Xiaorui Su, Shvat Messica, Yepeng Huang, Ruth Johnson, Lukas Fesser, Shanghua
+Gao, Faryad Sahneh, and Marinka Zitnik.
+
+Multimodal medical code tokenizer.
+
+In Forty-second International Conference on Machine Learning,
+2025.
+
+URL https://openreview.net/forum?id=UaTrcei5Ba.
+
+Sundararajan et al. [2017]
+
+Mukund Sundararajan, Ankur Taly, and Qiqi Yan.
+
+Axiomatic attribution for deep networks, 2017.
+
+URL https://arxiv.org/abs/1703.01365.
+
+Ta et al. [2018]
+
+Cao N. Ta, Michel Dumontier, George Hripcsak, Nicholas P. Tatonetti, and
+Chunhua Weng.
+
+Columbia open health data, clinical concept prevalence and
+co-occurrence from electronic health records.
+
+Scientific Data, 5:180273, 2018.
+
+doi: 10.1038/sdata.2018.273.
+
+van den Oord et al. [2017]
+
+Aaron van den Oord, Oriol Vinyals, and Koray Kavukcuoglu.
+
+Neural discrete representation learning.
+
+In Advances in Neural Information Processing Systems,
+volume 30, 2017.
+
+Waxler et al. [2025]
+
+Shane Waxler, Paul Blazek, Davis White, Daniel Sneider, Kevin Chung, Mani
+Nagarathnam, Patrick Williams, Hank Voeller, Karen Wong, Matthew Swanhorst,
+Sheng Zhang, Naoto Usuyama, Cliff Wong, Tristan Naumann, Hoifung Poon, Andrew
+Loza, Daniella Meeker, Seth Hain, and Rahul Shah.
+
+Generative medical event models improve with scale, 2025.
+
+URL https://arxiv.org/abs/2508.12104.
+
+WHO Collaborating Centre for Drug Statistics
+Methodology [2026]
+
+WHO Collaborating Centre for Drug Statistics Methodology.
+
+ATC Classification Index with DDDs, 2026.
+
+https://atcddd.fhi.no/atc_ddd_index/, 2026.
+
+Accessed: 2026-05-06.
+
+World Health Organization [1988]
+
+World Health Organization.
+
+International classification of diseases—ninth revision (ICD-9).
+
+Weekly Epidemiological Record = Relevé Épidémiologique
+Hebdomadaire, 63(45):343–344, 1988.
+
+World Health Organization [2016]
+
+World Health Organization.
+
+International Statistical Classification of Diseases and
+Related Health Problems.
+
+World Health Organization, Geneva, 10th edition, 2016.
+
+URL https://icd.who.int/browse10/2016/en.
+
+Wornow et al. [2023a]
+
+Michael Wornow, Rahul Thapa, Ethan Steinberg, Jason Fries, and Nigam Shah.
+
+EHRSHOT: An EHR benchmark for few-shot evaluation of foundation
+models.
+
+Advances in Neural Information Processing Systems,
+36:67125–67137, 2023a.
+
+Wornow et al. [2023b]
+
+Michael Wornow, Yizhe Xu, Rahul Thapa, Birju Patel, Ethan Steinberg, Scott
+Fleming, Michael A. Pfeffer, Jason Fries, and Nigam H. Shah.
+
+The shaky foundations of large language models and foundation models
+for electronic health records.
+
+npj Digital Medicine, 6(1):135, July
+2023b.
+
+ISSN 2398-6352.
+
+doi: 10.1038/s41746-023-00879-8.
+
+Wu et al. [2026a]
+
+Jialun Wu, Xin Mei, Rui Mao, Kai He, and Erik Cambria.
+
+TAKECare: A temporal-hierarchical framework with knowledge
+fusion for personalized clinical predictive modeling.
+
+Information Fusion, 126:103620, February
+2026a.
+
+ISSN 15662535.
+
+doi: 10.1016/j.inffus.2025.103620.
+
+Wu et al. [2026b]
+
+John Wu, Yongda Fan, Zhenbang Wu, Paul Landes, Eric Schrock, Sayeed Sajjad
+Razin, Arjun Chatterjee, Naveen Baskaran, Joshua Steier, Andrea Fitzpatrick,
+et al.
+
+PyHealth 2.0: A comprehensive open-source toolkit for accessible
+and reproducible clinical deep learning.
+
+arXiv preprint arXiv:2601.16414, 2026b.
+
+Yang et al. [2023]
+
+Zhichao Yang, Avijit Mitra, Weisong Liu, Dan Berlowitz, and Hong Yu.
+
+TransformEHR: transformer-based encoder-decoder generative model to
+enhance prediction of disease outcomes using electronic health records.
+
+Nature Communications, 14:7857, 2023.
+
+Zeghidour et al. [2022]
+
+Neil Zeghidour, Alejandro Luebs, Ahmed Omran, Jan Skoglund, and Marco
+Tagliasacchi.
+
+Soundstream: An end-to-end neural audio codec.
+
+IEEE/ACM Transactions on Audio, Speech, and Language
+Processing, 30:495–507, 2022.
+
+doi: 10.1109/TASLP.2021.3129994.
+
+Zhang et al. [2025]
+
+Yanzhao Zhang, Mingxin Li, Dingkun Long, Xin Zhang, Huan Lin, Baosong Yang,
+Pengjun Xie, An Yang, Dayiheng Liu, Junyang Lin, Fei Huang, and Jingren Zhou.
+
+Qwen3 embedding: Advancing text embedding and reranking through
+foundation models, 2025.
+
+URL https://arxiv.org/abs/2506.05176.
+
+Zhou et al. [2026]
+
+Doudou Zhou, Han Tong, Linshanshan Wang, Suqi Liu, Xin Xiong, Ziming Gan,
+Griffier Romain, Boris P Hejblum, Yun-Chung Liu, Chuan Hong, et al.
+
+Representation learning to advance multi-institutional studies with
+electronic health record data from US and France.
+
+Nature Communications, 2026.
+
+doi: 10.1038/s41467-026-71152-1.
+
+## Appendix A Impact statement
+
+This work proposes a discrete, ontology-agnostic tokenizer that aims to improve the interoperability of EHR-based machine learning models across coding systems, versions, and institutions, and to enable more structured use of information extracted from clinical notes. If adopted in clinical research or deployed in downstream decision-support tools, such representations could improve portability and reduce the engineering burden of manual code mapping, potentially accelerating model development and evaluation across sites. However, the approach inherits common risks of EHR modeling. Biases and missingness in clinical data may be preserved, performance may vary across demographic groups or care settings, and errors in concept normalization could propagate into downstream predictions. In particular, a systematic error in a supervision source, such as an incorrectly curated synonym group, affects every downstream use of that concept, so mappings for clinically critical concepts should be independently validated before deployment in high-stakes settings.
+
+## Appendix B Data processing
+
+## B.1 Training data preparation
+
+We construct the Mediator pretraining corpus as a set of concept groups, each associated with multiple textual views. We begin from UMLS 2025AB MRCONSO and retain English, unsuppressed entries from the target clinical and biomedical vocabularies. An LLM (Qwen3.5-35B-A3B [Qwen Team, 2026]) is used to filter the relations that are synonyms or medically related. We then merge CUIs connected by synonym-classified relations using union-find, where the resulting connected components define CUI_GROUP identifiers. All retained source strings from CUIs in the same CUI_GROUP are treated as positive textual views. We remove null and numeric-only strings, require at least two views per group before augmentation, and augment under-viewed groups so that each retained CUI_GROUP has at least five distinct descriptions.
+
+LLM-generated text resources.
+For minimum-view augmentation, we use Qwen3.5-35B-A3B [Qwen Team, 2026] to generate additional equivalent names for concept groups with fewer than five descriptions. The system prompt instructs the model to act as a medical expert and generate only new alternative names that are concise, medically accurate, semantically equivalent, of similar granularity, distinct from all existing names, and returned as a JSON array without explanations or metadata. The user prompt is as follows.
+
+Representative concept name: {representative name}. Existing equivalent names already known: {existing names}. Generate {n} additional equivalent names that are distinct from all existing names. Output only a JSON array of strings.
+
+For description-teacher supervision, the pipeline uses a CUI-level table with columns CUI, STR, and enriched_description. These enriched descriptions were generated offline with MedGemma-1.5-4B [Sellergren et al., 2026] and are aligned to CUI_GROUP; we release the generated descriptions and prompts with our code. The system prompt is as follows.
+
+You are a medical expert. Write only plain-text responses. Never use markdown, headers, bullet points, numbered lists, or bold text. Do not include thinking steps or generation notes – only the final description. Keep it concise.
+
+and the user prompt is as follows.
+
+In plain-text sentences, describe what this concept is and its primary clinical relevance. Be informative and concise.
+
+Embedding clinical strings and enriched descriptions.
+All tokenizer-input strings are embedded once with the frozen Qwen3-Embedding-8B encoder and cached before VQ training. We use instruction-aware formatting,
+Instruct: Given a clinical concept string, produce an embedding that preserves exact biomedical concept identity across synonyms, ontology versions, abbreviations, and local hospital wording. Strings that refer to the same medical concept should be close. Strings that are clinically related but not equivalent should remain distinguishable. Query: {text}.
+For enriched descriptions, we use the analogous “medical concept description” instruction.
+
+Empirical co-occurrence resource.
+We build raw PPMI from claims-derived structured events from a private healthcare system containing 7.1 million patients. The event sources are problem-list diagnoses, laboratory events, procedures, medications, and immunizations. Raw codes are normalized and mapped to UMLS using ICD10CM for diagnoses, LOINC for laboratories, CPT for procedures, RxNorm for medications, and CVX for immunizations. The UMLS code map is then collapsed to CUI_GROUP; codes that map ambiguously to multiple concept groups are excluded.
+
+After mapping, we deduplicate events at the patient–date–CUI_GROUP level and define contexts by patient and 30-day calendar time bin. Let $B\in\{0,1\}^{D\times|\mathcal{C}|}$ be the sparse context–concept matrix over $D$ patient-window contexts. We compute $C=B^{\top}B$ , where $C_{ij}$ is the number of contexts containing both concepts $i$ and $j$ , and $n_{i}=C_{ii}$ is the number of contexts containing concept $i$ . The final sparse teacher is the positive pointwise mutual information (PPMI) matrix
+
+ $M_{ij}=\max\left(0,\log_{2}\frac{D\,C_{ij}}{n_{i}n_{j}}\right).$ 
+
+(13)
+
+Public co-occurrence resource.
+To remove the dependence on private data, we also build a PPMI teacher from two public resources. Columbia Open Health Data (COHD) [Ta et al., 2018] provides concept prevalence and pairwise co-occurrence counts from the Columbia University Irving Medical Center EHR, encoded with OMOP standard concepts. The Stanford Graph of Medicine [Finlayson et al., 2014] provides co-occurrence counts of UMLS concepts mined from clinical narratives. We map COHD concepts to UMLS through their source vocabularies, collapse both resources to CUI_GROUP, compute a PPMI matrix from each resource’s co-occurrence and marginal counts as above, and average the two matrices to form the public teacher.
+
+Medical relation knowledge graph.
+The medical relation knowledge graph $G_{\mathrm{rel}}$ is built from UMLS relations classified as synonymous or medically related by Qwen3.5-35B-A3B [Qwen Team, 2026], after mapping both endpoints to CUI_GROUP. We remove self-loops after grouping, build an undirected graph over concept groups, and precompute two-hop neighborhoods for relation-based supervision during tokenizer training.
+
+## Appendix C Implementation details
+
+## C.1 Mediator training
+
+We initialize the codebook with $k$ -means over the precomputed encoder embeddings projected into the quantization space, update codebook statistics with EMA, and periodically revive under-used codes from current encoder outputs. Post-quantization objectives use rotation-trick gradient transport. Semantic teachers from enriched descriptions, raw PPMI co-occurrence, and the medical relation knowledge graph $G_{\mathrm{rel}}$ are applied as separate weighted contrastive losses, and PPMI-neighbor sampling is used to increase the frequency of informative co-occurrence pairs in minibatches. Additional hyperparameters are listed in Table A.1. Training requires 16GB. All experiments were trained on a single NVIDIA A100 GPU.
+
+Mediator is applied once, offline, as a vocabulary-level preprocessing step over unique clinical-concept strings. Each unique concept string is passed once through the model to obtain a discrete integer token id; these ids are then cached. At training and inference time the downstream EHR model consumes only these cached integer ids, and the text encoder is never invoked again. Concretely, tokenizing the entire concept vocabulary takes $\approx$ 70s per dataset on a single NVIDIA RTX PRO 6000 GPU. The 12,533 MIMIC-III concepts take 71.2s (5.7 ms/concept) and the 10,779 eICU concepts take 69.9s (6.5 ms/concept). Tokenization cost therefore scales only with the number of unique concepts and is independent of dataset size and sequence length. The text encoder and adaptor are never loaded by the downstream model. The codebook ( $100{,}000\times 512$ ; 51.2M parameters, $\approx$ 102 MB in fp16) is used once to initialize the downstream embedding table (Appendix C.2).
+
+Hyperparameter
+Value
+
+Adaptor hidden dim.
+1024
+
+VQ embedding dim.
+512
+
+Codebook size
+100,000
+
+Views per concept
+4
+
+Batch size
+1536
+
+Training epochs
+100
+
+Adaptor learning rate
+ $5\times 10^{-5}$ 
+
+Other learning rate
+ $1\times 10^{-4}$ 
+
+Weight decay
+ $1\times 10^{-5}$ 
+
+Warmup ratio
+0.1
+
+Max gradient norm
+1.0
+
+Contrastive temperature
+0.07
+
+Post-VQ temperature
+0.07
+
+Teacher temperature
+0.15
+
+EMA decay
+0.99
+
+EMA $\epsilon$ 
+ $1\times 10^{-5}$ 
+
+Revive threshold
+2.0
+
+Agreement warmup
+10 epochs
+
+PPMI batch fraction
+0.083
+
+ $\lambda_{\mathrm{vq}}$ 
+0.25
+
+ $\lambda_{\mathrm{pre}}$ 
+1.0
+
+ $\lambda_{\mathrm{post}}$ 
+1.5
+
+ $\lambda_{\mathrm{agree}}$ 
+1000.0
+
+ $\lambda_{\mathrm{rel}}$ 
+0.1
+
+ $\lambda_{\mathrm{co}}$ 
+0.1
+
+ $\lambda_{\mathrm{desc}}$ 
+0.1
+
+ $\lambda_{\mathrm{rec}}$ 
+0.01
+
+Table A.1: Hyperparameters used in final Mediator tokenizer training.
+
+Hyperparameter
+Value
+
+Hidden size
+288
+
+Number of hidden layers
+6
+
+Number of attention heads
+12
+
+Intermediate size
+512
+
+Dropout probability
+0.1
+
+Segmentation vocab size
+3
+
+Age vocab size
+91
+
+Sex vocab size
+2
+
+Batch size
+256
+
+Max epochs
+100
+
+Learning rate
+ $5\times 10^{-4}$ 
+
+Warmup proportion
+0.1
+
+Weight decay
+ $5\times 10^{-4}$ 
+
+Early-stop patience
+10
+
+Table A.2: Hyperparameters used in downstream BEHRT-style EHR training.
+
+## C.2 Downstream EHR model
+
+We train an end-to-end BEHRT [Li et al., 2020] model for every single task and integrate the tokens for time, visit, and patient information (sex, age) as in the original paper. Hyperparameters are listed in Table A.2.
+
+For in-domain EHR prediction, the Code Emb baseline trains BEHRT with a standard learned embedding table over structured codes. For the full MedTok baseline, medical codes are passed to the original MedTok model and the resulting code embeddings are used as model inputs. ClinVec uses knowledge graph embeddings following the official setup [Johnson et al., 2026]. For text baselines, in $\text{MedTok}_{\text{text}}$ -top5 and $\text{MedTok}_{\text{text}}$ -top1 settings, the official description of each medical code is encoded using the MedTok text encoder, and the average of the top-5 returned embeddings or the top-1 embedding is used, respectively. For Mediator, the input embedding table has one row per codebook entry ( $100{,}000\times 512$ ) and is initialized from the trained Mediator codebook, followed by a linear projection from 512 to the 288-dimensional BEHRT hidden size. Both the embedding table and the projection are trainable during BEHRT training. Each event is represented by the projected embedding of its assigned VQ index. All models are trained with 5-fold data split.
+
+For zero-shot transfer to eICU, we directly apply models trained on MIMIC-III without fine-tuning. All five fold-specific checkpoints are evaluated on eICU, and the final performance is reported as the average across folds. Code Emb, MedTok, and ClinVec must drop much of the text information, since eICU provides no official code mapping. To further ensure fair comparison, $\text{MedTok}_{\text{text}}$ -top5, $\text{MedTok}_{\text{text}}$ -top1 settings and Mediator embed all texts and structured code descriptions. We allow eICU VQ indices that were not observed in MIMIC training; we therefore evaluate transfer with the full, unfiltered tokenizer output. Because the embedding table is initialized from the codebook, rows for indices never observed in MIMIC-III training receive no gradient updates and retain their codebook initialization (up to weight decay), so these indices are mapped through the learned projection to embeddings that reflect their position in the shared semantic space.
+
+## C.3 Integrated gradients analysis
+
+We attribute predictions to Mediator tokens using integrated gradients (IG) [Sundararajan et al., 2017] in embedding space.
+Let a patient sequence be represented by a sequence of VQ indices, and let the model input be the corresponding sequence of VQ embeddings.
+For IG, we treat each token embedding as the attribution unit and use the all-zero vector as the baseline embedding.
+We compute IG with respect to the positive-class (mortality) logit.
+
+From per-patient IG scores, we compute population-level importance for each token in three steps.
+(i) We filter to tokens that appear in at least 5% of patients to avoid unstable estimates for rare tokens.
+(ii) Within each patient, if a token index appears multiple times, we apply max pooling over its IG scores so that each patient contributes at most one attribution value per token (capturing the strongest evidence for that concept in the trajectory).
+(iii) We then average pooled IG scores across patients (without taking absolute values) to obtain directional population-level importance, where positive scores indicate risk-associated concepts and negative scores indicate protective concepts.
+
+## Appendix D Task definition
+
+The selection of downstream prediction tasks is guided by both clinical relevance and data availability across the MIMIC-III and eICU datasets. In particular, we prioritize tasks that are well-established in the clinical machine learning literature. For disease-specific mortality and cancer survival tasks, cohort selection is further constrained by the need to ensure sufficient statistical power. We ensure that all evaluated tasks are supported by sufficient data for reliable modeling and evaluation.
+
+## D.1 MIMIC-III
+
+We use PyHealth 2.0 [Wu et al., 2026b] to construct the length-of-stay and readmission cohort. For other tasks,
+we follow a standard MIMIC-III cohort-construction pipeline. After filtering for age $\geq$ 18, ICU stay structure, and task-specific eligibility, we sample one admission per patient, so each patient contributes a single admission trajectory and all splits are patient-disjoint. We evaluate all downstream models with five-fold cross-validation. In each run, one fold serves as the validation set, one as the test set, and the remaining three as the training set, and the checkpoint with the best validation AUPRC is used for testing. eICU is never used for training, hyperparameter tuning, or model selection. Subcohort mortality is defined to predict ICU mortality for patients diagnosed with that specific disease within that stay. Survival tasks predict 1-year mortality after ICU discharge for patients diagnosed with a specific cancer. Cohort statistics are reproduced in Table A.3.
+
+ICU length of stay, ICU mortality, and sub-cohort mortality tasks are predicted using data available within the first 24 hours of ICU admission. ICU readmission and survival tasks are predicted at discharge for patients discharged alive. ICU readmission is defined as a subsequent ICU admission within 30 days. For survival tasks, the prediction time is ICU discharge; patients who die on or before the ICU discharge date are excluded, and the label is positive if the recorded date of death falls within 365 days after ICU discharge. Patients without a recorded date of death are treated as survivors; we do not explicitly censor patients with incomplete follow-up.
+
+MIMIC-III diagnosis and procedure codes (DIAGNOSES_ICD and PROCEDURES_ICD) carry no timestamps and are assigned at the end of the hospital stay, so we timestamp them at discharge time. For every task, model inputs are restricted to events timestamped at or before the prediction time.
+
+Disease-specific mortality tasks are built from ICD-9 cohorts corresponding to 584 (acute kidney injury); 410 (acute myocardial infarction (MI)); 577.0 (acute pancreatitis); 427.31 (atrial fibrillation); 518.81 (acute respiratory failure/acute respiratory distress syndrome (ARF/ARDS)); 571.5, 571.6 (cirrhosis); 428 (heart failure); 570, 572.2, 572.8 (liver failure); 578 (gastrointestinal (GI) bleeding); 785.52, 995.92 (severe sepsis/septic shock); 430, 431, 433, 434, 436 (cerebrovascular disease, comprising subarachnoid and intracerebral hemorrhage, all subcodes of precerebral (433) and cerebral (434) artery occlusion with or without recorded infarction, and acute ill-defined cerebrovascular disease); and 430 (subarachnoid hemorrhage). Cancer survival tasks are built from ICD-9 codes 155 (liver cancer); 191 (brain cancer, i.e., malignant neoplasm of brain; histology not specified); 204 (lymphoid leukemia); 205 (myeloid leukemia); and 185 (prostate cancer).
+
+Table A.3: Dataset statistics for prediction tasks on MIMIC-III and eICU. Total Stays is the number of ICU stays in each task cohort (one per patient); Events is the number of positive labels.
+
+MIMIC-III
+eICU
+
+Group
+Task
+Total Stays
+Events
+Total Stays
+Events
+
+Hospital Operation
+LOS $<$ 7 days
+40757
+18931
+83166
+21818
+
+ICU Mortality
+31650
+2954
+83166
+7003
+
+Readmission
+9515
+2613
+–
+–
+
+Subcohort ICU Mortality
+Acute Kidney Injury
+6757
+1370
+8309
+1367
+
+Acute MI
+3681
+439
+5671
+414
+
+Acute Pancreatitis
+627
+84
+322
+19
+
+Atrial Fibrillation
+8179
+984
+7491
+669
+
+ARF/ARDS
+4732
+1327
+11170
+2384
+
+Cirrhosis
+755
+133
+497
+92
+
+Heart Failure
+7921
+957
+6806
+708
+
+Liver Failure
+1090
+389
+622
+162
+
+GI Bleeding
+1384
+219
+4984
+403
+
+Severe Sepsis/Septic Shock
+2468
+818
+6033
+1279
+
+Cerebrovascular Disease
+3014
+525
+7101
+689
+
+Subarachnoid Hemorrhage
+509
+100
+497
+90
+
+Cancer Survival
+Liver Cancer
+245
+120
+–
+–
+
+Prostate Cancer
+180
+44
+–
+–
+
+Brain Cancer
+143
+66
+–
+–
+
+Lymphoid Leukemia
+116
+50
+–
+–
+
+Myeloid Leukemia
+122
+67
+–
+–
+
+## D.2 eICU
+
+We likewise follow the same eICU cohort-construction protocol for diagnoses, medications, admission drugs, past medical history, and treatments, again keeping one ICU stay per patient. Because eICU lacks post-discharge follow-up, we do not evaluate readmission and survival tasks.
+
+In addition to the ICD-9 label filtering rules applied to MIMIC-III, we define disease-specific subcohorts in eICU with the ICD-10 diagnosis codes N17 (acute kidney injury); I21, I22 (acute MI); K85 (acute pancreatitis); I48.0-I48.2, I48.91 (atrial fibrillation); J80 (ARF/ARDS); K74 (cirrhosis); I50 (heart failure); K72 (liver failure); K92.0, K92.1, and K92.2 (GI bleeding); R65.20, R65.21 (severe sepsis/septic shock); I60, I61, I62, I63, I64 (cerebrovascular disease); and I60 (subarachnoid hemorrhage). Because ARDS-specific coding is unavailable in ICD-9, the MIMIC-III ARF/ARDS cohort is defined by acute respiratory failure (518.81), whereas the eICU cohort uses ARDS (J80), a narrower subset; transfer results for this task should be interpreted with this definitional difference in mind. Cohort details are in Table A.3. eICU records are passed through the tokenizer without restricting predictions to VQ indices observed in the source dataset.
+
+## Appendix E Codebook visualization
+
+Figure A.1 shows the UMAP projections of Figure 3 with the complete category legends and the number of concepts in each category.
+
+Figure A.1: UMAP visualization of the Mediator codebook with full category legends.
+Each point denotes a source concept represented by its assigned VQ code embedding and projected to two dimensions with UMAP. Colors indicate ontology-derived categories, with the number of concepts per category in parentheses, for (a) diagnosis codes (ICD-9 and ICD-10), (b) measurement concepts (LOINC), (c) clinical concepts (SNOMED CT), and (d) procedure codes (ICD-9-PCS, ICD-10-PCS, and CPT-4).
+
+## Appendix F Codebook size ablations
+
+Figure A.2: Effect of codebook size $K$ .
+We vary the VQ codebook size and report mean BEL (VQ Evaluation) F1 and operational-task mean AUPRC on MIMIC-III and zero-shot eICU. We additionally report codebook usage on the training corpus.
+
+Table A.4: Biomedical entity linking F1 across codebook sizes.
+
+Codebook size
+NCBI
+MedMentions
+COMETA
+Mean
+
+10k
+0.663
+0.343
+0.669
+0.558
+
+20k
+0.670
+0.409
+0.707
+0.595
+
+40k
+0.681
+0.451
+0.723
+0.619
+
+60k
+0.637
+0.469
+0.732
+0.613
+
+80k
+0.673
+0.484
+0.738
+0.632
+
+100k
+0.664
+0.493
+0.734
+0.630
+
+120k
+0.680
+0.497
+0.739
+0.638
+
+We vary the codebook size $K$ from 10k to 120k (Figure A.2, Table A.4). Codebook size affects entity linking and downstream prediction differently. Entity-linking quality generally improves with $K$ . Mean F1 rises from 0.558 at 10k to 0.638 at 120k, monotonically on MedMentions and nearly so on COMETA. Downstream AUPRC on operational tasks is comparatively flat, ranging from 0.580 to 0.592 on MIMIC-III and from 0.635 to 0.649 on eICU, with no improvement beyond 100k on either dataset. From 100k to 120k, MIMIC-III declines from 0.592 to 0.586 and eICU stays at 0.645. We therefore select $K{=}100$ k as a cost-performance operating point that attains the best MIMIC-III value, lies within 0.004 of the best eICU value, and keeps entity-linking quality close to that of the largest codebook while keeping the vocabulary compact.
+Across all $K$ , codebook utilization on the training corpus stays above 96%, indicating that Mediator’s training stabilizes large codebooks and avoids the severe dead-code behavior commonly observed when scaling VQ models.
+
+## Appendix G Additional ablations
+
+This section reports the full component and encoder ablations summarized in Section 4.5, including leave-one-out results by task family (Table A.5), the additive component ablation over operational tasks (Table A.6), and the encoder and same-encoder tokenizer controls (Table A.7). Panel A of Table A.7 replaces the frozen Qwen3-Embedding-8B encoder with BioLORD-2023 [Remy et al., 2024] or Qwen3-Embedding-0.6B while keeping the rest of the pipeline fixed. Both weaker encoders lower performance, although Qwen3-Embedding-0.6B retains most of the eICU transfer performance (0.372 vs. 0.384), indicating that the transfer gains come substantially from the learned mapping.
+
+Table A.5: Leave-one-out component ablation by task family.
+Mean AUPRC $\pm$ standard deviation across folds for task-family
+means on MIMIC-III and zero-shot eICU transfer.
+
+MIMIC-III
+eICU
+
+Method
+Oper.
+Mort.
+Surv.
+All
+Oper.
+Mort.
+All
+
+ $-\mathcal{L}_{\mathrm{agree}}$ 
+0.582 $\pm$ 0.010
+0.524 $\pm$ 0.010
+0.610 $\pm$ 0.023
+0.554 $\pm$ 0.003
+0.642 $\pm$ 0.006
+0.334 $\pm$ 0.010
+0.378 $\pm$ 0.008
+
+ $-\mathcal{L}_{\mathrm{co}}$ (PPMI)
+0.585 $\pm$ 0.011
+0.530 $\pm$ 0.013
+0.628 $\pm$ 0.054
+0.562 $\pm$ 0.008
+0.644 $\pm$ 0.005
+0.324 $\pm$ 0.013
+0.370 $\pm$ 0.011
+
+ $-\mathcal{L}_{\mathrm{rel}}$ 
+0.590 $\pm$ 0.007
+0.549 $\pm$ 0.006
+0.585 $\pm$ 0.045
+0.564 $\pm$ 0.010
+0.644 $\pm$ 0.005
+0.330 $\pm$ 0.010
+0.375 $\pm$ 0.009
+
+ $-\mathcal{L}_{\mathrm{desc}}$ 
+0.588 $\pm$ 0.009
+0.537 $\pm$ 0.022
+0.601 $\pm$ 0.051
+0.561 $\pm$ 0.018
+0.640 $\pm$ 0.008
+0.337 $\pm$ 0.007
+0.380 $\pm$ 0.006
+
+Mediator full
+0.592 $\pm$ 0.007
+0.533 $\pm$ 0.012
+0.639 $\pm$ 0.037
+0.568 $\pm$ 0.011
+0.645 $\pm$ 0.003
+0.340 $\pm$ 0.009
+0.384 $\pm$ 0.007
+
+Table A.6: Additive component ablation.
+Mean AUPRC over operational tasks on MIMIC-III and zero-shot eICU transfer,
+adding components to a baseline trained with only the equivalence, VQ, and
+reconstruction losses.
+
+Objective
+MIMIC-III Oper.
+eICU Oper.
+
+Baseline
+0.585
+0.641
+
+Baseline $+\,\mathcal{L}_{\mathrm{desc}}$ 
+0.586
+0.642
+
+Baseline $+\,\mathcal{L}_{\mathrm{co}}$ (PPMI)
+0.580
+0.645
+
+Baseline $+\,\mathcal{L}_{\mathrm{rel}}$ 
+0.584
+0.635
+
+Baseline $+\,\mathcal{L}_{\mathrm{agree}}$ 
+0.583
+0.644
+
+Baseline $+\,\mathcal{L}_{\mathrm{agree}}+\mathcal{L}_{\mathrm{desc}}$ 
+0.584
+0.637
+
+Baseline $+\,\mathcal{L}_{\mathrm{agree}}+\mathcal{L}_{\mathrm{co}}$ (PPMI)
+0.586
+0.651
+
+Baseline $+\,\mathcal{L}_{\mathrm{agree}}+\mathcal{L}_{\mathrm{rel}}$ 
+0.584
+0.641
+
+Mediator full
+0.592
+0.645
+
+Table A.7: Encoder and tokenizer ablations.
+Panel A varies the frozen text encoder used by Mediator. Panel B keeps the
+same frozen Qwen3-Embedding-8B encoder fixed and compares Mediator against
+direct clustering controls. All results report mean AUPRC on 20 MIMIC-III
+tasks and 14 zero-shot eICU transfer tasks.
+
+Analysis
+Variant
+Dim.
+MIMIC-III
+eICU
+
+A. Alternative frozen encoders for Mediator
+
+Encoder
+BioLORD-2023
+768
+0.551
+0.312
+
+Encoder
+Qwen3-Embedding-0.6B
+1024
+0.550
+0.372
+
+Encoder
+Qwen3-Embedding-8B
+4096
+0.568
+0.384
+
+B. Same-encoder clustering controls
+
+Tokenizer
+Qwen embeddings + $k$ -means
+4096
+0.568
+0.378
+
+Tokenizer
+Qwen embeddings $\rightarrow$ PCA $\rightarrow$ $k$ -means
+512
+0.558
+0.379
+
+Tokenizer
+Mediator
+512
+0.568
+0.384
+
+## Appendix H Additional EHR architectures
+
+To test whether the benefit of Mediator depends on the specific downstream
+BEHRT-style architecture used in the main experiments, we evaluated the same
+tokenizer variants with two stronger EHR backbones, GT-BEHRT [Poulain and Beheshti, 2024] and TransformEHR [Yang et al., 2023].
+For each architecture, the tokenizer is the only component varied, while the
+downstream training and evaluation protocol follows the main MIMIC-III
+in-domain and MIMIC-to-eICU zero-shot transfer setup. As shown in
+Table A.8, Mediator remains the best tokenizer
+under both architectures and on both evaluation settings. This suggests that
+the gains from open-vocabulary discrete tokenization are not specific to the
+BEHRT-style model used in the main paper, but transfer to stronger EHR sequence
+modeling backbones.
+
+Table A.8: Tokenizer comparison under stronger EHR architectures.
+We evaluate Mediator as the token interface for GT-BEHRT and TransformEHR.
+Results are mean AUPRC on 20 MIMIC-III tasks and 14 zero-shot eICU transfer tasks.
+
+Tokenizer
+MIMIC-III
+eICU
+
+GT-BEHRT
+
+Code Emb
+0.572
+0.313
+
+ClinVec
+0.535
+0.280
+
+MedTok
+0.573
+0.313
+
+MedToktext-top1
+0.511
+0.219
+
+MedToktext-top5
+0.534
+0.224
+
+Mediator
+0.602
+0.414
+
+TransformEHR
+
+Code Emb
+0.470
+0.272
+
+ClinVec
+0.481
+0.264
+
+MedTok
+0.512
+0.299
+
+MedToktext-top1
+0.434
+0.227
+
+MedToktext-top5
+0.499
+0.218
+
+Mediator
+0.553
+0.384
+
+For GT-BEHRT, MIMIC-III and eICU in our benchmark contain a single admission
+trajectory per patient, so the original multi-visit, per-visit graph
+construction does not directly apply. We therefore use a single-visit
+adaptation with a per-patient star topology, where a learned readout token
+attends to and from all event tokens through dense masked attention, and edge
+typing is collapsed to code-category embeddings. This preserves the
+graph-attention mechanism of GT-BEHRT while matching the single-admission
+structure of our benchmark.
+
+## Appendix I Zero-shot comparison on the mappable subset
+
+Table A.9: Matched-input zero-shot transfer on eICU.
+All models are evaluated on the overlapping subset of eICU codes available to
+closed-vocabulary baselines. We report mean AUPRC with standard deviation
+across folds. Best results are bolded and second-best results are underlined.
+
+Task
+Code Emb
+ClinVec
+MedTok
+ $\text{MedTok}_{\text{text}}$ -top5
+ $\text{MedTok}_{\text{text}}$ -top1
+Mediator
+
+Operational tasks
+
+LOS $<$ 7
+0.933(0.003)
+0.939(0.002)
+0.934(0.001)
+0.937(0.004)
+0.926(0.003)
+0.938(0.002)
+
+ICU Mortality
+0.259(0.018)
+0.211(0.010)
+0.282(0.009)
+0.138(0.022)
+0.130(0.010)
+0.298(0.021)
+
+Mean
+0.596
+0.575
+0.608
+0.537
+0.528
+0.618
+
+Subcohort mortality tasks
+
+Acute Kidney Injury
+0.318(0.032)
+0.237(0.019)
+0.347(0.013)
+0.184(0.023)
+0.185(0.011)
+0.345(0.010)
+
+Acute MI
+0.241(0.032)
+0.191(0.015)
+0.227(0.049)
+0.102(0.020)
+0.108(0.010)
+0.227(0.011)
+
+Acute Pancreatitis
+0.110(0.034)
+0.121(0.015)
+0.140(0.064)
+0.087(0.022)
+0.089(0.025)
+0.162(0.042)
+
+Atrial Fibrillation
+0.200(0.027)
+0.169(0.018)
+0.214(0.019)
+0.132(0.043)
+0.084(0.009)
+0.242(0.015)
+
+ARF/ARDS
+0.285(0.025)
+0.253(0.014)
+0.363(0.022)
+0.231(0.014)
+0.228(0.011)
+0.340(0.022)
+
+Cirrhosis
+0.239(0.020)
+0.284(0.073)
+0.290(0.082)
+0.196(0.020)
+0.194(0.018)
+0.301(0.050)
+
+Heart Failure
+0.177(0.016)
+0.140(0.003)
+0.196(0.011)
+0.130(0.016)
+0.112(0.008)
+0.201(0.006)
+
+Liver Failure
+0.323(0.027)
+0.372(0.022)
+0.375(0.027)
+0.272(0.046)
+0.302(0.047)
+0.357(0.048)
+
+GI Bleeding
+0.153(0.027)
+0.164(0.009)
+0.226(0.013)
+0.108(0.015)
+0.125(0.006)
+0.268(0.021)
+
+Severe Sepsis/Septic Shock
+0.286(0.018)
+0.300(0.014)
+0.287(0.017)
+0.227(0.035)
+0.230(0.015)
+0.299(0.017)
+
+Cerebrovascular Disease
+0.136(0.027)
+0.147(0.033)
+0.105(0.011)
+0.117(0.013)
+0.104(0.010)
+0.185(0.021)
+
+Subarachnoid Hemorrhage
+0.191(0.027)
+0.199(0.016)
+0.189(0.021)
+0.188(0.018)
+0.183(0.022)
+0.268(0.034)
+
+Mean
+0.222
+0.215
+0.247
+0.165
+0.162
+0.266
+
+Table A.9 shows that matching coverage removes most, but not all, of the performance gap. Against the strongest baseline (MedTok), Mediator’s operational-mean margin falls from 3.7 to 1.0 points, and its subcohort-mortality margin falls from 9.3 to 1.9 points. Mediator remains the best model on both task-family means, while MedTok leads the mean on neither.
+
+## Appendix J Worked example
+
+Table A.10 traces three surface forms of one concept and one distinct concept through the Mediator pipeline of text encoding, projection, and nearest-code assignment.
+
+Table A.10: Worked example of Mediator tokenization. Each string is encoded by the frozen text encoder $f_{\eta}$ , projected into the quantization space by $p_{\theta}$ , and assigned to its nearest codebook entry. Three surface forms of dyspnea, from a clinical phrase, a colloquial expression, and the SNOMED CT term, are assigned the same code $i$ , whereas the distinct concept diabetes mellitus is assigned a different code $j$ . Because the codebook is fixed after training, strings from new code systems are tokenized in the same way without retraining.
+
+Input string $x$ 
+ $h=f_{\eta}(x)$ 
+ $z=p_{\theta}(h)$ 
+ $k^{\star}(z)$ 
+
+“shortness of breath” (clinical phrase)
+ $h_{1}$ 
+ $z_{1}$ 
+ $i$ 
+
+“can’t breathe” (colloquial)
+ $h_{2}$ 
+ $z_{2}$ 
+ $i$ 
+
+“dyspnea” (SNOMED CT term)
+ $h_{3}$ 
+ $z_{3}$ 
+ $i$ 
+
+“diabetes mellitus” (distinct concept)
+ $h_{4}$ 
+ $z_{4}$ 
+ $j\neq i$

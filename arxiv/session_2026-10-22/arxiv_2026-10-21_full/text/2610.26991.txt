@@ -1,0 +1,1658 @@
+## 3D-MoE: Complementarity-Guided Hardware–Software Co-Design for MoE Decode on 3D-Stacked NMP
+
+Yudong Pan12,
+Lian Liu12,
+Shixin Zhao12,
+Yintao He12,
+Kaiyan Chang12,
+Tianhua Han12,
+
+Chenyang Ai3,
+Haonan Zhu12,
+Mengdi Wang12,
+Yinhe Han12 and
+Ying Wang124
+
+Affiliation: 1SKLP, Institute of Computing Technology, Chinese Academy of Sciences, Beijing, China
+
+2University of Chinese Academy of Sciences, Beijing, China
+
+3University of Edinburgh, Edinburgh, United Kingdom
+
+4Corresponding author: wangying2009@ict.ac.cn
+
+Affiliation: Email: {panyudong23,liulian211,zhaoshixin18,hantianhua22,zhuhaonan24}@mails.ucas.ac.cn,
+
+{heyintao19z,wangmengdi,yinhes,wangying2009}@ict.ac.cn,
+changkaiyan@live.com, C.Ai-4@sms.ed.ac.uk
+
+Abstract
+
+Mixture-of-Experts (MoE) have become a mainstream way to scale Large Language Models (LLMs), because each token activates only a small subset of experts, reducing inference cost. However, MoE decode remains highly memory-bound and exhibits strongly skewed, time-varying expert loads. 3D-stacked DRAM near-memory processing (NMP) provides the bandwidth that decode demands, yet its tiled organization makes load balancing expensive: expert parallelism (EP) preserves locality but suffers from hotspot-induced imbalance, while more distributed strategies weaken locality and increase NoC traffic.
+
+To address this locality-balance conflict, we observe that domain-specialized token routing creates offsetting expert-load fluctuations across decode steps, a property we call expert complementarity. Using this insight, we propose 3D-MoE, a hardware–software co-designed system for MoE decode on 3D-stacked NMP. 3D-MoE uses offline, one-time complementarity-guided grouping and locality-aware mapping to establish coarse-grained inter-group balance, handles residual intra-group hotspots through a lightweight Collaborative Memory-Network (CMN) that streams each hot expert’s weight tiles once from its host DRAM channel to helper cores over a reconfigured local broadcast path, and uses cost-aware online remapping to remain robust to workload drift. Across MoE models, 3D-MoE achieves an average 4.63 $\times$ MoE-layer speedup over EP and improves end-to-end throughput by 1.58 $\times$ –1.86 $\times$ over the strongest NMP baselines, with 2.11% additional logic-die area.
+
+## I Introduction
+
+Mixture-of-Experts (MoE) architectures have become mainstream for scaling Large Language Models (LLMs): each token activates only a small expert subset, decoupling model capacity from inference cost [9, 30]. Yet this sparsity makes autoregressive decoding highly memory-bound; each expert receives few tokens per step, producing small GEMMs with poor data reuse [88]. In our profiling, MoE layers account for 83–92% of end-to-end latency at batch size 64 and dominate serving latency [25]. Expert loads are also highly skewed and dynamic, with the hottest expert receiving over 20 $\times$ the step-average token count [13].
+
+3D-stacked DRAM near-memory processing (NMP) is well matched to bandwidth-dominated MoE decode by serving expert weights directly from local stacked DRAM [80, 14, 68]. Yet its tiled organization creates a severe cost asymmetry: local accesses are fast, whereas remote accesses traverse the network-on-chip (NoC) and consume shared bandwidth. MoE deployment consequently faces a three-way tension among locality, load balance, and communication cost. Expert Parallelism (EP) best matches this structure by keeping expert weights local, but suffers from routing skew. Tensor Parallelism (TP) smooths load, yet turns every expert invocation into a distributed operation with synchronization and NoC overhead. Dynamic EP methods partially alleviate hotspots, but the difficulty of predicting expert loads and handling remote hotspots limits their benefits on NMP [10, 13]. The central challenge is therefore to retain EP’s locality while mitigating its imbalance.
+
+Our key observation is that MoE routing skew is not purely random. Although MoE training often includes load-balancing objectives, pre-trained models develop structured expert preferences, often reflected in domain-skewed activation patterns [56, 75]. As the request mix changes, demand shifts across expert subsets and induces offsetting variations in their decode-step loads. We call this trace-level load cancellation expert complementarity. This structural signal suggests an EP-friendly balancing mechanism: grouping complementary experts and mapping them to nearby NMP cores can stabilize aggregate group load without sacrificing weight locality.
+
+Turning complementarity into a practical deployment primitive remains non-trivial. First, highly volatile step-level token routing obscures the useful complementarity signal, requiring a robust method to distinguish persistent relations from transient noise. Second, complementarity improves balance mainly at the group level, leaving transient hotspots within a group. Because a hot expert’s weights remain pinned to its host core, nearby helper cores require repeated remote weight fetches or inefficient packet-routed one-to-many delivery. Third, the offline expert deployment derived from historical traces must remain robust under workload drift, calling for lightweight online correction rather than frequent global re-optimization.
+
+To address these challenges, we propose 3D-MoE, a hardware–software co-design for MoE decode on 3D-stacked NMP. 3D-MoE exploits complementarity hierarchically. First, it profiles decode-step expert loads on representative mixed workloads to filter transient routing noise and expose persistent complementary structure in the traces. It then performs one-time complementarity-guided expert grouping and mapping through a two-stage offline optimization that accounts for inter-group balance, expected residual collaboration cost, and communication-aware placement.
+Second, we introduce the Collaborative Memory-Network (CMN), a lightweight co-design of the memory controller and NoC that handles residual intra-group hotspots through a specialized “load once, broadcast to many” path: the host reads each hot expert’s weight tile once from local DRAM and streams it to helper cores over a temporary broadcast path created by lightweight NoC reconfiguration. Third, tiered cost-aware online remapping applies frequent low-cost adjustments while reserving higher-cost reconfigurations for long-term workload drift.
+
+This paper makes the following four contributions:
+
+• 
+
+We identify expert complementarity as a trace-level load-cancellation structure in MoE decode, and validate that it is sufficiently stable across datasets and time windows to support one-time offline deployment.
+
+• 
+
+We formulate complementarity-guided expert grouping and locality-aware mapping as sequential optimization stages that balance inter-group load while accounting for intra-group collaboration and routing costs.
+
+• 
+
+We design CMN, a lightweight hardware fast path for residual intra-group hotspot assistance that reduces redundant DRAM reads and per-hop packet processing.
+
+• 
+
+We integrate offline optimization, localized collaborative execution, and tiered online correction into 3D-MoE, achieving 4.63 $\times$ average MoE-layer speedup over EP and 1.58 $\times$ –1.86 $\times$ end-to-end throughput gains over the strongest NMP baselines with only 2.11% area overhead.
+
+## II Background and Design Implications
+
+## II-A MoE Architecture & Decode Behavior
+
+Fig. 1: MoE workflow, latency breakdown, and device roofline comparison.
+
+Fig. 2: Expert activation analysis on Qwen3-30B-A3B. (a) Expert hit rates across domains. (b) Inter-layer variation.
+
+Mixture-of-Experts (MoE) has become a pivotal architecture for scaling Large Language Models (LLMs) efficiently [8, 9, 30, 75, 12]. As shown in Fig. 1(a), it replaces each Transformer Feed-Forward Network (FFN) with parallel experts. A lightweight gate selects only a few experts for each token, scaling model capacity while keeping per-token computation bounded [3, 9]. Training-time load-balancing objectives do not eliminate expert specialization: pre-trained models often develop domain-preferred experts [45, 75], so different request domains activate different expert subsets rather than all experts uniformly (Fig. 2(a)).
+
+Efficient MoE inference remains challenging, especially during autoregressive decode. Even under batching, each expert receives few tokens per step, fragmenting execution into small GEMMs or GEMVs with poor data reuse and low arithmetic intensity [25]. MoE layers consequently account for $83$ – $92\%$ of end-to-end latency at batch size 64 in our profiling, consistent with prior studies [66], as shown in Fig. 1(b). Meanwhile, expert loads are highly skewed and rapidly changing [13]. As shown in Fig. 2, only a few experts become hot at a step; the hottest expert can receive over $20\times$ the step-average load, while each expert’s own load varies by $2$ – $7\times$ across steps and layers. MoE decode therefore poses two coupled challenges: it is highly memory-bound, yet its expert loads are also severely imbalanced and time-varying.
+
+Fig. 3: Stacked-DRAM NMP system organization.
+
+Fig. 4: A comparison of prior MoE deployment strategies and our proposed method.
+
+## II-B 3D-stacked DRAM NMP for MoE Decode
+
+The memory-bound nature of MoE decode is well matched to 3D-stacked Near-Memory Processing (NMP), whereas conventional GPUs/NPUs often hit the memory wall [56, 55]. In-DRAM NMP embeds lightweight logic inside DRAM banks [16, 39, 24, 57, 17, 76, 44, 22, 40, 43], but DRAM area and process technology constrain its compute capability [42]. In contrast, 3D-stacked NMP [80, 14, 35, 68, 73, 1, 83, 89, 63, 53] leverages the existing base logic die beneath the stacked DRAM dies for near-memory compute. Fabricated in an advanced logic process, this die can accommodate substantially more compute engines than in-DRAM designs, while dense through-silicon vias (TSVs) provide high-bandwidth, low-latency data access. This bandwidth–compute balance matches MoE decode (Fig. 1(c)); Fig. 3 shows the HBM-style instance evaluated here.
+
+Recent systems such as Duplex and Stratum [80, 56] adopt a heterogeneous xPU–NMP organization: the xPU executes compute-intensive operators, while NMP logic handles bandwidth-bound operators near DRAM. In our HBM-style instance, each logic-die core is tightly coupled to an HBM channel, forming a compute–memory unit; these cores communicate through a NoC. We call this unit an NMP core. Each core integrates a GEMM engine for matrix and nonlinear operations, on-die buffers, a channel controller, and a NoC router [80]. This tiled organization provides abundant parallelism and massive aggregate bandwidth, enabling experts to be distributed across cores and executed near data. However, realizing these benefits requires expert execution to remain near its designated memory partition.
+
+## II-C Parallelizing MoE on Distributed NMP Cores
+
+Parallelizing MoE on this tiled architecture is difficult because NMP has a strong cost asymmetry: local DRAM accesses are fast and bandwidth-rich, whereas remote accesses traverse the NoC and consume shared bandwidth. An effective design must therefore preserve locality, balance load, and control communication cost, as summarized in Fig. 4.
+
+Expert Parallelism (EP) maps each expert to dedicated NMP cores [41]. EP preserves expert locality, forms larger expert GEMMs by aggregating routed tokens [9], and keeps each token’s routing fan-out independent of total expert count under fixed top- $k$ [33]. However, skewed and dynamic expert loads (Fig. 2) turn cores hosting hot experts into stragglers.
+
+Tensor Parallelism (TP) distributes each expert across cores and smooths its work [62]. On 3D-stacked NMP, however, every invocation becomes a distributed execution followed by reduction-style synchronization over the mesh NoC [27, 20]; in our analysis, NoC overhead reaches 52% of expert execution time at 32 cores. Weight partitioning also weakens local reuse within each core’s GEMM engine. Thus, TP sacrifices the locality that benefits memory-bound decode. Restricting TP to nearby cores or hot experts in hybrid schemes [26] reduces, but does not remove, the partitioning and synchronization costs. Pipeline Parallelism (PP) is not considered, since splitting decode batches into micro-batches weakens data reuse and introduces pipeline bubbles [28].
+
+Dynamic optimization on top of EP.
+Given TP’s communication overhead, many systems retain EP and repair its imbalance through expert remapping, replication, or task stealing [10, 64, 15, 21, 81, 82, 77, 48, 69, 71, 2, 61]. These methods are less effective on NMP for two reasons. First, step- and layer-level variation makes hot-expert prediction difficult and limits the effectiveness of proactive reallocation; prior work reports below 50% accuracy [13]. Second, weight migration and remote helper requests consume the NoC bandwidth on which NMP locality depends.
+
+Overall, EP is the most suitable backbone for MoE on 3D-stacked NMP: it best matches the platform’s locality-oriented cost structure. The remaining challenge is to balance load without sacrificing locality.
+
+## II-D Design Implications for EP Deployment
+
+Modern MoE models may contain 128 or more experts, while NMP exposes a fine-grained multi-core architecture, making global core-level load balance difficult. A more natural objective is to avoid localized hotspots: partition experts into groups whose aggregate loads remain balanced over time, rather than allowing multiple hot experts to cluster in the same physical region. Residual imbalance is then confined within each group, where its impact and the cost of further optimization are lower. This objective is also consistent with the general principle of multi-GPU MoE deployment [10].
+
+## III Expert Complementarity
+
+## III-A Domain-Specialized Routing and Expert Complementarity
+
+As in Sec. II-A, MoE routing uses a learned gating network. Although MoE training includes load-balancing objectives, routed experts still specialize by domain rather than serving all inputs uniformly [11, 59]. This tendency strengthens in many-expert models: as shared experts absorb common patterns, routed experts become domain-specialized [75, 6]. Figure 2(a) shows that different Qwen-MoE domains prefer different expert subsets; our profiling further finds that over 90% of hits in math- and code-related workloads fall within the corresponding preferred subsets, consistent with Stratum [56]. When the request mix changes, demand shifts across these subsets, causing some expert loads to rise while others fall. We call this trace-level load cancellation expert complementarity. Because this structure reflects learned specialization rather than random fluctuations, grouping complementary experts can stabilize aggregate group load as targeted in Sec. II-D.
+
+## III-B Trace Construction and Metric Definition
+
+We operationalize complementarity with decode-step-level expert-load traces. For each layer, expert $e$ is represented by its routed-token count $F_{e,d}$ at step $d$ under batched serving. Figure 5 shows two examples. Highly complementary traces exhibit anti-phase behavior and yield a smoother aggregate load, whereas low-complementarity traces co-vary or show no systematic cancellation.
+
+TABLE I: Domain-preference similarity across pair types.
+
+Model
+Complementary
+Positive
+Random
+
+DeepSeek-V2-Lite
+0.19
+0.67
+0.43
+
+Qwen3-30B-A3B
+0.25
+0.71
+0.46
+
+GLM-4.5-Air
+0.21
+0.69
+0.44
+
+• 
+
+Complementary pairs are significantly negatively correlated; positive pairs are significantly positively correlated; random pairs are sampled uniformly.
+
+TABLE II: Expert complementarity across models and datasets.
+
+Model
+LMSys [85]
+ShareGPT [49]
+HumanEval [87]
+
+DeepSeek (64 E)
+
+7.1 / 82.8% / 75.7%
+6.4 / 83.7% / 77.1%
+5.8 / 82.2% / 77.3%
+
+Qwen3 (128 E)
+
+10.1 / 82.5% / 74.8%
+10.9 / 86.0% / 72.1%
+12.2 / 88.3% / 80.5%
+
+GLM-4.5 (128 E)
+
+9.8 / 82.8% / 70.6%
+11.3 / 85.6% / 74.5%
+12.5 / 87.7% / 79.4%
+
+ $E$ : routed-expert count; entries are partners / coverage / cross-dataset retention.
+
+We quantify load offsetting with Pearson correlation between expert traces: experts that consistently offset each other’s token volume can smooth aggregate runtime load when grouped. Instead of using a model-independent threshold, we construct an empirical null distribution for each model–dataset setting by repeatedly circularly shifting one expert trace relative to the other and recomputing the correlation [5]. This preserves each trace’s marginal load while disrupting temporal alignment [79]. A pair is significantly complementary when its observed correlation falls below the lower $\alpha$ -quantile of this null (the 5th percentile for $\alpha=0.05$ ). These significant pairwise relations reveal a stable complementary structure guiding expert grouping. We call such expert pairs complementary pairs; all tests and statistics are computed independently per layer.
+
+## III-C Validation and Stability of Complementarity
+
+We first test whether complementarity is consistent with domain-specialized routing. For each expert, we build a normalized preference profile from four representative datasets: HumanEval [87] for code, MATH [23] for math, SciQ [72] for science, and LogiQA [47] for logic. Table I shows that complementary pairs have lower cosine similarity than positively correlated and random pairs across models, supporting our interpretation that complementarity is associated with load shifts across domain-preferred expert subsets.
+
+We then evaluate three MoE models across three serving datasets. For each model–dataset setting, Table II reports the average number of significant complementary partners per expert, the fraction of experts with at least one partner, and partner retention on the other datasets for the same model. Complementarity is prevalent: 82.2%–88.3% of experts have at least one partner, with 9.6 partners per expert on average. Moreover, 70.6%–80.5% of partners identified on one dataset remain significant in the other datasets, indicating substantial cross-dataset stability.
+
+We also examine temporal stability using serving traces. We identify significant complementary partners from the first 256 decode steps and track their retention over the next three 256-step windows. Retention is 94.5%, 92.7%, and 90.8%, respectively. Thus, although individual experts exhibit volatile step-level loads, the complementary structure remains stable over time.
+
+Fig. 5: Complementarity examples from layer 10 of DeepSeek-V2-Lite. (a) High-complementarity experts. (b) Low-complementarity experts.
+
+Fig. 6: Inter-group load balance.
+
+## III-D From Complementarity to Group-Level Load Balance
+
+We next test whether complementarity improves load balance across expert groups. Figure 6 compares three MoE models on LMSys under matched group sizes. We quantify per-step imbalance using the max-to-mean load ratio (M2M), i.e., the maximum group load divided by the mean group load; lower is better and 1 is ideal. Unlike coarse history-load-guided expert grouping [15, 46], our method groups experts using complementarity from finer-grained decode traces, as detailed in Sec. IV-B. Both methods use historical traces for grouping and later traces for evaluation. Across the three models, our method reduces average M2M by 17%, keeping it near 1.1, demonstrating effective inter-group load balancing. A more comprehensive evaluation appears in Sec. V-B.
+
+The benefit is primarily group-level: complementary experts smooth aggregate load, but individual experts within a group may still exhibit transient imbalance. Under mixed-domain serving, preferred subsets can offset one another; under homogeneous serving, experts with similar preferences are less likely to cluster within the same group. Residual intra-group hotspots are handled by the lightweight hardware support in Sec. IV-D. Both expert grouping and mapping rely only on decode-step load statistics, not explicit domain labels.
+
+Fig. 7: Software framework of 3D-MoE system: (a) Offline complementarity-guided expert grouping and mapping. (b) Runtime intra-group expert scheduling. (c) Online adaptive expert remapping.
+
+## IV 3D-MoE System
+
+## IV-A System Overview
+
+Building on the complementarity in Sec. III, we propose 3D-MoE, a hardware–software co-designed system for high-throughput MoE inference on 3D-stacked NMP. 3D-MoE combines offline expert grouping and mapping, lightweight hardware support, and online scheduling and remapping.
+
+(1) Offline Grouping & Mapping. Using decode-step load traces, complementarity-guided expert grouping balances aggregate loads across expert groups, while locality-aware mapping places each group’s experts on nearby NMP cores to localize collaboration.
+
+(2) Hardware Support. Complementarity improves group-level balance but leaves transient intra-group hotspots. We therefore propose the Collaborative Memory-Network (CMN), which reads each hot expert’s weight tile once from its host core’s local DRAM and streams it to nearby helper cores over a reconfigured broadcast path, avoiding repeated remote reads and per-hop processing in the packet-switched NoC.
+
+(3) Online Scheduling & Remapping. At runtime, intra-group scheduling selects helper cores and configures CMN for step-level hotspots, while cost-aware remapping adjusts expert replicas and placement under longer-term workload drift.
+
+Workflow and Scope. 3D-MoE targets MoE layers during autoregressive decode, which account for 83–92% of end-to-end latency. Following the cooperative xPU–NMP model [80], the xPU handles prefill and compute-intensive dense operators, while NMP executes bandwidth-bound attention, gating, and MoE experts. Routing metadata then drives token dispatch, expert execution, collaboration, and output gathering on NMP. For dense models, 3D-MoE bypasses the expert-specific mechanisms and follows the baseline path [80, 43].
+
+## IV-B Complementarity-Guided Offline Expert Grouping and Mapping
+
+As Fig. 7(a) shows, 3D-MoE derives a static expert grouping and mapping plan independently for each layer. Expert grouping balances inter-group load and minimizes intra-group collaboration overhead, while physical mapping also considers token-routing locality [54]. Smaller groups simplify intra-group collaboration, but overly fine partitioning leaves less room for complementarity to smooth group load. We therefore select group size according to model and hardware constraints and keep each group within one stack whenever capacity permits. Using direct decode-step loads rather than Pearson correlation, we formulate expert grouping as an ILP and subsequent mapping as a binary quadratic placement problem.
+
+TABLE III: Grouping and mapping notation.
+
+Notation: for each Transformer layer
+
+ $\mathbb{E}$ 
+
+All experts
+
+ $\mathbb{D}$ 
+
+All decode steps
+
+ $\mathbb{G}$ 
+
+All expert groups
+
+ $\mathbb{N}$ 
+
+All NMP cores
+
+ $F_{e,d}$ 
+
+Routed-token count of expert $e$ at decode step $d$ 
+
+ $C_{e_{1},e_{2},d}$ 
+
+Pairwise load-offset score of expert $e_{1}$ and $e_{2}$ at decode step $d$ 
+
+ $A_{e_{1},e_{2}}$ 
+
+Co-activation affinity of experts $e_{1}$ and $e_{2}$ , defined as their normalized co-activation frequency
+
+ $T_{g,d}$ / $M_{g,d}$ 
+
+Computation / Collaboration cost for expert group $g$ at decode step $d$ 
+
+ $B_{e,g}\in\{0,1\}$ 
+
+1 if expert $e$ is assigned to group $g$ , 0 otherwise
+
+ $D_{e,g}\in[0,1]$ 
+
+Workload fraction of expert $e$ assigned to group $g$ (zero if $B_{e,g}=0$ )
+
+ $P_{e,n}\in\{0,1\}$ 
+
+1 if expert $e$ is mapped to NMP core $n$ 
+
+ $H_{n_{1},n_{2}}\in\mathbb{Z}_{\geq 0}$ 
+
+Communication cost between cores $n_{1}$ and $n_{2}$ 
+
+Expert Grouping Objective. We use a hierarchical multi-objective ILP. At decode step $d$ , each group $g$ incurs computation cost $T_{g,d}$ and collaboration cost $M_{g,d}$ . We first minimize the inter-group range of $T_{g,d}$ (Equation 1); among layouts with comparable computation balance, we then minimize the inter-group range of $M_{g,d}$ (Equation 2), followed by total collaboration cost (Equation 3). We show the formulation before standard linearization.
+
+ $\text{Minimize}\sum_{d\in\mathbb{D}}(\max_{g\in\mathbb{G}}T_{g,d}-\min_{g\in\mathbb{G}}T_{g,d})$ 
+
+(1)
+
+ $\text{Minimize}\sum_{d\in\mathbb{D}}(\max_{g\in\mathbb{G}}M_{g,d}-\min_{g\in\mathbb{G}}M_{g,d})$ 
+
+(2)
+
+ $\text{Minimize}\sum_{d\in\mathbb{D}}\sum_{g\in\mathbb{G}}M_{g,d}$ 
+
+(3)
+
+The computation cost depends on the total tokens processed by a group. With expert replication, each replica processes a fraction of an expert’s workload; thus, group computation cost sums the assigned fractions of expert token loads:
+
+ $T_{g,d}=\sum_{e\in\mathbb{E}}B_{e,g}\cdot D_{e,g}\cdot F_{e,d}$ 
+
+(4)
+
+Although the computation-balance objective exploits complementarity to stabilize each group’s aggregate load, hot and cold experts may still coexist within a group at a given step and require local collaboration. We quantify this residual demand with a pairwise load-offset score relative to the step-average expert load, $AL_{d}=\frac{1}{|\mathbb{E}|}\sum_{e\in\mathbb{E}}F_{e,d}$ . Equation 5 estimates the transferable workload of each pair, and Equation 6 sums these scores into each group’s collaboration cost. We retain the pairwise form because the subsequent mapping objective explicitly optimizes collaboration locality.
+
+ $\displaystyle C_{e_{1},e_{2},d}=\begin{cases}\min\bigl(|F_{e_{1},d}-AL_{d}|,\,|F_{e_{2},d}-AL_{d}|\bigr)\\
+\quad\text{if }(F_{e_{1},d}-AL_{d})(F_{e_{2},d}-AL_{d})<0\\
+0\quad\text{otherwise}\end{cases}$ 
+
+(5)
+
+ $M_{g,d}=\sum_{e_{1}\in\mathbb{E}}\sum_{{e_{2}\in\mathbb{E},e_{2}>e_{1}}}B_{e_{1},g}\cdot B_{e_{2},g}\cdot C_{e_{1},e_{2},d}$ 
+
+(6)
+
+Expert Mapping Objective. Mapping uses the pairwise scores above to place likely collaborators on nearby cores. For token routing, it also places experts frequently selected by the same token near one another; as multicast co-destinations, they can share more route segments and thus reduce redundant link traversals. Two experts are co-activated when the same token selects both under top- $k$ routing in the profiling trace; their normalized co-activation frequency defines affinity $A_{e_{1},e_{2}}$ . Under mapping $P$ , $R_{e_{1},e_{2}}=\sum_{n_{1},n_{2}\in\mathbb{N}}P_{e_{1},n_{1}}P_{e_{2},n_{2}}H_{n_{1},n_{2}}$ is the communication cost between experts $e_{1}$ and $e_{2}$ . Equation 7 combines both objectives.
+
+ $\displaystyle\text{Minimize}$ 
+ $\displaystyle\sum_{e_{1}\in\mathbb{E}}\sum_{\begin{subarray}{c}e_{2}\in\mathbb{E}\\
+e_{2}>e_{1}\end{subarray}}\Bigg[\sum_{g\in\mathbb{G}}B_{e_{1},g}B_{e_{2},g}\sum_{d\in\mathbb{D}}C_{e_{1},e_{2},d}$ 
+
+(7)
+
+ $\displaystyle+\lambda_{\mathrm{route}}A_{e_{1},e_{2}}\Bigg]R_{e_{1},e_{2}}$ 
+
+Here $\lambda_{\text{route}}$ weights token-routing locality, while collaboration locality remains the primary mapping objective. The first term reduces intra-group collaboration distance; the second places co-destinations closer for multicast token dispatch. This second term affects only physical mapping, not grouping, and is a lightweight proxy rather than a full All-to-All model. Removing it increases Qwen3-30B-A3B dispatch/gather latency by 47% on average in our evaluation.
+
+Large experts exceeding one core’s capacity are split through TP and represented as virtual experts in the placement problem. Their all-reduce communication is included when evaluating candidate mappings, allowing the solver to trade off collaboration, token-routing locality, and TP communication.
+
+Constraints. Equations 8–10 show representative constraints on workload allocation, uniform group size, and core capacity. The solver also consistent expert grouping and core placement under the stack-locality policy described above. All evaluated configurations are feasible in evaluation.
+
+ $\forall e\in\mathbb{E},\sum_{g\in\mathbb{G}}{D_{e,g}}=1$ 
+
+(8)
+
+ $\forall g_{1},g_{2}\in\mathbb{G},\sum_{e\in\mathbb{E}}{B_{e,g_{1}}}=\sum_{e\in\mathbb{E}}{B_{e,g_{2}}}$ 
+
+(9)
+
+ $\forall n\in\mathbb{N},\sum_{e\in\mathbb{E}}{P_{e,n}}\leq P_{\text{max}}$ 
+
+(10)
+
+We solve the two stages sequentially with Gurobi [18], terminating each at a 3% relative MIP gap or after three minutes and retaining the best incumbent. In our evaluation, 68% of optimization runs reach the 3% target; timed-out runs have a worst final gap of 7.1%. For each model, we profile 256 prompts over 256 decode steps from representative multi-domain traces, without domain labels. The resulting layer-wise plan is computed once and reused across workloads. Total preprocessing takes 1–3 hours per model and is amortized over deployment [86]; Sec. V-B shows that this fixed profiling budget captures most of the achievable grouping benefit.
+
+## IV-C Hardware Motivation for Residual Intra-Group Hotspots
+
+Complementarity stabilizes aggregate group load but leaves transient imbalance among experts within a group. These localized intra-group hotspots may still require nearby underloaded cores to assist a hot expert. On 3D-stacked NMP, such collaboration is costly because the hot expert’s weights remain attached to the host core.
+
+There are three representative ways to handle such hotspots on NMP. In on-demand remote fetch, every helper requests weight tiles from the host, repeating host service, increasing memory contention, and stalling helpers on NoC transfers. Single-read + NoC broadcast eliminates redundant DRAM reads, but its one-to-many stream still traverses the general packet-switched network. Intra-group TP distributes an expert across nearby cores, but every invocation requires partitioned execution and reduction, while weight partitioning weakens local reuse. Therefore, effective hotspot assistance should preserve EP residency and reduce the overhead of assistance.
+
+We build a hotspot-expert benchmark on NMP to quantify these alternatives for 2–16 cores collaborating on one hot expert. Table IV shows that remote fetch and intra-group TP exceed the ideal latency by 29–242% and 19–185%, respectively; single-read NoC broadcast still adds 48% on average. Table V explains this gap: fixed router stages contribute 63.2% of average flit latency, versus only 7.8% from dynamic waiting. CMN/RCL avoids repeated per-hop processing through reserved-link streaming during expert computation.
+
+TABLE IV: Characterizing hotspot collaboration on NMP.
+
+#Collab Cores
+2
+4
+8
+16
+
+Ideal latency (ms)
+0.84
+0.42
+0.21
+0.105
+
+On-demand remote fetch (ms)
+1.08
+0.69
+0.45
+0.36
+
+Single-read + NoC broadcast (ms)
+0.94
+0.56
+0.33
+0.20
+
+Intra-group TP (ms)
+1.00
+0.64
+0.42
+0.30
+
+CMN (ms)
+0.88
+0.46
+0.25
+0.14
+
+TABLE V: Flit-level breakdown of regular NoC broadcast.
+
+Collab.
+
+cores
+
+Avg. flit
+
+lat. (cyc.)
+
+Inter-router
+
+link
+
+Inj./ej.
+
+channel
+
+Fixed router
+
+pipeline
+
+Dynamic wait
+
+/congestion
+
+2
+
+10.00
+
+10.0%
+
+20.0%
+
+60.0%
+
+10.0%
+
+4
+
+11.33
+
+11.8%
+
+17.6%
+
+61.8%
+
+8.8%
+
+8
+
+14.00
+
+14.3%
+
+14.3%
+
+64.3%
+
+7.1%
+
+16
+
+18.80
+
+17.0%
+
+10.6%
+
+67.0%
+
+5.3%
+
+These results motivate a single-read, multi-helper path that avoids repeated host service and packet-switched buffering, routing, and VC allocation [36, 37]. Such a path directly matches the structured one-to-many weight stream, which conventional multihop NoCs handle inefficiently [51].
+
+## IV-D Collaborative Memory-Network for Intra-Group Hotspots
+
+Fig. 8: (a) Resource sharing via CMN. (b) CMN microarchitecture.
+
+To provide the dedicated “load once, broadcast to many” path described above for hot-expert assistance, we propose the Collaborative Memory-Network (CMN), illustrated in Fig. 8. CMN comprises a Data Forwarding Unit (DFU), a Data Receiving Unit (DRU), and a Reconfigurable Collaboration Link (RCL) in each NMP core. During collaboration, when the host core fetches a hot expert’s weight tile from its local 3D-stacked memory for computation, CMN simultaneously streams the same tile to helper cores over a temporary, bus-like local broadcast path. Thus, a single DRAM read serves all participating cores without repeated remote requests or replicated packet delivery over the regular NoC.
+
+Data forwarding and reception.
+The DFU and DRU implement this single-read, multi-helper path (Fig. 8(b)). The DFU is integrated into the 3D memory controller after the Read Return Buffer. Before each collaboration task, the controller configures the DFU with the hot expert’s address range and helper-core mask. When a matching DRAM read returns, the DFU forwards the tile to both the host core’s local Weight Buffer and the configured RCL path. Each helper’s DRU captures the incoming stream and writes it to its local Weight Buffer for immediate GEMM consumption. Helper cores therefore consume the hot expert’s weights as a streamed local input rather than issuing individual remote requests.
+
+Reconfigurable collaboration link.
+To distribute streamed weight tiles efficiently, the RCL reuses existing NoC links in two phase-aligned modes: standard packet transport for token dispatch/gather and temporary local broadcast for hot-expert collaboration [70, 52, 65]. During decode, token dispatch and output gathering use packet transport, whereas residual-hotspot collaboration streams the same weight tiles from one host to several nearby helpers. Because these patterns occur in different phases, the same physical links can support both modes without concurrent contention.
+
+Each router integrates a lightweight Bus Switch and a distributed Session Arbiter. The Bus Switch detaches selected links from the packet pipeline and reconnects them into a temporary bus-like broadcast path [84], while the Session Arbiter grants exclusive access among collaborating hosts. Compared with replicated packets sent through the regular router pipeline, this path avoids repeated per-hop packet processing during expert computation.
+
+Reconfiguration proceeds in three workload-aligned phases. 1) Planning: after gating reveals the per-expert loads for the current decode step, the runtime scheduler (Sec. IV-E) identifies residual hotspots, selects nearby helpers, and constructs collaboration domains and broadcast schedules. 2) Setup: tokens are first delivered to the selected helpers through the regular NoC, after which the designated links enter collaboration mode. The configured path remains fixed throughout expert computation and reverts to normal NoC mode at the end of the step, amortizing the switch cost over step-level hot-expert collaboration. The RTL-derived transition takes 40 cycles: 16 cycles for session setup, an 8-cycle selected-link drain guard, and 16 cycles to restore normal NoC mode. At 650 MHz, this transition adds 61.5 ns, below 0.05% of the CMN latency in Table IV. 3) Execution: within each collaboration domain, the host streams each hot-expert weight tile once over the temporary broadcast path, and helpers consume it in parallel under arbiter-controlled sessions. At the end of the step, the links return to normal NoC mode.
+
+CMN targets only residual intra-group hotspot assistance. Ordinary token dispatch, output gathering, and general inter-core communication remain on the conventional NoC. Thus, CMN does not replace the general-purpose interconnect; it is a selective fast path tailored to the structured one-host-to-many-helper pattern arising from residual intra-group hotspots. As Table IV shows, this specialized path substantially reduces the gap remaining under conventional NoC broadcast and moves collaboration latency closer to the ideal lower bound.
+
+## IV-E Intra-group Expert Scheduling
+
+CMN enables low-cost collaboration, but realizing its benefits requires scheduling to identify hotspot experts per decode step and form collaboration domains and schedules. Because gating exposes per-expert loads before expert execution, the stack controller can use this window to run the latency-driven heuristic in Algorithm 1. The heuristic selects nearby helpers and constructs benefit-guided, link-disjoint collaboration domains and schedules to reduce group latency.
+
+Algorithm 1 Intra-Group CMN Scheduling
+
+Input: Set of overloaded cores $A$ ; set of underloaded cores $B$ ;
+
+Output: 
+ $D$ : The final set of collaboration domains (topologies);
+
+ $S$ : The final ordered collaboration schedule;
+
+Sort $A$ by load (descending); Sort $B$ by load (ascending);
+
+ $D\leftarrow\emptyset$ ; $S\leftarrow\emptyset$ ;
+
+// Pair overloaded sources with underloaded helpers;
+
+foreach $c_{\text{src}}\in A$ do
+
+      foreach $c_{\text{dst}}\in B$ do
+
+             $\text{Topology}_{\text{new}}\leftarrow$ merge domains containing $c_{\text{src}}$ and $c_{\text{dst}}$ ;
+
+            if $|\text{Topology}_{\text{new}}|\leq\text{MAX\_SIZE}$ and IsLinkConflictFree( $\text{Topology}_{\text{new}}$ , D) then
+
+                   $\text{Plan}_{\text{new}}\leftarrow$ GenerateOrderedScheduleFor( $\text{Topology}_{\text{new}}$ );
+
+                  // Order broadcast plans within the candidate domain;
+
+                   $G\leftarrow$ CalculateGlobalBenefit( $D,S,\text{Topology}_{\text{new}},\text{Plan}_{\text{new}}$ );
+
+                  // Estimate makespan reduction after CMN cost;
+
+                  if $G>0$ then
+
+                         $D\leftarrow$ UpdateDomains( $D,\text{Topology}_{\text{new}}$ );
+
+                         $S\leftarrow$ UpdateSchedules( $S,\text{Plan}_{\text{new}}$ );
+
+                        Update loads of all involved cores;
+
+As Fig. 7(b) shows, expert metadata converts per-expert token counts into estimated core latencies through a pre-measured performance table [34, 74]. Based on this latency profile, the scheduler starts from the most overloaded source core and incrementally expands its broadcast domain with underloaded helpers, forming candidate collaboration domains $\text{Topology}_{\text{new}}$ . This allows part of the hot expert’s routed tokens to be reassigned to the newly added helper, while CMN broadcasts the expert’s weights from the source. Once the current hotspot is relieved, the scheduler proceeds to the next most overloaded core. Each candidate is limited to at most 16 cores within one stack and must be link-disjoint from active domains. The scheduler greedily retains beneficial candidates after accounting for CMN collaboration cost and generates the corresponding ordered collaboration schedule.
+
+This procedure runs on the stack controller with compact metadata. Each expert group spans only 8–16 cores in our settings, keeping metadata small. A compact performance table covering up to 2048 tokens per expert supports the evaluated batched-decode settings with about 4 KB of SRAM.
+
+## IV-F Online Expert Remapping
+
+Although offline grouping and mapping provide a strong initial layout, MoE workload drift can create imbalances and reduce performance by up to 15% in our evaluation. 3D-MoE therefore uses cost-aware online expert remapping that combines frequent low-cost adjustments with selective higher-cost reconfigurations.
+
+Online remapping uses metadata maintained by the stack controller to predict expert loads. The metadata records expert-to-core mappings, replica locations, and per-step workloads. For each expert prediction, we maintain an exponential moving average (EMA), $\text{EMA}_{e}(t)=\alpha F_{e}(t)+(1-\alpha)\text{EMA}_{e}(t-1)$ , where $F_{e}(t)$ is expert $e$ ’s load at step $t$ . The smoothing parameter $\alpha$ weights the latest observation against historical trends; we set $\alpha=0.3$ based on profiling-trace prediction accuracy. EMA remains responsive to recent changes while suppressing noise, helping identify sustained load drift.
+
+Multi-Tiered Adjustment. Based on migration cost, we use three adjustment tiers (Fig. 7(c)). Tier-1 redistributes load fractions among existing expert replicas without moving weights. Tier-2 adds a replica for an overloaded expert and removes a redundant replica from an underutilized one; the new replica overwrites the freed space and requires one weight transfer. Tier-3 swaps experts across groups to correct severe inter-group imbalance, requiring two weight migrations.
+
+Cost-Aware Trigger. Migration-free Tier-1 runs before every MoE layer. Tier-2 and Tier-3 candidates are checked every eight decode steps or earlier when sustained imbalance is detected. The eight-step interval is selected from profiling traces. Sustained imbalance is detected when EMA-predicted group-level M2M exceeds the profiled steady-state level by 20% for three consecutive decode steps. At each check, the controller estimates candidate benefits from EMA-predicted loads, subtracts migration costs based on moved expert-weight volume, transfer distance, and available bandwidth, and executes the highest-benefit action only if net benefit is positive. Weight transfers are executed asynchronously and overlap with computation. On Qwen3-30B-A3B, each layer averages 24 weight-moving remappings over 256 decode steps; 91% of transfer time is hidden by xPU dense execution or NMP idle windows, leaving 0.87% exposed end-to-end overhead.
+
+## V Evaluation
+
+## V-A Experimental Setup
+
+1) Target NMP System: We evaluate all NMP schemes on the same HBM-style heterogeneous xPU–NMP platform. Each NMP device is a single package comprising one H100-class xPU die and four 16-GB NMP stacks interconnected through a silicon interposer [80, 56]. HBM PHYs provide the xPU–stack interfaces, while the four stack logic dies form a $2\times 2$ interposer mesh [60]. Based on model size, we select NMP-S/M/L with 1/2/4 NMP devices connected by an NVLink-like fabric. Each NMP stack follows Duplex’s NMP compute capability and internal DRAM bandwidth for MoE decoding [80]; NMP-local bandwidth refers to the internal DRAM-to-logic path rather than the xPU-visible HBM interface. Each stack’s logic die uses a $4\times 4$ mesh NoC with 512-bit links [32]. Table VI lists the parameters.
+
+TABLE VI: NMP system configurations.
+
+Level
+
+Configuration
+
+NMP-S/M/L
+
+1/2/4 NMP devices; 64/128/256 GB total capacity
+
+NMP device
+
+1 H100-class xPU die + 4 NMP stacks on one interposer
+xPU: 0.99 PFLOPS; aggregate xPU–stack HBM BW: 2.68 TB/s
+
+NMP stack
+
+16-GB 8-hi DRAM; 16 channels;
+16 NMP cores, $4\times 4$ mesh
+
+NMP core
+
+650 MHz; 1.33 TFLOPS;
+166.4 GB/s local DRAM BW; 64-KB buffer
+
+Interconnect
+
+Intra-stack: 512-bit, 2 cycles/hop; Inter-stack: 128 GB/s/direction
+Inter-device: NVLink-like, 450 GB/s/direction
+
+TABLE VII: MoE model configurations.
+
+Model
+
+Param
+ $\mathbf{N_{ex}}$ 
+top- $k$ 
+GPU Cfg
+NMP Cfg
+
+DeepSeek-V2-Lite [8]
+
+16B
+64
+6
+1 $\times$ H100
+NMP-S
+
+Qwen3-30B-A3B [75]
+
+31B
+128
+8
+2 $\times$ H100
+NMP-M
+
+GLM-4.5-Air [67]
+
+106B
+128
+8
+4 $\times$ H100
+NMP-L
+
+• 
+
+DeepSeek-V2-Lite/GLM-4.5-Air include 2/1 additional shared experts, respectively.
+
+2) System Models: Our evaluation uses a cycle-accurate simulator built on Ramulator 2.0 [50] and BookSim [31]. We extend Ramulator to model HBM3 timing [29] and NMP-core memory accesses, and extend BookSim to model packet-switched intra- and inter-stack traffic and stack-local RCL collaboration. Specifically, the RCL extension reserves selected intra-stack links at the phase level while retaining BookSim’s topology and link parameters, and adds RTL-derived setup and drain costs. Computation is modeled at tile granularity: GEMM and reduction tiles are scheduled when inputs are ready, with compute, memory access, and communication overlapped when dependencies permit. We implement CMN in RTL and synthesize it with Synopsys Design Compiler in 7 nm technology [4] to estimate area and peak-power overhead. For end-to-end results, dense operators executed on the xPU use GPU-profiled latency, which is combined with the NMP simulator for attention and MoE execution.
+
+3) Baselines: We compare 3D-MoE with GPU reference systems and representative NMP deployment strategies. Every configuration in Table VII accommodates the model and its KV cache. GPU baselines are evaluated with vLLM 0.8.1 [38]. All NMP baselines use the same hardware configuration as 3D-MoE: static Expert Parallelism (EP) and Tensor Parallelism (TP); HD-MoE, a representative NMP-oriented hybrid strategy that applies TP to hot experts and EP to cold experts through offline analysis [26]; EPLB-based predictive replication and mapping (PS) [10]; and dynamic work stealing (WS).
+
+4) Workloads and Evaluation Metrics: We construct serving workloads using real-world prompts from LMSys [85], ShareGPT [49], MATH [23], and HumanEval [87]. We evaluate batch sizes 32–256 with fixed lengths (512 or 2048 tokens) and irregular sequence lengths. Each model’s offline grouping/mapping plan is solved once from the representative profiling trace described in Sec. IV-B and is reused in evaluations. We report MoE decode-layer latency, M2M ratio, compute resource utilization, and end-to-end throughput. All NMP schemes share the cooperative xPU–NMP attention path; 3D-MoE changes only the NMP execution path for token dispatch, expert execution, collaboration, and output gathering.
+
+## V-B Generalization of Offline Expert Grouping
+
+Fig. 9: Generalization of one-time offline expert grouping. (a) Cross-dataset generalization. (b) Cross-window stability; the dashed curve denotes Ours+Remap. (c) Cross-batch stability. (b) and (c) use Qwen3 on ShareGPT.
+
+Fig. 10: MoE layer decode speedup of all schemes relative to the EP baseline under varying batch sizes.
+
+Fig. 11: End-to-end throughput of all schemes relative to the EP baseline.
+
+We first test whether one-time offline grouping improves inter-group balance and remains robust to serving dynamics. For each model, we solve one plan from 256 LMSys prompts over 256 decode steps. The ILP uses only per-step expert loads, without domain labels, to identify complementary patterns. We compare History-Reuse, a MoETuner-based plan using coarse historical loads [15]; Ours-Reuse, our complementarity-guided plan; and Oracle-Reopt, an upper bound that re-solves the plan for each condition.
+
+Figure 9(a) evaluates cross-dataset reuse. We test the fixed grouping plan on three held-out workloads: ShareGPT, HumanEval, and MATH. Ours-Reuse lowers group-level M2M by 20%–24% over History-Reuse and closes 86% of the gap to Oracle-Reopt, showing that trace-level complementarity not only yields better grouping quality than history-guided methods, but also generalizes beyond the profiling workload without domain labels.
+
+Figure 9(b) evaluates cross-window reuse by reporting the average M2M of the fixed grouping over successive 256-step windows from the same serving stream. Ours-Reuse degrades by only 9% across windows and consistently outperforms History-Reuse. Ours+Remap further reduces later-window M2M, showing that online remapping effectively corrects residual long-term drift. Under an abrupt Qwen3-30B-A3B code-to-math transition, our plan lowers peak M2M to 1.21 versus History-Reuse’s 1.62, and remapping reaches 1.15 within 16 steps. Figure 9(c) evaluates cross-batch reuse: Ours-Reuse remains stable from batch size 32 to 768, reducing M2M by 22% over History-Reuse while staying within 25% of Oracle-Reopt. Thus, a single offline plan generalizes across datasets, time windows, and batch sizes, while remapping corrects longer-term drift.
+
+## V-C 3D-MoE Performance
+
+1) MoE Layer Decode Performance: 3D-MoE targets the primary bottleneck in MoE inference: the expert decode phase. Figure 10 shows that 3D-MoE consistently reduces latency, with average speedups of 5.87 $\times$ , 4.63 $\times$ , and 1.72 $\times$ over GPU, EP, and HD-MoE, respectively. This gain stems from 3D-MoE’s highly efficient use of NMP compute resources. 3D-MoE achieves 83% average utilization, more than 4.25 $\times$ that of static deployment strategies (Fig. 12). This highlights key shortcomings of existing schemes: EP/TP cannot adapt to dynamic workloads or incur communication overhead; PS misallocates resources due to inaccurate predictions; WS relies on costly general-purpose NoC collaboration; and HD-MoE incurs communication overhead from applying global TP to hot experts. By combining balanced placement with low-cost local collaboration, 3D-MoE achieves 1.93 $\times$ , 1.59 $\times$ , and 1.84 $\times$ the utilization of the best NMP baseline on DeepSeek, Qwen, and GLM, respectively.
+
+Fig. 12: Average compute resource utilization.
+
+2) End-to-End Performance: Across all workloads in Fig. 11, 3D-MoE outperforms the strongest NMP baseline by 1.58 $\times$ –1.86 $\times$ , confirming that MoE-layer gains translate to system throughput. For instance, on the Qwen model, the 5.34 $\times$ improvement in MoE-layer resource utilization over EP baseline efficiently yields 4.71 $\times$ higher end-to-end throughput.
+
+Compared with the GPU, 3D-MoE achieves speedups of 5.54 $\times$ , 7.88 $\times$ , and 6.95 $\times$ across the three models. The GPU is severely hindered by irregular memory accesses from sparse expert activations, which makes it memory-bound. In contrast, 3D-MoE unlocks the NMP architecture’s potential and converts NMP’s bandwidth advantage into end-to-end gains by mitigating the load imbalance and communication overhead.
+
+3) Decode-Token Latency: Because 3D-MoE targets decode, Fig. 13 reports normalized TBT rather than TTFT for DeepSeek-V2-Lite at batch size 64. It reduces p50/p90/p99 TBT over HD-MoE by 45.3%/43.7%/26.0%, showing that complementarity-guided grouping and local collaboration improve tail decode-token latency from hot-expert imbalance.
+
+Impact of Output Length and Batch Size. First, 3D-MoE’s speedup over the GPU baseline grows with output sequence length, as our optimizations target the autoregressive decode phase, which increasingly dominates latency in long-generation tasks. Second, 3D-MoE’s advantage over other NMP baselines widens as batch size increases. This is because larger batches exacerbate expert load imbalance, an issue our complementarity-based scheduling effectively mitigates for large-scale serving scenarios.
+
+## V-D Ablation Study
+
+To isolate each component’s contribution, we progressively enable 3D-MoE from Random, which uses random mapping and NoC-based collaboration: +G/M-Coarse groups and maps with coarse-grained historical loads; +G-Steps groups with decode-step loads but maps randomly; +G/M-Steps enables our full fine-grained grouping and mapping; +Hardware adds dedicated low-overhead collaboration; and +Remapping completes the system with online expert remapping.
+
+Fig. 13: TBT latency distribution on DeepSeek-V2-Lite.
+
+Fig. 14: Ablation of 3D-MoE components.
+
+Figure 14 shows clear stepwise gains. +G/M-Coarse achieves a 1.35 $\times$ speedup over Random by mitigating static placement mismatches. +G/M-Steps achieves 1.72 $\times$ and 1.70 $\times$ speedups over +G/M-Coarse and +G-Steps, demonstrating that effective complementarity-guided mapping requires fine-grained decode-step statistics rather than coarse historical averages. +Hardware provides a 1.77 $\times$ speedup, validating low-overhead local collaboration. Finally, +Remapping adds another 1.11 $\times$ under dynamic workloads by adapting the offline grouping and mapping plan to longer-term drift.
+
+## V-E Sensitivity Study
+
+The NMP compute-to-bandwidth ratio is a key hardware design parameter. We vary compute provisioning at fixed memory bandwidth, producing machine-balance points from 4 to 12 peak Op/B. Figure 15 shows that 3D-MoE consistently outperforms the best baseline by 1.59 $\times$ –1.86 $\times$ across these design points. Compared with EP, its speedup decreases modestly from 4.9 $\times$ at 4 peak Op/B to 4.34 $\times$ at 12. This indicates that when compute is relatively underprovisioned, hotspot experts dominate performance and benefit more from our low-overhead collaboration support. As compute capability increases, part of the imbalance penalty is naturally hidden, but 3D-MoE remains consistently beneficial.
+
+Fig. 15: Normalized MoE layer decode speedup at different Op/B ratios.
+
+Fig. 16: Normalized throughput for scale-out and low-expert-count workloads.
+
+## V-F Analysis of Scale-Out and Expert Count
+
+We evaluate scale-out by deploying 236B DeepSeek-V2 on eight NMP devices and comparing against 8 $\times$ H100. Because its experts are larger, too few experts fit per stack for effective complementary groups, so we relax the default stack-local constraint and allow each group to span several stacks within one device. Inter-group balance avoids cross-device hotspot collaboration, while physical mapping keeps helper collaboration stack-local whenever possible to use RCL. In Fig. 16, 3D-MoE achieves throughput speedups of 3.51 $\times$ and 1.46 $\times$ over the GPU and strongest NMP baselines, respectively.
+
+On an 8-expert Llama model [7] using NMP-S and 1 $\times$ H100, 3D-MoE achieves a 1.2 $\times$ gain over the best NMP baseline because fewer experts provide less grouping flexibility. This is consistent with our target of modern many-expert models.
+
+## V-G Hardware Overhead
+
+Table VIII shows that 3D-MoE adds 2.11% logic-die area per stack relative to the NMP substrate shared by all schemes [58, 19, 80, 43]. It also consumes 0.337 W of peak power per stack, less than 0.8% of the 45 W logic-die budget assumed in prior 3D-stacked NMP designs [56].
+
+TABLE VIII: Additional area and power of 3D-MoE.
+
+Components
+Area (mm2)
+Area ratio of logic die
+Peak power (W)
+
+DFU
+0.56
+0.94%
+0.172
+
+RCL
+0.156
+0.28%
+0.033
+
+DRU
+0.26
+0.42%
+0.080
+
+Look-Up Table
+0.28
+0.47%
+0.052
+
+Total
+1.256
+2.11%
+0.337
+
+## VI Related Work
+
+MoE placement and load balancing. Existing methods either predict expert demand or react to observed hotspots. MoETuner [15] uses coarse historical loads; dynamic EP methods [10, 64, 82, 77, 48] use replication or remapping with weight-movement overhead; and Yu et al. [78] characterize temporal/spatial selection patterns for data-movement forecasting and GPU/wafer-scale placement. HD-MoE [26] trades EP locality for TP-based hot-expert balancing on 3D NMP, while Stratum [56] uses topic prediction for tiered placement. The key distinction is the optimization signal: prior methods forecast demand, replicate/relocate experts, or distribute hot experts with TP, whereas 3D-MoE uses offsetting per-layer decode-step loads to place complementary experts in stack-local EP groups, then uses CMN for residual hotspots without domain labels.
+
+NMP accelerators for LLM serving. AttAcc [57], Duplex [80], H2-LLM [42], PAPI [22], and Helios [43] accelerate attention and other bandwidth-bound LLM kernels on NMP. They do not directly address MoE load balancing or stack-local one-to-many assistance for EP hotspots, which are the focus of 3D-MoE.
+
+## VII Conclusion
+
+This paper presents 3D-MoE, a hardware–software co-designed system for MoE decode on 3D-stacked NMP. To preserve EP locality while mitigating severe, time-varying load imbalance, 3D-MoE combines complementarity-guided grouping and mapping, a lightweight Collaborative Memory-Network for low-cost local hotspot assistance, and online remapping to track workload drift. Across three MoE models, 3D-MoE achieves 1.58 $\times$ –1.86 $\times$ end-to-end throughput improvement over the strongest NMP baseline.
+
+## References
+
+[1]
+M. Besta, R. Kanakagiri, G. Kwasniewski, R. Ausavarungnirun, J. Beránek, K. Kanellopoulos, K. Janda, Z. Vonarburg-Shmaria, L. Gianinazzi, I. Stefan, J. G. Luna, M. Copik, L. Kapp-Schwoerer, S. D. Girolamo, M. Konieczny, N. Blach, O. Mutlu, and T. Hoefler (2021)
+
+Sisa: set-centric instruction set architecture for graph mining on processing-in-memory systems.
+
+In MICRO-54: 54th Annual IEEE/ACM International Symposium on Microarchitecture,
+
+pp. 282–297.
+
+Cited by: §II-B.
+
+[2]
+R. D. Blumofe and C. E. Leiserson (1999)
+
+Scheduling multithreaded computations by work stealing.
+
+Journal of the ACM (JACM) 46 (5), pp. 720–748.
+
+Cited by: §II-C.
+
+[3]
+W. Chiang, L. Zheng, Y. Sheng, A. N. Angelopoulos, T. Li, D. Li, H. Zhang, B. Zhu, M. Jordan, J. E. Gonzalez, and I. Stoica (2024)
+
+Chatbot arena: an open platform for evaluating llms by human preference.
+
+In Forty-first International Conference on Machine Learning,
+
+Cited by: §II-A.
+
+[4]
+L. T. Clark, V. Vashishtha, L. Shifren, A. Gujja, S. Sinha, B. Cline, C. Ramamurthy, and G. Yeric (2016)
+
+ASAP7: a 7-nm finfet predictive process design kit.
+
+Microelectronics Journal 53, pp. 105–115.
+
+Cited by: §V-A.
+
+[5]
+J. Cohen (2013)
+
+Statistical power analysis for the behavioral sciences.
+
+ routledge.
+
+Cited by: §III-B.
+
+[6]
+D. Dai, C. Deng, C. Zhao, R. X. Xu, H. Gao, D. Chen, J. Li, W. Zeng, X. Yu, Y. Wu, Z. Xie, Y. K. Li, P. Huang, F. Luo, C. Ruan, Z. Sui, and W. Liang (2024)
+
+Deepseekmoe: towards ultimate expert specialization in mixture-of-experts language models.
+
+In Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+
+pp. 1280–1297.
+
+Cited by: §III-A.
+
+[7]
+DavidAU (2025)
+
+Llama-3.2-8x3b-moe-dark-champion-instruct-uncensored-abliterated-18.4b.
+
+Note: Hugging Face model cardAvailable online: https://huggingface.co/DavidAU/Llama-3.2-8X3B-MOE-Dark-Champion-Instruct-uncensored-abliterated-18.4B
+
+Cited by: §V-F.
+
+[8]
+DeepSeek-AI, A. Liu, B. Feng, B. Wang, B. Wang, B. Liu, C. Zhao, C. Dengr, C. Ruan, D. Dai, D. Guo, D. Yang, D. Chen, D. Ji, E. Li, F. Lin, F. Luo, G. Hao, G. Chen, G. Li, H. Zhang, H. Xu, H. Yang, H. Zhang, H. Ding, H. Xin, H. Gao, H. Li, H. Qu, J. L. Cai, J. Liang, J. Guo, J. Ni, J. Li, J. Chen, J. Yuan, J. Qiu, J. Song, K. Dong, K. Gao, K. Guan, L. Wang, L. Zhang, L. Xu, L. Xia, L. Zhao, L. Zhang, M. Li, M. Wang, M. Zhang, M. Zhang, M. Tang, M. Li, N. Tian, P. Huang, P. Wang, P. Zhang, Q. Zhu, Q. Chen, Q. Du, R. J. Chen, R. L. Jin, R. Ge, R. Pan, R. Xu, R. Chen, S. S. Li, S. Lu, S. Zhou, S. Chen, S. Wu, S. Ye, S. Ma, S. Wang, S. Zhou, S. Yu, S. Zhou, S. Zheng, T. Wang, T. Pei, T. Yuan, T. Sun, W. L. Xiao, W. Zeng, W. An, W. Liu, W. Liang, W. Gao, W. Zhang, X. Q. Li, X. Jin, X. Wang, X. Bi, X. Liu, X. Wang, X. Shen, X. Chen, X. Chen, X. Nie, X. Sun, X. Wang, X. Liu, X. Xie, X. Yu, X. Song, X. Zhou, X. Yang, X. Lu, X. Su, Y. Wu, Y. K. Li, Y. X. Wei, Y. X. Zhu, Y. Xu, Y. Huang, Y. Li, Y. Zhao, Y. Sun, Y. Li, Y. Wang, Y. Zheng, Y. Zhang, Y. Xiong, Y. Zhao, Y. He, Y. Tang, Y. Piao, Y. Dong, Y. Tan, Y. Liu, Y. Wang, Y. Guo, Y. Zhu, Y. Wang, Y. Zou, Y. Zha, Y. Ma, Y. Yan, Y. You, Y. Liu, Z. Z. Ren, Z. Ren, Z. Sha, Z. Fu, Z. Huang, Z. Zhang, Z. Xie, Z. Hao, Z. Shao, Z. Wen, Z. Xu, Z. Zhang, Z. Li, Z. Wang, Z. Gu, Z. Li, and Z. Xie (2024)
+
+Deepseek-v2: a strong, economical, and efficient mixture-of-experts language model.
+
+arXiv preprint arXiv:2405.04434.
+
+Cited by: §II-A,
+TABLE VII.
+
+[9]
+DeepSeek-AI, A. Liu, B. Feng, B. Xue, B. Wang, B. Wu, C. Lu, C. Zhao, C. Deng, C. Zhang, C. Ruan, D. Dai, D. Guo, D. Yang, D. Chen, D. Ji, E. Li, F. Lin, F. Dai, F. Luo, G. Hao, G. Chen, G. Li, H. Zhang, H. Bao, H. Xu, H. Wang, H. Zhang, H. Ding, H. Xin, H. Gao, H. Li, H. Qu, J. L. Cai, J. Liang, J. Guo, J. Ni, J. Li, J. Wang, J. Chen, J. Chen, J. Yuan, J. Qiu, J. Li, J. Song, K. Dong, K. Hu, K. Gao, K. Guan, K. Huang, K. Yu, L. Wang, L. Zhang, L. Xu, L. Xia, L. Zhao, L. Wang, L. Zhang, M. Li, M. Wang, M. Zhang, M. Zhang, M. Tang, M. Li, N. Tian, P. Huang, P. Wang, P. Zhang, Q. Wang, Q. Zhu, Q. Chen, Q. Du, R. J. Chen, R. L. Jin, R. Ge, R. Zhang, R. Pan, R. Wang, R. Xu, R. Zhang, R. Chen, S. S. Li, S. Lu, S. Zhou, S. Chen, S. Wu, S. Ye, S. Ye, S. Ma, S. Wang, S. Zhou, S. Yu, S. Zhou, S. Pan, T. Wang, T. Yun, T. Pei, T. Sun, W. L. Xiao, W. Zeng, W. Zhao, W. An, W. Liu, W. Liang, W. Gao, W. Yu, W. Zhang, X. Q. Li, X. Jin, X. Wang, X. Bi, X. Liu, X. Wang, X. Shen, X. Chen, X. Zhang, X. Chen, X. Nie, X. Sun, X. Wang, X. Cheng, X. Liu, X. Xie, X. Liu, X. Yu, X. Song, X. Shan, X. Zhou, X. Yang, X. Li, X. Su, X. Lin, Y. K. Li, Y. Q. Wang, Y. X. Wei, Y. X. Zhu, Y. Zhang, Y. Xu, Y. Xu, Y. Huang, Y. Li, Y. Zhao, Y. Sun, Y. Li, Y. Wang, Y. Yu, Y. Zheng, Y. Zhang, Y. Shi, Y. Xiong, Y. He, Y. Tang, Y. Piao, Y. Wang, Y. Tan, Y. Ma, Y. Liu, Y. Guo, Y. Wu, Y. Ou, Y. Zhu, Y. Wang, Y. Gong, Y. Zou, Y. He, Y. Zha, Y. Xiong, Y. Ma, Y. Yan, Y. Luo, Y. You, Y. Liu, Y. Zhou, Z. F. Wu, Z. Z. Ren, Z. Ren, Z. Sha, Z. Fu, Z. Xu, Z. Huang, Z. Zhang, Z. Xie, Z. Zhang, Z. Hao, Z. Gou, Z. Ma, Z. Yan, Z. Shao, Z. Xu, Z. Wu, Z. Zhang, Z. Li, Z. Gu, Z. Zhu, Z. Liu, Z. Li, Z. Xie, Z. Song, Z. Gao, and Z. Pan (2024)
+
+Deepseek-v3 technical report.
+
+arXiv preprint arXiv:2412.19437.
+
+Cited by: §I,
+§II-A,
+§II-C.
+
+[10]
+DeepSeek (2025)
+
+Expert parallelism load balancer (eplb).
+
+Note: https://github.com/deepseek-ai/EPLB
+
+Cited by: §I,
+§II-C,
+§II-D,
+§V-A,
+§VI.
+
+[11]
+Z. Dong, H. Peng, P. Liu, W. X. Zhao, D. Wu, F. Xiao, and Z. Wang (2025)
+
+Domain-specific pruning of large mixture-of-experts models with few-shot demonstrations.
+
+arXiv preprint arXiv:2504.06792.
+
+Cited by: §III-A.
+
+[12]
+N. Du, Y. Huang, A. M. Dai, S. Tong, D. Lepikhin, Y. Xu, M. Krikun, Y. Zhou, A. W. Yu, O. Firat, B. Zoph, L. Fedus, M. Bosma, Z. Zhou, T. Wang, Y. E. Wang, K. Webster, M. Pellat, K. Robinson, K. Meier-Hellstern, T. Duke, L. Dixon, K. Zhang, Q. V. Le, Y. Wu, Z. Chen, and C. Cui (2022)
+
+Glam: efficient scaling of language models with mixture-of-experts.
+
+In International conference on machine learning,
+
+pp. 5547–5569.
+
+Cited by: §II-A.
+
+[13]
+Z. Fang, Y. Huang, Z. Hong, Y. Lyu, W. Chen, Y. Yu, F. Yu, and Z. Zheng (2025)
+
+Klotski: efficient mixture-of-expert inference via expert-aware multi-batch pipeline.
+
+In Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2,
+
+pp. 574–588.
+
+Cited by: §I,
+§I,
+§II-A,
+§II-C.
+
+[14]
+M. Gao, J. Pu, X. Yang, M. Horowitz, and C. Kozyrakis (2017)
+
+Tetris: scalable and efficient neural network acceleration with 3d memory.
+
+In Proceedings of the Twenty-Second International Conference on Architectural Support for Programming Languages and Operating Systems,
+
+pp. 751–764.
+
+Cited by: §I,
+§II-B.
+
+[15]
+S. Go and D. Mahajan (2025)
+
+Moetuner: optimized mixture of expert serving with balanced expert placement and token routing.
+
+arXiv preprint arXiv:2502.06643.
+
+Cited by: §II-C,
+§III-D,
+§V-B,
+§VI.
+
+[16]
+P. Gu, X. Xie, Y. Ding, G. Chen, W. Zhang, D. Niu, and Y. Xie (2020)
+
+IPIM: programmable in-memory image processing accelerator using near-bank architecture.
+
+In 2020 ACM/IEEE 47th Annual International Symposium on Computer Architecture (ISCA),
+
+pp. 804–817.
+
+Cited by: §II-B.
+
+[17]
+Y. Gu, A. Khadem, S. Umesh, N. Liang, X. Servot, O. Mutlu, R. Iyer, and R. Das (2025)
+
+PIM is all you need: a cxl-enabled gpu-free system for large language model inference.
+
+In Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2,
+
+pp. 862–881.
+
+Cited by: §II-B.
+
+[18]
+Gurobi Optimization, LLC (2025)
+
+Gurobi Optimizer Reference Manual.
+
+External Links: Link
+
+Cited by: §IV-B.
+
+[19]
+R. Hadidi, B. Asgari, B. A. Mudassar, S. Mukhopadhyay, S. Yalamanchili, and H. Kim (2017)
+
+Demystifying the characteristics of 3d-stacked memories: a case study for hybrid memory cube.
+
+In 2017 IEEE international symposium on Workload characterization (IISWC),
+
+pp. 66–75.
+
+Cited by: §V-G.
+
+[20]
+C. He, Y. Huang, P. Mu, Z. Miao, J. Xue, L. Ma, F. Yang, and L. Mai (2025)
+
+WaferLLM: large language model inference at wafer scale.
+
+arXiv preprint arXiv:2502.04563.
+
+Cited by: §II-C.
+
+[21]
+J. He, J. Zhai, T. Antunes, H. Wang, F. Luo, S. Shi, and Q. Li (2022)
+
+Fastermoe: modeling and optimizing training of large-scale dynamic pre-trained models.
+
+In Proceedings of the 27th ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming,
+
+pp. 120–134.
+
+Cited by: §II-C.
+
+[22]
+Y. He, H. Mao, C. Giannoula, M. Sadrosadati, J. Gómez-Luna, H. Li, X. Li, Y. Wang, and O. Mutlu (2025)
+
+Papi: exploiting dynamic parallelism in large language model decoding with a processing-in-memory-enabled computing system.
+
+In Proceedings of the 30th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2,
+
+pp. 766–782.
+
+Cited by: §II-B,
+§VI.
+
+[23]
+D. Hendrycks, C. Burns, S. Kadavath, A. Arora, S. Basart, E. Tang, D. Song, and J. Steinhardt (2021)
+
+Measuring mathematical problem solving with the math dataset.
+
+arXiv preprint arXiv:2103.03874.
+
+Cited by: §III-C,
+§V-A.
+
+[24]
+G. Heo, S. Lee, J. Cho, H. Choi, S. Lee, H. Ham, G. Kim, D. Mahajan, and J. Park (2024)
+
+Neupims: npu-pim heterogeneous acceleration for batched llm inferencing.
+
+In Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3,
+
+pp. 722–737.
+
+Cited by: §II-B.
+
+[25]
+H. Huang, N. Ardalani, A. Sun, L. Ke, H. S. Lee, A. Sridhar, S. Bhosale, C. Wu, and B. Lee (2023)
+
+Towards moe deployment: mitigating inefficiencies in mixture-of-expert (moe) inference.
+
+arXiv preprint arXiv:2303.06182.
+
+Cited by: §I,
+§II-A.
+
+[26]
+H. Huang, S. Zhong, Z. Zhang, S. Li, D. Niu, H. Zheng, R. Wang, and M. Li (2025)
+
+HD-moe: hybrid and dynamic parallelism for mixture-of-expert llms with 3d near-memory processing.
+
+arXiv preprint arXiv:2509.09420.
+
+Cited by: §II-C,
+§V-A,
+§VI.
+
+[27]
+J. Huang, P. Majumder, S. Kim, A. Muzahid, K. H. Yum, and E. J. Kim (2021)
+
+Communication algorithm-architecture co-design for distributed deep learning.
+
+In 2021 ACM/IEEE 48th Annual International Symposium on Computer Architecture (ISCA),
+
+pp. 181–194.
+
+Cited by: §II-C.
+
+[28]
+Y. Huang, Y. Cheng, A. Bapna, O. Firat, M. X. Chen, D. Chen, H. Lee, J. Ngiam, Q. V. Le, Y. Wu, and Z. Chen (2019)
+
+Gpipe: efficient training of giant neural networks using pipeline parallelism.
+
+Advances in neural information processing systems 32.
+
+Cited by: §II-C.
+
+[29]
+JEDEC (2022)
+
+High Bandwidth Memory DRAM (HBM3).
+
+Note: https://www.jedec.org/standards-documents/docs/jesd238
+
+Cited by: §V-A.
+
+[30]
+A. Q. Jiang, A. Sablayrolles, A. Roux, A. Mensch, B. Savary, C. Bamford, D. S. Chaplot, D. d. l. Casas, E. B. Hanna, F. Bressand, G. Lengyel, G. Bour, G. Lample, L. R. Lavaud, L. Saulnier, M. Lachaux, P. Stock, S. Subramanian, S. Yang, S. Antoniak, T. L. Scao, T. Gervet, T. Lavril, T. Wang, T. Lacroix, and W. E. Sayed (2024)
+
+Mixtral of experts.
+
+arXiv preprint arXiv:2401.04088.
+
+Cited by: §I,
+§II-A.
+
+[31]
+N. Jiang, D. U. Becker, G. Michelogiannakis, J. Balfour, B. Towles, D. E. Shaw, J. Kim, and W. J. Dally (2013)
+
+A detailed and flexible cycle-accurate network-on-chip simulator.
+
+In 2013 IEEE international symposium on performance analysis of systems and software (ISPASS),
+
+pp. 86–96.
+
+Cited by: §V-A.
+
+[32]
+Q. Jiang, B. Tu, and H. An (2025)
+
+NDPage: efficient address translation for near-data processing architectures via tailored page table.
+
+In 2025 Design, Automation & Test in Europe Conference (DATE),
+
+pp. 1–7.
+
+Cited by: §V-A.
+
+[33]
+C. Jin, Z. Jiang, Z. Bai, Z. Zhong, J. Liu, X. Li, N. Zheng, X. Wang, C. Xie, Q. Huang, W. Heng, Y. Ma, W. Bao, S. Zheng, Y. Peng, H. Lin, X. Liu, X. Jin, and X. Liu (2025)
+
+MegaScale-moe: large-scale communication-efficient training of mixture-of-experts models in production.
+
+CoRR abs/2505.11432.
+
+External Links: Link,
+Document,
+2505.11432
+
+Cited by: §II-C.
+
+[34]
+L. Ke, U. Gupta, M. Hempstead, C. Wu, H. S. Lee, and X. Zhang (2022)
+
+Hercules: heterogeneity-aware inference serving for at-scale personalized recommendation.
+
+In 2022 IEEE International Symposium on High-Performance Computer Architecture (HPCA),
+
+pp. 141–154.
+
+Cited by: §IV-E.
+
+[35]
+D. Kim, J. Kung, S. Chai, S. Yalamanchili, and S. Mukhopadhyay (2016)
+
+Neurocube: a programmable digital neuromorphic architecture with high-density 3d memory.
+
+ACM SIGARCH Computer Architecture News 44 (3), pp. 380–392.
+
+Cited by: §II-B.
+
+[36]
+J. Kim, D. Park, T. Theocharides, N. Vijaykrishnan, and C. R. Das (2005)
+
+A low latency router supporting adaptivity for on-chip interconnects.
+
+In Proceedings of the 42nd annual Design Automation Conference,
+
+pp. 559–564.
+
+Cited by: §IV-C.
+
+[37]
+T. Krishna, C. O. Chen, W. Kwon, and L. Peh (2014)
+
+Smart: single-cycle multihop traversals over a shared network on chip.
+
+IEEE micro 34 (3), pp. 43–56.
+
+Cited by: §IV-C.
+
+[38]
+W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez, H. Zhang, and I. Stoica (2023)
+
+Efficient memory management for large language model serving with pagedattention.
+
+In Proceedings of the 29th symposium on operating systems principles,
+
+pp. 611–626.
+
+Cited by: §V-A.
+
+[39]
+Y. Kwon, S. H. Lee, J. Lee, S. Kwon, J. M. Ryu, J. Son, O. Seongil, H. Yu, H. Lee, S. Y. Kim, Y. Cho, J. G. Kim, J. Choi, H. Shin, J. Kim, B. Phuah, H. Kim, M. J. Song, A. Choi, D. Kim, S. Kim, E. Kim, D. Wang, S. Kang, Y. Ro, S. Seo, J. Song, J. Youn, K. Sohn, and N. S. Kim (2021)
+
+25.4 a 20nm 6gb function-in-memory dram, based on hbm2 with a 1.2 tflops programmable computing unit using bank-level parallelism, for machine learning applications.
+
+In 2021 IEEE International Solid-State Circuits Conference (ISSCC),
+
+Vol. 64, pp. 350–352.
+
+Cited by: §II-B.
+
+[40]
+S. Lee, S. Kang, J. Lee, H. Kim, E. Lee, S. Seo, H. Yoon, S. Lee, K. Lim, H. Shin, J. Kim, O. Seongil, A. Iyer, D. Wang, K. Sohn, and N. S. Kim (2021)
+
+Hardware architecture and software stack for pim based on commercial dram technology: industrial product.
+
+In 2021 ACM/IEEE 48th Annual International Symposium on Computer Architecture (ISCA),
+
+pp. 43–56.
+
+Cited by: §II-B.
+
+[41]
+D. Lepikhin, H. Lee, Y. Xu, D. Chen, O. Firat, Y. Huang, M. Krikun, N. Shazeer, and Z. Chen (2020)
+
+Gshard: scaling giant models with conditional computation and automatic sharding.
+
+arXiv preprint arXiv:2006.16668.
+
+Cited by: §II-C.
+
+[42]
+C. Li, Y. Yin, X. Wu, J. Zhu, Z. Gao, D. Niu, Q. Wu, X. Si, Y. Xie, C. Zhang, and G. Sun (2025)
+
+H2-llm: hardware-dataflow co-exploration for heterogeneous hybrid-bonding-based low-batch llm inference.
+
+In Proceedings of the 52nd Annual International Symposium on Computer Architecture,
+
+pp. 194–210.
+
+Cited by: §II-B,
+§VI.
+
+[43]
+C. Li, Y. Yin, C. Xue, Z. Wang, F. Bai, Y. Guo, X. Jiang, Q. Wu, Y. Xie, and G. Sun (2026)
+
+Hardware-software co-design for 3d-dram-based llm serving accelerator.
+
+arXiv preprint arXiv:2603.04797.
+
+Cited by: §II-B,
+§IV-A,
+§V-G,
+§VI.
+
+[44]
+C. Li, Z. Zhou, S. Zheng, J. Zhang, Y. Liang, and G. Sun (2024)
+
+Specpim: accelerating speculative inference on pim-enabled system via architecture-dataflow co-exploration.
+
+In Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3,
+
+pp. 950–965.
+
+Cited by: §II-B.
+
+[45]
+J. Li, Y. Jiang, Y. Zhu, C. Wang, and H. Xu (2023)
+
+Accelerating distributed $\{$ moe $\}$ training and inference with lina.
+
+In 2023 USENIX Annual Technical Conference (USENIX ATC 23),
+
+pp. 945–959.
+
+Cited by: §II-A.
+
+[46]
+Y. Li, Z. Zhang, Z. Wang, P. Chen, and P. Zheng (2026)
+
+Semantic Parallelism: Redefining Efficient MoE Inference via Model-Data Co-Scheduling.
+
+ arXiv.
+
+Note: arXiv:2503.04398Comment: Published as a conference paper at ICLR 2026
+
+External Links: Link,
+Document
+
+Cited by: §III-D.
+
+[47]
+J. Liu, L. Cui, H. Liu, D. Huang, Y. Wang, and Y. Zhang (2020)
+
+Logiqa: a challenge dataset for machine reading comprehension with logical reasoning.
+
+arXiv preprint arXiv:2007.08124.
+
+Cited by: §III-C.
+
+[48]
+X. Liu, Y. Wang, F. Fu, X. Miao, S. Zhu, X. Nie, and B. Cui (2025)
+
+Netmoe: accelerating moe training through dynamic sample placement.
+
+In The Thirteenth International Conference on Learning Representations,
+
+Cited by: §II-C,
+§VI.
+
+[49]
+liyucheng (2023)
+
+ShareGPT90K dataset.
+
+Note: Hugging Face dataset
+
+External Links: Link
+
+Cited by: TABLE II,
+§V-A.
+
+[50]
+H. Luo, Y. C. Tuğrul, F. N. Bostancı, A. Olgun, A. G. Yağlıkçı, and O. Mutlu (2023)
+
+Ramulator 2.0: a modern, modular, and extensible dram simulator.
+
+IEEE Computer Architecture Letters 23 (1), pp. 112–116.
+
+Cited by: §V-A.
+
+[51]
+S. Ma, L. Huang, M. Lai, and W. Shi (2015)
+
+Virtual bus structure-based network-on-chip topologies.
+
+In Networks-On-Chip: From Implementations to Programming Paradigms, Z. Wang (Ed.),
+
+pp. 107–138.
+
+External Links: Document
+
+Cited by: §IV-C.
+
+[52]
+R. Manevich, I. Walter, I. Cidon, and A. Kolodny (2009)
+
+Best of both worlds: a bus enhanced noc (benoc).
+
+In 2009 3rd ACM/IEEE International Symposium on Networks-on-Chip,
+
+pp. 173–182.
+
+Cited by: §IV-D.
+
+[53]
+L. Nai, R. Hadidi, J. Sim, H. Kim, P. Kumar, and H. Kim (2017)
+
+Graphpim: enabling instruction-level pim offloading in graph computing frameworks.
+
+In 2017 IEEE International symposium on high performance computer architecture (HPCA),
+
+pp. 457–468.
+
+Cited by: §II-B.
+
+[54]
+X. Nie, P. Zhao, X. Miao, T. Zhao, and B. Cui (2022)
+
+HetuMoE: an efficient trillion-scale mixture-of-expert distributed training system.
+
+arXiv preprint arXiv:2203.14685.
+
+Cited by: §IV-B.
+
+[55]
+Y. Pan, Y. He, T. Han, L. Liu, S. Zhao, Z. Chen, M. Wang, C. Li, Y. Han, and Y. Wang (2026)
+
+TriMoE: augmenting gpu with amx-enabled cpu and dimm-ndp for high-throughput moe inference via offloading.
+
+arXiv preprint arXiv:2603.01058.
+
+Cited by: §II-B.
+
+[56]
+Y. Pan, Z. Xia, P. Hsu, L. Hu, H. Kim, J. Sharda, M. Zhou, N. S. Kim, S. Yu, T. Rosing, and M. Kang (2025)
+
+Stratum: system-hardware co-design with tiered monolithic 3d-stackable dram for efficient moe serving.
+
+In Proceedings of the 58th IEEE/ACM International Symposium on Microarchitecture,
+
+pp. 1–17.
+
+Cited by: §I,
+§II-B,
+§II-B,
+§III-A,
+§V-A,
+§V-G,
+§VI.
+
+[57]
+J. Park, J. Choi, K. Kyung, M. J. Kim, Y. Kwon, N. S. Kim, and J. H. Ahn (2024)
+
+Attacc! unleashing the power of pim for batched transformer-based generative model inference.
+
+In Proceedings of the 29th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 2,
+
+pp. 103–119.
+
+Cited by: §II-B,
+§VI.
+
+[58]
+M. Park, H. S. Cho, T. Yun, S. Byeon, Y. J. Koo, S. Yoon, D. U. Lee, S. Choi, J. Park, J. Lee, K. Cho, J. Moon, B. Yoon, Y. Park, S. Oh, C. K. Lee, T. Kim, S. Lee, H. Kim, Y. Ju, S. Lim, S. G. Baek, K. Y. Lee, S. H. Lee, W. S. We, S. Kim, Y. Choi, S. Lee, S. M. Yang, G. Lee, I. Kim, Y. Jeon, J. Park, J. C. Yun, C. Park, S. Kim, S. Kim, D. Lee, S. Oh, T. Hwang, J. Shin, Y. Lee, H. Kim, J. Lee, Y. Hur, S. Lee, J. Jang, J. Chun, and J. Cho (2022)
+
+A 192-gb 12-high 896-gb/s hbm3 dram with a tsv auto-calibration scheme and machine-learning-based layout optimization.
+
+IEEE Journal of Solid-State Circuits 58 (1), pp. 256–269.
+
+Cited by: §V-G.
+
+[59]
+Z. Qiu, Z. Huang, B. Zheng, K. Wen, Z. Wang, R. Men, I. Titov, D. Liu, J. Zhou, and J. Lin (2025)
+
+Demons in the detail: on implementing load balancing loss for training specialized mixture-of-expert models.
+
+In Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+
+pp. 5005–5018.
+
+Cited by: §III-A.
+
+[60]
+Y. S. Shao, J. Clemons, R. Venkatesan, B. Zimmer, M. Fojtik, N. Jiang, B. Keller, A. Klinefelter, N. Pinckney, P. Raina, S. G. Tell, Y. Zhang, W. J. Dally, J. Emer, C. T. Gray, B. Khailany, and S. W. Keckler (2019)
+
+Simba: scaling deep-learning inference with multi-chip-module-based architecture.
+
+In Proceedings of the 52nd Annual IEEE/ACM International Symposium on Microarchitecture,
+
+pp. 14–27.
+
+External Links: Document
+
+Cited by: §V-A.
+
+[61]
+S. Shiina and K. Taura (2019)
+
+Almost deterministic work stealing.
+
+In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis,
+
+pp. 1–16.
+
+Cited by: §II-C.
+
+[62]
+M. Shoeybi, M. Patwary, R. Puri, P. LeGresley, J. Casper, and B. Catanzaro (2019)
+
+Megatron-lm: training multi-billion parameter language models using model parallelism.
+
+arXiv preprint arXiv:1909.08053.
+
+Cited by: §II-C.
+
+[63]
+G. Singh, J. Gómez-Luna, G. Mariani, G. F. Oliveira, S. Corda, S. Stuijk, O. Mutlu, and H. Corporaal (2019)
+
+Napel: near-memory computing application performance prediction via ensemble learning.
+
+In Proceedings of the 56th annual design automation conference 2019,
+
+pp. 1–6.
+
+Cited by: §II-B.
+
+[64]
+X. Song, Z. Zhong, R. Chen, and H. Chen (2024)
+
+Promoe: fast moe-based llm serving using proactive caching.
+
+arXiv preprint arXiv:2410.22134.
+
+Cited by: §II-C,
+§VI.
+
+[65]
+M. Tahghighi, M. Mousavi, P. Khadivi, and K. Bazargan (2012)
+
+A new hybrid topology for network on chip.
+
+In 20th Iranian Conference on Electrical Engineering (ICEE2012),
+
+pp. 769–774.
+
+Cited by: §IV-D.
+
+[66]
+P. Tang, J. Liu, X. Hou, Y. Pu, J. Wang, P. Heng, C. Li, and M. Guo (2024)
+
+Hobbit: a mixed precision expert offloading system for fast moe inference.
+
+arXiv preprint arXiv:2411.01433.
+
+Cited by: §II-A.
+
+[67]
+G. Team, A. Zeng, X. Lv, Q. Zheng, Z. Hou, B. Chen, C. Xie, C. Wang, D. Yin, H. Zeng, J. Zhang, K. Wang, L. Zhong, M. Liu, R. Lu, S. Cao, X. Zhang, X. Huang, Y. Wei, Y. Cheng, Y. An, Y. Niu, Y. Wen, Y. Bai, Z. Du, Z. Wang, Z. Zhu, B. Zhang, B. Wen, B. Wu, B. Xu, C. Huang, C. Zhao, C. Cai, C. Yu, C. Li, C. Ge, C. Huang, C. Zhang, C. Xu, C. Zhu, C. Li, C. Yin, D. Lin, D. Yang, D. Jiang, D. Ai, E. Zhu, F. Wang, G. Pan, G. Wang, H. Sun, H. Li, H. Li, H. Hu, H. Zhang, H. Peng, H. Tai, H. Zhang, H. Wang, H. Yang, H. Liu, H. Zhao, H. Liu, H. Yan, H. Liu, H. Chen, J. Li, J. Zhao, J. Ren, J. Jiao, J. Zhao, J. Yan, J. Wang, J. Gui, J. Zhao, J. Liu, J. Li, J. Li, J. Lu, J. Wang, J. Yuan, J. Li, J. Du, J. Du, J. Liu, J. Zhi, J. Gao, K. Wang, L. Yang, L. Xu, L. Fan, L. Wu, L. Ding, L. Wang, M. Zhang, M. Li, M. Xu, M. Zhao, M. Zhai, P. Du, Q. Dong, S. Lei, S. Tu, S. Yang, S. Lu, S. Li, S. Li, Shuang-Li, S. Yang, S. Yi, T. Yu, W. Tian, W. Wang, W. Yu, W. L. Tam, W. Liang, W. Liu, X. Wang, X. Jia, X. Gu, X. Ling, X. Wang, X. Fan, X. Pan, X. Zhang, X. Zhang, X. Fu, X. Zhang, Y. Xu, Y. Wu, Y. Lu, Y. Wang, Y. Zhou, Y. Pan, Y. Zhang, Y. Wang, Y. Li, Y. Su, Y. Geng, Y. Zhu, Y. Yang, Y. Li, Y. Wu, Y. Li, Y. Liu, Y. Wang, Y. Li, Y. Zhang, Z. Liu, Z. Yang, Z. Zhou, Z. Qiao, Z. Feng, Z. Liu, Z. Zhang, Z. Wang, Z. Yao, Z. Wang, Z. Liu, Z. Chai, Z. Li, Z. Zhao, W. Chen, J. Zhai, B. Xu, M. Huang, H. Wang, J. Li, Y. Dong, and J. Tang
+
+GLM-4.5: Agentic, Reasoning, and Coding (ARC) Foundation Models.
+
+External Links: Link
+
+Cited by: TABLE VII.
+
+[68]
+B. Tian, Q. Chen, and M. Gao (2023)
+
+Abndp: co-optimizing data access and load balance in near-data processing.
+
+In Proceedings of the 28th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Volume 3,
+
+pp. 3–17.
+
+Cited by: §I,
+§II-B.
+
+[69]
+B. Tian, Y. Li, L. Jiang, S. Cai, and M. Gao (2024)
+
+Ndpbridge: enabling cross-bank coordination in near-dram-bank processing architectures.
+
+In 2024 ACM/IEEE 51st Annual International Symposium on Computer Architecture (ISCA),
+
+pp. 628–643.
+
+Cited by: §II-C.
+
+[70]
+V. Todorov, D. Mueller-Gritschneder, H. Reinig, and U. Schlichtmann (2014)
+
+Deterministic synthesis of hybrid application-specific network-on-chip topologies.
+
+IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems 33 (10), pp. 1503–1516.
+
+Cited by: §IV-D.
+
+[71]
+X. Wang, B. Zhao, R. Hou, A. Awad, Z. Tian, and D. Meng (2021)
+
+NASGuard: a novel accelerator architecture for robust neural architecture search (nas) networks.
+
+In 2021 ACM/IEEE 48th Annual International Symposium on Computer Architecture (ISCA),
+
+pp. 776–789.
+
+Cited by: §II-C.
+
+[72]
+J. Welbl, N. F. Liu, and M. Gardner (2017)
+
+Crowdsourcing multiple choice science questions.
+
+In Proceedings of the 3rd Workshop on Noisy User-generated Text,
+
+pp. 94–106.
+
+Cited by: §III-C.
+
+[73]
+X. Xie, Z. Liang, P. Gu, A. Basak, L. Deng, L. Liang, X. Hu, and Y. Xie (2021)
+
+SpaceA: sparse matrix vector multiplication on processing-in-memory accelerator.
+
+In 2021 IEEE International Symposium on High-Performance Computer Architecture (HPCA),
+
+pp. 570–583.
+
+Cited by: §II-B.
+
+[74]
+Z. Xie, X. Xu, M. Walker, J. Knebel, K. Palaniswamy, N. Hebert, J. Hu, H. Yang, Y. Chen, and S. Das (2021)
+
+APOLLO: an automated power modeling framework for runtime power introspection in high-volume commercial microprocessors.
+
+In MICRO-54: 54th Annual IEEE/ACM International Symposium on Microarchitecture,
+
+pp. 1–14.
+
+Cited by: §IV-E.
+
+[75]
+A. Yang, A. Li, B. Yang, B. Zhang, B. Hui, B. Zheng, B. Yu, C. Gao, C. Huang, C. Lv, C. Zheng, D. Liu, F. Zhou, F. Huang, F. Hu, H. Ge, H. Wei, H. Lin, J. Tang, J. Yang, J. Tu, J. Zhang, J. Yang, J. Yang, J. Zhou, J. Zhou, J. Lin, K. Dang, K. Bao, K. Yang, L. Yu, L. Deng, M. Li, M. Xue, M. Li, P. Zhang, P. Wang, Q. Zhu, R. Men, R. Gao, S. Liu, S. Luo, T. Li, T. Tang, W. Yin, X. Ren, X. Wang, X. Zhang, X. Ren, Y. Fan, Y. Su, Y. Zhang, Y. Zhang, Y. Wan, Y. Liu, Z. Wang, Z. Cui, Z. Zhang, Z. Zhou, and Z. Qiu (2025)
+
+Qwen3 technical report.
+
+arXiv preprint arXiv:2505.09388.
+
+Cited by: §I,
+§II-A,
+§III-A,
+TABLE VII.
+
+[76]
+W. Yang, Y. Yang, S. Ji, J. Jiang, N. Jing, Q. Wang, Z. Mao, and W. Sheng (2024)
+
+Recpim: efficient in-memory processing for personalized recommendation inference using near-bank architecture.
+
+IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems 43 (10), pp. 2854–2867.
+
+Cited by: §II-B.
+
+[77]
+J. Yao, Q. Anthony, A. Shafi, H. Subramoni, and D. K. D. Panda (2024)
+
+Exploiting inter-layer expert affinity for accelerating mixture-of-experts model inference.
+
+In 2024 IEEE International Parallel and Distributed Processing Symposium (IPDPS),
+
+pp. 915–925.
+
+Cited by: §II-C,
+§VI.
+
+[78]
+Z. Yu, Y. Guan, Z. Yu, C. Zhou, Z. Hu, S. Pei, Y. Kang, Y. Ding, and P. Tsai (2025)
+
+Orders in chaos: enhancing large-scale moe llm serving with data movement forecasting.
+
+arXiv preprint arXiv:2510.05497.
+
+Cited by: §VI.
+
+[79]
+A. E. Yuan and W. Shou (2024)
+
+A rigorous and versatile statistical test for correlations between stationary time series.
+
+PLoS biology 22 (8), pp. e3002758.
+
+Cited by: §III-B.
+
+[80]
+S. Yun, K. Kyung, J. Cho, J. Choi, J. Kim, B. Kim, S. Lee, K. Sohn, and J. H. Ahn (2024)
+
+Duplex: a device for large language models with mixture of experts, grouped query attention, and continuous batching.
+
+In 2024 57th IEEE/ACM International Symposium on Microarchitecture (MICRO),
+
+pp. 1429–1443.
+
+Cited by: §I,
+§II-B,
+§II-B,
+§IV-A,
+§V-A,
+§V-G,
+§VI.
+
+[81]
+M. Zhai, J. He, Z. Ma, Z. Zong, R. Zhang, and J. Zhai (2023)
+
+ $\{$ smartmoe $\}$ : Efficiently training $\{$ sparsely-activated $\}$ models through combining offline and online parallelization.
+
+In 2023 USENIX Annual Technical Conference (USENIX ATC 23),
+
+pp. 961–975.
+
+Cited by: §II-C.
+
+[82]
+J. Zhang, C. Ma, X. Wang, Y. Nie, Y. Li, Y. Xu, X. Liao, B. Li, and H. Jin (2025)
+
+ $\{$ popfetcher $\}$ : Towards accelerated $\{$ mixture-of-experts $\}$ training via popularity based $\{$ expert-wise $\}$ prefetch.
+
+In 2025 USENIX Annual Technical Conference (USENIX ATC 25),
+
+pp. 1053–1069.
+
+Cited by: §II-C,
+§VI.
+
+[83]
+M. Zhang, Y. Zhuo, C. Wang, M. Gao, Y. Wu, K. Chen, C. Kozyrakis, and X. Qian (2018)
+
+GraphP: reducing communication for pim-based graph processing with efficient data partition.
+
+In 2018 IEEE International Symposium on High Performance Computer Architecture (HPCA),
+
+pp. 544–557.
+
+Cited by: §II-B.
+
+[84]
+H. Zhao, O. Jang, W. Ding, Y. Zhang, M. Kandemir, and M. J. Irwin (2012)
+
+A hybrid noc design for cache coherence optimization for chip multiprocessors.
+
+In Proceedings of the 49th Annual Design Automation Conference,
+
+pp. 834–842.
+
+Cited by: §IV-D.
+
+[85]
+L. Zheng, W. Chiang, Y. Sheng, T. Li, S. Zhuang, Z. Wu, Y. Zhuang, Z. Li, Z. Lin, E. P. Xing, J. E. Gonzalez, I. Stoica, and H. Zhang (2023)
+
+Lmsys-chat-1m: a large-scale real-world llm conversation dataset.
+
+arXiv preprint arXiv:2309.11998.
+
+Cited by: TABLE II,
+§V-A.
+
+[86]
+L. Zheng, Z. Li, H. Zhang, Y. Zhuang, Z. Chen, Y. Huang, Y. Wang, Y. Xu, D. Zhuo, E. P. Xing, J. E. Gonzalez, and I. Stoica (2022)
+
+Alpa: automating inter-and $\{$ intra-operator $\}$ parallelism for distributed deep learning.
+
+In 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22),
+
+pp. 559–578.
+
+Cited by: §IV-B.
+
+[87]
+Q. Zheng, X. Xia, X. Zou, Y. Dong, S. Wang, Y. Xue, Z. Wang, L. Shen, A. Wang, Y. Li, T. Su, Z. Yang, and J. Tang (2023)
+
+Codegeex: a pre-trained model for code generation with multilingual benchmarking on humaneval-x.
+
+In Proceedings of the 29th ACM SIGKDD Conference on Knowledge Discovery and Data Mining,
+
+pp. 5673–5684.
+
+Cited by: §III-C,
+TABLE II,
+§V-A.
+
+[88]
+Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, and H. Zhang (2024)
+
+ $\{$ distserve $\}$ : Disaggregating prefill and decoding for goodput-optimized large language model serving.
+
+In 18th USENIX Symposium on Operating Systems Design and Implementation (OSDI 24),
+
+pp. 193–210.
+
+Cited by: §I.
+
+[89]
+Y. Zhuo, C. Wang, M. Zhang, R. Wang, D. Niu, Y. Wang, and X. Qian (2019)
+
+Graphq: scalable pim-based graph processing.
+
+In Proceedings of the 52nd Annual IEEE/ACM International Symposium on Microarchitecture,
+
+pp. 712–725.
+
+Cited by: §II-B.

@@ -1,0 +1,2440 @@
+## Racer: Hunting GPU Kernel Bugs with Symbolic Equivalence Checking
+
+Tuan Truong Vu and Cheng Tan
+
+Affiliation: Northeastern University
+
+Abstract.
+
+GPU kernels are critical to the performance of today’s AI services, yet the
+same operators are rewritten repeatedly: for each GPU generation, numeric
+format, serving regime, and kernel language. Every rewrite must preserve the
+function computed by the implementation it replaces. Today, this obligation
+depends almost entirely on differential testing: run the new kernel and a
+trusted reference on randomly sampled tensors, then compare their outputs
+within a tolerance.
+This approach has blind spots that additional test cases cannot eliminate. For
+example, a logical bug may produce an error smaller than the tolerance
+required to accommodate a correct optimized kernel.
+
+We propose symbolic equivalence checking , which executes a kernel and its reference on
+symbolic inputs, turning each output cell into an exact algebraic expression,
+and then checks whether the paired expressions agree for all inputs. Because
+these expressions are exact, symbolic equivalence checking distinguishes floating-point error from
+logical bugs, while a single check covers the entire input space.
+
+We implement Racer, a PTX-level symbolic equivalence checking engine, with three techniques that make
+this approach practical for production kernels:
+(1) Shape Reduction to control checking cost,
+(2) a lockstep CTA scheduler to handle concurrency,
+and (3) idiom templates with exact numeric refutation for otherwise inconclusive results.
+Across 2,408 production kernels from 41 collection targets, Racer found
+82 real bugs in 23 libraries, including 76 previously unknown bugs and 41 confirmed so far.
+
+## 1. Introduction
+
+GPUs power modern AI, and GPU kernels largely determine its performance.
+AI model throughput is closely tied to the throughput of its GPU kernels (Wang et al., 2025).
+Optimized kernels are therefore central to the performance of modern AI
+systems: they directly determine inference latency and serving throughput, and
+can make impractical workloads feasible. FlashAttention, for example,
+substantially reduced the cost of attention and enabled efficient long-context
+inference (Dao et al., 2022).
+
+Because performance matters,
+the same GPU kernel gets written over and over.
+Attention alone has been rewritten for each architecture
+generation as new primitives arrived,
+from Ampere’s asynchronous copies to Hopper’s TMA and warpgroup MMA (Dao, 2024; Bikshandi and Shah, 2023; Chen et al., 2026);
+specialized per head dimension and per serving regime, prefill against decode (Zhong et al., 2024);
+re-tuned for each numeric format (Micikevicius et al., 2022; Frantar et al., 2025; Lin et al., 2024);
+and written again in new languages such as Triton (Hsu et al., 2024; Yang and Zhang, 2024; Spector et al., 2025).
+It happens across serving platforms too:
+vLLM (Kwon et al., 2023) and SGLang (Zheng et al., 2024)
+each ship their own fused RMSNorm,
+one written to accept any hidden size,
+the other optimized for the shapes it expects to serve.
+
+This rewriting paradigm is the norm in modern GPU kernel development: a
+set of mathematical functions is implemented repeatedly, with each new
+implementation striving to outperform its predecessors.
+
+Beyond performance,
+every rewrite carries a critical obligation:
+it must still compute the same function as the implementation it replaces.
+For today, meeting that obligation is left almost entirely
+to differential testing: run the new kernel and a trusted
+implementation, usually PyTorch’s, on randomly sampled input tensors, and
+compare the outputs elementwise within an absolute and relative tolerance (McKeeman, 1998; Paszke et al., 2019).
+This practice is widespread in production, and for good reason.
+The operator set is bounded, and each operator has a precise mathematical
+meaning, so a trusted reference implementation is almost always available.
+Moreover, kernels are typically pure functions from input tensors to output
+tensors, making side-by-side execution straightforward.
+
+And yet, production systems still ship GPU kernels with bugs.
+By studying 82 bugs we found in deployed libraries (§7)
+that slipped through differential testing, we identified four major obstacles:
+(a) sampling cannot cover the input space:
+some bugs trigger only on needle-in-a-haystack values that random sampling is unlikely to produce;
+(b) not every input is an explicit argument:
+many bugs depend on implicit inputs, such as uninitialized memory that happens
+to contain zeros during testing but may hold arbitrary values in practice;
+(c) not every output is checked:
+some bugs we found corrupt memory outside the intended output region, which tests therefore never inspect;
+and most notably,
+(d) floating-point error can be indistinguishable from a bug:
+6 bugs we found cause only small numerical errors—smaller than the
+tolerance required for correct optimized kernels.
+
+As a real bug example,
+FlagGems’ InstanceNorm reconstructs the variance from the stored
+ $\mathrm{rstd}=1/\sqrt{\mathrm{var}+\epsilon}$ as
+ $1/\mathrm{rstd}^{2}+\epsilon$ , instead of the correct
+ $1/\mathrm{rstd}^{2}-\epsilon$ .
+Such a bug cannot be detected by differential testing.
+This is because, for typical input tensors, the output deviation caused by the
+logical bug is smaller than the tolerance required to accommodate normal
+floating-point error.
+But this is not harmless numerical noise: the kernel computes the wrong
+function, and the resulting systematic error can compound over millions of
+training steps and ultimately cause training to fail.
+
+We argue that ensuring the correctness of GPU kernels requires a more systematic and principled approach than differential testing.
+To this end, we propose symbolic equivalence checking .
+Symbolic equivalence checking executes two GPU programs over symbolic inputs rather than concrete values.
+As a result, each output element is represented by an algebraic expression over
+free variables rather than a concrete number.
+The two kernels are equivalent exactly when, for every output element, the
+corresponding expressions evaluate to the same value for all possible inputs.
+
+In symbolic equivalence checking,
+each blind spot of differential testing is eliminated by design
+rather than by testing harder.
+First, a free variable stands for every input value at once,
+so one check covers the entire space.
+Second, uninitialized memory is symbolic too, so a kernel
+that depends on what the previous launch left behind is checked over every
+value it could have left.
+Third, symbolic execution knows the address of every
+store, so a write outside a declared tensor is caught where it happens.
+Finally, expressions are exact rather than floating-point, removing
+floating-point error from the checking problem.
+Any difference between the two
+kernels therefore reflects a difference in the function they compute, rather
+than an artifact of rounding.
+
+In this paper,
+we introduce Racer, a symbolic equivalence checking engine for GPU kernels.
+Racer takes two kernels—one under test and one reference implementation—together with a launch configuration,
+and returns one of three outcomes:
+Equivalent, Inequivalent with a concrete input that distinguishes the two kernels,
+or Unknown.
+
+Racer executes symbolic equivalence checking at the level of PTX,
+NVIDIA’s virtual instruction set (, 2026).
+PTX provides a stable interface across GPU generations and is, in fact,
+the lowest-level instruction set that NVIDIA publicly documents.
+As a result, many front ends, including CUDA C++ and Triton, compile to it.
+Moreover, PTX exposes memory operations explicitly,
+allowing the engine to model the address space that a kernel actually accesses.
+
+Checking production GPU kernels poses three technical challenges for Racer.
+First, symbolic equivalence checking is expensive at the scale of real kernels.
+For example, a naive implementation of symbolic equivalence checking times out under a 600s
+budget even for a simple Softmax kernel with tensor shape $4\times 64$ .
+Second, a kernel launch is not a single piece of code running on one core, but
+thousands of concurrent threads executing and interacting through
+synchronization and shared memory. Racer must therefore reason not only about
+each thread’s arithmetic computation, but also about synchronization and
+cross-thread interactions.
+Finally, deciding the equivalence of arbitrary arithmetic expressions is
+fundamentally difficult. In many cases, the underlying computer algebra
+system cannot establish equivalence and returns
+Unknown. Racer must therefore reduce the frequency of such inconclusive
+cases while preserving soundness.
+
+Racer introduces three techniques to answer the three challenges:
+Shape reduction proves one representative output cell per uniformity class and transports the
+proof to the rest by a verified renaming, rather than paying for every cell
+(§5.1);
+a CTA scheduler steps every thread in
+lockstep between synchronization points and refuses what it cannot order,
+so that no verdict rests on an interleaving the engine chose
+(§5.2);
+and idiom templates with exact numeric refutation plus a second prover for inconclusive results (§5.3).
+
+We evaluate Racer on production kernels from 41 GitHub repositories.
+In total, Racer checks 2,408 GPU kernels.
+It identifies 82 real bugs, including 76 previously
+unknown bugs, of which 41 have been confirmed.
+These bugs are nontrivial:
+among the 82 bugs, an oracle differential tester could, in theory, detect only 47.
+In comparison, NVIDIA’s compute-sanitizer (, 2026)
+detects 18, while Volta (Driscoll et al., 2026), the
+closest existing equivalence checker, detects only 9 (§7.2).
+
+We are not the first to check GPU kernels symbolically, nor the first to
+decide equivalence of tensor programs (Driscoll et al., 2026; Arora et al., 2025; Lu et al., 2025).
+We are, to our knowledge, the first to scale symbolic equivalence checking to
+bug detection in production GPU kernels: handling whole grids rather than a
+single thread block, multi-launch programs, atomics, and asynchronous copies,
+while achieving the performance needed to check real-world kernels.
+This paper contributes:
+
+• 
+
+A study of 82 real bugs in production GPU kernels that identifies
+four blind spots of differential testing and shows, bug by bug, why the
+practice cannot close them (§2, §6).
+
+• 
+
+Racer, a symbolic equivalence checking engine that decides kernel equivalence at PTX level
+over exact arithmetic, models GPU execution faithfully, and fails closed
+rather than approximating (§4).
+
+• 
+
+Three techniques that make the check practical on production kernels:
+shape reduction,
+a lockstep CTA scheduler,
+and idiom templates (§5).
+
+• 
+
+An evaluation on 2,408 production kernels: 82 real bugs across 23 libraries, 76 previously unknown,
+and 41 confirmed at the moment.
+(§7).
+
+## 2. Motivation: Kernel Correctness Today
+
+The same operators are repeatedly rewritten.
+Unlike traditional software,
+the functionality of GPU kernels for LLMs is bounded:
+a few dozen operators (e.g., matrix multiply,
+attention, normalization, activation) account for nearly all
+of the computation a large language model performs.
+Yet those same operators are written again and again: once per framework,
+per hardware generation, per data type, per fusion opportunity, per
+workload regime (Zhong et al., 2024; Yu et al., 2026; Dao et al., 2022; Dao, 2024; Bikshandi and Shah, 2023; Hsu et al., 2024; Spector et al., 2025; Yang and Zhang, 2024; Beck et al., 2026).
+
+What forces the rewrites is performance.
+A kernel that is correct but slow is worthless,
+because the functional implementation already exists;
+the only reason to write it at all is to make it faster or cheaper.
+Each rewrite therefore buys speed with specialization: tiling and vectorization tuned to a shape, hand-staged
+shared memory, warp-level collectives, asynchronous copies, low-precision accumulation (Dao et al., 2022; Dao, 2024; Chen et al., 2026; Bikshandi and Shah, 2023; Beck et al., 2026).
+Every one of those is a place to get the code wrong.
+
+Compounding these optimizations,
+the code can also go wrong because of the underlying arithmetic: tensor algebra,
+whose indices, strides, reductions, and broadcast semantics
+are tricky and error-prone.
+An index offset by one stride, or a reduction over the wrong axis, is easy to write and difficult to spot.
+For example, a buggy log-softmax kernel in FlagGems (contributors, 2024)
+normalizes along the tensor’s last axis, even when asked to normalize
+along a different one, thereby combining the wrong group of elements.
+Similarly, a buggy multi-head attention kernel in attorch (Ahmadzadeh, 2024)
+maps every head to head 0, causing all heads to compute the same output.
+
+Differential testing is the de facto approach for correctness evaluation:
+a test samples random input tensors,
+runs the newly developed kernel and a trusted reference (e.g., PyTorch’s implementation)
+on the same data, and compares the two outputs element-wise.
+The comparison uses absolute and/or relative tolerances.
+The kernel passes only if the discrepancy falls within a predefined threshold.
+
+Differential testing fits naturally into GPU kernel development.
+Because the operator set is bounded and each operator has a crisp mathematical meaning, a trusted
+reference is almost always at hand, and because kernels are pure functions
+from input tensors to output tensors, comparing the two is simple.
+In practice, nearly all GPU kernels today ship with tests of this form.
+
+However, differential testing misses bugs.
+Despite widespread use of differential testing,
+GPU kernels continue to ship with bugs:
+scanning 2,408 GPU kernels from 41 production-quality libraries,
+we found 82 bugs (§7.1).
+Studying those bugs, we find four reasons why differential testing is
+insufficient, each a challenge that any stronger correctness check must meet.
+
+(1) 
+
+Sampling cannot cover the input space.
+Testing samples insufficient input space is an old complaint, but the kernel setting amplifies it.
+A single argument is a tensor of thousands
+of elements, and an element is not drawn from a handful of categories but
+from a floating-point domain of billions of bit patterns.
+The combination of the two makes good coverage infeasible.
+Meanwhile, we do find bugs that manifest only for specific input tensor values,
+for example,
+attorch’s hardshrink keeps an input equal to exactly $\pm\lambda$ , where
+PyTorch’s keep-set is strict ( $|x|>\lambda$ ); the two differ only where an
+input element equals the threshold $\lambda$ exactly (default $0.5$ ).
+
+(2) 
+
+Not every input is an argument.
+Further, a kernel’s result depends on state that never appears in its signature.
+Some kernels depend on allocated but uninitialized memory, which often happens
+to contain zeros during testing but is not guaranteed to be zero in production.
+For example, a reduction kernel in
+Triton-distributed (Zheng et al., 2025) has each CTA atomically
+add its partial sum into an output cell that is only allocated but not
+initialized as zero, so the result is the sum plus whatever the cell held
+before the launch.
+
+(3) 
+
+Not every output is checked.
+A test compares the tensors the kernel declares; the kernel writes wherever
+its computed addresses point. A miscomputed index or a missing bounds guard
+on a ragged final tile scribbles outside the intended region, into a
+neighboring tensor or into a buffer another kernel owns, while the declared
+output still matches the reference element for element.
+For example,
+fla’s squared-ReLU (Yang and Zhang, 2024) backward writes past the tensor end when the length is
+not a multiple of block size.
+
+(4) 
+
+Floating-point error is indistinguishable from a bug.
+Most importantly,
+numeric thresholds cannot distinguish an incorrect function from a correct one evaluated under a different floating-point order, leading to errors in both directions.
+A correct kernel may exceed the tolerance due to reduction reordering; more seriously, an incorrect kernel may remain within the tolerance on sampled inputs.
+Loosening the tolerance suppresses false alarms but can also mask real bugs.
+We have found 6 cases in this category, where incorrect logic is hidden by the floating-point error threshold.
+
+These four points lead to one conclusion:
+a test compares numbers, but correctness
+is a statement about functions.
+What the setting calls for is a check that
+ranges over all inputs rather than sampled ones, that accounts for the
+memory a kernel actually touches rather than the tensors it declares, and
+that decides whether two implementations compute the same value rather than
+producing nearby ones.
+
+## 3. Equivalence Checking for GPU Kernels
+
+## 3.1. Beyond Testing: Toward Principled Checking
+
+We believe testing cannot address the four challenges described in §2.
+Our answer is symbolic equivalence checking .
+
+Symbolic equivalence checking.
+This method executes a kernel over symbolic inputs, so each instruction
+builds an algebraic expression instead of computing a number, and every
+output tensor holds one expression per cell rather than one value.
+Running the new kernel and its reference this way yields, for every
+output cell, a pair of expressions over the same input variables.
+The two kernels are equivalent when both expressions result in the same value
+for all possible inputs.
+Nothing is sampled and compared numerically.
+
+All four challenges dissolve at this level.
+Input coverage:
+a free variable stands for every value at once, so a single check covers the
+entire input space.
+Implicit inputs: the cells of an
+uninitialized buffer are free variables too, so the check ranges over
+whatever the running context may have left in that memory.
+Unchecked outputs: the execution records the
+address of every store, and each expression records which inputs reached the
+cell, so a write outside a declared tensor is caught where it happens instead
+of surfacing later as someone else’s wrong number.
+Floating-point error: expressions are exact rather than
+floating point, so reordering a reduction changes an expression’s shape but
+not its value.
+There is no tolerance parameter to tune; any difference between two expressions
+corresponds to a difference in the computed function, not to floating-point rounding.
+
+Prior equivalence checkers.
+The idea of proving two implementations equivalent is not new, and
+§8 returns to it.
+For example,
+TrainVerify (Lu et al., 2025) checks a distributed training
+program against its single-device specification;
+TensorRight (Arora et al., 2025)
+applies equivalence reasoning to tensor-graph rewrites, certifying that a
+rewritten graph computes what the original did;
+Volta (Driscoll et al., 2026), the closest to us,
+brings equivalence checking to GPU kernels themselves.
+Racer differs from prior work in its focus on finding bugs:
+of the 82 bugs Racer finds, Volta detects only 9.
+We explain this gap in §7.2.
+
+## 3.2. Background: GPU Execution and PTX
+
+GPU programs have distinctive characteristics that shape how symbolic equivalence checking must be
+built. This subsection reviews the basics of GPU execution, then PTX (, 2026),
+the instruction set at which Racer operates.
+
+GPU execution.
+A GPU is a massively parallel processor that runs tens of thousands of
+threads at once. The program those threads run is a kernel: a single
+function, written from the perspective of one thread, that every thread
+executes over its own slice of the data. To run a kernel, the CPU host
+launches a grid of cooperative thread arrays (CTAs), also called
+thread blocks; the grid and block dimensions, chosen at launch time
+together with the kernel’s arguments, form the launch
+configuration. Every thread runs the same kernel body and is distinguished
+only by its block and thread indices: the single-instruction,
+multiple-thread (SIMT) model. Threads advance in groups of 32, called
+warps, whose members can exchange values directly.
+
+A kernel reads and writes three memory spaces of different scope and
+lifetime: registers and local memory, private to a thread; shared memory, a
+per-CTA scratchpad that dies with the CTA; and global memory, visible to
+every thread in the launch and persistent across launches. Threads within a
+CTA synchronize with a barrier (bar.sync), but threads in different
+CTAs cannot synchronize within an ordinary launch, so a computation needing
+a grid-wide handoff is split into several launches, each reading through
+global memory what the previous one wrote.
+Split-K matrix multiplication is
+the standard example: one launch has each CTA reduce its own slice of K into
+a partial-product buffer, and a second launch sums those partials.
+Both facts matter later: the engine must reproduce this ordering discipline
+faithfully (§5.2).
+
+PTX.
+
+PTX is NVIDIA’s stable virtual instruction set. Kernels written in different
+front ends, such as CUDA C++ (, 2026), Triton (Tillet et al., 2019), Numba (Lam et al., 2015), TVM (Chen et al., 2018), and CuPy (Okuta et al., 2017),
+all lower to PTX before reaching the GPU, which makes it the one level at
+which kernels from different front ends can be compared instruction for
+instruction.
+For example,
+Figure 1
+shows one add-and-narrow computation in CUDA C++
+and Triton, both of which are compiled to
+the same PTX instructions.
+
+⬇
+
+// CUDA C++ (nvcc)
+
+h[i] = __float2half_rn(x[i] + y[i]);
+
+# Triton (MLIR/LLVM)
+
+tl.store(H + i, (tl.load(X + i)
+
+ + tl.load(Y + i)).to(tl.float16))
+
+// PTX (both front ends compile to the same PTX)
+
+add.rn.f32 %
+
+cvt.rn.f16.f32 %
+
+st.global.b16 [%
+
+Figure 1. Add two fp32 values and narrow to fp16, in CUDA C++, in Triton, and
+the PTX both compile to.CUDA and Triton snippets for the same computation and the
+three PTX instructions both lower to.
+
+## 3.3. Challenges in Applying Symbolic Execution
+
+⬇
+
+A: t = x + y; out = t * t
+
+B: out = x*x + 2*x*y + y*y
+
+ $e_{A}=(x+y)^{2},\hskip 16.38895pte_{B}=x^{2}+2xy+y^{2},$ 
+
+ $\mathrm{simplify}(e_{A}-e_{B})\to 0\;\;\Rightarrow\;\;\forall x,y,\,A\equiv B$ 
+
+Figure 2. Symbolic execution and CAS equality: each program yields an
+expression in the free inputs, and their difference simplifying to zero
+proves their equivalence.
+
+Symbolic execution and computer algebra.
+Symbolic execution runs a program over free variables instead of
+concrete data: each arithmetic instruction builds an algebraic expression in
+those variables rather than computing a number, and each branch on a
+symbolic condition is resolved under the constraint that selects its path.
+A computer algebra system (CAS) (Meurer et al., 2017; Wolfram Research, Inc., 2024; Maplesoft, a division of Waterloo Maple Inc., 2024; The Sage Developers, 2024; Maxima.sourceforge.net, 2024)
+then manipulates those expressions exactly,
+using unbounded-precision rational arithmetic
+and algebraic rewriting instead of evaluating them as floating-point approximations.
+We use SymPy (Meurer et al., 2017), a CAS implemented as a Python library.
+To check whether two expressions are equivalent,
+we simplify their difference and check whether it reduces to zero.
+Figure 2 shows an example.
+
+Symbolic executing PTX code.
+Applying symbolic execution on PTX code yields a recipe for symbolic equivalence checking.
+Bind every cell of every input tensor to a free variable instead of a number. Execute the
+kernel’s PTX one instruction at a time, interpreting each by the mathematical
+operation it denotes in the CAS: a floating-point instruction becomes the
+corresponding operation over the reals.
+When the launch ends, every output cell holds an
+exact expression in the input variables, and no rounding has been lost to an
+approximation along the way. Checking two kernels is then subtraction: run
+both over the same symbolic inputs, form the difference of their
+expressions cell by cell, and ask the CAS whether every difference is zero.
+A logical bug is found if the two kernels disagree.
+
+Challenges.
+Naively applying a CAS to PTX instructions, however, does not work.
+Three challenges arise in practice.
+
+• 
+
+Scalability.
+
+A GPU kernel launch can contain thousands of threads, each performing thousands
+of arithmetic operations. Executing all threads and proving each output
+cell independently scales poorly with both thread count and expression
+size: an output at the end of a long reduction carries the full
+expression chain that produced it, which the CAS must repeatedly simplify.
+
+• 
+
+Concurrency.
+GPU kernels are highly concurrent, with many threads cooperating to complete a computation.
+A symbolic engine must therefore model concurrency primitives such as
+barriers,
+warp collectives,
+asynchronous copies,
+atomic instructions,
+and tensor-core instructions.
+Moreover, the result may depend on thread interleavings, so the engine must
+detect and reason about data races. Each construct must either be
+modeled faithfully or rejected outright (§5.2).
+
+• 
+
+Inconclusive results.
+Deciding whether two symbolic expressions are equal is a hard problem.
+For expressions involving a sufficiently rich set of functions, modern CASs may fail to reach a conclusion or may time out.
+In practice, this happens often.
+We therefore need to minimize the chance that the engine returns Unknown (§5.3).
+
+## 4. Racer: a Symbolic Equivalence Checker
+
+(a) The two kernels (CUDA C++)
+
+⬇
+
+ 1
+
+ // reference: GPT-J rotates the pairs (2i, 2i+1)
+
+ 2
+
+ __global__ void rope_gptj(float* out, const float* x,
+
+ 3
+
+ const float* cosv, const float* sinv, int D) {
+
+ 4
+
+ int t = blockIdx.x;
+
+ 5
+
+ for (int i = 0; i < D / 2; i++) {
+
+ 6
+
+ float a = x[t*D + 2*i], b = x[t*D + 2*i+1];
+
+ 7
+
+ float c = cosv[i], s = sinv[i];
+
+ 8
+
+ out[t*D + 2*i] = a*c - b*s;
+
+ 9
+
+ out[t*D + 2*i+1] = a*s + b*c;
+
+ 10
+
+ } }
+
+ 11
+
+ 12
+
+ // shipped for GPT-J heads (#941): the NeoX pairing
+
+ 13
+
+ __global__ void rope_neox(...) { // same prologue
+
+ 14
+
+ for (int i = 0; i < D / 2; i++) {
+
+ 15
+
+ float a = x[t*D + i], b = x[t*D + i + D/2];
+
+ 16
+
+ float c = cosv[i], s = sinv[i];
+
+ 17
+
+ out[t*D + i] = a*c - b*s;
+
+ 18
+
+ out[t*D + i + D/2] = a*s + b*c;
+
+ 19
+
+ } }
+
+(c) The PTX loop bodies
+
+⬇
+
+ 1
+
+ // rope_gptj: one pointer, stepping 8B per iteration
+
+ 2
+
+ $L__BB0_2:
+
+ 3
+
+ ld.global.f32 %
+
+ 4
+
+ ld.global.f32 %
+
+ 5
+
+ // rope_neox: two pointers (D/2)*4B apart, each 4B
+
+ 6
+
+ $L__BB1_2:
+
+ 7
+
+ ld.global.f32 %
+
+ 8
+
+ ld.global.f32 %
+
+(b) The checking instance (Python)
+
+⬇
+
+ 1
+
+ import vk
+
+ 2
+
+ 3
+
+ class RopeGptjNeox(vk.VerifyCase):
+
+ 4
+
+ T, D = 2, 4 # tokens, head dim
+
+ 5
+
+ 6
+
+ def setup(self):
+
+ 7
+
+ self.x = vk.input("x", (self.T, self.D))
+
+ 8
+
+ self.cosv = vk.input("cosv", (self.D // 2,))
+
+ 9
+
+ self.sinv = vk.input("sinv", (self.D // 2,))
+
+ 10
+
+ self.out = vk.empty("out", (self.T, self.D))
+
+ 11
+
+ 12
+
+ def _run(self, kernel):
+
+ 13
+
+ vk.launch(
+
+ 14
+
+ source="rope.cu", kernel=kernel,
+
+ 15
+
+ grid=(self.T, 1, 1),
+
+ 16
+
+ block=(1, 1, 1),
+
+ 17
+
+ args=[vk.write(self.out),
+
+ 18
+
+ vk.read(self.x),
+
+ 19
+
+ vk.read(self.cosv),
+
+ 20
+
+ vk.read(self.sinv),
+
+ 21
+
+ self.D])
+
+ 22
+
+ return {"out": self.out}
+
+ 23
+
+ 24
+
+ def program_a(self): # the shipped kernel
+
+ 25
+
+ return self._run("rope_neox")
+
+ 26
+
+ 27
+
+ def program_b(self): # the reference
+
+ 28
+
+ return self._run("rope_gptj")
+
+Figure 3. The running example, vLLM #941.
+(a) two CUDA rotary-embedding kernels that differ only in which
+elements they pair;
+(b) the checking instance declaring both over the same symbolic inputs at one
+launch configuration;
+(c) the PTX loop bodies the two kernels lower to: same arithmetic,
+different addresses.Three code panels. Panel (a) gives two CUDA
+rotary-embedding kernels that differ only in which elements they pair,
+panel (b) the Python checking instance declaring both over the same
+symbolic input tensors at one launch configuration, and panel (c) the
+PTX loop body each kernel lowers to.
+
+Racer answers the question:
+do the two given GPU kernels compute the same function?
+A user poses this question as a checking instance containing two GPU programs—the
+second serving as the reference implementation, as in differential testing—the
+tensors they read and write, and their launch configurations.
+Racer runs the checking instance.
+When done,
+Racer returns one of three verdicts: Equivalent,
+Inequivalent with a concrete input that separates the two,
+or Unknown.
+
+It takes four steps for Racer to produce the verdict.
+Racer (1) reads the checking instance,
+(2) lowers both programs to PTX whatever front end they were written in,
+(3) executes every thread of every CTA of both programs
+symbolically, leaving one algebraic expression in each output cell,
+and (4) decides, cell by cell, whether
+the two expressions denote the same value.
+The rest of this section walks the four steps on a running example in
+Figure 3, a bug from vLLM (#941).
+
+Step 1: posing the question as a checking instance.
+In Racer,
+a checking instance is a Python class with three methods.
+The first, setup, declares the tensors both sides share;
+the other two, program_a and program_b, each declare one program as a
+sequence of launches.
+Tensor declarations specify shapes, data types, and initial contents:
+vk.input() introduces a free variable for each cell,
+vk.empty() leaves cells uninitialized, and
+vk.zeros() or vk.full() initializes cells
+to a specified constant.
+Each program records a sequence of kernel launches through
+launch call, specifying the kernel, its arguments,
+and its launch configuration.
+Tensor arguments are wrapped in vk.read,
+vk.write, or vk.readwrite to declare
+how each launch accesses them.
+Successive launches exchange data by accessing the same tensors.
+Each program method returns a dictionary naming the output tensors
+whose corresponding cells Racer should compare.
+
+In Figure 3(b),
+setup declares the tensors:
+a $2{\times}4$ activation x and the rotation tables
+cosv and sinv as inputs (free variable)
+and the output out as empty. Each program is a single
+launch of one of the two kernels over the same arguments: one CTA per
+token, one thread per CTA, the head dimension $D{=}4$ passed as a scalar,
+and out wrapped as vk.write where the inputs are
+vk.read.
+The checking instance poses the question: at this
+configuration, do these two kernels compute the same function of
+x, cosv, and sinv?
+
+Step 2: lowering GPU programs to PTX.
+Each launched kernel is lowered to PTX before analysis, making all subsequent stages front-end agnostic (§3.2).
+The current Racer implementation supports three input forms: CUDA C++, Triton, and PTX.
+In principle, Racer can support any GPU programming language whose toolchain compiles to PTX.
+Racer only requires a language-specific adapter.
+
+In our example, both programs are written in CUDA and lower to different PTX
+instructions: Figure 3(c) excerpts the loop body.
+The bug lives in the address arithmetic.
+rope_gptj loads adjacent elements from
+[%rd40+-4] and [%rd40], advancing
+%rd40 by 8 bytes per iteration.
+rope_neox instead loads from [%rd45]
+and [%rd39], where %rd39 is computed as
+%rd45 plus $(D/2)\cdot 4$ bytes.
+Advancing %rd45 by 4 bytes per iteration therefore
+pairs elements from the two halves of the head.
+
+Step 3: executing PTX symbolically.
+Racer implements a symbolic execution engine that interprets each PTX
+instruction into a CAS representation.
+Across threads, Racer uses a lockstep scheduler to coordinate execution within
+each thread block.
+For example, consider the first iteration ( $i=0$ ) of
+rope_neox for token $t$ , with $D=4$ .
+Address calculations resolve to concrete input and output cells,
+while the values loaded from inputs remain symbolic.
+The following instruction sequence illustrates how Racer constructs
+the expression for out[ $t$ ,0].
+Each row shows an instruction and its effect on symbolic state,
+with floating-point arithmetic interpreted over the reals:
+
+PTX instruction
+Symbolic state update
+
+ld.global.f32 %f37,[%rd47]
+ $\texttt{\%f37}\leftarrow c_{0}$ 
+
+ld.global.f32 %f38,[%rd45]
+ $\texttt{\%f38}\leftarrow x_{t,0}$ 
+
+mul.f32 %f39,%f38,%f37
+ $\texttt{\%f39}\leftarrow c_{0}\,x_{t,0}$ 
+
+ld.global.f32 %f40,[%rd48]
+ $\texttt{\%f40}\leftarrow s_{0}$ 
+
+ld.global.f32 %f41,[%rd39]
+ $\texttt{\%f41}\leftarrow x_{t,2}$ 
+
+mul.f32 %f42,%f41,%f40
+ $\texttt{\%f42}\leftarrow s_{0}\,x_{t,2}$ 
+
+sub.f32 %f43,%f39,%f42
+ $\texttt{\%f43}\leftarrow c_{0}x_{t,0}-s_{0}x_{t,2}$ 
+
+st.global.f32 [%rd46],%f43
+ $\texttt{out}[t,0]\leftarrow c_{0}x_{t,0}-s_{0}x_{t,2}$ 
+
+Each arithmetic instruction builds an expression from those already
+held in its source registers; the store writes the resulting
+expression to the addressed output cell.
+In rope_gptj, the corresponding second activation load
+reads $x_{t,1}$ instead of $x_{t,2}$ , producing
+ $c_{0}x_{t,0}-s_{0}x_{t,1}$ .
+
+Step 4: checking output cells.
+When both programs have run, their declared output tensors are paired by
+name, giving for every output cell a pair of expressions to compare.
+The checker forms the difference of each pair and hands it to the underlying CAS (§3.3).
+A checking instance is Equivalent only if every cell of
+every output tensor simplified to zero; a single refuted cell fails the case.
+
+If the CAS leaves a cell unresolved, Racer applies exact numeric refutation,
+which substitutes a concrete rational assignment for the free variables and evaluates expressions exactly:
+a non-zero result is an Inequivalent witness,
+and its absence leaves the cell Unknown,
+since exact evaluation at one point can
+refute but never prove.
+
+In the running example, for cells at position $[t,0]$ ,
+
+ $e_{a}[t,0]=c_{0}\,x_{t,0}-s_{0}\,x_{t,2},\quad\overset{?}{=}\quad e_{b}[t,0]=c_{0}\,x_{t,0}-s_{0}\,x_{t,1}.$ 
+
+Their difference is
+ $e_{a}-e_{b}=s_{0}\,(x_{t,1}-x_{t,2})$ .
+Exact numeric refutation establishes that this expression is not
+identically zero: substituting $s_{0}{=}1$ , $x_{t,1}{=}1$ , and
+ $x_{t,2}{=}0$ yields $e_{a}-e_{b}=1$ .
+This assignment is a concrete witness, so Racer returns Inequivalent.
+
+## 5. Technical Challenges
+
+The design in §4 must address the three challenges
+introduced in §3.3: scalability, concurrency,
+and inconclusive results. This section explains how Racer addresses them
+with shape reduction, a lockstep CTA scheduler, and idiom templates
+with exact numeric refutation and a second prover based on Z3.
+
+## 5.1. Scalability
+
+To prove equality at output cell $c$ , the CAS attempts to simplify
+ $e^{a}_{c}-e^{b}_{c}$ to zero using algebraic transformations such as expanding
+products, cancelling factors, and combining fractions. This process can
+be costly for large expressions. For an output tensor with thousands of cells,
+deciding each cell independently repeats this work even when the
+expression pairs differ only in the input variables they reference.
+Shape reduction reduces the deciding cost by reusing proofs across
+output cells with the same expression structure.
+
+Reusing a representative’s proof.
+GPU kernels commonly apply the same function to different slices of an
+input tensor. Their output expressions then differ only in the input
+variables they reference. Shape reduction groups output cells into uniformity classes: their expression pairs match under a shared renaming of input variables.
+
+Let $e^{a}_{r}$ and $e^{b}_{r}$ be the expressions produced by the two programs
+at a representative cell $r$ , and suppose the deciding procedure has proved
+ $e^{a}_{r}=e^{b}_{r}$ . Another cell $c$ can reuse this proof if a renaming
+ $\tau$ satisfies
+
+ $e^{a}_{c}=\tau(e^{a}_{r})\quad\text{and}\quad e^{b}_{c}=\tau(e^{b}_{r}),$ 
+
+hence $e^{a}_{c}=e^{b}_{c}$ .
+
+For each output tensor, Racer processes cells in sequence and tries to
+reuse a proved representative. It validates each candidate renaming by
+comparing both expression pairs structurally, allowing reordering of
+commutative arguments without invoking CAS simplification.
+
+(a) $C=AB$ $A$ $B$ $C$ $A[0,k]\mapsto A[i,k]$ $B[k,0]\mapsto B[k,j]$ (b) $Y[i,j]=e^{X[i,j]}\big/\sum_{k}e^{X[i,k]}$ $X$ $Y$ $X[0,k]\mapsto X[i,k]$ then $X[i,0]\leftrightarrow X[i,j]$ 
+
+Figure 4. Candidate renamings from representative (black) to target
+(outlined) cells.
+
+Finding candidate renamings.
+Candidates come from input footprints: the indices in each input
+tensor referenced by either program’s expression at a cell. Racer first
+proposes a translation that maps each representative footprint onto the
+target footprint. When the output position identifies an element within
+an input footprint, it also proposes exchanging the translated
+representative position with the target position.
+Figure 4 illustrates both patterns: matrix
+multiplication translates a row of $A$ and a column of $B$ ; row softmax
+translates a row of $X$ and exchanges two entries to select the target
+numerator while preserving the denominator’s sum. Footprints only
+generate candidates; proof reuse requires the structural validation above.
+Algorithm 1 in Appendix A
+gives the candidate-generation procedure.
+
+## 5.2. Concurrency
+
+Threads can compute correct expressions individually and still produce
+an incorrect result if one reads a value before another writes it.
+To address the concurrency challenge in
+§3.3, Racer models both what each thread
+computes and when threads can exchange values.
+
+Coordinating threads.
+Racer executes every thread symbolically. Within each CTA, its scheduler
+runs a thread until it exits or reaches a synchronization point.
+At a barrier, the thread waits until all required participants arrive;
+only then can they continue. The scheduler also coordinates the
+participants of supported warp and tensor-core collectives. If required
+threads cannot meet at the same synchronization point, execution is
+refused. Thus, a thread cannot pass a barrier simply because the engine
+happened to execute it first.
+Algorithm 2 in Appendix A
+gives the scheduler pseudocode.
+
+Ordering memory accesses.
+Scheduling alone cannot detect a missing barrier: running a writer
+before a reader could hide the error. Racer therefore records reads and
+writes in epochs, the intervals between CTA-wide barriers, and
+reports conflicting accesses that lack the required ordering. A CTA
+barrier orders accesses within that CTA; conflicts across CTAs are
+tracked separately, and global memory is retained across launches.
+Asynchronous copies require another ordering rule: issuing a copy does
+not make its data available. Racer exposes the copied data only at the
+modeled completion point—the corresponding wait for cp.async,
+or completion of the associated barrier for TMA—and refuses accesses
+that would use it earlier.
+
+Combining atomic updates.
+Multiple threads may atomically update the same cell in different
+orders. Racer collects these updates and combines them at the next CTA
+barrier for shared memory, or at launch completion for global memory.
+This is valid only when the final value is independent of update order
+under the arithmetic model, as with addition over exact reals
+(§3.3) and supported integer add, min, max,
+and bitwise operations. The engine refuses uses of an atomic’s returned
+old value, mixtures of atomic operations on one cell, and ordinary
+accesses that conflict with pending updates.
+
+## 5.3. Inconclusive Results
+
+The CAS may fail to prove equality within its time budget even when two
+expressions denote the same function (§3.3).
+Racer uses three techniques to reduce these inconclusive outcomes.
+
+Idiom templates.
+Compilation can turn a familiar function, such as $\log(x)$ , into a
+long sequence of bit operations and polynomial arithmetic that obscures
+its meaning to the CAS. Racer recognizes supported routines using
+templates that match their coefficients, operations, guards, and
+register dependencies. It replaces each matched sequence with the
+corresponding mathematical operation under the real-arithmetic model
+of §3.3.
+For example, an inlined libdevice __nv_logf contains the
+following PTX instructions:
+
+⬇
+
+mov.b32 %
+
+add.s32 %
+
+and.b32 %
+
+// ...
+
+mov.f32 %
+
+fma.rn.ftz.f32 %
+
+// ...
+
+setp.lt.u32 %
+
+// ...
+
+selp.f32 %
+
+Matching the full
+routine lets Racer represent its result in %f37 as $\log(x)$ 
+for a positive input $x$ , rather than carrying this instruction sequence
+into the output comparison.
+
+Exact numeric refutation.
+If the CAS leaves a cell unresolved, Racer evaluates both expressions
+at the same concrete input: rational values for free real inputs and
+integers for index inputs, satisfying the checking instance’s constraints and the
+expressions’ domains. It computes their difference using exact fractions
+for rational arithmetic. For functions such as square roots, exponentials,
+and logarithms, it uses interval evaluation with outward rounding to
+bound the true difference. A nonzero exact difference, or an interval
+excluding zero, yields an Inequivalent witness; otherwise, the cell remains
+unresolved.
+
+A second prover.
+When both the CAS and numeric refutation leave a cell unresolved, Racer uses Z3 (de Moura and Bjørner, 2008) to search for an input where its expressions
+differ. This can target boundaries that random inputs rarely reach:
+ $x\geq\lambda$ and $x>\lambda$ , for example, differ only at
+ $x=\lambda$ . For supported expressions, the query encodes both outputs
+and the checking instance’s input constraints. A proposed counterexample yields
+Inequivalent only after the numeric procedure above confirms a nonzero
+difference in the original expressions. An unsatisfiable query proves
+equality only if the encoding preserves the expressions’ arithmetic
+semantics and input domain. Like a CAS proof, this proof can be reused
+by shape reduction after validating the shared renaming. Unsupported
+translations, timeouts, inconclusive solver results, and unvalidated
+candidates leave the cell unresolved.
+
+A concrete refutation yields Inequivalent. Otherwise, the checking instance is Equivalent only when every output cell has been proved equal, directly or by proof
+reuse; any remaining unresolved cell makes it Unknown.
+For an Unknown case, we manually inspect the kernel code alongside
+the unresolved symbolic expressions. This helps us identify bugs or
+limitations of the deciding procedure.
+
+## 6. Bug Study
+
+Our study of 82 bugs across 23 libraries, including 76 previously unknown bugs and six rediscoveries, reveals how real GPU
+kernel defects escape testing. We assign each bug to one category based
+on the primary reason a test can overlook it, illustrating the four
+limitations in §2 before describing the other findings.
+
+Sampled input.
+Some bugs manifest only at a special input value that random tests rarely
+produce, even when they exercise the faulty code.
+
+For example, hardshrink should return zero when $|x|\leq\lambda$ 
+and leave the input unchanged otherwise. The attorch implementation
+instead keeps values equal to the threshold: with $\lambda=0.5$ ,
+it returns $0.5$ for input $0.5$ instead of zero. Inputs on either
+side give correct results, so exposing the bug requires hitting the
+boundary. The seven findings in this category require values rarely
+produced or omitted by the studied generators, including special labels
+that mark elements to ignore.
+
+Implicit input.
+A kernel’s result can depend on memory state or execution conditions
+that tests leave unchanged while varying tensor values.
+
+For example, a Triton-distributed reduction allocates an output cell
+with torch.empty and atomically adds each block’s partial sum
+without first setting the cell to zero. The cell may retain data from
+an earlier use: if it initially contains $c$ , the result is $s+c$ 
+instead of the intended sum $s$ . Atomic addition prevents lost updates
+but does not initialize the cell. Racer reports an uninitialized-memory
+diagnostic, which disappears after zero-initialization.
+The 11 findings in this category also involve tensor layouts and
+parameter settings left unvaried by the studied tests, even when these
+are explicit arguments.
+
+Unchecked output.
+A kernel can compute the output tensor correctly yet write past its
+allocated buffer. A test comparing only that tensor does not inspect
+the extra writes.
+
+For example, fla’s squared-ReLU backward kernel handles 4,096
+elements per block and should limit the final block’s writes to valid
+elements. Instead, it writes all 4,096 results even when the output
+has only 64 elements. Those 64 values match the reference, but the
+remaining 4,032 writes exceed the output allocation and overwrite
+memory beyond it. This category contains six out-of-bounds write bugs
+across five libraries.
+
+Below tolerance.
+A wrong formula can produce values close enough to the reference to
+pass a test: tolerances intended to allow floating-point rounding can
+also hide programming errors.
+
+For example, FlagGems’ InstanceNorm recovers variance from a stored
+value $\mathrm{rstd}=1/\sqrt{\mathrm{var}+\epsilon}$ .
+Squaring and inverting gives $\mathrm{var}+\epsilon$ , so recovery
+requires subtracting $\epsilon$ . The kernel adds it instead,
+overestimating the variance by $2\epsilon$ before updating the running
+statistics. For small $\epsilon$ , the resulting error can fall within
+the test’s tolerance. The six findings in this category are masked by
+the tolerances used for the studied inputs.
+
+Other.
+Other findings involve gaps in test coverage, invalid memory accesses,
+and synchronization errors. For example, the rotary-embedding kernel
+in Figure 3 pairs the wrong input elements.
+Of these 52 bugs, 40 can be exposed by comparison
+with an independent reference at a triggering configuration; existing
+tests miss relevant paths, share faulty logic, or omit a comparison.
+Seven read outside an allocated buffer, e.g. FlagGems’ bucketize fetches elements past the input’s end.
+Four are data races: threads access the same memory, with
+at least one writing, without synchronization to order the accesses.
+Their effects depend on thread timing, so a passing run does not
+establish correct synchronization.
+One further bug modifies padding within the allocation without changing the operator’s semantic output.
+
+## 7. Evaluation
+
+We evaluate Racer’s bug findings, detection by other methods,
+equivalence coverage, and end-to-end checking cost.
+
+Experimental setup.
+We conduct the experiments on a server with two AMD EPYC 9575F CPUs
+(128 cores), Python 3.11.16, and SymPy 1.13.1. An NVIDIA RTX PRO 6000
+captures launches, replays witnesses, and runs
+the concrete baselines. The server runs Rocky Linux 9.6 with CUDA 13.1.
+Racer compiles CUDA sources with nvcc 12.4 and
+Triton kernels with Triton 3.2.0, both emitting PTX ISA 8.4.
+
+## 7.1. Finding Bugs in Production Kernels
+
+We examine production kernels from 41 collection targets with Racer and identify 82 distinct bugs across 23 libraries:
+76 previously unknown bugs and six rediscoveries.
+§6 analyzes the defects; here we describe
+how they were found and counted.
+
+Pipeline.
+We first harvest kernel entry points from open-source implementations
+and capture the kernel together with the grid, block,
+and shared-memory size of a real GPU launch as a checking instance (§4).
+We then construct
+comparisons against an independent implementation, a naive reference
+drafted by an LLM-based agent under our direction, or another
+configuration of the same kernel. The last comparison uses the same
+inputs and changes a configuration expected to preserve the
+operator’s semantics.
+
+Counting.
+We review refuted and unresolved output comparisons alongside
+engine diagnostics. Of the 82 bugs, 35 are exposed
+by race or memory diagnostics, 41 by output refutations, and six by
+manual inspection of cases that remain Unknown.
+An Unknown result alone does not establish a bug.
+
+The study excludes duplicates and previously unknown findings not filed
+upstream. All 76 new bugs have an upstream
+issue or pull request.
+Table 1 reports their
+distribution. These counts refer to distinct bugs, not distinct buggy
+kernels or the number of refuted kernels in §7.3.
+41 of the 76 new bugs are
+confirmed: 29 are fixed upstream, four are acknowledged by maintainers,
+and eight are independently validated (six with a proposed fix and
+two with a public endorsement).
+
+Table 1. Bugs in the study by library. Found includes previously
+unknown bugs and rediscoveries; new denotes previously unknown bugs
+filed upstream; confirmed denotes new bugs fixed or acknowledged by
+maintainers, or validated by an independent contributor.
+
+Library
+Found
+New
+Confirmed
+
+FlagGems
+25
+23
+5
+
+flash-linear-attention
+11
+11
+11
+
+Attorch
+6
+6
+6
+
+CuPy
+6
+6
+1
+
+Triton-distributed
+4
+3
+1
+
+torchao
+4
+4
+3
+
+Liger-Kernel
+3
+2
+2
+
+vLLM
+2
+0
+0
+
+15 others
+21
+21
+12
+
+Total
+82
+76
+41
+
+## 7.2. Comparison with Other Methods
+
+We compare Racer with differential testing and two tools:
+Volta (Driscoll et al., 2026), used as shipped, and
+compute-sanitizer from NVIDIA (, 2026).
+The comparison uses the set of 82 bugs found by Racer.
+
+We assess an oracle differential tester with unlimited compute:
+given a triggering launch configuration and an independent reference,
+it tests every possible tensor input using a tolerance-based output
+comparison. This is a per-bug assessment, not a measured testing campaign.
+Sanitizer and Volta results come from recorded runs.
+Figure 5 groups the results using the categories
+of §6.
+
+Figure 5. Comparison of Racer, oracle differential-testing, compute-sanitizer, and Volta on the 82-bug set.
+
+Differential testing.
+Under exhaustive input enumeration, differential testing can detect
+all seven sampled-input bugs: it reaches the exact boundary values
+and special inputs that random generators can miss. Together with the
+40 bugs in Other identified by the audit, this gives 47 of 82 bugs. Exhausting tensor inputs does not by itself ensure variation of
+prior memory state or thread schedules, inspection of writes outside
+the output tensor, or detection of differences within the tolerance.
+The remaining assessments retain the audit’s judgments under these
+conditions; they do not establish that no concrete test can expose
+those bugs.
+
+compute-sanitizer.
+The recorded runs detect 18 bugs:
+four in implicit input, three in unchecked output, and eleven in Other.
+Seven of the detections in Other are read-only overruns. These
+results illustrate the value of checking memory accesses in addition
+to comparing output values. None of these runs reports the four race bugs;
+this result is specific to the configurations and executions evaluated.
+
+Volta.
+We run the shipped Volta baseline and it detects 9 bugs:
+one in implicit input, two in unchecked output, and six in Other.
+It detects none of the sampled-input or below-tolerance bugs,
+and none of the four races.
+
+The recorded failures identify concrete barriers to applying Volta
+to these kernels. In 41 cases, unsupported instructions prevent
+execution. One example is the Triton-distributed
+reduction in §6: Volta stops at an atomic instruction
+before it can expose the uninitialized-memory bug.
+
+Another limitation arises when the two implementations divide work
+differently across CTAs. In the FlagGems MSE-backward comparison,
+the tested kernel writes four output cells in CTA 0, while the
+reference writes one cell per CTA across four CTAs. Because Volta
+compares only CTA 0 on each side, it encounters different sets of
+written cells and cannot compare their values. Racer executes both
+grids in full, allowing it to compare corresponding output cells
+regardless of which CTA writes them. Three study cases encounter
+this limitation in Volta. Four others require comparing programs
+with multiple launches, which Volta does not support.
+
+## 7.3. Coverage
+
+We assess Racer’s coverage by measuring how many kernels it can
+execute and how often it reaches an equivalence decision.
+Each kernel is evaluated through several checking instances, each
+specifying a launch configuration. Their outcomes can differ: a
+kernel may be proved equivalent at one configuration, remain
+unresolved at another, and be refuted at a third.
+Table 2 summarizes the evidence across these instances.
+We group kernels with an Inequivalent or Unknown result, or a race or
+memory diagnostic, as bug candidates. This group takes priority
+over a proof at another configuration. An Unknown result alone
+does not establish a bug; these candidates require triage.
+
+Table 2. Coverage over 2,408 kernels, summarized across their
+checking instances. Each kernel appears in exactly one row.
+
+Kernel summary
+Kernels
+Share
+
+Equivalent
+1,698
+70.5%
+
+Bug candidates
+197
+8.2%
+
+Timeout, no decision
+14
+0.6%
+
+Execution refused
+499
+20.7%
+
+Total
+2,408
+100.0%
+
+The Equivalent row contains 1,698 kernels with at least one proof and
+no recorded bug-candidate outcome. Each proof applies only to the
+outputs and index assignments checked at that configuration.
+The 197 candidates include 77 kernels with refutations, 23 with
+Unknown results, and 110 with race or memory diagnostics; these
+counts overlap. A kernel appears in this row even if another
+configuration is proved equivalent. Timeouts can also coexist with
+other outcomes: 132 of the 146 kernels with timed-out instances have
+a proof or refutation elsewhere; the remaining 14 appear separately.
+
+Extending coverage.
+The remaining 499 kernels (20.7%) fall in the execution-refusal row.
+These refusals include unsupported integer operations, addresses or
+control flow that depend on symbolic data, synchronization patterns
+beyond the current model, and execution limits (§5).
+We leave extending this coverage to future work.
+
+Resolving inconclusive results.
+Of the 82 bugs, 35 produce race or memory diagnostics.
+Among the remaining bugs, CAS cancellation alone detects one:
+a constant bias in FlagGems’ running-statistics update leaves a
+nonzero constant after cancellation. For the other output comparisons,
+symbols remain in the difference, so cancellation leaves these comparisons unresolved.
+Exact numeric refutation resolves 36 of these cases, and the Z3
+second prover resolves four more. Together, these techniques resolve
+40 of the 46 cases (87.0%) left inconclusive by cancellation.
+Including the diagnostics and constant-bias refutation, Racer automatically exposes 76 of the 82 bugs (92.7%). The remaining
+six retain Unknown verdicts; we identify their bugs by manually
+inspecting the kernel code and symbolic expressions.
+
+## 7.4. Shape Reduction vs. Whole-Grid Checking
+
+We compare deciding each output cell independently (whole-grid
+checking) with reusing proofs through shape reduction
+(§5.1). We measure end-to-end wall-clock time,
+including symbolic execution, deciding, and other engine stages.
+
+Our sample contains 50 kernels: 40 with Equivalent verdicts at their
+captured shapes and ten with bugs. We run each at its captured
+shape ( $\times 1$ ) and at $\times 2$ and $\times 4$ , scaling one
+selected dimension while keeping the others fixed. This gives
+150 kernel–configuration pairs.
+
+Shape reduction preserves every proof and refutation returned by
+whole-grid checking: the methods agree on all 148
+kernel–configuration pairs that both decide. Both decide all
+50 kernels at $\times 1$ and $\times 2$ , and both refute all ten
+bugs at every shape. At $\times 4$ , whole-grid checking decides
+48 kernels and shape reduction decides 49; one kernel times out
+under both methods. Thus, there are no contradictory verdicts,
+and shape reduction proves one additional configuration within
+the budget.
+
+Shape reduction substantially reduces the cost of repeated proofs.
+For the linear-attention backward kernel
+chunk_ttt_linear_bwd_dv, it reduces end-to-end time
+from 204.9 s to 17.4 s at $\times 1$ and from 415.8 s to
+34.0 s at $\times 2$ , speedups of $11.8\times$ and $12.2\times$ .
+At $\times 4$ , whole-grid checking exceeds 600 s without a
+proof, whereas shape reduction proves equivalence in 70.7 s.
+It uses only 16 representative proofs for 2,048, 4,096, and
+8,192 output cells, respectively. A separate configuration of
+this kernel, scaling a different shape dimension, shows the same
+benefit: whole-grid checking again exceeds 600 s, while shape
+reduction requires only 66.7 s.
+
+Across the 40 equivalent kernels at $\times 1$ , shape reduction
+lowers mean end-to-end time from 14.5 s to 6.0 s, an aggregate
+speedup of $2.4\times$ . Aggregate speedup is the ratio of summed
+end-to-end times over the same completed comparisons.
+Table 3 follows the fixed set of 38 equivalent
+kernels completed by both methods at every shape. It excludes
+both kernels with timeouts from all three columns. Shape reduction
+reduces their mean end-to-end cost by $1.72\times$ , $1.55\times$ ,
+and $1.55\times$ , respectively. At $\times 4$ , mean deciding time
+falls from 18.7 s to 2.1 s, while symbolic execution still takes
+about 28 s under either method. Symbolic execution therefore
+limits the end-to-end speedup even when proof reuse substantially
+reduces deciding time.
+
+Table 3. Mean end-to-end time in seconds for the same 38 equivalent
+kernels completed by both methods at all three shapes. Kernels
+with a timeout under either method are excluded at every shape.
+
+Shape multiplier
+ $\times 1$ 
+ $\times 2$ 
+ $\times 4$ 
+
+Whole-grid checking
+9.5
+22.2
+47.0
+
+Shape reduction
+5.5
+14.3
+30.3
+
+End-to-end speedup
+ $1.72\times$ 
+ $1.55\times$ 
+ $1.55\times$ 
+
+## 8. Related Work
+
+Testing and property checking for GPU kernels.
+Existing tools expose functional errors through testing or check specific
+kernel properties.
+NNSmith (Liu et al., 2023a), Tzer (Liu et al., 2022), and
+NeuRI (Liu et al., 2023b) generate or mutate tensor programs to expose
+compiler bugs. Differential output comparisons can reveal functional
+errors, subject to the testing limitations discussed in §2.
+cuFuzz (Tarek Ibn Ziad and Kozyrakis, 2026) uses coverage-guided fuzzing of CUDA
+applications with sanitizer integration. NVIDIA’s
+compute-sanitizer (, 2026)
+checks memory accesses and synchronization during execution.
+Race detectors include Barracuda (Eizenberg et al., 2017),
+CURD (Peng et al., 2018), and ScoRD (Kamath et al., 2020);
+Simulee (Wu et al., 2020) models
+memory accesses to detect synchronization bugs.
+PUG (Li and Gopalakrishnan, 2010), GPUVerify (Betts et al., 2012; Betts et al., 2015),
+GKLEE (Li et al., 2012), and ESBMC-GPU (Pereira et al., 2016)
+use symbolic execution or formal verification to check properties such as
+race freedom and synchronization correctness within their supported
+execution models and analysis bounds;
+PUG and GKLEE also check functional assertions.
+Model execution can provide input constraints for checking kernel memory safety.
+M2K (He et al., 2026) checks CUDA memory safety under argument constraints
+inferred from model execution, using symbolic tensor sizes and thread identifiers to cover
+variable shapes and launch configurations.
+Racer instead compares the functions computed by two programs at declared
+tensor shapes and launch configurations, an equivalence question that
+memory and synchronization checks alone do not resolve.
+
+Program equivalence and translation validation.
+Comparing program behavior provides a basis for validating compiler
+transformations and alternative implementations.
+Translation validation checks the correctness of individual compiler
+transformations (Pnueli et al., 1998; Necula, 2000);
+Alive2 (Lopes et al., 2021) provides bounded validation for LLVM.
+Regression verification, SymDiff, and product programs reason about
+relationships between programs (Godlin and Strichman, 2009; Lahiri et al., 2012; Barthe et al., 2011);
+KLEE (Cadar et al., 2008) uses symbolic execution to cross-check
+implementations along explored paths.
+GPU-kernel equivalence additionally requires modeling communication and
+synchronization among threads whose work assignments may differ between
+implementations (§3.3).
+
+Tensor-program verification.
+Tensor-program verifiers reason about computations expressed in tensor
+graphs or specialized languages.
+At the tensor-graph level, TASO (Jia et al., 2019) and
+TensorRight (Arora et al., 2025) prove rewrites correct under their
+operator semantics.
+TrainVerify (Lu et al., 2025) checks a distributed training plan
+against its single-device specification. Its shape reduction shrinks
+tensor shapes while preserving the equivalence question over the modeled
+operators. Racer instead executes the compiled kernels and reuses an
+output-cell proof only when a validated shared renaming relates both
+programs’ expression pairs (§5.1).
+Mirage (Wu et al., 2025) uses probabilistic equivalence verification
+with formal guarantees over its representation of tensor programs at the
+kernel, thread-block, and thread levels.
+Ave (Mai et al., 2026) guides kernel optimization by checking data-flow
+invariants expressed as symbolic tags and assertions in its tensor language,
+and tests candidate kernels for functional correctness.
+Racer compares symbolic output expressions derived from compiled PTX,
+modeling the memory accesses and synchronization that implement the computation.
+
+GPU-kernel equivalence checking.
+Functional proofs can also connect CUDA kernels to high-level specifications.
+ProofWright (Chatterjee et al., 2025) uses LLMs to generate VerCors
+annotations for CUDA memory and thread safety, and combines Rocq proofs
+with functional annotations to relate kernels to PyTorch specifications.
+Its evaluated functional proofs cover a subclass of element-wise kernels;
+the translation from Rocq specifications to VerCors annotations is
+manually validated.
+
+Volta (Driscoll et al., 2026) is the closest prior work, sharing Racer’s approach of
+symbolically executing PTX over exact reals to check equivalence.
+It provides an equality decision procedure for its
+supported expression class. It also checks concurrency properties under
+its structured-CTA model and rejects programs outside that model.
+Racer compares complete output tensors across all CTAs and successive
+launches, allowing the two implementations to partition work
+differently. It also supports additional production PTX constructs
+and reuses output-cell proofs through shape reduction.
+
+## Acknowledgments
+
+ChatGPT and Claude assisted with drafting and revising the manuscript.
+LLM-based agents also assisted with constructing reference kernels
+and investigating candidate bugs, as described in Section 7.1.
+The authors are responsible for the paper’s content and conclusions.
+
+## References
+
+Ahmadzadeh (2024)
+Attorch: a subset of PyTorch’s NN module written in Python using triton
+
+External Links: Link
+
+Cited by: §2.
+
+Arora et al. (2025)
+J. Arora, S. Lu, D. Jain, T. Xu, F. Houshmand, P. M. Phothilimthana, M. Lesani, P. Narayanan, K. S. Murthy, R. Bodik, et al.
+
+Tensorright: automated verification of tensor graph rewrites.
+
+Proceedings of the ACM on Programming Languages 9 (POPL), pp. 832–863.
+
+Cited by: §1,
+§3.1,
+§8.
+
+Barthe et al. (2011)
+G. Barthe, J. M. Crespo, and C. Kunz
+
+Relational verification using product programs.
+
+In FM 2011: Formal Methods,
+
+Lecture Notes in Computer Science, Vol. 6664, pp. 200–214.
+
+External Links: Document
+
+Cited by: §8.
+
+Beck et al. (2026)
+M. Beck, K. Pöppel, P. Lippe, and S. Hochreiter
+
+Tiled flash linear attention: more efficient linear rnn and xlstm kernels.
+
+Advances in Neural Information Processing Systems 38, pp. 75093–75148.
+
+Cited by: §2,
+§2.
+
+Betts et al. (2015)
+A. Betts, N. Chong, A. F. Donaldson, J. Ketema, S. Qadeer, P. Thomson, and J. Wickerson
+
+The design and implementation of a verification technique for GPU kernels.
+
+ACM Trans. Program. Lang. Syst. 37 (3).
+
+External Links: Document
+
+Cited by: §8.
+
+Betts et al. (2012)
+A. Betts, N. Chong, A. Donaldson, S. Qadeer, and P. Thomson
+
+GPUVerify: a verifier for GPU kernels.
+
+In Proceedings of the ACM International Conference on Object Oriented Programming Systems Languages and Applications (OOPSLA),
+
+pp. 113–132.
+
+External Links: Document
+
+Cited by: §8.
+
+Bikshandi and Shah (2023)
+G. Bikshandi and J. Shah
+
+A case study in cuda kernel fusion: implementing flashattention-2 on nvidia hopper architecture using the cutlass library.
+
+arXiv preprint arXiv:2312.11918.
+
+Cited by: §1,
+§2,
+§2.
+
+Cadar et al. (2008)
+C. Cadar, D. Dunbar, and D. Engler
+
+KLEE: unassisted and automatic generation of high-coverage tests for complex systems programs.
+
+In 8th USENIX Symposium on Operating Systems Design and Implementation (OSDI),
+
+Cited by: §8.
+
+Chatterjee et al. (2025)
+B. Chatterjee, D. Zagieboylo, S. Damani, S. Hari, and C. Kozyrakis
+
+ProofWright: towards agentic formal verification of CUDA.
+
+External Links: 2511.12294,
+Link
+
+Cited by: §8.
+
+Chen et al. (2026)
+H. Chen, B. Fan, A. Collins, B. Hagedorn, E. Gaburov, M. Masuda, M. Brookhart, C. Sullivan, J. Knight, Z. Zhang, et al.
+
+Tawa: automatic warp specialization for modern gpus with asynchronous references.
+
+In 2026 IEEE/ACM International Symposium on Code Generation and Optimization (CGO),
+
+pp. 255–267.
+
+Cited by: §1,
+§2.
+
+Chen et al. (2018)
+T. Chen, T. Moreau, Z. Jiang, L. Zheng, E. Yan, H. Shen, M. Cowan, L. Wang, Y. Hu, L. Ceze, et al.
+
+ $\{$ tvm $\}$ : An automated $\{$ end-to-end $\}$ optimizing compiler for deep learning.
+
+In 13th USENIX symposium on operating systems design and implementation (OSDI 18),
+
+pp. 578–594.
+
+Cited by: §3.2.
+
+[12]
+ (2026)
+
+Compute sanitizer api reference manual.
+
+ NVIDIA Corporation.
+
+Note: Accessed: 2026-08-28
+
+External Links: Link
+
+Cited by: §1,
+§7.2,
+§8.
+
+contributors (2024)
+T. F. contributors
+
+FlagOS/flaggems: an operator library for large language models implemented in the triton language..
+
+External Links: Link
+
+Cited by: §2.
+
+[14]
+ (2026)
+
+CUDA C++ programming guide.
+
+ NVIDIA Corporation.
+
+Note: Accessed: 2026-09-05
+
+External Links: Link
+
+Cited by: §3.2.
+
+Dao et al. (2022)
+T. Dao, D. Fu, S. Ermon, A. Rudra, and C. Ré
+
+Flashattention: fast and memory-efficient exact attention with io-awareness.
+
+Advances in neural information processing systems 35, pp. 16344–16359.
+
+Cited by: §1,
+§2,
+§2.
+
+Dao (2024)
+T. Dao
+
+Flashattention-2: faster attention with better parallelism and work partitioning.
+
+In International Conference on Learning Representations,
+
+Vol. 2024, pp. 35549–35562.
+
+Cited by: §1,
+§2,
+§2.
+
+de Moura and Bjørner (2008)
+L. de Moura and N. Bjørner
+
+Z3: an efficient SMT solver.
+
+In Tools and Algorithms for the Construction and Analysis of Systems (TACAS),
+
+Lecture Notes in Computer Science, Vol. 4963, pp. 337–340.
+
+External Links: Document
+
+Cited by: §5.3.
+
+Driscoll et al. (2026)
+B. Driscoll, K. Dubey, A. Wei, N. Kayal, R. Sharma, and A. Aiken
+
+Equivalence checking of ML GPU kernels.
+
+Proc. ACM Program. Lang. 10 (OOPSLA2).
+
+External Links: Document
+
+Cited by: §1,
+§1,
+§3.1,
+§7.2,
+§8.
+
+Eizenberg et al. (2017)
+A. Eizenberg, Y. Peng, T. Pigli, W. Mansky, and J. Devietti
+
+BARRACUDA: binary-level analysis of runtime RAces in CUDA programs.
+
+In Proceedings of the 38th ACM SIGPLAN Conference on Programming Language Design and Implementation (PLDI),
+
+pp. 126–140.
+
+External Links: Document
+
+Cited by: §8.
+
+Frantar et al. (2025)
+E. Frantar, R. L. Castro, J. Chen, T. Hoefler, and D. Alistarh
+
+Marlin: mixed-precision auto-regressive parallel inference on large language models.
+
+In Proceedings of the 30th ACM SIGPLAN Annual Symposium on Principles and Practice of Parallel Programming,
+
+pp. 239–251.
+
+Cited by: §1.
+
+Godlin and Strichman (2009)
+B. Godlin and O. Strichman
+
+Regression verification.
+
+In Proceedings of the 46th Annual Design Automation Conference (DAC),
+
+pp. 466–471.
+
+External Links: Document
+
+Cited by: §8.
+
+He et al. (2026)
+M. He, S. Xia, H. Jia, W. Wu, and L. Song
+
+M2K: making the model-kernel interface explicit for reliable CUDA kernel verification.
+
+In Proceedings of the 32nd ACM SIGOPS Symposium on Operating Systems Principles (SOSP),
+
+Note: To appear
+
+External Links: Link
+
+Cited by: §8.
+
+Hsu et al. (2024)
+P. Hsu, Y. Dai, V. Kothapalli, Q. Song, S. Tang, S. Zhu, S. Shimizu, S. Sahni, H. Ning, and Y. Chen
+
+Liger kernel: efficient triton kernels for llm training.
+
+arXiv preprint arXiv:2410.10989.
+
+Cited by: §1,
+§2.
+
+Jia et al. (2019)
+Z. Jia, O. Padon, J. Thomas, T. Warszawski, M. Zaharia, and A. Aiken
+
+TASO: optimizing deep learning computation with automatic generation of graph substitutions.
+
+In Proceedings of the 27th ACM Symposium on Operating Systems Principles (SOSP),
+
+pp. 47–62.
+
+External Links: Document
+
+Cited by: §8.
+
+Kamath et al. (2020)
+A. K. Kamath, A. A. George, and A. Basu
+
+ScoRD: a scoped race detector for GPUs.
+
+In Proceedings of the 47th Annual International Symposium on Computer Architecture (ISCA),
+
+pp. 1036–1049.
+
+External Links: Document
+
+Cited by: §8.
+
+Kwon et al. (2023)
+W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E. Gonzalez, H. Zhang, and I. Stoica
+
+Efficient memory management for large language model serving with pagedattention.
+
+In Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles,
+
+Cited by: §1.
+
+Lahiri et al. (2012)
+S. K. Lahiri, C. Hawblitzel, M. Kawaguchi, and H. Rebêlo
+
+SYMDIFF: a language-agnostic semantic diff tool for imperative programs.
+
+In Computer Aided Verification (CAV),
+
+Lecture Notes in Computer Science, Vol. 7358, pp. 712–717.
+
+External Links: Document
+
+Cited by: §8.
+
+Lam et al. (2015)
+S. K. Lam, A. Pitrou, and S. Seibert
+
+Numba: a llvm-based python jit compiler.
+
+In Proceedings of the Second Workshop on the LLVM Compiler Infrastructure in HPC,
+
+pp. 1–6.
+
+Cited by: §3.2.
+
+Li and Gopalakrishnan (2010)
+G. Li and G. Gopalakrishnan
+
+Scalable SMT-based verification of GPU kernel functions.
+
+In Proceedings of the 18th ACM SIGSOFT International Symposium on Foundations of Software Engineering (FSE),
+
+pp. 187–196.
+
+External Links: Document
+
+Cited by: §8.
+
+Li et al. (2012)
+G. Li, P. Li, G. Sawaya, G. Gopalakrishnan, I. Ghosh, and S. P. Rajan
+
+GKLEE: concolic verification and test generation for GPUs.
+
+In Proceedings of the 17th ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming (PPoPP),
+
+pp. 215–224.
+
+External Links: Document
+
+Cited by: §8.
+
+Lin et al. (2024)
+J. Lin, J. Tang, H. Tang, S. Yang, W. Chen, W. Wang, G. Xiao, X. Dang, C. Gan, and S. Han
+
+AWQ: activation-aware weight quantization for llm compression and acceleration.
+
+In MLSys,
+
+Cited by: §1.
+
+Liu et al. (2023a)
+J. Liu, J. Lin, F. Ruffy, C. Tan, J. Li, A. Panda, and L. Zhang
+
+NNSmith: generating diverse and valid test cases for deep-learning compilers.
+
+In Proceedings of the 28th ACM International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS),
+
+Cited by: §8.
+
+Liu et al. (2023b)
+J. Liu, J. Peng, Y. Wang, and L. Zhang
+
+NeuRI: diversifying DNN generation via inductive rule inference.
+
+In Proceedings of the 31st ACM Joint European Software Engineering Conference and Symposium on the Foundations of Software Engineering (ESEC/FSE),
+
+pp. 657–669.
+
+External Links: Document
+
+Cited by: §8.
+
+Liu et al. (2022)
+J. Liu, Y. Wei, S. Yang, Y. Deng, and L. Zhang
+
+Coverage-guided tensor compiler fuzzing with joint IR-pass mutation.
+
+Proc. ACM Program. Lang. 6 (OOPSLA1).
+
+External Links: Document
+
+Cited by: §8.
+
+Lopes et al. (2021)
+N. P. Lopes, J. Lee, C. Hur, Z. Liu, and J. Regehr
+
+Alive2: bounded translation validation for LLVM.
+
+In Proceedings of the 42nd ACM SIGPLAN International Conference on Programming Language Design and Implementation (PLDI),
+
+pp. 65–79.
+
+External Links: Document
+
+Cited by: §8.
+
+Lu et al. (2025)
+Y. Lu, Y. Miao, C. Tan, P. Huang, Y. Zhu, X. Zhang, and F. Yang
+
+Trainverify: equivalence-based verification for distributed llm training.
+
+In Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles,
+
+pp. 237–253.
+
+Cited by: §1,
+§3.1,
+§8.
+
+Mai et al. (2026)
+H. Mai, X. Guo, X. Ding, D. Li, Q. Yu, C. Guo, C. Wang, J. Zhao, C. Kozyrakis, and B. Yuan
+
+Ave: guiding agentic GPU optimization using data-flow invariants.
+
+In Proceedings of the 32nd ACM SIGOPS Symposium on Operating Systems Principles (SOSP),
+
+Note: To appear. Preprint circulated as ARGUS
+
+External Links: Link
+
+Cited by: §8.
+
+Maplesoft, a division of Waterloo Maple Inc. (2024)
+Maplesoft, a division of Waterloo Maple Inc.
+
+Maple 2024.
+
+Waterloo, Ontario.
+
+External Links: Link
+
+Cited by: §3.3.
+
+Maxima.sourceforge.net (2024)
+Maxima.sourceforge.net
+
+Maxima, a Computer Algebra System, Version 5.47.0.
+
+External Links: Link
+
+Cited by: §3.3.
+
+McKeeman (1998)
+W. M. McKeeman
+
+Differential testing for software.
+
+Digital Technical Journal 10 (1), pp. 100–107.
+
+Cited by: §1.
+
+Meurer et al. (2017)
+A. Meurer, C. P. Smith, M. Paprocki, O. Čertík, S. B. Kirpichev, M. Rocklin, A. Kumar, S. Ivanov, J. K. Moore, S. Singh, T. Rathnayake, S. Vig, B. E. Granger, R. P. Muller, F. Bonazzi, H. Gupta, S. Vats, F. Johansson, F. Pedregosa, M. J. Curry, A. R. Terrel, Š. Roučka, A. Saboo, I. Fernando, S. Kulal, R. Cimrman, and A. Scopatz
+
+SymPy: symbolic computing in python.
+
+PeerJ Computer Science 3, pp. e103.
+
+External Links: ISSN 2376-5992,
+Link,
+Document
+
+Cited by: §3.3.
+
+Micikevicius et al. (2022)
+P. Micikevicius, D. Stosic, N. Burgess, M. Cornea, P. Dubey, R. Grisenthwaite, S. Ha, A. Heinecke, P. Judd, J. Kamalu, et al.
+
+Fp8 formats for deep learning.
+
+arXiv preprint arXiv:2209.05433.
+
+Cited by: §1.
+
+Necula (2000)
+G. C. Necula
+
+Translation validation for an optimizing compiler.
+
+In Proceedings of the ACM SIGPLAN 2000 Conference on Programming Language Design and Implementation (PLDI),
+
+pp. 83–94.
+
+External Links: Document
+
+Cited by: §8.
+
+Okuta et al. (2017)
+R. Okuta, Y. Unno, D. Nishino, S. Hido, and C. Loomis
+
+CuPy: a numpy-compatible library for nvidia gpu calculations.
+
+In Proceedings of Workshop on Machine Learning Systems (LearningSys) in The Thirty-first Annual Conference on Neural Information Processing Systems (NIPS),
+
+External Links: Link
+
+Cited by: §3.2.
+
+[45]
+ (2026)
+
+Parallel thread execution isa.
+
+ NVIDIA Corporation.
+
+Note: Accessed: 2026-08-28
+
+External Links: Link
+
+Cited by: §1,
+§3.2.
+
+Paszke et al. (2019)
+A. Paszke, S. Gross, F. Massa, A. Lerer, J. Bradbury, G. Chanan, T. Killeen, Z. Lin, N. Gimelshein, L. Antiga, et al.
+
+Pytorch: an imperative style, high-performance deep learning library.
+
+Advances in neural information processing systems 32.
+
+Cited by: §1.
+
+Peng et al. (2018)
+Y. Peng, V. Grover, and J. Devietti
+
+CURD: a dynamic CUDA race detector.
+
+In Proceedings of the 39th ACM SIGPLAN Conference on Programming Language Design and Implementation (PLDI),
+
+pp. 390–403.
+
+External Links: Document
+
+Cited by: §8.
+
+Pereira et al. (2016)
+P. Pereira, H. Albuquerque, H. Marques, I. Silva, C. Carvalho, L. Cordeiro, V. Santos, and R. Ferreira
+
+Verifying CUDA programs using SMT-based context-bounded model checking.
+
+In Proceedings of the 31st Annual ACM Symposium on Applied Computing (SAC),
+
+pp. 1648–1653.
+
+External Links: Document
+
+Cited by: §8.
+
+Pnueli et al. (1998)
+A. Pnueli, M. Siegel, and E. Singerman
+
+Translation validation.
+
+In Tools and Algorithms for the Construction and Analysis of Systems (TACAS),
+
+Lecture Notes in Computer Science, Vol. 1384, pp. 151–166.
+
+External Links: Document
+
+Cited by: §8.
+
+Spector et al. (2025)
+B. F. Spector, S. Arora, A. Singhal, A. Parthasarathy, D. Y. Fu, and C. Re
+
+ThunderKittens: simple, fast, and $\textit{adorable}$ kernels.
+
+In The Thirteenth International Conference on Learning Representations,
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Tarek Ibn Ziad and Kozyrakis (2026)
+M. Tarek Ibn Ziad and C. Kozyrakis
+
+Hunting CUDA bugs at scale with cuFuzz.
+
+Proc. ACM Program. Lang. 10 (OOPSLA1), pp. 877–904.
+
+External Links: Document
+
+Cited by: §8.
+
+The Sage Developers (2024)
+The Sage Developers
+
+SageMath, the Sage Mathematics Software System (Version 10.4).
+
+Note: https://www.sagemath.org
+
+External Links: Link
+
+Cited by: §3.3.
+
+Tillet et al. (2019)
+P. Tillet, H. Kung, and D. Cox
+
+Triton: an intermediate language and compiler for tiled neural network computations.
+
+In Proceedings of the 3rd ACM SIGPLAN International Workshop on Machine Learning and Programming Languages,
+
+pp. 10–19.
+
+Cited by: §3.2.
+
+Wang et al. (2025)
+H. Wang, X. Xiao, M. Yan, Z. Zhu, D. Han, D. Wang, W. Li, X. Ye, C. Hu, H. Chen, et al.
+
+A systematic characterization of llm inference on gpus.
+
+arXiv preprint arXiv:2512.01644.
+
+Cited by: §1.
+
+Wolfram Research, Inc. (2024)
+Wolfram Research, Inc.
+
+Mathematica, Version 14.1.
+
+Note: Champaign, IL
+
+External Links: Link
+
+Cited by: §3.3.
+
+Wu et al. (2025)
+M. Wu, X. Cheng, S. Liu, C. Shi, J. Ji, M. K. Ao, P. Velliengiri, X. Miao, O. Padon, and Z. Jia
+
+Mirage: a multi-level superoptimizer for tensor programs.
+
+In 19th USENIX Symposium on Operating Systems Design and Implementation (OSDI),
+
+pp. 21–38.
+
+Cited by: §8.
+
+Wu et al. (2020)
+M. Wu, Y. Ouyang, H. Zhou, L. Zhang, C. Liu, and Y. Zhang
+
+Simulee: detecting CUDA synchronization bugs via memory-access modeling.
+
+In Proceedings of the ACM/IEEE 42nd International Conference on Software Engineering (ICSE),
+
+pp. 937–948.
+
+External Links: Document
+
+Cited by: §8.
+
+Yang and Zhang (2024)
+FLA: a triton-based library for hardware-efficient implementations of linear attention mechanism
+
+External Links: Link
+
+Cited by: §1,
+item 3,
+§2.
+
+Yu et al. (2026)
+Y. Yu, P. Zang, C. H. Tsai, H. Wu, Y. Shen, J. Zhang, H. Wang, Z. Xiao, J. Shi, Y. Luo, et al.
+
+Towards automated kernel generation in the era of llms.
+
+arXiv preprint arXiv:2601.15727.
+
+Cited by: §2.
+
+Zheng et al. (2024)
+L. Zheng, L. Yin, Z. Xie, C. Sun, J. Huang, C. H. Yu, S. Cao, C. Kozyrakis, I. Stoica, J. E. Gonzalez, C. Barrett, and Y. Sheng
+
+SGLang: efficient execution of structured language model programs.
+
+In Advances in Neural Information Processing Systems (NeurIPS),
+
+Cited by: §1.
+
+Zheng et al. (2025)
+S. Zheng, W. Bao, Q. Hou, X. Zheng, J. Fang, C. Huang, T. Li, H. Duanmu, R. Chen, R. Xu, Y. Guo, N. Zheng, Z. Jiang, X. Di, D. Wang, J. Ye, H. Lin, L. Chang, L. Lu, Y. Liang, J. Zhai, and X. Liu
+
+Triton-distributed: programming overlapping kernels on distributed ai systems with the triton compiler.
+
+External Links: 2504.19442,
+Link
+
+Cited by: item 2.
+
+Zhong et al. (2024)
+Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, and H. Zhang
+
+ $\{$ distserve $\}$ : Disaggregating prefill and decoding for goodput-optimized large language model serving.
+
+In 18th USENIX symposium on operating systems design and implementation (OSDI 24),
+
+pp. 193–210.
+
+Cited by: §1,
+§2.
+
+## Appendix A Shape Reduction and CTA Scheduling Algorithms
+
+Algorithm 1 gives the candidate-renaming procedure used
+by shape reduction (§5.1). The candidates must pass
+structural validation on both programs’ expressions before a proof can
+be reused. Algorithm 2 gives the CTA scheduler
+described in §5.2; each thread’s memory accesses
+are checked by the memory model as it executes.
+
+Algorithm 1 Candidate renamings for shape reduction (§5.1):
+candidate re-indexings $\tau$ from a proven cell $r$ to a cell $c$ , read
+off their input footprints alone; $\rho_{T}(c)$ is the set of flattened indices
+in input tensor $T$ referenced by either program’s expression at $c$ .
+Cell $c$ reuses $r$ ’s equality proof only if
+ $e^{a}_{c}=\tau(e^{a}_{r})$ and $e^{b}_{c}=\tau(e^{b}_{r})$ 
+structurally.
+
+ 1:
+
+ function Propose( $r$ , $c$ )
+
+ 2:
+
+    if $\rho(r)$ and $\rho(c)$ name different tensors then return $\emptyset$ 
+
+ 3:
+
+    end if
+
+ 4:
+
+    for all input tensors $T$ do
+
+ 5:
+
+      $d_{T}\leftarrow\min\rho_{T}(c)-\min\rho_{T}(r)$ 
+ $\triangleright$ shift of the lowest index
+
+ 6:
+
+     if $\rho_{T}(r)+d_{T}\neq\rho_{T}(c)$ then return $\emptyset$ 
+ $\triangleright$ not a translation
+
+ 7:
+
+     end if
+
+ 8:
+
+    end for
+
+ 9:
+
+     $\tau_{1}\leftarrow\big(T[x]\mapsto T[x+d_{T}]\big)$ for every $T$ 
+ $\triangleright$ translation
+
+ 10:
+
+    if $r\in\rho_{T}(r)$ and $c\in\rho_{T}(c)$ for some $T$ then
+ $\triangleright$ row softmax
+
+ 11:
+
+      $\tau_{2}\leftarrow\tau_{1}$ followed by $T[r+d_{T}]\leftrightarrow T[c]$ 
+
+ 12:
+
+     return $\{\tau_{1},\tau_{2}\}$ 
+
+ 13:
+
+    end if
+
+ 14:
+
+    return $\{\tau_{1}\}$ 
+
+ 15:
+
+ end function
+
+Algorithm 2 The CTA scheduler.
+
+ 1:
+
+ Notation.
+
+ 2:
+
+     $T$ : the threads of one CTA;  $Q\subseteq T$ : the threads ready to run.
+
+ 3:
+
+     $S$ : the synchronization points of the
+kernel.
+
+ 4:
+
+     $P(s)\subseteq T$ : the threads that
+ $s\in S$ synchronizes.
+
+ 5:
+
+     $W[s]\subseteq P(s)$ : the threads
+waiting at $s$ .
+
+ 6:
+
+     $M$ : the CTA’s memory model.
+
+ 7:
+
+ 8:
+
+ $Q\leftarrow T$ ;  $W[s]\leftarrow\emptyset$ for every $s\in S$ 
+
+ 9:
+
+ while $Q\neq\emptyset$ do
+
+ 10:
+
+    pop a thread $t$ from $Q$ 
+
+ 11:
+
+    run $t$ symbolically on $M$ , checking every access, until it
+exits or reaches some $s\in S$ 
+
+ 12:
+
+    if $t$ reached $s$ then
+
+ 13:
+
+      $W[s]\leftarrow W[s]\cup\{t\}$ 
+
+ 14:
+
+     if $W[s]=P(s)$ then $\triangleright$ every thread $s$ waits for has met
+
+ 15:
+
+       if $P(s)=T$ then $M.\mathrm{endEpoch}()$ 
+ $\triangleright$ publish writes
+
+ 16:
+
+       end if
+
+ 17:
+
+       resolve $s$ ;  $Q\leftarrow Q\cup W[s]$ ;  $W[s]\leftarrow\emptyset$ 
+
+ 18:
+
+     end if
+
+ 19:
+
+    end if
+
+ 20:
+
+ end while
+
+ 21:
+
+ if $W[s]\neq\emptyset$ for some $s\in S$ then
+
+ 22:
+
+    refuse: divergence $\triangleright$ some threads never met
+
+ 23:
+
+ end if

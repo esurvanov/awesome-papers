@@ -1,0 +1,2547 @@
+## Ask to Distill: Learning to Synthesize Data for On-Policy Distillation
+
+Jiashuo Sun
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Correspondence to: jiashuo5@illinois.edu
+
+Hao Zhang
+
+Affiliation: The Hong Kong University of Science and Technology, Hong Kong SAR, China
+
+Xueqiang Xu
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Heng Wang
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Yixuan Xie
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Pengcheng Jiang
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Zhenrui Yue
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Jiajun Fan
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Peiran Li
+
+Affiliation: Texas A&M University, College Station, TX, USA
+
+Ge Liu
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Shaowen Wang
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Jiawei Han
+
+Affiliation: University of Illinois Urbana-Champaign, Urbana, IL, USA
+
+Abstract
+
+On-policy distillation (OPD) can succeed with surprisingly few training questions, motivating a view of questions as carriers of distributional knowledge transfer. How can we assess whether a newly generated question is valuable for distillation, and learn to generate better questions—without access to its correct answer? We introduce Ask-to-Distill (A2D), a framework that treats synthetic questions as distribution elicitors and optimizes the teacher supervision they expose along student-generated trajectories. A student-initialized synthesizer is optimized using a distributional surrogate for question value, computed from a frozen student–teacher pair without reference answers, correctness rewards, or per-candidate student updates. The reward combines teacher–student disagreement with teacher probability mass on the student’s candidate support, together with length and diversity controls. The generated questions are filtered and deduplicated into a prompt-only bank for standard OPD. Across mathematical reasoning, code generation, and agentic tasks, our method improves average performance and teacher-gap recovery over unoptimized student-generated prompts and KL-filtered real questions, while matching or exceeding real-bank OPD in the evaluated settings. Signal analyses further show that optimized questions can elicit denser supervision and more total signal from shorter student responses, supporting elicited distributional supervision as an objective for synthetic distillation data. Our code, data and models are publicly available at https://github.com/GasolSun36/Ask_to_Distill.
+
+Keywords: 
+On-policy distillation, synthetic data, reinforcement learning
+
+ GitHub
+
+ Model and Data Collections
+
+ Eval Data
+
+Figure 1: A2D learns to ask questions where the teacher can help.
+(a) Schematic. A student-initialized synthesizer is RL-trained against a frozen
+student–teacher pair to elicit disagreement $\delta$ that remains within the student’s
+top- $K$ support (compatibility $\omega$ ). Real questions mostly elicit little
+disagreement or disagreement outside the student’s reach, which KL filtering cannot
+separate. Insets: typical student and teacher next-token distributions per region.
+(b) Generated questions yield 20% shorter responses and 28% more total signal than
+DAPO-17k-Math.
+
+## 1 Introduction
+
+On-policy distillation (OPD) transfers the behavior of a strong teacher to a student on trajectories sampled by the student itself (Agarwal et al., 2024; Gu et al., 2024). By supervising the states the student actually visits, OPD mitigates the distribution mismatch associated with learning only from fixed teacher demonstrations and provides dense token-level guidance without requiring a task-specific correctness verifier. Although the teacher supplies this supervision, the training questions determine which trajectories the student generates and where teacher feedback becomes available. Constructing effective distillation data therefore requires understanding not only what a question asks, but also what supervision it elicits from a particular student–teacher pair.
+
+Figure 2: Overview of A2D. A student-initialized synthesizer is optimized using learning-value signals from a frozen student–teacher pair. The generated questions are filtered and deduplicated into a prompt-only synthetic bank, which is then used for on-policy distillation with a frozen teacher providing supervision on the student’s top- $K$ candidates.
+
+Recent studies suggest that OPD can be highly prompt-efficient: small subsets can approach full-data performance, and even a single question can recover much of the gain obtained from a large question bank (Fu et al., 2026; Hou et al., 2026). Moreover, self-generated questions can support effective OPD without external seed examples (Li et al., 2026a). These findings motivate a different perspective on OPD training data, centered on the supervision that questions elicit. In supervised fine-tuning, synthetic examples provide target responses for imitation (Wang et al., 2023; Xu et al., 2024); in self-play reinforcement learning, generated tasks provide opportunities to learn from answer-quality or task-success feedback (Huang et al., 2026; Chen et al., 2025). OPD instead obtains supervision from the teacher’s token distributions on student-generated prefixes. A question therefore serves as a distribution elicitor: it guides the student into states where teacher–student differences become available for learning. From this perspective, training questions act as carriers of distributional knowledge transfer, rather than directly supplying the target knowledge through reference answers. Their distillation value depends on the usable teacher supervision exposed along the induced trajectories for a particular student–teacher pair, consistent with findings that prompt utility is pair-dependent (Wang et al., 2026a). Although OPD supplies teacher supervision without reference answers, optimizing a question synthesizer requires an additional signal: feedback on which questions are worth generating. This raises a central question: without access to the correct answer to a newly generated question, how can we assess its value for a target student–teacher pair and use that assessment to learn to generate better questions? We address this question by scoring the distributional supervision exposed along student-generated trajectories, using a frozen student–teacher pair without performing a student update for each candidate.
+
+Turning elicited supervision into an optimization objective requires distinguishing disagreement from useful correction. Token-selection and reweighting methods already exploit the unequal value of supervision across response positions (Xu et al., 2026; Li et al., 2026c). In particular, support-aware analyses of token teachability show that large divergence can reflect either corrective teacher preferences within the student’s candidate support or a mismatch concentrated outside that support (Wang et al., 2026b). Building on this characterization, we combine teacher–student discrepancy with teacher probability mass on the student’s candidate tokens as a surrogate for local learning value. We adapt this token-level principle to question generation by aggregating the signal along student trajectories. This introduces additional challenges: a synthesizer may increase its reward through longer responses or repeatedly produce a narrow family of questions. The question-level objective must therefore balance elicited signal with trajectory length and question diversity.
+
+We introduce Ask-to-Distill (A2D), a self-contained framework that optimizes synthetic questions for a target student–teacher pair before performing OPD. We initialize the question-generation policy from the student and train it with reinforcement learning, while keeping the scoring student and teacher frozen. Its reward aggregates support-aware token signals using sublinear length normalization, a soft response-budget penalty, and a batch-diversity term. We then curate the generated questions through format filtering and lexical and semantic deduplication, and perform standard OPD on the resulting prompt-only dataset. Synthesizer training reuses the target student–teacher pair and requires neither external training questions nor auxiliary models. After training, a frozen Qwen3-Embedding-4B model is used only for semantic deduplication of the generated question bank; it does not participate in synthesizer optimization. Our method operates on the prompt-construction axis, which is complementary to approaches that select supervision positions, reweight trajectories, or modify the downstream distillation procedure.
+
+Our contributions are threefold: (i) we formulate synthetic prompt construction as optimizing the distributional supervision elicited from a target student–teacher pair; (ii) we develop a question-level reward that turns support-aware teacher–student signals into feedback for synthesizer optimization, without reference answers, task-specific correctness rewards, or per-candidate student updates, while controlling response length and question diversity; and (iii) we validate the framework across multiple model scales and mathematical reasoning, code generation, and agentic tasks through downstream comparisons, reward-component ablations, and learning-signal analyses. A2D exceeds real-bank OPD on the average scores of the evaluated student–teacher pairs. Our analyses further show that optimized questions can elicit denser distributional signals from shorter student responses, supporting the value of optimizing elicited supervision beyond simply increasing rollout length.
+
+## 2 Method
+
+## 2.1 Problem formulation: synthetic prompts as distribution elicitors
+
+On-policy distillation (OPD) provides teacher supervision on trajectories sampled by the student. Unlike synthetic examples used for supervised fine-tuning, a question used for OPD need not include a reference response: it supplies the context from which the student generates a trajectory and the teacher provides token-level supervision. Our synthetic data therefore consist of questions only, without ground-truth answers or reference solutions; neither synthesizer reward computation nor downstream OPD requires such annotations. We therefore study synthetic questions as distribution elicitors, whose value depends on the supervision they expose for a particular student–teacher pair.
+
+Let $\pi_{S}$ and $\pi_{T}$ denote the student and teacher, with policies $\pi_{S}$ and $\pi_{T}$ . Given a question $q$ , the student samples a response $y\sim\pi_{S}(\cdot\mid q)$ of length $L$ . At each response position $t$ , both models are evaluated on the student-generated prefix $c_{t}=(q,y_{<t})$ , producing next-token distributions $\pi_{S}(\cdot\mid c_{t})$ and $\pi_{T}(\cdot\mid c_{t})$ . The question thus induces a distribution over the states at which distillation takes place.
+
+Our goal is to construct questions that expose useful teacher supervision along these trajectories. Disagreement alone is insufficient: a question may elicit substantially different predictions while placing little teacher probability mass on the candidates considered by the student’s update. We therefore assess questions using both teacher–student discrepancy and compatibility, while retaining basic format and self-containedness requirements during curation.
+
+We formalize the elicited signal through a trajectory-based surrogate:
+
+ $\mathcal{V}(q;\pi_{S},\pi_{T})=\mathbb{E}_{y\sim\pi_{S}(\cdot\mid q)}\left[\frac{1}{L^{\alpha}}\sum_{t=1}^{L}s_{t}\right],$ 
+
+(1)
+
+where $s_{t}$ is a support-aware token score defined in §2.3, and $\alpha$ controls the balance between signal density and trajectory length. This quantity measures the distributional signal exposed by a question; it is a surrogate for learning value rather than a direct estimate of downstream performance improvement.
+
+We parameterize the question distribution with a synthesizer $S_{\theta}$ , initialized as an independent copy of the initial student. During synthesizer optimization, the scoring student and teacher remain frozen, and only $\theta$ is updated. The synthesizer’s reward combines a sampled estimate of Eq. (1) with response-length and question-diversity controls. The resulting questions are curated and used for downstream OPD, which starts from the original student parameters. Question generation and synthesizer training use only the target student–teacher pair and the student-initialized synthesizer, without external training questions, labeled examples, or auxiliary models. A separate frozen embedding model is used only for semantic deduplication after question generation (§2.5).
+
+## 2.2 Overview
+
+The basic pipeline consists of three stages, each performed once. We also consider repeating the pipeline with the updated student in §3.10.
+
+1. 
+
+Synthetic question optimization (§2.3–§2.4). We train $S_{\theta}$ with group relative policy optimization (GRPO) (Shao et al., 2024). Each generated question is answered by the frozen student, and the frozen teacher is evaluated on the same student-generated prefixes. Their predictions determine a question-level learning-value reward.
+
+2. 
+
+Synthetic question curation (§2.5). We sample the trained synthesizer at scale, filter malformed outputs, and remove lexical and semantic duplicates to construct a prompt-only question bank.
+
+3. 
+
+On-policy distillation (§2.6). We update the original student using teacher supervision on responses sampled from the curated questions, with the same response budget used for question scoring.
+
+The synthesizer and scoring student share their initial parameters but are separate model copies. Only the synthesizer is updated in stage 1; only the student is updated in stage 3. The teacher remains frozen throughout. Algorithm 1 in the appendix summarizes the full pipeline; hyperparameter values for all stages are reported in Appendix A.2.
+
+## 2.3 The learning-value reward
+
+## Per-position quantities.
+
+Given a question $q$ , we sample a student response $y\sim\pi_{S}(\cdot\mid q)$ under a response budget $L_{\max}$ . Let $L\leq L_{\max}$ be its length and $c_{t}=(q,y_{<t})$ its prefix at position $t$ . We write $p_{S}(v)=\pi_{S}(v\mid c_{t})$ and $p_{T}(v)=\pi_{T}(v\mid c_{t})$ , suppressing the dependence on $t$ for readability. For a candidate size $K$ , we define the student and teacher candidate sets and their union:
+
+ $\displaystyle A_{t}$ 
+ $\displaystyle=\mathrm{Top}\text{-}K(p_{S}),$ 
+ $\displaystyle B_{t}$ 
+ $\displaystyle=\mathrm{Top}\text{-}K(p_{T}),$ 
+
+(2)
+
+ $\displaystyle U_{t}$ 
+ $\displaystyle=A_{t}\cup B_{t},$ 
+ $\displaystyle|U_{t}|$ 
+ $\displaystyle\leq 2K.$ 
+
+For $M\in\{S,T\}$ , let
+
+ $\bar{p}_{M}^{U}(v)=\frac{p_{M}(v)}{\sum_{u\in U_{t}}p_{M}(u)},\qquad v\in U_{t},$ 
+
+(3)
+
+denote the corresponding distribution restricted to and renormalized over $U_{t}$ .
+
+Following support-aware characterizations of token teachability (Wang et al., 2026b), we use two quantities to characterize the supervision at each position:
+
+ $\displaystyle\delta_{t}$ 
+ $\displaystyle=\mathrm{KL}\!\left(\bar{p}_{T}^{U}\,\|\,\bar{p}_{S}^{U}\right)=\sum_{v\in U_{t}}\bar{p}_{T}^{U}(v)\log\frac{\bar{p}_{T}^{U}(v)}{\bar{p}_{S}^{U}(v)},$ 
+
+(4)
+
+ $\displaystyle\omega_{t}$ 
+ $\displaystyle=\sum_{v\in A_{t}}p_{T}(v).$ 
+
+(5)
+
+The elicited discrepancy $\delta_{t}$ measures differences between teacher and student preferences over their combined candidate set. Its teacher-to-student KL direction emphasizes teacher-preferred candidates to which the student assigns relatively low probability. The compatibility $\omega_{t}$ measures the teacher’s probability mass on the student’s top- $K$ candidates, which are the candidates used by our downstream OPD update. Unlike $\delta_{t}$ , $\omega_{t}$ uses the original full-vocabulary teacher probabilities without renormalization.
+
+## Gating discrepancy by compatibility.
+
+Large discrepancy can occur even when the teacher places little probability mass on the student’s candidate set. Candidates outside this set do not receive explicit candidate-level terms in our downstream update (§2.6). We therefore combine discrepancy and compatibility at each position:
+
+ $s_{t}=\min\!\left(\frac{\delta_{t}}{\delta_{\mathrm{ref}}+\epsilon},1\right)\omega_{t},$ 
+
+(6)
+
+where $\epsilon$ is a small constant for numerical stability and $\delta_{\mathrm{ref}}$ is a fixed calibration scale. The resulting score lies in $[0,1]$ and favors positions with both substantial discrepancy and teacher probability mass within the student’s candidate support. Multiplying the quantities before aggregation requires them to occur at the same position; multiplying their trajectory-level means could instead combine high discrepancy at one position with high compatibility at another. This construction remains a proxy for useful supervision and does not guarantee that every high-scoring position yields a large learning gain.
+
+## Calibrating $\delta_{\mathrm{ref}}$ .
+
+We set $\delta_{\mathrm{ref}}$ to the $\kappa$ -th percentile of token-level discrepancies measured on $N_{\mathrm{cal}}$ questions sampled from the initial student policy. The frozen student answers these questions under the response budget used for downstream OPD, and the teacher is evaluated on the resulting student-generated prefixes. We pool the resulting $\delta_{t}$ values to compute the percentile and hold it fixed during synthesizer optimization. This calibration uses no external questions and provides a common discrepancy scale across optimization steps.
+
+## Length control.
+
+We aggregate the token scores using
+
+ $R_{\mathrm{raw}}(q)=\frac{1}{L^{\alpha}}\sum_{t=1}^{L}s_{t}.$ 
+
+(7)
+
+Writing $\bar{s}(q)=L^{-1}\sum_{t=1}^{L}s_{t}$ gives $R_{\mathrm{raw}}(q)=L^{1-\alpha}\bar{s}(q)$ . Thus, $\alpha$ controls the balance between average signal and accumulated signal. A per-token mean ( $\alpha=1$ ) gives the same score to trajectories with equal average signal regardless of length, while a sum ( $\alpha=0$ ) grows linearly with length at fixed average signal. We use an intermediate exponent $0<\alpha<1$ to reward sustained signal while reducing the advantage conferred by additional tokens.
+
+This aggregation retains an incentive for longer responses. We moderate it with a multiplicative penalty based on response-budget consumption:
+
+ $P_{\mathrm{len}}(q)=1-\lambda_{\mathrm{len}}\min\!\left(\frac{L}{L_{\max}},1\right).$ 
+
+(8)
+
+Here, $\lambda_{\mathrm{len}}\in(0,1)$ sets the penalty strength. The penalty decreases with response length and equals $1-\lambda_{\mathrm{len}}$ at the generation cap. Its multiplicative form makes the relative discount independent of the absolute scale of $R_{\mathrm{raw}}$ . Together, these controls attenuate length-driven reward growth while retaining a preference for signal accumulated across response positions; they do not eliminate the incentive for longer trajectories.
+
+## Diversity control.
+
+Optimizing the trajectory-level signal alone can concentrate generation on repetitive questions. Following the cluster-based repetition penalty in R-Zero (Huang et al., 2026), we measure within-batch redundancy using BLEU-based text similarity, without extracting hidden-state representations or using an embedding model.
+
+Let $\mathcal{B}=\{q_{1},\ldots,q_{N_{\mathcal{B}}}\}$ denote the full batch of questions scored in one synthesizer-training step. We construct a pairwise distance matrix from one minus the sentence-level BLEU similarity between question texts, following the R-Zero implementation, and apply average-linkage agglomerative clustering with distance threshold $\tau$ . If $\ell_{i}$ is the cluster label of $q_{i}$ , its cluster share is
+
+ $\mathrm{share}(q_{i};\mathcal{B})=\frac{\left|\{j:\ell_{j}=\ell_{i}\}\right|}{N_{\mathcal{B}}}.$ 
+
+(9)
+
+We then define
+
+ $P_{\mathrm{div}}(q_{i};\mathcal{B})=\max\!\left(0,\,1-\lambda_{\mathrm{div}}\mathrm{share}(q_{i};\mathcal{B})\right),$ 
+
+(10)
+
+where $\lambda_{\mathrm{div}}>0$ sets the penalty strength.
+
+Questions in larger text-similarity clusters receive a stronger discount. A singleton cluster receives a factor of $1-\lambda_{\mathrm{div}}/N_{\mathcal{B}}$ , while for $\lambda_{\mathrm{div}}\geq 1$ a batch assigned entirely to one cluster receives zero reward. The multiplicative form discounts the elicited signal proportionally, avoiding an additive penalty whose relative strength would depend on the signal’s numerical scale. Clustering is performed across the full scoring batch, separately from the within-group advantage normalization used by GRPO.
+
+## Final question-level reward.
+
+The reward for a question combines its sampled token signals with the length and diversity factors:
+
+ $R(q;\mathcal{B})=\frac{P_{\mathrm{len}}(q)P_{\mathrm{div}}(q;\mathcal{B})}{L^{\alpha}}\sum_{t=1}^{L}s_{t}.$ 
+
+(11)
+
+We make the batch dependence explicit because the diversity factor depends on the other questions scored in the same step. The token-signal term is estimated from one student response per question, providing a single-sample estimate of the expectation in Eq. (1) before applying the additional controls. Appendix B establishes a compatible-disagreement coverage bound for the normalized reward and relates compatibility to the OPD candidate advantages.
+
+Table 1: 
+Results across six mathematical reasoning benchmarks for three student–teacher pairs.
+Within each block and metric, shading is relative to Student-Generated OPD
+(white): blue indicates improvement and
+red indicates degradation. Positive and negative changes
+are normalised separately across OPD methods and mapped nonlinearly
+(exponent 1.5) to muted palettes.
+Bold indicates the best result among OPD methods, including ties.
+The baselines compare real-bank OPD, untrained student-generated prompts,
+KL-filtered selection, and two additional synthetic-data methods.
+
+Method
+AIME24
+AIME25
+AIME26
+AMC23
+BRUMO25
+MATH500
+Avg.
+Recovery (%)
+
+Qwen3-1.7B (Non-thinking) Teacher: Qwen3-4B-Non-Thinking-RL-Math
+
+Student
+10.0
+8.3
+8.3
+37.5
+17.9
+72.0
+25.7
+0.0
+
+Teacher†
+41.2
+33.1
+34.4
+57.5
+45.8
+78.3
+48.4
+100.0
+
+Student-Generated
+
+OPD
+
+27.5
+22.7
+21.3
+61.6
+35.0
+78.4
+41.1
+67.9
+
+KL-Filtered OPD
+33.5
+26.7
+23.3
+64.4
+36.7
+80.2
+44.1
+81.3
+
+Vanilla OPD (Li et al., 2026b)
+31.5
+23.5
+20.0
+71.1
+31.7
+80.4
+43.0
+76.4
+
+Evol-Instruct (Xu et al., 2024)
+30.0
+21.2
+21.0
+63.9
+37.9
+78.2
+42.1
+72.0
+
+R-Zero (Huang et al., 2026)
+29.6
+21.7
+20.8
+65.0
+37.5
+79.5
+42.3
+73.4
+
+A2D
+34.8
+26.0
+26.5
+71.9
+35.4
+82.4
+46.2
+90.2
+
+DeepSeek-R1-Distill-Qwen-1.5B Teacher: JustRL-DeepSeek-1.5B
+
+Student
+31.0
+26.0
+19.4
+65.8
+29.6
+60.9
+38.8
+0.0
+
+Teacher†
+44.8
+32.9
+32.3
+85.5
+34.6
+79.8
+51.7
+100.0
+
+Student-Generated
+
+OPD
+
+37.9
+30.4
+26.9
+77.8
+34.0
+82.2
+48.2
+73.2
+
+KL-Filtered OPD
+37.5
+29.2
+29.0
+79.1
+35.2
+81.7
+48.6
+76.4
+
+Vanilla OPD (Li et al., 2026b)
+45.4
+32.7
+29.2
+78.1
+35.8
+81.5
+50.5
+90.7
+
+Evol-Instruct (Xu et al., 2024)
+41.5
+32.5
+28.1
+79.5
+35.0
+82.3
+49.8
+85.6
+
+R-Zero (Huang et al., 2026)
+42.1
+32.9
+28.3
+80.0
+35.2
+81.7
+50.0
+87.2
+
+A2D
+45.0
+35.8
+29.2
+83.6
+34.0
+82.2
+51.6
+99.9
+
+DeepSeek-R1-Distill-Qwen-7B Teacher: Skywork-OR1-Math-7B
+
+Student
+46.5
+36.7
+44.0
+84.1
+49.8
+87.3
+58.1
+0.0
+
+Teacher†
+62.7
+42.9
+50.8
+89.7
+59.0
+91.0
+66.0
+100.0
+
+Student-Generated
+
+OPD
+
+53.1
+41.0
+45.0
+84.4
+53.3
+88.0
+60.8
+34.4
+
+KL-Filtered OPD
+53.5
+40.2
+49.0
+87.0
+55.0
+89.3
+62.3
+53.7
+
+Vanilla OPD (Li et al., 2026b)
+54.8
+41.5
+50.0
+88.8
+52.9
+89.5
+62.9
+61.0
+
+Evol-Instruct (Xu et al., 2024)
+54.6
+41.5
+49.0
+86.8
+54.0
+90.4
+62.7
+58.3
+
+R-Zero (Huang et al., 2026)
+55.0
+42.1
+49.6
+87.0
+52.5
+89.0
+62.5
+55.8
+
+A2D
+57.5
+44.8
+52.5
+89.2
+53.3
+89.9
+64.5
+81.3
+
+† Teachers are reference models.
+Recovery: $(\mathrm{Avg.}_{\mathrm{method}}-\mathrm{Avg.}_{\mathrm{student}})/(\mathrm{Avg.}_{\mathrm{teacher}}-\mathrm{Avg.}_{\mathrm{student}})\times 100\%$ , computed from unrounded averages and rounded to one decimal place.
+
+## 2.4 Optimizing the synthetic data distribution
+
+We initialize $S_{\theta}$ from the student to use its existing generative capabilities as the starting point for question construction. Shared initialization supplies a prior for generation; the reward determines which questions are favored for the target student–teacher pair. Throughout this stage, the scoring student and teacher remain frozen.
+
+For each question-generation instruction $x$ , we sample a group of $g$ candidate questions from $S_{\theta}(\cdot\mid x)$ under a question budget $L_{q}$ . The synthesis and student-solving prompt templates are provided in Appendix C. For each candidate $q_{i}$ , the frozen student generates one response, and the teacher is evaluated on the same response prefixes. These predictions provide the token scores and response-length factor. We compute the batch-diversity factor across the full scoring batch and assign each candidate its reward from Eq. (11).
+
+We optimize the synthesizer with GRPO, normalizing rewards within each group of questions sampled from the same instruction. The resulting group-relative advantage is applied to the generated tokens of the corresponding question. Thus, the optimization updates the policy that generates questions; the student responses are used only to score those questions. Operationally, the question-level reward is attached to the final generated question token as a sequence-level outcome reward. This reward closes the feedback loop for question generation: it evaluates a candidate through the supervision exposed by a frozen student–teacher pair and uses that signal to improve the synthesizer. Candidate scoring requires neither reference answers nor task-specific correctness rewards, and does not involve training a student on each candidate. It therefore provides a distributional surrogate for question value before downstream distillation.
+
+## 2.5 Synthetic data curation
+
+After synthesizer optimization, we sample $N$ raw outputs from the selected checkpoint.
+We first filter malformed or incomplete outputs. When a valid question is followed by model self-talk, we retain the question by truncating at the earliest meta-commentary marker. We otherwise reject outputs with repeated $n$ -grams, low lexical diversity, unbalanced mathematical delimiters, answer leakage, missing context, or references to absent figures.
+
+We then deduplicate the remaining questions in two passes.
+Token-set Jaccard matching removes lexical near-duplicates whose similarity reaches a threshold $\tau_{\mathrm{lex}}$ . A subsequent greedy semantic pass uses a frozen Qwen3-Embedding-4B model (Zhang et al., 2025): a question is retained only if the cosine similarity of its embedding to that of every previously retained question is below $\tau_{\mathrm{sem}}$ . This embedding model is used only for post-generation deduplication and does not participate in synthesizer training or reward computation.
+
+The retained questions form a prompt-only synthetic bank. Any placeholder answers stored for file-format compatibility are ignored during OPD; all training responses are sampled from the student.
+
+## 2.6 On-policy distillation
+
+We use the curated question bank for candidate-restricted OPD, starting from the original student parameters. For each question, the current rollout policy $\pi_{S,\mathrm{old}}$ samples $n_{\mathrm{roll}}$ responses under the response budget $L_{\max}$ used for question scoring. The teacher remains frozen and is evaluated on the student-generated prefixes.
+
+At each response position $t$ , let $p_{S,\mathrm{old}}(v)=\pi_{S,\mathrm{old}}(v\mid c_{t})$ and $p_{T}(v)=\pi_{T}(v\mid c_{t})$ . We construct $A_{t}=\mathrm{Top}\text{-}K(p_{S,\mathrm{old}})$ with the same $K$ as in §2.3 and define the student probabilities normalized over this set:
+
+ $\bar{p}_{S,\mathrm{old}}^{A}(v)=\frac{p_{S,\mathrm{old}}(v)}{\sum_{u\in A_{t}}p_{S,\mathrm{old}}(u)},\qquad v\in A_{t}.$ 
+
+(12)
+
+The superscript $A$ distinguishes this normalization from the union-support normalization used to score questions in §2.3.
+
+Table 2: 
+Results across six code benchmarks for three student–teacher pairs.
+Within each block and metric, shading is relative to Student-Generated OPD
+(white): blue indicates improvement and
+red indicates degradation. Positive and negative changes
+are normalised separately across OPD methods and mapped nonlinearly
+(exponent 1.5) to muted palettes.
+Bold indicates the best result among OPD methods, including ties.
+The baselines compare real-bank OPD, untrained student-generated prompts,
+KL-filtered selection, and two additional code-generation methods.
+
+Method
+LCB
+MBPP+
+APPS-Intro
+APPS-Interv.
+APPS-Comp.
+CodeContests
+Avg.
+Recovery (%)
+
+Qwen3-4B (Non-thinking) Teacher: Qwen3-4B-Instruct-2507
+
+Student
+21.6
+68.8
+46.4
+19.1
+8.8
+7.3
+28.7
+0.0
+
+Teacher†
+33.7
+72.0
+65.6
+41.0
+19.7
+18.8
+41.8
+100.0
+
+Student-Generated
+
+OPD
+
+30.2
+67.2
+55.8
+27.8
+10.4
+9.7
+33.5
+36.9
+
+KL-Filtered OPD
+31.1
+67.7
+58.2
+30.0
+11.5
+11.5
+35.0
+48.2
+
+Vanilla OPD (Li et al., 2026b)
+31.0
+68.5
+57.1
+27.6
+10.7
+12.1
+34.5
+44.4
+
+Evol-Instruct (Xu et al., 2024)
+30.3
+68.5
+56.8
+27.8
+10.0
+10.3
+34.0
+40.2
+
+SQLM (Chen et al., 2025)
+31.3
+69.8
+57.7
+28.9
+10.9
+10.9
+34.9
+47.6
+
+A2D
+35.9
+68.5
+64.0
+36.0
+15.9
+17.0
+39.6
+82.9
+
+Qwen3-4B (Non-thinking) Teacher: Qwen3-30B-A3B-Instruct-2507
+
+Student
+21.6
+68.8
+46.4
+19.1
+8.8
+7.3
+28.7
+0.0
+
+Teacher†
+42.3
+75.9
+73.4
+51.2
+30.4
+26.7
+50.0
+100.0
+
+Student-Generated
+
+OPD
+
+28.0
+66.9
+50.5
+20.0
+5.5
+6.1
+29.5
+3.9
+
+KL-Filtered OPD
+29.4
+66.9
+53.4
+25.1
+8.4
+9.7
+32.2
+16.3
+
+Vanilla OPD (Li et al., 2026b)
+30.6
+68.8
+51.3
+21.3
+4.2
+4.8
+30.2
+7.0
+
+Evol-Instruct (Xu et al., 2024)
+28.8
+67.1
+51.9
+22.5
+5.0
+5.0
+30.1
+6.5
+
+SQLM (Chen et al., 2025)
+29.9
+67.5
+53.5
+23.7
+5.7
+6.3
+31.1
+11.4
+
+A2D
+31.7
+67.5
+58.3
+31.6
+11.0
+13.9
+35.7
+32.8
+
+Qwen2.5-Coder-3B-Instruct Teacher: Qwen2.5-Coder-32B-Instruct
+
+Student
+13.7
+64.0
+28.7
+6.6
+3.0
+2.4
+19.7
+0.0
+
+Teacher†
+27.9
+76.7
+51.8
+18.8
+11.1
+5.5
+32.0
+100.0
+
+Student-Generated
+
+OPD
+
+14.5
+64.3
+29.0
+6.3
+2.8
+1.8
+19.8
+0.4
+
+KL-Filtered OPD
+15.3
+64.8
+30.0
+6.8
+3.4
+2.4
+20.5
+5.9
+
+Vanilla OPD (Li et al., 2026b)
+16.2
+64.0
+30.7
+6.5
+2.9
+0.6
+20.2
+3.4
+
+Evol-Instruct (Xu et al., 2024)
+15.5
+64.6
+29.8
+6.9
+3.2
+1.6
+20.3
+4.4
+
+SQLM (Chen et al., 2025)
+15.8
+64.8
+30.4
+7.1
+3.4
+1.8
+20.6
+6.7
+
+A2D
+17.0
+65.1
+31.6
+7.6
+3.7
+2.4
+21.2
+12.3
+
+† Teachers are reference models.
+Recovery:
+ $(\mathrm{Avg.}_{\mathrm{method}}-\mathrm{Avg.}_{\mathrm{student}})/(\mathrm{Avg.}_{\mathrm{teacher}}-\mathrm{Avg.}_{\mathrm{student}})\times 100\%$ ,
+computed from unrounded averages and rounded to one decimal place.
+
+Each candidate receives the fixed advantage
+
+ $r_{t}(v)=-\bar{p}_{S,\mathrm{old}}^{A}(v)\left[\log p_{S,\mathrm{old}}(v)-\log p_{T}(v)\right],\qquad v\in A_{t}.$ 
+
+(13)
+
+The log-probabilities in brackets are full-vocabulary probabilities; only the weighting factor $\bar{p}_{S,\mathrm{old}}^{A}$ is normalized over $A_{t}$ . The candidate sets and advantages are computed from the rollout policy and held fixed during the subsequent update.
+
+Let $p_{S,\phi}(v)=\pi_{S,\phi}(v\mid c_{t})$ denote the trainable student’s probability and define
+
+ $\rho_{t}(v)=\frac{p_{S,\phi}(v)}{p_{S,\mathrm{old}}(v)}.$ 
+
+(14)
+
+Figure 3: Downstream performance during training for student- and
+teacher-initialized question synthesizers, with and without pair-specific RL,
+using Qwen3-4B (non-thinking) as the student and
+Qwen3-4B-Instruct-2507 as the teacher, evaluated on LCB, APPS-Intro, and
+APPS-Interview. Dashed lines show the
+student and teacher reference scores. RL improves both initializations;
+student initialization with RL is competitive across benchmarks and exceeds
+the teacher reference on LCB, while remaining below it on APPS-Intro and
+APPS-Interview.
+
+Table 3: 
+Results across the three $\tau^{2}$ -Bench domains.
+Within each metric, shading is relative to Student-Generated OPD
+(white): blue indicates improvement and
+red indicates degradation. Positive and negative
+changes are normalised separately across OPD methods and mapped
+nonlinearly (exponent 1.5) to muted palettes.
+Bold indicates the best result among OPD methods, including ties.
+The three baselines isolate the effects of synthesizer training
+and learning-value-based question generation.
+
+Method
+Airline
+Retail
+Telecom
+Avg.
+
+Recovery
+
+(%)
+
+Qwen3-4B (Non-thinking)
+
+Teacher: Qwen3-4B-Thinking-2507 (Non-thinking)
+
+Student
+15.0
+17.5
+10.6
+14.4
+0.0
+
+Teacher†
+47.5
+48.1
+34.4
+43.3
+100.0
+
+Student-Generated
+
+OPD
+
+42.5
+42.5
+26.9
+37.3
+79.2
+
+KL-Filtered OPD
+45.0
+48.8
+28.8
+40.9
+91.7
+
+Vanilla OPD
+45.0
+46.9
+29.4
+40.4
+90.0
+
+A2D
+46.3
+49.4
+30.0
+41.9
+95.2
+
+† The teacher is a reference model.
+Recovery:
+ $(\mathrm{Avg.}_{\mathrm{method}}-\mathrm{Avg.}_{\mathrm{student}})/(\mathrm{Avg.}_{\mathrm{teacher}}-\mathrm{Avg.}_{\mathrm{student}})\times 100\%$ ,
+computed from unrounded averages and rounded to one decimal place.
+
+We use the candidate advantages directly in a PPO-style clipped objective (Schulman et al., 2017):
+
+ $\displaystyle\widehat{r}_{t}(v)={}$ 
+ $\displaystyle\min\!\left\{\rho_{t}(v)r_{t}(v),\right.$ 
+
+(15)
+
+ $\displaystyle\left.\mathrm{clip}\!\left(\rho_{t}(v),1-\varepsilon,1+\varepsilon\right)r_{t}(v)\right\},$ 
+
+ $\displaystyle\mathcal{L}(\phi)={}$ 
+ $\displaystyle-\mathbb{E}\!\left[\frac{\sum_{t}m_{t}\sum_{v\in A_{t}}\widehat{r}_{t}(v)}{\sum_{t}m_{t}}\right],$ 
+
+where $m_{t}$ masks valid response positions and the expectation is over sampled questions and student responses. Gradients flow through $p_{S,\phi}$ , while the rollout probabilities, candidate sets, and advantages are treated as constants.
+We use a single inner epoch per rollout batch, without a value function, return accumulation, group normalization of these advantages, or a KL anchor to a reference model.
+
+At the beginning of an update, the trainable student matches the rollout policy and $\rho_{t}(v)=1$ ; the ratios can change as optimization proceeds. The advantages provide a student-probability-weighted, reverse-KL-style learning signal restricted to the student’s top- $K$ candidates. We do not identify this clipped, candidate-restricted objective with exact full-vocabulary reverse-KL minimization.
+
+The question-generation reward and the downstream update serve different roles. The forward-KL discrepancy in Eq.(4) identifies teacher-preferred candidates that the scoring student underweights, while compatibility measures how much teacher probability mass lies within the candidate set used for training. Their combination scores the supervision a question exposes without reproducing the downstream loss or directly estimating its gradient magnitude. We hold the downstream OPD procedure fixed across prompt-source comparisons to assess the effect of the constructed question distribution.
+
+## 3 Experiments
+
+## 3.1 Models
+
+## Mathematical reasoning.
+
+We evaluate three student–teacher pairs spanning different model sizes and reasoning modes. The first pair uses Qwen3-1.7B (Team, 2025) in non-thinking mode as the student and Qwen3-4B-Non-Thinking-RL-Math (Yang et al., 2026a) as the teacher. The other two pairs use DeepSeek-R1-Distill-Qwen-1.5B and DeepSeek-R1-Distill-Qwen-7B (Guo et al., 2025), paired with JustRL-DeepSeek-1.5B (He et al., 2025a) and Skywork-OR1-Math-7B (He et al., 2025b), respectively. These pairs cover both non-thinking and reasoning models, including settings where the student and teacher have the same parameter count but differ in post-training.
+
+## Code generation.
+
+We evaluate Qwen3-4B in non-thinking mode with two teachers: Qwen3-4B-Instruct-2507 and Qwen3-30B-A3B-Instruct-2507 (Team, 2025). This comparison examines distillation from different teachers while keeping the initial student fixed. We additionally evaluate Qwen2.5-Coder-3B-Instruct with Qwen2.5-Coder-32B-Instruct (Hui et al., 2024), extending the evaluation to a code-specialized model family.
+
+## Agentic tasks and model roles.
+
+For agentic tasks, we use Qwen3-4B as the student and Qwen3-4B-Thinking-2507 as the teacher, both configured in non-thinking mode. In our default setup, the question synthesizer is initialized as an independent copy of the corresponding student. During synthesizer optimization, the scoring student and teacher remain frozen; downstream OPD starts from the original student parameters and updates only the student. We separately examine teacher-initialized synthesizers in the synthesizer-initialization ablation. Exact checkpoint identifiers and inference configurations are provided in the appendix.
+
+## Auxiliary models.
+
+For agentic tasks, we use GPT-4o-mini (OpenAI, 2024) as the user simulator and judge. For semantic deduplication of the generated question bank, we use a frozen Qwen3-Embedding-4B model (Zhang et al., 2025) only after synthesizer training. It is not used to compute training-time diversity rewards or optimize the synthesizer. These auxiliary models remain fixed throughout our experiments.
+
+## 3.2 Baselines
+
+We compare A2D with the following baselines and reference models: (1) Student and Teacher: the initial student before distillation and its corresponding teacher, which establish the starting performance and the reference for teacher-gap recovery; (2) Vanilla OPD (Li et al., 2026b): on-policy distillation using the original question bank for each domain, DAPO-17k-Math (Yu et al., 2025) for mathematical reasoning, OpenCodeReasoning (Ahmad et al., 2025) for code generation, and the official $\tau^{2}$ -Bench training set (Barrès et al., 2025) for agentic tasks—where the student generates responses and the teacher provides token-level supervision on student-generated prefixes, serving as the standard real-data reference; (3) Student-Generated OPD: OPD using questions sampled directly from the initial student without synthesizer optimization, evaluating whether explicitly training the question-generation policy provides benefits beyond the student’s existing generation capability; (4) KL-Filtered OPD: OPD using the 20% of real questions with the highest teacher–student KL disagreement, testing whether retaining high-disagreement questions alone provides effective distillation data;
+
+Figure 4: Reward-component ablation on AIME24, AIME25, and AIME26. Numbers above bars indicate accuracy (%). Removing compatibility, the
+training-time diversity term, or the explicit length penalty reduces
+accuracy on all three benchmarks.
+
+Table 4: Iterative training on code pair A, with student Qwen3-4B
+(non-thinking) and teacher Qwen3-30B-A3B-Instruct-2507. Avg. is the mean
+of LiveCodeBench v5_v6, APPS-Intro and APPS-Interview. Recovery
+ $=(\text{Avg}-\text{student})/(\text{teacher}-\text{student})$ . Dashes indicate entries that are not applicable.
+
+Training variant
+Avg.
+
+Gain over
+
+round 1
+
+Recovery
+
+(%)
+
+Student
+29.0
+-
+0.0
+
+Teacher
+55.6
+-
+100.0
+
+A2D: round 1
+40.5
+0.0
+43.3
+
+A2D: round 2
+40.8
++0.3
+44.3
+
+A2D: final round ( $R=3$ )
+41.0
++0.5
+44.8
+
+(5) Evol-Instruct (Xu et al., 2024): an instruction-evolution method that iteratively rewrites seed instructions to increase complexity and diversity, which we adapt to construct mathematical and programming questions for OPD;
+(6) R-Zero (Huang et al., 2026): a self-evolution framework in which a Challenger proposes tasks and a Solver learns to solve them, with Challenger optimization guided by feedback about the Solver’s capabilities, whose task-generation procedure we use to construct mathematical questions for OPD;
+(7) SQLM (Chen et al., 2025): an asymmetric self-play framework with a topic-conditioned proposer and a solver, whose coding formulation uses generated unit tests and solver test performance to encourage non-trivial but solvable tasks, providing programming questions for downstream OPD. Evol-Instruct is evaluated in both domains, while R-Zero and SQLM are included in the mathematical and code-generation comparisons, respectively. For these question-bank comparisons, the generated or selected questions are used as prompts for the same downstream OPD procedure. We reproduce Evol-Instruct, R-Zero, and SQLM using their official implementations.
+
+## 3.3 Datasets and Evaluation Metrics
+
+## Mathematical reasoning.
+
+We evaluate on six benchmarks: AIME24 (Mathematical Association of America, 2024), AIME25 (Zhang and Math-AI, 2025), AIME26 (Dekoninck et al., 2026), AMC23 (Mathematical Association of America, 2023), BRUMO25 (Dekoninck et al., 2026), and MATH500 (Hendrycks et al., 2021b; Lightman et al., 2024). Each AIME benchmark and BRUMO25 contains 30 problems, AMC23 contains 40, and MATH500 contains 500. These benchmarks cover competition-level mathematical reasoning across algebra, geometry, number theory, and combinatorics. We evaluate final-answer correctness using rule-based normalization and symbolic equivalence checking.
+
+## Code generation.
+
+We evaluate on six benchmarks: LiveCodeBench (Jain et al., 2025), MBPP+ (Liu et al., 2023; Austin et al., 2021), the introductory, interview, and competition subsets of APPS (Hendrycks et al., 2021a), and CodeContests (Li et al., 2022). We use the LiveCodeBench v5–v6 subset with 342 problems and MBPP+ v0.2.0 with 378 problems. For APPS, we use all 1,000 introductory and 1,000 competition test problems, together with a fixed sample of 1,000 interview test problems. CodeContests contains 165 test problems. A generated program is considered correct only if it passes every test case used by the evaluator within the time limit. For MBPP+, we apply entry-point name normalization when the required function is absent and the generated program defines exactly one top-level function.
+
+## Agentic tasks.
+
+We additionally evaluate on the Airline, Retail, and Telecom domains of $\tau^{2}$ -Bench (Barrès et al., 2025), using the official test splits containing 20, 40, and 40 tasks, respectively. These tasks require an agent to interact with a simulated user and invoke tools to complete domain-specific objectives. We run four trials per task and report $\mathrm{pass}^{1}$ , the average single-trial task success rate under the benchmark evaluator.
+
+## Evaluation metrics.
+
+Following Li et al. (2026b), for mathematical reasoning and code generation, we report $\mathrm{avg}@k$ , defined as the fraction of correct responses among $k$ generations per problem, averaged over all problems:
+
+ $\mathrm{avg}@k=\frac{100}{Nk}\sum_{i=1}^{N}\sum_{j=1}^{k}\mathbb{I}\!\left[y_{i}^{(j)}\text{ is correct}\right],$ 
+
+(16)
+
+where $N$ is the number of problems. This metric measures average response accuracy rather than whether at least one of the $k$ responses is correct. We use $k=16$ for AIME24/25/26, AMC23, and BRUMO25; $k=4$ for MATH500 and LiveCodeBench; and $k=1$ for the remaining code benchmarks. MBPP+ uses greedy decoding. Within each domain, Avg. is the unweighted mean of the benchmark scores. To measure how much of the initial student–teacher performance gap is recovered, we also report
+
+ $\mathrm{Recovery}=100\times\frac{\mathrm{Avg.}_{\mathrm{method}}-\mathrm{Avg.}_{\mathrm{student}}}{\mathrm{Avg.}_{\mathrm{teacher}}-\mathrm{Avg.}_{\mathrm{student}}}.$ 
+
+(17)
+
+A recovery of $100\%$ indicates that the distilled student matches the teacher’s average performance, while values above $100\%$ indicate that it exceeds the teacher. Recovery is computed from unrounded averages. Detailed decoding settings and evaluation procedures are provided in Appendix A.3.
+
+Figure 5: Average accuracy versus cumulative training tokens for (a)
+R1-Distill-1.5B on JustRL and (b) R1-Distill-7B on Skywork. Gray squares
+show Vanilla checkpoints and the dashed line its best-so-far accuracy;
+blue circles show A2D checkpoints. Shaded
+regions indicate intervals where A2D is above (gain) or below (loss)
+Vanilla’s best-so-far reference. Average accuracy is computed over
+AIME24, AIME25, and AMC23, and therefore differs from the six-benchmark
+average in Table 1.
+
+Figure 6: Simple prompts can elicit dense distillation signals. Comparison of (a) a real question from DAPO-17k-Math and (b) a synthetic question generated by our method. Darker token backgrounds indicate higher support-aware scores $s_{t}$ ; the strips summarize the complete rollouts, with boxes marking the displayed excerpts. Although both student answers are incorrect, the apparently simpler synthetic question elicits a higher mean $s_{t}$ (0.172 versus 0.117; approximately $1.5\times$ ) with a shorter rollout (1,241 versus 2,002 tokens), illustrating that surface complexity alone does not characterize the density of elicited supervision.
+
+All reported results are means over three independent runs with different random seeds. Evaluation settings, including decoding parameters and answer verification, are described in Appendix A.3.
+
+## 3.4 Main Results
+
+We evaluate A2D across six mathematical reasoning and six code-generation benchmarks, with three student–teacher pairs in each domain. Tables 1 and 2 report the main results.
+Across all six settings, A2D achieves the highest average performance among the compared distillation methods, demonstrating the effectiveness of optimizing synthetic questions for the target student–teacher pair.
+
+## Mathematical reasoning.
+
+As shown in Table 1, A2D achieves average scores of 46.2, 51.6, and 64.5 for Qwen3-1.7B, R1-Distill-1.5B, and R1-Distill-7B, respectively, compared with 43.0, 50.5, and 62.9 for Vanilla OPD. These results show that optimized synthetic questions can outperform the original real question bank across both non-thinking and reasoning students. The corresponding teacher-gap recovery rates reach 90.2%, 99.9%, and 81.3%; notably, R1-Distill-1.5B nearly matches its teacher’s average performance. Relative to Student-Generated OPD, our method improves the reported average scores by 5.1, 3.4, and 3.7 percentage points, indicating that optimizing the synthesizer provides additional value beyond sampling questions directly from the student.
+
+A2D also outperforms KL-Filtered OPD, Evol-Instruct, and R-Zero on the average score in every mathematical setting. The comparison with KL-Filtered OPD supports the value of optimizing the prompt distribution using support-aware supervision beyond selecting real questions with large teacher–student disagreement. At the benchmark level, representative gains over Vanilla OPD include an increase from 20.0 to 26.5 on AIME26 for Qwen3-1.7B and from 78.1 to 83.6 on AMC23 for R1-Distill-1.5B. The improvements are not uniform across benchmarks: other methods remain stronger on some BRUMO25 and MATH500 evaluations. Nevertheless, the consistent average gains indicate that our optimized question banks provide effective supervision across the evaluated mathematical tasks.
+
+## Code generation.
+
+Table 2 shows that A2D also improves code-generation performance across all three student–teacher pairs.
+Its average scores reach 39.6, 35.7, and 21.2, compared with 34.5, 30.2, and 20.2 for Vanilla OPD, respectively. Our method also exceeds Student-Generated OPD, KL-Filtered OPD, Evol-Instruct, and SQLM in average performance, and achieves the best or tied-best score among the compared distillation methods in 16 of the 18 benchmark–pair combinations. The gains extend across multiple coding benchmarks. For example, with Qwen3-30B-A3B as the teacher, APPS-Interview improves from 21.3 to 31.6 and CodeContests from 4.8 to 13.9 relative to Vanilla OPD. These results extend the benefits of optimizing elicited supervision beyond mathematical reasoning to code generation.
+
+The magnitude of improvement nevertheless varies substantially across student–teacher pairs. Teacher-gap recovery reaches 82.9% for Qwen3-4B distilled from the 4B teacher, but remains at 32.8% with the stronger 30B-A3B teacher and 12.3% for the Qwen2.5-Coder-3B/32B pair. Moreover, for the same Qwen3-4B student, the stronger teacher yields a lower distilled average score than the 4B teacher under our setup. This comparison indicates that teacher benchmark performance alone does not determine downstream distillation effectiveness. Optimizing the question distribution consistently improves the evaluated outcomes, while substantial headroom remains in some student–teacher settings.
+
+## 3.5 Ablation: Can a stronger model replace synthetic data optimization?
+
+A natural alternative to training a synthesizer for each student–teacher pair is
+to ask a stronger off-the-shelf model—in our setting, the teacher itself—to
+generate the questions. To separate the effect of synthesizer initialization from
+that of pair-specific optimization, we compare student- and teacher-initialized
+synthesizers, each with and without RL, while holding the downstream distillation
+setup fixed. Figure 3 reports performance over training
+for a representative code student–teacher pair; the dashed lines mark the
+student and teacher reference scores.
+
+Without RL, teacher initialization improves over student initialization on the
+two APPS subsets, but not on LCB, and neither unoptimized synthesizer matches the
+student-initialized RL variant across the three benchmarks. Applying RL improves
+the trajectories for both initializations, indicating that the benefit is not
+explained by simply prompting a stronger model to write questions. The
+student-initialized RL variant reaches roughly 35% on LCB, above the teacher
+reference of 33.7%, and about 62% on APPS-Intro. On APPS-Interview it reaches
+about 36%; both APPS scores remain below their teacher references (65.6% and
+41.0%, respectively). The teacher-initialized RL variant is competitive—and
+slightly higher at some APPS-Intro checkpoints—but does not consistently
+dominate the student-initialized variant. Thus, synthesizer strength alone is not
+a substitute for optimizing questions against the target pair, while the choice
+of initialization can still affect performance by benchmark. These curves are
+descriptive: they show checkpoint trends, not uncertainty across independent
+runs.
+
+## 3.6 Ablation: which reward components matter?
+
+We ablate compatibility, the training-time diversity term, and the explicit
+length penalty, and evaluate the resulting question banks by downstream best
+accuracy on AIME24, AIME25, and AIME26 (Figure 4). The
+full reward performs best on all three benchmarks, reaching 45.0%, 35.8%, and
+29.2%, respectively. Removing any one of the three components lowers accuracy
+on every benchmark, with drops ranging from 2.1 to 6.6 percentage points.
+
+The size of each drop depends on the benchmark. On AIME25, removing
+compatibility, diversity, or the length penalty reduces accuracy by 6.2, 6.0,
+and 6.6 points, respectively. On AIME24, the largest reduction is 4.2 points
+without diversity; on AIME26, it is 3.4 points without the length penalty. These
+results suggest that all three components contribute to the performance of the
+complete reward, while their relative importance varies across benchmarks. The
+figure reports downstream accuracy rather than synthesizer reward, directly
+assessing the quality of the prompts for distillation.
+
+## 3.7 Applicability to agentic tasks
+
+To test whether A2D applies beyond mathematical reasoning and code
+generation, we evaluate it on the three agentic task domains in $\tau^{2}$ -Bench:
+Airline, Retail, and Telecom. Table 3 reports results for
+Qwen3-4B (non-thinking).
+
+Our method reaches 46.3%, 49.4%, and 30.0% in the three domains,
+respectively, for an average of 41.9%. This exceeds Student-Generated OPD by
+3.8, 6.9, and 3.1 percentage points, respectively (4.6 points on average), and
+raises teacher-gap recovery from 79.2% to 95.2%. It also outperforms Vanilla
+OPD (40.4% average) and KL-Filtered OPD (40.9%) on the average score. For this
+student–teacher pair, these results support the applicability of pair-specific
+question optimization to agentic task domains as well as to reasoning and code
+generation. The average remains 1.4 percentage points below the teacher
+reference (43.3%).
+
+## 3.8 Cross-Domain Transfer between Math and Code
+
+Our distribution-elicitation perspective suggests that the benefits of OPD need not be confined to the domain of its training questions. We examine this hypothesis in two directions: code-to-math transfer with Qwen3-4B (non-thinking) distilled from Qwen3-4B-Instruct-2507, and math-to-code transfer with R1-Distill-7B distilled from Skywork-OR1-Math-7B. In each setting, we directly evaluate the student after source-domain OPD, without additional target-domain training, comparing our optimized synthetic questions with the real source-domain questions used by Vanilla OPD. We report gains over the initial student and compute an unweighted average across the target benchmarks.
+
+## Code-to-math transfer.
+
+We evaluate code-trained students on AIME24, AIME26, AMC23, and BRUMO25. As shown in Figure 7(a), both methods improve performance on all four mathematics benchmarks. A2D raises average accuracy from 31.38% to 38.60%, a gain of 7.23 percentage points, compared with 5.33 points for Vanilla OPD. Our method consistently yields larger improvements across the four benchmarks, with gains of 11.0, 5.2, 8.5, and 4.2 points, respectively. These results show that supervision elicited by code questions can also benefit mathematical reasoning.
+
+## Math-to-code transfer.
+
+We evaluate mathematics-trained students on LiveCodeBench, APPS-Intro, and APPS-Interview. Figure 7(b) shows that A2D improves performance by 2.7, 4.8, and 8.7 percentage points, respectively, compared with 1.9, 3.8, and 6.7 points for Vanilla OPD. Average accuracy increases from 47.00% to 52.40% with our method, exceeding Vanilla OPD’s 51.13% and approaching the teacher’s 52.70%. The student also surpasses the teacher on APPS-Intro (70.1% versus 68.7%), while remaining below it on the other two benchmarks.
+
+Together, these results demonstrate cross-domain gains in both evaluated directions, with our optimized synthetic questions outperforming real source-domain questions on every reported target benchmark. This finding is consistent with questions serving as carriers of distributional supervision whose benefits extend beyond the training domain. Although these experiments do not isolate the mechanism underlying transfer, they show that optimizing the supervision elicited from a particular student–teacher pair can improve performance beyond source-domain tasks.
+
+Figure 7: Cross-domain transfer between math and code. Gains over the initial student after source-domain OPD, without additional target-domain training. (a) Code-to-math transfer with Qwen3-4B (non-thinking) distilled from Qwen3-4B-Instruct-2507. (b) Math-to-code transfer with R1-Distill-7B distilled from Skywork-OR1-Math-7B. A2D uses optimized synthetic source-domain questions, while Vanilla OPD uses real source-domain questions. Bars report gains in percentage points; shaded groups show unweighted averages across the displayed benchmarks. Both methods improve all seven evaluated pair–benchmark combinations, and A2D consistently yields larger gains.
+
+## 3.9 Training-token efficiency and checkpoint gains
+
+We compare downstream accuracy against cumulative training tokens for
+R1-Distill-1.5B on JustRL and R1-Distill-7B on Skywork
+(Figure 5). The plot shows the Vanilla and A2D checkpoint trajectories, the Vanilla best-so-far reference, and the best
+checkpoint for each method. A2D reaches a best accuracy of 54.80% on
+R1-Distill-1.5B, compared with 52.27% for Vanilla, a gain of 2.53 percentage
+points. On R1-Distill-7B, A2D reaches 63.80% versus 61.70% for Vanilla, a
+gain of 2.10 points. The best-checkpoint token counts are similar for the
+1.5B model, while A2D reaches its best checkpoint with substantially fewer
+training tokens for the 7B model.
+
+These trajectories indicate that the accuracy gains are achieved without a
+substantial increase in downstream training-token use, particularly for
+R1-Distill-7B. They report downstream accuracy and token use only; they do not
+establish lower end-to-end cost, which also depends on the upstream cost of
+generating and scoring synthetic questions.
+
+## 3.10 Iterative Training
+
+Our main framework optimizes synthetic questions for a fixed student–teacher pair before performing OPD. We further examine whether repeating this process as the student improves yields additional benefits. We conduct three rounds on the code-generation pair consisting of a Qwen3-4B student and a Qwen3-30B-A3B teacher. After each round, we update the student used for question optimization, construct a new synthetic question bank, and continue OPD while keeping the teacher fixed. We evaluate on LiveCodeBench, APPS-Intro, and APPS-Interview and report the highest observed average accuracy across the evaluated checkpoints within each round. This comparison provides an optimistic assessment of the benefits of additional rounds, rather than a validation-selected final result.
+
+The first round raises average accuracy from 29.03% to 40.53%, an improvement of 11.50 percentage points. In contrast, the best observed averages in the second and third rounds reach only 40.82% and 40.97%, respectively. Thus, two additional rounds yield a cumulative gain of just 0.44 points over the first round, despite the additional question-generation and distillation effort. Even under this best-checkpoint comparison, iterative training provides only marginal improvements in the evaluated setting.
+
+One possible explanation is that the first round already captures much of the readily accessible supervision for this student–teacher pair. As the student becomes better aligned with the teacher, the synthesizer may find it increasingly difficult to identify questions that expose substantial disagreement while remaining within regions where the teacher provides useful guidance. In terms of our learning-value objective, maintaining both disagreement and compatibility may therefore become harder across rounds. This interpretation remains a hypothesis, as downstream scores alone do not establish how these signals evolve during training. Nevertheless, the observed diminishing returns suggest that repeatedly adapting the question distribution is not sufficient to sustain the large gains achieved in the first round, supporting single-round optimization as a practical choice in this setting.
+
+## 3.11 Case study: where does the teacher provide useful signal?
+
+To examine what the learning-value reward captures at the token level,
+Figure 6 contrasts a real geometry question from DAPO-17k-Math
+with a short combinatorics question posed by our student-initialized
+synthesizer, both scored with the same student–teacher pair. Each panel reports
+the apparent difficulty of the question, the mean teacher–student discrepancy,
+and the mean support-aware score $s_{t}$ (§2.3) over one student
+rollout. Below these statistics, an excerpt of the rollout is shaded by $s_{t}$ 
+and discrepancy, and two strips summarize both quantities over the full
+response, with a box marking the excerpt. The student answers both questions
+incorrectly.
+
+## Signal density.
+
+Despite its simpler surface form, the synthetic question elicits denser
+supervision. Its rollout contains 1,241 tokens, compared with 2,002 for the
+real question, while achieving approximately $1.5\times$ the mean $s_{t}$ 
+(0.172 versus 0.117) and $1.7\times$ the mean discrepancy (0.513 versus 0.307).
+Thus, the synthetic question produces a 38% shorter trajectory with a higher
+average support-aware score. Its cumulative score remains comparable to that of the real question
+( $\sum_{t}s_{t}=214$ versus $234$ ), retaining approximately 91% of the scored
+signal with only 62% of the response tokens.
+
+## Where the signal arises.
+
+The excerpts indicate where this difference comes from. In the geometry
+rollout, the displayed segment consists of routine coordinate algebra: the
+teacher largely agrees with the student token by token, and most positions
+receive low scores. In the combinatorics rollout, high-scoring positions
+cluster at the decisions that structure the solution—treating B and S as a
+single entity and then counting the resulting items—including the step
+where the student counts three items although there are four (U, E, the
+B–S block, and C). In both rollouts, $s_{t}$ is almost perfectly
+rank-correlated with the discrepancy (Spearman $\rho=0.994$ and $0.997$ ).
+Thus, the combined score largely preserves the ordering of positions by
+discrepancy in these examples. This rank correlation alone does not determine
+the magnitude of the compatibility factor.
+
+Figure 8: Optimized questions elicit more signal with fewer tokens. We compare student rollouts on 1,000 questions each from DAPO-17k-Math and our synthetic bank. (a) Mean response length and cumulative support-aware score $\sum_{t}s_{t}$ , normalized to the real-question baseline (100%); labels above bars show raw means. Synthetic questions yield 20% shorter responses and 28% more cumulative signal. (b) Mean token-level score $s_{t}$ across relative response-position bins. Synthetic questions maintain higher scores throughout the response, indicating that the signal-density advantage extends across the trajectory.
+
+This example illustrates that surface complexity alone is an incomplete
+indicator of a question’s value for OPD: a concise, apparently straightforward
+problem can elicit dense teacher–student disagreement with substantial
+support-aware signal. The observed advantage concerns signal density; the
+cumulative support-aware score is slightly lower for the synthetic question.
+These observations provide a qualitative illustration of our
+distribution-elicitation perspective, complementing the downstream performance
+comparisons.
+
+## Aggregate signal analysis.
+
+To complement the individual examples, we sample 1,000 questions each from DAPO-17k-Math and our synthetic question bank and analyze the support-aware signal along student rollouts. As shown in Figure 8(a), synthetic questions elicit shorter responses on average (1,020.7 versus 1,280.2 tokens, a 20% reduction), yet yield a higher mean cumulative score $\sum_{t}s_{t}$ (181.7 versus 141.7, a 28% increase). Thus, across these samples, the higher signal density translates into more total scored signal despite fewer response tokens. Figure 8(b) further shows that the mean $s_{t}$ remains higher for synthetic questions across all displayed relative-position bins, indicating that the advantage extends throughout the response rather than being confined to a narrow segment. Together with the concrete examples, these aggregate results support our distribution-elicitation perspective: optimized questions can expose denser and more abundant support-aware supervision without relying on longer student trajectories.
+
+## 3.12 Is Elicited Divergence a Learning Signal?
+
+Our reward rests on the premise that questions eliciting larger teacher–student divergence along student trajectories provide more useful supervision. On natural questions, the support-aware score closely tracks its divergence component (Spearman $\rho(\bar{s},\bar{\delta})=0.90$ ). We examine whether these signals predict actual learning gains through two experiments on the Qwen3-1.7B $\leftarrow$ Qwen3-4B-RL-Math pair.
+
+## Per-question learning value.
+
+For each of 1,500 held-out DAPO questions, we apply a single OPD update starting from the same base student and measure the resulting decrease in teacher–student KL on a fixed probe set. As shown in Figure 9 (left), mean divergence $\bar{\delta}$ strongly correlates with this learning value ( $\rho=0.727$ , 95% CI $[0.695,0.755]$ ). The association remains positive after controlling for response length, student pass rate, and student entropy (partial $\rho=0.386$ , 95% CI $[0.329,0.443]$ ). The full score $\bar{s}$ exhibits similar associations, with raw and partial correlations of $0.750$ and $0.399$ , respectively. Consistently, probe KL decrease rises monotonically across quintiles ranked by $\bar{s}$ , with the highest quintile yielding $2.15\times$ the decrease of the lowest (middle).
+
+## Downstream training utility.
+
+We further train students on five score-ranked question banks under an identical token budget of 24.4M tokens, using three seeds per bank. Figure 9 (right) shows that higher-scoring banks generally yield better final accuracy across six benchmarks. Average accuracy rises from $41.06\%$ in R1 to $43.49\%$ in R4, while R5 reaches $43.11\%$ , exceeding R1 by $2.05$ percentage points. Thus, the overall trend favors higher-scoring banks, although performance is not strictly monotonic. Additional high-versus-low divergence comparisons retain a positive advantage after balancing compatibility (Appendix A.5). Together, these results support elicited divergence as a useful indicator of distillation value, with evidence from both single-update gains and downstream training.
+
+Both experiments use natural DAPO-17k-Math questions, without synthesizer outputs, to evaluate whether the proposed signals predict learning value independently of synthesizer optimization. The one-step analysis measures changes on a fixed, disjoint probe set, while downstream comparisons use a common training-token budget. Appendix A.5 provides the data splits, update and evaluation protocols, controlled designs, and statistical procedures.
+
+Figure 9: 
+Teacher–student divergence is positively associated with learning value.
+Left: Raw and partial Spearman correlations of mean divergence
+ $\bar{\delta}$ and mean score $\bar{s}$ with one-step learning value
+over 1,500 questions. Partial correlations control for response length,
+pass rate, and entropy; error bars indicate 95% confidence intervals.
+Middle: Probe KL decrease increases across question quintiles
+ranked by $\bar{s}$ , with the highest quintile yielding
+ $2.15\times$ the decrease of the lowest.
+Right: Final average accuracy over six benchmarks for training
+on five score buckets, annotated with their mean $\bar{\delta}$ .
+Points show means over three seeds; error bars and shading indicate
+ $\pm$ 1 standard deviation.
+
+## 4 Related Work
+
+## 4.1 On-Policy Distillation and Selective Supervision
+
+On-policy distillation supervises student-generated trajectories using teacher predictions at the same visited states. GKD addresses the distribution mismatch of fixed-response distillation by training on student-generated sequences (Agarwal et al., 2024), while MiniLLM develops an on-policy optimization approach based on reverse KL divergence (Gu et al., 2024). Subsequent work improves the trajectories and teacher targets used for distillation. Speculative Knowledge Distillation interleaves student and teacher sampling to improve training sequences while accounting for the student’s generation distribution (Xu et al., 2025). Best-of-N Teacher Rollout Selection augments student-context supervision with an auxiliary teacher trajectory selected according to correctness and student alignment (Zhang et al., 2026). PromptKD instead tunes teacher-side prompts to produce student-friendly supervision (Kim et al., 2024). These approaches modify how supervision is produced or delivered, whereas our method learns the questions that elicit it.
+
+Selective OPD further recognizes that response positions provide unequal learning value. TIP characterizes token importance through student entropy and teacher–student divergence (Xu et al., 2026). Entropy-Aware OPD augments reverse KL with forward KL at high-teacher-entropy positions (Jin et al., 2026), and FiRe-OPD combines trajectory filtering with soft token reweighting (Li et al., 2026c). Token Teachability distinguishes locally learnable disagreement from mismatch outside the student’s candidate support, using teacher–student discrepancy and teacher probability mass on the student’s top- $K$ candidates (Wang et al., 2026b). In the related setting of on-policy self-distillation, matching supervision to student capacity has also been studied through joint token weighting and privileged-information adjustment (Yang et al., 2026b). We build on the support-aware characterization of teachability, adapting it into a question-level reward with trajectory aggregation, length control, and batch-diversity control. Our optimization changes the synthetic prompt distribution while holding the downstream OPD procedure fixed.
+
+## 4.2 Synthetic Data Generation and Selection for Distillation
+
+Synthetic-data methods differ in the feedback used to construct training examples. Self-Instruct generates instruction–response pairs for supervised finetuning (Wang et al., 2023), and WizardLM evolves instructions toward greater complexity (Xu et al., 2024). R-Zero and Self-Questioning Language Models train task proposers through solver feedback to support self-improving reasoning (Huang et al., 2026; Chen et al., 2025). Self-Adapting Language Models learns to generate finetuning data and update directives using the adapted model’s downstream performance (Zweiger et al., 2025). Particularly relevant to our setting, Prompting to Distill uses reinforced prompts and teacher–student discrepancy to synthesize data for text-classification distillation (Ma et al., 2022). Our work extends the broader idea of feedback-guided synthesis to prompt-only OPD data, where value is assessed through teacher distributions along student-generated reasoning trajectories.
+
+Recent studies directly examine the role of training questions in OPD. Rethinking OPD identifies teacher–student compatibility as an important factor and proposes teacher-aligned prompt selection (Li et al., 2026b). Its follow-up shows that a single query can expose broad state coverage and recover much of the gain from full-data training (Fu et al., 2026). What Matters in OPD studies difficulty-based selection, finding that a small set of hard questions can match a much larger dataset in its evaluated settings and relating their utility to longer reasoning trajectories (Hou et al., 2026). Beyond Prompt Count shows that prompt usefulness depends on the student–teacher pair and target capability, with targeted selection not consistently outperforming random sampling (Wang et al., 2026a). Data-Free OPD further demonstrates effective distillation using self-generated questions without external seed examples (Li et al., 2026a).
+
+A2D learns a synthesizer to actively shape the question distribution for a target student–teacher pair. Its objective evaluates the support-aware supervision elicited by each question, rather than using surface complexity, answer correctness, or raw disagreement alone as the generation criterion. Unlike selection from an existing question bank or direct sampling from an unoptimized model, our pipeline trains the synthesizer using a frozen scoring pair and then constructs a curated prompt-only bank for OPD. Question generation and synthesizer training reuse the target student and teacher without external training questions or auxiliary models. A frozen embedding model is used only to remove semantically redundant questions during post-generation curation.
+
+## 5 Conclusion
+
+We introduced A2D, a framework that treats synthetic questions as distribution elicitors for on-policy distillation. Rather than judging a question by its surface form, A2D trains a student-initialized synthesizer against a frozen student–teacher pair to expose useful teacher supervision along student-generated trajectories. Its learning-value reward combines teacher–student disagreement with teacher probability mass on the student’s candidate support, together with length and diversity controls, and the generated questions are filtered and deduplicated into a prompt-only bank for standard OPD. Synthesizer training reuses the target student and teacher without external training questions or auxiliary models; a frozen embedding model is used only for post-generation semantic deduplication. Across mathematical reasoning, code generation, and agentic tasks, A2D improves average performance and teacher-gap recovery over unoptimized student-generated prompts and KL-filtered real questions, while matching or exceeding real-bank OPD in the evaluated settings. Signal analyses further show that optimized questions can elicit denser supervision from shorter student responses. These results support elicited distributional supervision as an objective for constructing synthetic distillation data.
+
+Our learning-value reward is a surrogate estimated from a single student response per question, and the synthesizer is optimized once for a fixed student–teacher pair. Developing more effective adaptive question-generation strategies as the student improves, and combining learned question generation with token-level selection methods for OPD, are natural directions for future work.
+
+## References
+
+Agarwal et al. (2024)
+R. Agarwal, N. Vieillard, Y. Zhou, P. Stanczyk, S. R. Garea, M. Geist, and O. Bachem
+
+On-policy distillation of language models: learning from self-generated mistakes.
+
+In The Twelfth International Conference on Learning Representations,
+ICLR 2024, Vienna, Austria, May 7-11, 2024,
+
+External Links: Link
+
+Cited by: §1,
+§4.1.
+
+Ahmad et al. (2025)
+W. U. Ahmad, S. Narenthiran, S. Majumdar, A. Ficek, S. Jain, J. Huang, V. Noroozi, and B. Ginsburg
+
+OpenCodeReasoning: advancing data distillation for competitive coding.
+
+CoRR abs/2504.01943.
+
+External Links: Link,
+Document,
+2504.01943
+
+Cited by: §3.2.
+
+Austin et al. (2021)
+J. Austin, A. Odena, M. I. Nye, M. Bosma, H. Michalewski, D. Dohan, E. Jiang, C. J. Cai, M. Terry, Q. V. Le, and C. Sutton
+
+Program synthesis with large language models.
+
+CoRR abs/2108.07732.
+
+External Links: Link,
+Document,
+2108.07732
+
+Cited by: §3.3.
+
+Barrès et al. (2025)
+V. Barrès, H. Dong, S. Ray, X. Si, and K. Narasimhan
+
+ $\tau$ ${}^{\mbox{2}}$ -bench: evaluating conversational agents in a dual-control environment.
+
+CoRR abs/2506.07982.
+
+External Links: Link,
+Document,
+2506.07982
+
+Cited by: §3.2,
+§3.3.
+
+Chen et al. (2025)
+L. Chen, M. Prabhudesai, K. Fragkiadaki, H. Liu, and D. Pathak
+
+Self-questioning language models.
+
+CoRR abs/2508.03682.
+
+External Links: Link,
+Document,
+2508.03682
+
+Cited by: §1,
+Table 2,
+Table 2,
+Table 2,
+§3.2,
+§4.2.
+
+Dekoninck et al. (2026)
+J. Dekoninck, N. Jovanovic, T. Gehrunger, K. Rögnvaldsson, I. Petrov, C. Sun, and M. T. Vechev
+
+Beyond benchmarks: matharena as an evaluation platform for mathematics with llms.
+
+CoRR abs/2605.00674.
+
+External Links: Link,
+Document,
+2605.00674
+
+Cited by: §3.3.
+
+Fu et al. (2026)
+Z. Fu, B. He, Y. Zuo, H. Huang, J. Zhang, R. Xiao, C. Qian, Q. Luo, H. Gao, Y. Wang, Z. Liu, N. Ding, and C. Xiao
+
+Rethinking on-policy distillation of large language models II: one training example.
+
+CoRR abs/2609.04172.
+
+External Links: Link,
+Document,
+2609.04172
+
+Cited by: §1,
+§4.2.
+
+Gu et al. (2024)
+Y. Gu, L. Dong, F. Wei, and M. Huang
+
+MiniLLM: knowledge distillation of large language models.
+
+In The Twelfth International Conference on Learning Representations,
+ICLR 2024, Vienna, Austria, May 7-11, 2024,
+
+External Links: Link
+
+Cited by: §1,
+§4.1.
+
+Guo et al. (2025)
+D. Guo, D. Yang, H. Zhang, J. Song, P. Wang, Q. Zhu, R. Xu, R. Zhang, S. Ma, X. Bi, X. Zhang, X. Yu, Y. Wu, Z. F. Wu, Z. Gou, Z. Shao, Z. Li, Z. Gao, A. Liu, B. Xue, B. Wang, B. Wu, B. Feng, C. Lu, C. Zhao, C. Deng, C. Ruan, D. Dai, D. Chen, D. Ji, E. Li, F. Lin, F. Dai, F. Luo, G. Hao, G. Chen, G. Li, H. Zhang, H. Xu, H. Ding, H. Gao, H. Qu, H. Li, J. Guo, J. Li, J. Chen, J. Yuan, J. Tu, J. Qiu, J. Li, J. L. Cai, J. Ni, J. Liang, J. Chen, K. Dong, K. Hu, K. You, K. Gao, K. Guan, K. Huang, K. Yu, L. Wang, L. Zhang, L. Zhao, L. Wang, L. Zhang, L. Xu, L. Xia, M. Zhang, M. Zhang, M. Tang, M. Zhou, M. Li, M. Wang, M. Li, N. Tian, P. Huang, P. Zhang, Q. Wang, Q. Chen, Q. Du, R. Ge, R. Zhang, R. Pan, R. Wang, R. J. Chen, R. L. Jin, R. Chen, S. Lu, S. Zhou, S. Chen, S. Ye, S. Wang, S. Yu, S. Zhou, S. Pan, S. S. Li, S. Zhou, S. Wu, T. Yun, T. Pei, T. Sun, T. Wang, W. Zeng, W. Liu, W. Liang, W. Gao, W. Yu, W. Zhang, W. L. Xiao, W. An, X. Liu, X. Wang, X. Chen, X. Nie, X. Cheng, X. Liu, X. Xie, X. Liu, X. Yang, X. Li, X. Su, X. Lin, X. Q. Li, X. Jin, X. Shen, X. Chen, X. Sun, X. Wang, X. Song, X. Zhou, X. Wang, X. Shan, Y. K. Li, Y. Q. Wang, Y. X. Wei, Y. Zhang, Y. Xu, Y. Li, Y. Zhao, Y. Sun, Y. Wang, Y. Yu, Y. Zhang, Y. Shi, Y. Xiong, Y. He, Y. Piao, Y. Wang, Y. Tan, Y. Ma, Y. Liu, Y. Guo, Y. Ou, Y. Wang, Y. Gong, Y. Zou, Y. He, Y. Xiong, Y. Luo, Y. You, Y. Liu, Y. Zhou, Y. X. Zhu, Y. Huang, Y. Li, Y. Zheng, Y. Zhu, Y. Ma, Y. Tang, Y. Zha, Y. Yan, Z. Z. Ren, Z. Ren, Z. Sha, Z. Fu, Z. Xu, Z. Xie, Z. Zhang, Z. Hao, Z. Ma, Z. Yan, Z. Wu, Z. Gu, Z. Zhu, Z. Liu, Z. Li, Z. Xie, Z. Song, Z. Pan, Z. Huang, Z. Xu, Z. Zhang, and Z. Zhang
+
+DeepSeek-r1 incentivizes reasoning in llms through reinforcement learning.
+
+Nat. 645 (8081), pp. 633–638.
+
+External Links: Link,
+Document
+
+Cited by: §3.1.
+
+He et al. (2025a)
+B. He, Z. Qu, Z. Liu, Y. Chen, Y. Zuo, C. Qian, K. Zhang, W. Chen, C. Xiao, G. Cui, N. Ding, and Z. Liu
+
+JustRL: scaling a 1.5b LLM with a simple RL recipe.
+
+CoRR abs/2512.16649.
+
+External Links: Link,
+Document,
+2512.16649
+
+Cited by: §3.1.
+
+He et al. (2025b)
+J. He, J. Liu, C. Y. Liu, R. Yan, C. Wang, P. Cheng, X. Zhang, F. Zhang, J. Xu, W. Shen, S. Li, L. Zeng, T. Wei, C. Cheng, B. An, Y. Liu, and Y. Zhou
+
+Skywork open reasoner 1 technical report.
+
+CoRR abs/2505.22312.
+
+External Links: Link,
+Document,
+2505.22312
+
+Cited by: §3.1.
+
+Hendrycks et al. (2021a)
+D. Hendrycks, S. Basart, S. Kadavath, M. Mazeika, A. Arora, E. Guo, C. Burns, S. Puranik, H. He, D. Song, and J. Steinhardt
+
+Measuring coding challenge competence with APPS.
+
+In Proceedings of the Neural Information Processing Systems Track on
+Datasets and Benchmarks 1, NeurIPS Datasets and Benchmarks 2021, December
+2021, virtual, J. Vanschoren and S. Yeung (Eds.),
+
+External Links: Link
+
+Cited by: §3.3.
+
+Hendrycks et al. (2021b)
+D. Hendrycks, C. Burns, S. Kadavath, A. Arora, S. Basart, E. Tang, D. Song, and J. Steinhardt
+
+Measuring mathematical problem solving with the MATH dataset.
+
+In Proceedings of the Neural Information Processing Systems Track on
+Datasets and Benchmarks 1, NeurIPS Datasets and Benchmarks 2021, December
+2021, virtual, J. Vanschoren and S. Yeung (Eds.),
+
+External Links: Link
+
+Cited by: §3.3.
+
+Hou et al. (2026)
+Z. Hou, J. Zhang, X. Cai, and K. You
+
+What matters in on-policy distillation? A perspective on data efficiency and data selection.
+
+CoRR abs/2609.05198.
+
+External Links: Link,
+Document,
+2609.05198
+
+Cited by: §1,
+§4.2.
+
+Huang et al. (2026)
+C. Huang, W. Yu, X. Wang, H. Zhang, Z. Li, R. Li, J. Huang, H. Mi, and D. Yu
+
+R-zero: self-evolving reasoning LLM from zero data.
+
+In The Fourteenth International Conference on Learning Representations,
+ICLR 2026, Rio de Janeiro, Brazil, April 23-27, 2026, C. Vondrick, B. Hariharan, C. Raffel, L. Pinto, D. Yang, and A. Faust (Eds.),
+
+External Links: Link
+
+Cited by: §1,
+§2.3,
+Table 1,
+Table 1,
+Table 1,
+§3.2,
+§4.2.
+
+Hui et al. (2024)
+B. Hui, J. Yang, Z. Cui, J. Yang, D. Liu, L. Zhang, T. Liu, J. Zhang, B. Yu, K. Dang, A. Yang, R. Men, F. Huang, X. Ren, X. Ren, J. Zhou, and J. Lin
+
+Qwen2.5-coder technical report.
+
+CoRR abs/2409.12186.
+
+External Links: Link,
+Document,
+2409.12186
+
+Cited by: §3.1.
+
+Jain et al. (2025)
+N. Jain, K. Han, A. Gu, W. Li, F. Yan, T. Zhang, S. Wang, A. Solar-Lezama, K. Sen, and I. Stoica
+
+LiveCodeBench: holistic and contamination free evaluation of large language models for code.
+
+In The Thirteenth International Conference on Learning Representations,
+ICLR 2025, Singapore, April 24-28, 2025,
+
+External Links: Link
+
+Cited by: §3.3.
+
+Jin et al. (2026)
+W. Jin, T. Min, Y. Yang, S. R. Kadhe, Y. Zhou, D. Wei, N. Baracaldo, and K. Lee
+
+Entropy-aware on-policy distillation of language models.
+
+CoRR abs/2603.07079.
+
+External Links: Link,
+Document,
+2603.07079
+
+Cited by: §4.1.
+
+Kim et al. (2024)
+G. Kim, D. Jang, and E. Yang
+
+PromptKD: distilling student-friendly knowledge for generative language models via prompt tuning.
+
+In Findings of the Association for Computational Linguistics: EMNLP
+2024, Miami, Florida, USA, November 12-16, 2024, Y. Al-Onaizan, M. Bansal, and Y. Chen (Eds.),
+
+Findings of ACL, Vol. EMNLP 2024, pp. 6266–6282.
+
+External Links: Link,
+Document
+
+Cited by: §4.1.
+
+Kwon et al. (2023)
+W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. Gonzalez, H. Zhang, and I. Stoica
+
+Efficient memory management for large language model serving with pagedattention.
+
+In Proceedings of the 29th Symposium on Operating Systems Principles,
+SOSP 2023, Koblenz, Germany, October 23-26, 2023, J. Flinn, M. I. Seltzer, P. Druschel, A. Kaufmann, and J. Mace (Eds.),
+
+pp. 611–626.
+
+External Links: Link,
+Document
+
+Cited by: §A.3.
+
+Li et al. (2026a)
+G. Li, M. Zheng, M. Song, J. Sun, Z. Liu, R. Liu, Q. Zhong, H. Guo, J. Fang, and J. Wang
+
+Data-free on-policy distillation.
+
+CoRR abs/2609.14193.
+
+External Links: Link,
+Document,
+2609.14193
+
+Cited by: §1,
+§4.2.
+
+Li et al. (2026b)
+Y. Li, Y. Zuo, B. He, J. Zhang, C. Xiao, C. Qian, T. Yu, H. Gao, W. Yang, Z. Liu, and N. Ding
+
+Rethinking on-policy distillation of large language models: phenomenology, mechanism, and recipe.
+
+CoRR abs/2604.13016.
+
+External Links: Link,
+Document,
+2604.13016
+
+Cited by: Table 1,
+Table 1,
+Table 1,
+Table 2,
+Table 2,
+Table 2,
+§3.2,
+§3.3,
+§4.2.
+
+Li et al. (2022)
+Y. Li, D. H. Choi, J. Chung, N. Kushman, J. Schrittwieser, R. Leblond, T. Eccles, J. Keeling, F. Gimeno, A. D. Lago, T. Hubert, P. Choy, C. de Masson d’Autume, I. Babuschkin, X. Chen, P. Huang, J. Welbl, S. Gowal, A. Cherepanov, J. Molloy, D. J. Mankowitz, E. S. Robson, P. Kohli, N. de Freitas, K. Kavukcuoglu, and O. Vinyals
+
+Competition-level code generation with alphacode.
+
+CoRR abs/2203.07814.
+
+External Links: Link,
+Document,
+2203.07814
+
+Cited by: §3.3.
+
+Li et al. (2026c)
+Y. Li, L. Zheng, Y. Yu, W. Zhou, X. Zhong, X. Hu, J. Jin, H. Yuan, and T. Feng
+
+Filter, then reweight: rethinking optimization granularity in on-policy distillation.
+
+CoRR abs/2606.02684.
+
+External Links: Link,
+Document,
+2606.02684
+
+Cited by: §1,
+§4.1.
+
+Lightman et al. (2024)
+H. Lightman, V. Kosaraju, Y. Burda, H. Edwards, B. Baker, T. Lee, J. Leike, J. Schulman, I. Sutskever, and K. Cobbe
+
+Let’s verify step by step.
+
+In The Twelfth International Conference on Learning Representations,
+ICLR 2024, Vienna, Austria, May 7-11, 2024,
+
+External Links: Link
+
+Cited by: §3.3.
+
+Liu et al. (2023)
+J. Liu, C. S. Xia, Y. Wang, and L. Zhang
+
+Is your code generated by chatgpt really correct? rigorous evaluation of large language models for code generation.
+
+In Advances in Neural Information Processing Systems 36: Annual Conference
+on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans,
+LA, USA, December 10 - 16, 2023, A. Oh, T. Naumann, A. Globerson, K. Saenko, M. Hardt, and S. Levine (Eds.),
+
+External Links: Link
+
+Cited by: §3.3.
+
+Ma et al. (2022)
+X. Ma, X. Wang, G. Fang, Y. Shen, and W. Lu
+
+Prompting to distill: boosting data-free knowledge distillation via reinforced prompt.
+
+In Proceedings of the Thirty-First International Joint Conference on
+Artificial Intelligence, IJCAI 2022, Vienna, Austria, 23-29 July
+2022, L. D. Raedt (Ed.),
+
+pp. 4296–4302.
+
+External Links: Link,
+Document
+
+Cited by: §4.2.
+
+Mathematical Association of America (2023)
+Mathematical Association of America
+
+American Mathematics Competitions (AMC) 2023.
+
+External Links: Link
+
+Cited by: §3.3.
+
+Mathematical Association of America (2024)
+Mathematical Association of America
+
+American Invitational Mathematics Examination (AIME) 2024.
+
+External Links: Link
+
+Cited by: §3.3.
+
+Meurer et al. (2017)
+A. Meurer, C. P. Smith, M. Paprocki, O. Certík, S. B. Kirpichev, M. Rocklin, A. Kumar, S. Ivanov, J. K. Moore, S. Singh, T. Rathnayake, S. Vig, B. E. Granger, R. P. Muller, F. Bonazzi, H. Gupta, S. Vats, F. Johansson, F. Pedregosa, M. J. Curry, A. R. Terrel, S. Roucka, A. Saboo, I. Fernando, S. Kulal, R. Cimrman, and A. M. Scopatz
+
+SymPy: symbolic computing in python.
+
+PeerJ Comput. Sci. 3, pp. e103.
+
+External Links: Link,
+Document
+
+Cited by: §A.3.
+
+OpenAI (2024)
+OpenAI
+
+GPT-4o mini: advancing cost-efficient intelligence.
+
+External Links: Link
+
+Cited by: §3.1.
+
+Schulman et al. (2017)
+J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov
+
+Proximal policy optimization algorithms.
+
+CoRR abs/1707.06347.
+
+External Links: Link,
+Document,
+1707.06347
+
+Cited by: §2.6.
+
+Shao et al. (2024)
+Z. Shao, P. Wang, Q. Zhu, R. Xu, J. Song, M. Zhang, Y. K. Li, Y. Wu, and D. Guo
+
+DeepSeekMath: pushing the limits of mathematical reasoning in open language models.
+
+CoRR abs/2402.03300.
+
+External Links: Link,
+Document,
+2402.03300
+
+Cited by: item 1.
+
+Sheng et al. (2025)
+G. Sheng, C. Zhang, Z. Ye, X. Wu, W. Zhang, R. Zhang, Y. Peng, H. Lin, and C. Wu
+
+HybridFlow: A flexible and efficient RLHF framework.
+
+In Proceedings of the Twentieth European Conference on Computer Systems,
+EuroSys 2025, Rotterdam, The Netherlands, 30 March 2025 - 3 April
+2025,
+
+pp. 1279–1297.
+
+External Links: Link,
+Document
+
+Cited by: §A.2.
+
+Team (2025)
+Q. Team
+
+Qwen3 technical report.
+
+CoRR abs/2505.09388.
+
+External Links: Link,
+Document,
+2505.09388
+
+Cited by: §3.1,
+§3.1.
+
+Wang et al. (2026a)
+J. Wang, J. Lyu, Y. Cai, S. Wu, P. Wang, J. Liu, X. Cheng, K. Yang, Y. Chen, S. Yang, and L. Guo
+
+Beyond prompt count: how data shapes transfer in on-policy distillation.
+
+External Links: 2609.37377,
+Link
+
+Cited by: §1,
+§4.2.
+
+Wang et al. (2023)
+Y. Wang, Y. Kordi, S. Mishra, A. Liu, N. A. Smith, D. Khashabi, and H. Hajishirzi
+
+Self-instruct: aligning language models with self-generated instructions.
+
+In Proceedings of the 61st Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), ACL 2023, Toronto, Canada,
+July 9-14, 2023, A. Rogers, J. L. Boyd-Graber, and N. Okazaki (Eds.),
+
+pp. 13484–13508.
+
+External Links: Link,
+Document
+
+Cited by: §1,
+§4.2.
+
+Wang et al. (2026b)
+Y. Wang, S. Lu, Y. Gu, P. Wang, Y. Yang, Z. Yan, C. Xie, J. Wu, and H. Yang
+
+Not all disagreement is learnable: token teachability in on-policy distillation.
+
+CoRR abs/2605.26844.
+
+External Links: Link,
+Document,
+2605.26844
+
+Cited by: §1,
+§2.3,
+§4.1.
+
+Xu et al. (2024)
+C. Xu, Q. Sun, K. Zheng, X. Geng, P. Zhao, J. Feng, C. Tao, Q. Lin, and D. Jiang
+
+WizardLM: empowering large pre-trained language models to follow complex instructions.
+
+In The Twelfth International Conference on Learning Representations,
+ICLR 2024, Vienna, Austria, May 7-11, 2024,
+
+External Links: Link
+
+Cited by: §1,
+Table 1,
+Table 1,
+Table 1,
+Table 2,
+Table 2,
+Table 2,
+§3.2,
+§4.2.
+
+Xu et al. (2025)
+W. Xu, R. Han, Z. Wang, L. T. Le, D. Madeka, L. Li, W. Y. Wang, R. Agarwal, C. Lee, and T. Pfister
+
+Speculative knowledge distillation: bridging the teacher-student gap through interleaved sampling.
+
+In The Thirteenth International Conference on Learning Representations,
+ICLR 2025, Singapore, April 24-28, 2025,
+
+External Links: Link
+
+Cited by: §4.1.
+
+Xu et al. (2026)
+Y. Xu, H. Sang, Z. Zhou, R. He, Z. Wang, and A. Geramifard
+
+TIP: token importance in on-policy distillation.
+
+External Links: 2604.14084,
+Link
+
+Cited by: §1,
+§4.1.
+
+Yang et al. (2026a)
+W. Yang, W. Liu, R. Xie, K. Yang, S. Yang, and Y. Lin
+
+Learning beyond teacher: generalized on-policy distillation with reward extrapolation.
+
+CoRR abs/2602.12125.
+
+External Links: Link,
+Document,
+2602.12125
+
+Cited by: §3.1.
+
+Yang et al. (2026b)
+Y. Yang, Z. Hao, H. Zhang, Y. Liu, X. Lin, W. Ji, F. Wei, J. Yu, Q. Lin, X. Liang, and H. Dong
+
+Matching supervision to the student’s learning capacity: a unified framework for on-policy self-distillation.
+
+External Links: 2608.08176,
+Link
+
+Cited by: §4.1.
+
+Yu et al. (2025)
+Q. Yu, Z. Zhang, R. Zhu, Y. Yuan, X. Zuo, Y. Yue, W. Dai, T. Fan, G. Liu, J. Liu, L. Liu, X. Liu, H. Lin, Z. Lin, B. Ma, G. Sheng, Y. Tong, C. Zhang, M. Zhang, R. Zhang, W. Zhang, H. Zhu, J. Zhu, J. Chen, J. Chen, C. Wang, H. Yu, Y. Song, X. Wei, H. Zhou, J. Liu, W. Ma, Y. Zhang, L. Yan, Y. Wu, and M. Wang
+
+DAPO: an open-source LLM reinforcement learning system at scale.
+
+In Advances in Neural Information Processing Systems 38: Annual Conference
+on Neural Information Processing Systems 2025, NeurIPS 2025, San Diego,
+CA, USA, December 2-7, 2025 / Mexico City, Mexico, November 30 - December
+5, 2025, D. Belgrave, C. Zhang, L. N. Montoya, H. Lin, R. Pascanu, P. Koniusz, M. Ghassemi, N. Chen, I. V. M. Ruíz, and A. Loaiza-Bonilla (Eds.),
+
+External Links: Link
+
+Cited by: §3.2.
+
+Zhang et al. (2026)
+K. Zhang, Y. Tian, D. Zhao, Y. Li, Y. Liu, V. M. Patel, and D. Fu
+
+On-policy distillation with best-of-n teacher rollout selection.
+
+CoRR abs/2605.09725.
+
+External Links: Link,
+Document,
+2605.09725
+
+Cited by: §4.1.
+
+Zhang et al. (2025)
+Y. Zhang, M. Li, D. Long, X. Zhang, H. Lin, B. Yang, P. Xie, A. Yang, D. Liu, J. Lin, F. Huang, and J. Zhou
+
+Qwen3 embedding: advancing text embedding and reranking through foundation models.
+
+CoRR abs/2506.05176.
+
+External Links: Link,
+Document,
+2506.05176
+
+Cited by: §2.5,
+§3.1.
+
+Zhang and Math-AI (2025)
+Y. Zhang and T. Math-AI
+
+American invitational mathematics examination (aime) 2025.
+
+Cited by: §3.3.
+
+Zweiger et al. (2025)
+A. Zweiger, J. Pari, H. Guo, E. Akyürek, Y. Kim, and P. Agrawal
+
+Self-adapting language models.
+
+CoRR abs/2506.10943.
+
+External Links: Link,
+Document,
+2506.10943
+
+Cited by: §4.2.
+
+## Appendix A Experimental Details
+
+## A.1 Algorithm
+
+Algorithm 1 summarizes our method.
+
+Algorithm 1 A2D: Learning to Elicit Teacher Supervision
+
+ 0:
+
+  Student $\pi_{S}$ , teacher $\pi_{T}$ , question-generation instruction $x$ ;
+candidate size $K$ , question budget $L_{q}$ , shared response budget $L_{\max}$ ;
+calibration percentile $\kappa$ and question count $N_{\mathrm{cal}}$ ;
+synthesizer steps $T_{\mathrm{syn}}$ , groups per step $B$ , group size $g$ ;
+raw question count $N$ , OPD epochs $E$ , responses per question $n_{\mathrm{roll}}$ .
+
+ 0:
+
+  Synthetic question bank $\mathcal{D}$ and distilled student $\pi_{S}$ .
+
+ 1:
+
+  Initialize synthesizer $S_{\theta}\leftarrow\operatorname{Copy}(\pi_{S})$ .
+
+ 2:
+
+  Freeze $\pi_{S}$ and $\pi_{T}$ during synthesizer optimization.
+
+ 3:
+
+  Calibrate $\delta_{\mathrm{ref}}$ as the $\kappa$ -th percentile of token discrepancies
+on student rollouts for $N_{\mathrm{cal}}$ student-generated questions.
+
+ 4:
+
+  Stage 1: Optimize the synthetic question distribution
+
+ 5:
+
+  for $k=1,\ldots,T_{\mathrm{syn}}$ do
+
+ 6:
+
+   Sample $B$ groups of questions
+ $\mathcal{Q}_{b}=\{q_{b,i}\}_{i=1}^{g}$ from $S_{\theta}(\cdot\mid x)$ 
+under budget $L_{q}$ .
+
+ 7:
+
+   Form the question batch $\mathcal{Q}$ by concatenating all groups.
+
+ 8:
+
+   Cluster questions using BLEU-based pairwise distances
+to compute $\operatorname{share}(q)$ for each $q\in\mathcal{Q}$ .
+
+ 9:
+
+   for all $q\in\mathcal{Q}$ do
+
+ 10:
+
+    Sample $y\sim\pi_{S}(\cdot\mid q)$ under budget $L_{\max}$ ;
+let $L=|y|$ .
+
+ 11:
+
+    At each position $t$ , evaluate
+ $p_{S}=\pi_{S}(\cdot\mid q,y_{<t})$ and
+ $p_{T}=\pi_{T}(\cdot\mid q,y_{<t})$ .
+
+ 12:
+
+    Set
+ $A_{t}=\operatorname{TopK}(p_{S})$ ,
+ $B_{t}=\operatorname{TopK}(p_{T})$ , and
+ $U_{t}=A_{t}\cup B_{t}$ .
+
+ 13:
+
+    Normalize $p_{S}$ and $p_{T}$ over $U_{t}$ to obtain
+ $\bar{p}_{S}$ and $\bar{p}_{T}$ .
+
+ 14:
+
+    Compute
+ $\delta_{t}=\operatorname{KL}(\bar{p}_{T}\|\bar{p}_{S})$ ,
+ $\omega_{t}=\sum_{v\in A_{t}}p_{T}(v)$ , and
+ $s_{t}=\min\!\left(\delta_{t}/(\delta_{\mathrm{ref}}+\epsilon),1\right)\omega_{t}$ .
+
+ 15:
+
+    Compute
+ $P_{\mathrm{len}}(q)=1-\lambda_{\mathrm{len}}\min(L/L_{\max},1)$ 
+and
+ $P_{\mathrm{div}}(q)=\max(0,1-\lambda_{\mathrm{div}}\operatorname{share}(q))$ .
+
+ 16:
+
+    Assign question reward
+ $R(q)=P_{\mathrm{len}}(q)P_{\mathrm{div}}(q)L^{-\alpha}\sum_{t=1}^{L}s_{t}$ .
+
+ 17:
+
+   end for
+
+ 18:
+
+   Compute reward mean $\mu_{b}$ and standard deviation $\sigma_{b}$ 
+within each group $\mathcal{Q}_{b}$ .
+
+ 19:
+
+   Set
+ $\widehat{A}_{b,i}=(R(q_{b,i})-\mu_{b})/(\sigma_{b}+\epsilon)$ .
+
+ 20:
+
+   Update only $S_{\theta}$ with GRPO, applying
+ $\widehat{A}_{b,i}$ to the generated tokens of question $q_{b,i}$ .
+
+ 21:
+
+   Save synthesizer checkpoints at the prescribed interval.
+
+ 22:
+
+  end for
+
+ 23:
+
+  Stage 2: Construct the synthetic question bank
+
+ 24:
+
+  Select a synthesizer checkpoint $S_{\theta^{\star}}$ .
+
+ 25:
+
+  Sample $N$ questions from $S_{\theta^{\star}}(\cdot\mid x)$ 
+under budget $L_{q}$ .
+
+ 26:
+
+  Apply format filtering and remove malformed, incomplete,
+or answer-leaking outputs.
+
+ 27:
+
+  Apply lexical deduplication using token-set Jaccard similarity.
+
+ 28:
+
+  Apply semantic deduplication using the frozen Qwen3-Embedding-4B model.
+
+ 29:
+
+  Store the retained questions as the prompt-only bank $\mathcal{D}$ .
+
+ 30:
+
+  Stage 3: Distill the student on the synthetic bank
+
+ 31:
+
+  Unfreeze $\pi_{S}$ and keep $\pi_{T}$ frozen.
+
+ 32:
+
+  for $e=1,\ldots,E$ do
+
+ 33:
+
+   for all minibatches $\mathcal{B}\subset\mathcal{D}$ do
+
+ 34:
+
+    Snapshot the current student as $\pi_{\mathrm{old}}$ .
+
+ 35:
+
+    For each $q\in\mathcal{B}$ , sample $n_{\mathrm{roll}}$ responses
+from $\pi_{\mathrm{old}}(\cdot\mid q)$ under budget $L_{\max}$ .
+
+ 36:
+
+    At each response position $t$ , evaluate
+ $p_{S}=\pi_{\mathrm{old}}(\cdot\mid q,y_{<t})$ and
+ $p_{T}=\pi_{T}(\cdot\mid q,y_{<t})$ .
+
+ 37:
+
+    Set $A_{t}=\operatorname{TopK}(p_{S})$ and
+ $w_{t}(v)=p_{S}(v)/\sum_{u\in A_{t}}p_{S}(u)$ for $v\in A_{t}$ .
+
+ 38:
+
+    Compute per-candidate advantages
+ $r_{t}(v)=w_{t}(v)\log\!\left(p_{T}(v)/p_{S}(v)\right)$ ,
+ $v\in A_{t}$ .
+
+ 39:
+
+    Update $\pi_{S}$ with the PPO-clipped objective using
+ $r_{t}(v)$ directly as fixed advantages,
+summing over candidates and averaging over valid response tokens.
+
+ 40:
+
+   end for
+
+ 41:
+
+  end for
+
+ 42:
+
+  return $\mathcal{D},\pi_{S}$ .
+
+## A.2 Implementation Details
+
+Our framework was developed based on verl (Sheng et al., 2025). For reward computation, we use $K=16$ candidate tokens, a question-generation budget of $L_{q}=4096$ tokens, and a student-response budget of $L_{\max}=7168$ tokens, with the latter matched to the downstream OPD response budget by construction (§2.6). For each student–teacher pair, the discrepancy scale $\delta_{\mathrm{ref}}$ is set to the $\kappa=95$ th percentile of $\delta_{t}$ estimated from $N_{\mathrm{cal}}=200$ questions, and we use $\epsilon=10^{-8}$ in Eq. (6). For reward shaping, we set the aggregation exponent $\alpha=0.5$ , the length-penalty coefficient $\lambda_{\mathrm{len}}=0.3$ , the diversity-penalty coefficient $\lambda_{\mathrm{div}}=1.0$ , and the clustering threshold $\tau=0.1$ . The synthetic-data synthesizer is optimized with GRPO using 8 prompts and a group size of $g=8$ , yielding 64 candidate questions per step. We use a learning rate of $1\times 10^{-6}$ , entropy and KL coefficients of 0.01 and 0.005, respectively, and a rollout temperature of 1.0, training for 60 steps and saving checkpoints every 5 steps. We generate $N=20{,}000$ raw questions in 10 shards of 2000 samples each and apply Jaccard and cosine deduplication thresholds of $\tau_{\mathrm{lex}}=0.7$ and $\tau_{\mathrm{sem}}=0.95$ , respectively. Downstream OPD uses token-level rewards directly as advantages, with the student’s top- $K$ candidates ( $K=16$ ) weighted by $\bar{p}_{S}$ . We sample $n_{\mathrm{roll}}=4$ responses per prompt at temperature 1.0 and train with a batch size of 64, a learning rate of $1\times 10^{-6}$ , and fp32 parameters for 2 epochs, saving checkpoints every 5 steps. For each student–teacher pair and each OPD method, we select a single downstream student checkpoint based on AMC23 performance for mathematical reasoning and LiveCodeBench performance for code generation. All benchmark scores reported for that method are evaluated at this same checkpoint, rather than selected independently for each benchmark. AMC23 and LiveCodeBench therefore serve as checkpoint-selection benchmarks; their reported scores are not held-out estimates.
+
+## A.3 Evaluation Details
+
+## Metric.
+
+For each benchmark, we sample $k$ responses per problem and report avg@ $k$ : the fraction of correct responses for each problem, averaged over problems and scaled to $[0,100]$ . With $k=1$ , this reduces to single-sample accuracy. All reported results are means over three independent runs with different random seeds. The reported averages weight each benchmark equally, regardless of its number of problems. Table 5 lists the per-benchmark settings. All evaluations use vLLM (v0.11.0) (Kwon et al., 2023) with bf16 inference on NVIDIA A100 80GB GPUs.
+
+## Mathematical reasoning.
+
+We use the DAPO prompt format, which asks the model to reason step by step and to give its final answer within \boxed{}. Qwen3 students and teachers are evaluated in non-thinking mode, whereas DeepSeek-R1-Distill students and their teachers (JustRL and Skywork-OR1) use their default thinking templates. We extract the last \boxed{} expression, falling back to the last “Answer:” line, and verify it against the reference answer by rule-based string normalization and symbolic equivalence checking with SymPy (Meurer et al., 2017); no model-based judge is used.
+
+## Code generation.
+
+For LiveCodeBench, we use the v5–v6 release subset of 342 problems published between September 2024 and April 2025, with the original LiveCodeBench prompt. For APPS, we use the full introductory and competition test splits (1,000 problems each) and 1,000 interview problems drawn from the test split with a fixed random seed, keeping at most 50 test cases per problem; prompts follow the LiveCodeBench standard-input template. MBPP+ uses EvalPlus v0.2.0 (378 problems) with its standard prompt template and greedy decoding. Qwen3 models are evaluated in non-thinking mode. We extract the last fenced code block from each response and execute it against all test cases; a response is counted as correct only if it passes every test within the time limit. In the math-to-code transfer experiment (Figure 7), the Qwen3 models use the non-thinking settings in Table 5, whereas DeepSeek-R1-Distill students and their mathematics teachers are evaluated in thinking mode with their default chat templates, using temperature 0.6, top- $p$ 0.95, top- $k$ 20, and a maximum generation length of 32,768 tokens on all three benchmarks.
+
+Table 5: Evaluation settings. $k$ is the number of sampled responses per problem; “Max tokens” is the maximum generation length.
+
+Benchmark
+#Problems
+ $k$ 
+Temperature
+Top- $p$ 
+Top- $k$ 
+Max tokens
+
+AIME24 / AIME25 / AIME26
+30 each
+16
+0.7
+0.95
+–
+31,744
+
+AMC23
+40
+16
+0.7
+0.95
+–
+31,744
+
+BRUMO25
+30
+16
+0.7
+0.95
+–
+31,744
+
+MATH500
+500
+4
+0.7
+0.95
+–
+31,744
+
+LiveCodeBench (v5–v6)
+342
+4
+0.7
+0.8
+20
+8,192
+
+APPS-Intro
+1,000
+1
+0.2
+0.95
+20
+4,096
+
+APPS-Interview
+1,000
+1
+0.2
+0.95
+20
+4,096
+
+APPS-Competition
+1,000
+1
+0.2
+0.95
+20
+4,096
+
+MBPP+
+378
+1
+greedy
+1,024
+
+CodeContests
+165
+1
+0.2
+0.95
+20
+4096
+
+## A.4 Discussion
+
+## Combining with filtering and OPD variants
+
+A2D learns a question distribution for a target student–teacher pair, while filtering determines which sampled questions are retained and the downstream OPD procedure determines how teacher supervision updates the student. These operations act at different stages of the pipeline. Consequently, learned question generation can be followed by additional filtering or selection rules, and the resulting synthetic bank can be used by alternative distillation procedures that accept prompt-only datasets. Our format filtering and deduplication already illustrate this separation: they curate the synthesizer’s outputs before those questions are used for OPD.
+
+The learning-value reward nevertheless connects prompt optimization to the downstream distillation procedure. Our support-aware score is designed around teacher supervision on the student’s candidate support. A procedure using a different divergence, candidate support, or supervision allocation rule may benefit from a corresponding adaptation of the generation reward. We therefore view A2D as a modular approach to constructing distillation prompts, with the effectiveness of any particular combination depending on how well the generation objective matches the downstream learning signal. Exploring such combinations is a natural direction for future work.
+
+Figure 10: 
+Accuracy gains of high- over low-divergence training groups.
+Each cell reports the gain in percentage points,
+its 95% confidence interval, and $p$ -value.
+
+## A.5 Experimental Details and Additional Signal Validation
+
+## Data and splits.
+
+All questions in these analyses are natural questions from DAPO-17k-Math; no synthesizer outputs are used. Among 17,177 eligible questions, we exclude a 128-question probe set and 500 questions reserved for token-level analysis from downstream training, leaving a pool of 16,549 questions. The one-step analysis uses 1,500 update questions disjoint from the probe set: the 500 token-level questions and 1,000 additional questions from the training pool. The one-step and downstream training analyses are conducted independently.
+
+## One-step learning value.
+
+For each update question, we apply a single plain-SGD OPD step with a learning rate of $3\times 10^{-5}$ using four responses sampled from the base student. Each question is evaluated starting from the same base-student parameters. Its learning value is the resulting decrease in full-vocabulary $\mathrm{KL}(\pi_{T}\|\pi_{S})$ on the fixed probe set, averaged over tokens of one fixed base-student response per probe question. This measurement differs from the OPD update in its questions, prefixes, and KL direction: the update uses a reverse-KL-style objective on the student’s top-16 candidate tokens, whereas the probe evaluates full-vocabulary teacher-to-student KL on separate questions and fixed prefixes.
+
+## Test–retest reliability.
+
+We estimate test–retest reliability on 200 of the update questions by repeating the analysis with an independent draw of four student responses per question. For each pair of quantities being correlated, we compute a reliability-corrected correlation by dividing the observed Spearman correlation by the square root of the product of their two test–retest reliabilities. We report this correction as a supplementary analysis of sensitivity to rollout-sampling noise.
+
+## Score-ranked training banks.
+
+We partition the training pool into five approximately equal-sized buckets by mean support-aware score $\bar{s}$ , yielding approximately 3,310 questions per bucket. A random bank of the same size serves as a reference. Each bank is evaluated using three training seeds.
+
+## Factorial designs and divergence matching.
+
+For the $2\times 2$ designs, we select the bottom and top tertiles of mean divergence $\bar{\delta}$ , corresponding to $\bar{\delta}\leq 0.290$ and $\bar{\delta}\geq 0.404$ , respectively. Within each tertile, we split questions at the median of mean compatibility $\bar{\omega}$ , producing four cells of approximately 2,758 questions each. Because $\bar{\delta}$ and $\bar{\omega}$ are negatively correlated, this split can leave differences in divergence between the compatibility cells. The $\delta$ -matched variant therefore divides each divergence tertile into 20 strata by $\bar{\delta}$ and splits $\bar{\omega}$ at its median within each stratum. This procedure approximately balances mean divergence between the two compatibility cells within each divergence level: 0.528 versus 0.531 in the high-divergence tertile and 0.229 versus 0.230 in the low-divergence tertile. Each resulting cell contains approximately 2,758 questions.
+
+## Training budgets and checkpoints.
+
+All banks use a common target budget of 24.37M training tokens. Runs reach this budget within 26–36 steps, including 30–31 steps for the five score buckets and the random reference bank, and consume at most 2,304 questions. No question is used more than once within a run. Seeds differ in question order and therefore in the subset consumed before reaching the budget. We evaluate the end checkpoint at the first step reaching the full budget. For the mid checkpoint, we use the first saved checkpoint reaching half the budget, with checkpoints saved every five steps. Consequently, mid checkpoints span 12.4M–18.2M tokens across banks and provide less tightly budget-controlled comparisons than end checkpoints.
+
+## Statistical analysis.
+
+Confidence intervals for the one-step analysis are obtained by bootstrapping over the 1,500 update questions. For downstream training, benchmark scores are first averaged within each run, and the training run is the unit of inference, with three seeds per bank. Pairwise contrasts use run-level two-sample $t$ -tests, and effects in the $2\times 2$ designs are evaluated using a two-way ANOVA over runs. The Jonckheere–Terpstra test assesses the ordered trend across the five score buckets using permutations over their 15 training runs. Figure 9 reports means and standard deviations across seeds.
+
+## Additional controlled comparisons.
+
+To examine whether the training advantage associated with higher divergence persists after accounting for compatibility, we compare high- and low-divergence question banks under both the original design and a design balanced on the compatibility factor $\omega$ . Figure 10 reports accuracy differences in percentage points at intermediate and final training checkpoints, together with 95% confidence intervals and $p$ -values.
+
+At the final checkpoint, high-divergence banks outperform low-divergence banks by $2.21$ points in the original design (95% CI $[1.37,3.06]$ , $p=3.1\times 10^{-4}$ ). After balancing $\omega$ , the advantage remains positive at $1.59$ points (95% CI $[0.63,2.56]$ , $p=0.005$ ). The intermediate checkpoint shows the same direction: gains of $2.27$ points in the original design (95% CI $[0.62,3.91]$ , $p=0.013$ ) and $2.79$ points after balancing $\omega$ (95% CI $[1.75,3.82]$ , $p=2.6\times 10^{-4}$ ). All four confidence intervals exclude zero, supporting a positive training advantage for high-divergence banks that persists under compatibility balancing.
+
+## Appendix B Theoretical Properties of the Elicited-Signal Objective
+
+We establish two properties of our framework: high normalized
+reward certifies positions with simultaneous discrepancy and
+compatibility, and compatibility enters the implemented OPD
+advantages through an explicit log-ratio term. These results
+characterize the elicited supervision and its connection to
+the update, without assuming convergence of synthesizer
+optimization.
+
+## Notation.
+
+Fix the scoring student $\pi_{S}$ and teacher $\pi_{T}$ .
+For a question $q$ , let $y\sim\pi_{S}(\cdot\mid q)$ be a
+nonempty response of length $1\leq L\leq L_{\max}$ .
+At position $t$ , let $p_{S,t}$ and $p_{T,t}$ denote the
+next-token distributions on the student-generated prefix,
+and define
+
+ $A_{t}=\mathrm{Top}\text{-}K(p_{S,t}),\qquad B_{t}=\mathrm{Top}\text{-}K(p_{T,t}),\qquad U_{t}=A_{t}\cup B_{t}.$ 
+
+For a nonempty token set $C$ , write
+ $p_{M,t}(C)=\sum_{v\in C}p_{M,t}(v)$ and let
+ $\bar{p}_{M,t}^{C}$ denote the distribution conditioned
+on $C$ , extended by zero outside $C$ .
+We assume strictly positive next-token probabilities.
+All logarithms are natural.
+
+Following Eqs. (4)–(6), write
+
+ $\delta_{t}=\mathrm{KL}\!\left(\bar{p}_{T,t}^{U_{t}}\,\middle\|\,\bar{p}_{S,t}^{U_{t}}\right),\qquad\omega_{t}=p_{T,t}(A_{t}),$ 
+
+and
+
+ $s_{t}=\min\{\delta_{t}/\Delta,1\}\omega_{t},\qquad\Delta=\delta_{\mathrm{ref}}+\epsilon>0.$ 
+
+Thus $s_{t}\in[0,1]$ . With
+ $\bar{s}=L^{-1}\sum_{t=1}^{L}s_{t}$ , the reward in
+Eq. (11) is
+
+ $R=P_{\mathrm{len}}P_{\mathrm{div}}L^{1-\alpha}\bar{s},\qquad 0<\alpha<1,$ 
+
+where both penalty factors lie in $[0,1]$ .
+We suppress the dependence of $R$ on the sampled response
+and scoring batch, and write $[x]_{+}=\max\{x,0\}$ .
+
+## B.1 Compatible-disagreement coverage
+
+For a threshold $h\in(0,1)$ , define
+
+ $\mathcal{E}_{h}=\{t:\delta_{t}\geq h\Delta,\ \omega_{t}\geq h\}.$ 
+
+These positions simultaneously exhibit teacher–student
+discrepancy and teacher probability mass within the
+student’s candidate set.
+
+Proposition B.1 (Compatible-disagreement coverage).
+
+For every nonempty response,
+
+ $\frac{|\mathcal{E}_{h}|}{L}\geq\left[\frac{\bar{s}-h}{1-h}\right]_{+}\geq\left[\frac{R/L^{1-\alpha}-h}{1-h}\right]_{+}.$ 
+
+Proof.
+
+If $t\notin\mathcal{E}_{h}$ , then either
+ $\delta_{t}<h\Delta$ or $\omega_{t}<h$ , and hence $s_{t}\leq h$ .
+Since $s_{t}\leq 1$ at every position,
+
+ $\bar{s}\leq h+(1-h)\frac{|\mathcal{E}_{h}|}{L}.$ 
+
+Rearranging, using nonnegativity, and noting that
+
+ $R/L^{1-\alpha}=P_{\mathrm{len}}P_{\mathrm{div}}\bar{s}\leq\bar{s}$ 
+
+gives the result.
+∎
+
+Thus, a normalized reward above $h$ certifies a nonzero
+fraction of positions exhibiting both discrepancy and
+compatibility. Normalization by $L^{1-\alpha}$ is
+necessary because the unnormalized reward also depends
+on response length.
+
+## Expected coverage.
+
+Sample a scoring batch, select a question uniformly,
+sample its student response, and select a response
+position uniformly. Then
+
+ $\Pr(t\in\mathcal{E}_{h})\geq\left[\frac{\mathbb{E}[R/L^{1-\alpha}]-h}{1-h}\right]_{+}.$ 
+
+This follows by taking expectations of the pointwise
+inequality in the proof above and using nonnegativity.
+The expectation includes question generation, student
+responses, and the batch-dependent diversity factor.
+
+## B.2 Compatibility and OPD advantages
+
+We next relate compatibility to the candidate advantages
+used in §2.6. Unlike the coverage certificate
+computed with the frozen scoring student, the following
+identity holds for any rollout policy during OPD.
+
+Proposition B.2 (Compatibility in the OPD advantage).
+
+Fix a response position and let
+ $p_{S}=p_{S,\mathrm{old}}$ be the rollout-policy
+distribution. Write
+
+ $A=\mathrm{Top}\text{-}K(p_{S}),\qquad a=p_{S}(A),\qquad\omega=p_{T}(A).$ 
+
+For the candidate advantages in
+Eq. (13),
+
+ $r(v)=\bar{p}_{S}^{A}(v)\log\frac{p_{T}(v)}{p_{S}(v)},\qquad v\in A,$ 
+
+we have
+
+ $\sum_{v\in A}r(v)=-\mathrm{KL}\!\left(\bar{p}_{S}^{A}\,\middle\|\,\bar{p}_{T}^{A}\right)+\log\frac{\omega}{a}.$ 
+
+If the position is scored using these same student and
+teacher distributions, then $s\geq h$ implies
+ $\log(\omega/a)\geq\log h$ .
+
+Proof.
+
+For each $v\in A$ ,
+
+ $\log\frac{p_{T}(v)}{p_{S}(v)}=\log\frac{\bar{p}_{T}^{A}(v)}{\bar{p}_{S}^{A}(v)}+\log\frac{\omega}{a}.$ 
+
+Multiplying by $\bar{p}_{S}^{A}(v)$ and summing over $A$ 
+gives the identity. The final claim follows from
+ $\omega\geq s\geq h$ and $a\leq 1$ .
+∎
+
+Compatibility therefore contributes a common additive
+offset to the candidate log-ratios, while the conditional
+distributions determine their relative values.
+When $\omega<a$ , this offset is negative; at
+high-scoring positions, it is bounded below by $\log h$ .
+The identity characterizes the fixed advantages,
+rather than the resulting parameter-gradient norm.
+
+## Teacher truncation.
+
+Compatibility also has a distributional interpretation:
+
+ $\mathrm{TV}(p_{T},\bar{p}_{T}^{A})=1-\omega,$ 
+
+where $\mathrm{TV}(P,Q)=\frac{1}{2}\sum_{v}|P(v)-Q(v)|$ .
+Indeed, the total absolute difference inside $A$ is
+ $1-\omega$ , as is the teacher mass outside $A$ .
+Consequently, $s_{t}\geq h$ implies
+
+ $\mathrm{TV}(p_{T,t},\bar{p}_{T,t}^{A_{t}})\leq 1-h.$ 
+
+Here $\bar{p}_{T}^{A}$ is an analysis device: the implemented
+update uses full-vocabulary teacher log-probabilities.
+Moreover, a fixed top- $K$ set need not contain most of
+the student’s probability mass; this must be assessed
+separately through $p_{S}(A)$ .
+
+## Scope.
+
+These results characterize the scoring signal and its
+relationship to the fixed OPD advantages. They do not
+lower-bound parameter gradients or downstream
+improvement: the scoring discrepancy is computed on
+ $U_{t}$ , whereas explicit candidate-level update terms
+are restricted to $A_{t}$ , and the scoring and update
+divergences have different directions. Coverage
+certificates computed with the frozen scoring student
+also need not persist as the student evolves during
+OPD. Compatibility concerns candidate probability mass,
+rather than question correctness or membership in
+either model’s training distribution. The effectiveness
+of the elicited supervision for student learning is
+evaluated empirically in §3.
+
+## Appendix C Prompt Templates
+
+We provide the synthesizer and student-solving templates below. Both mathematical
+and code question synthesis use fixed instructions without persona conditioning
+or few-shot example problems. In the templates, {q} denotes the question
+to be solved. Line wrapping is adjusted for readability.
+
+SYNTHESIZER / MATH
+
+SYSTEM
+FIRST, in your private scratch-pad, think step-by-step to design a brand-new, non-trivial problem. The problem could come from any field of mathematics, including but not limited to algebra, geometry, number theory, combinatorics, prealgebra, probability, statistics, and calculus. Aim for a difficulty such that fewer than 30% of advanced high-school students could solve it. Avoid re-using textbook cliches or famous contest problems.
+The problem must be self-contained, have a well-defined answer, and require several non-obvious reasoning steps that build on each other, not a single formula lookup.
+THEN, without revealing any of your private thoughts, output ONLY the problem statement. Do not include a solution, an answer, or any commentary.
+
+USER
+Generate one new, challenging mathematical reasoning problem now.
+
+SYNTHESIZER / CODE
+
+SYSTEM
+FIRST, in your private scratch-pad, think step-by-step to design a brand-new, non-trivial competitive programming problem on your own subject. Aim for a difficulty such that a strong contestant would need several non-obvious algorithmic insights, not a single library call. Avoid re-using classic textbook tasks or well-known contest problems.
+The problem must be self-contained and must state its Input format, its Output format, and the constraints on the input. The program that solves it reads from standard input and writes to standard output.
+THEN, without revealing any of your private thoughts, output ONLY the problem statement. Do not include a solution, sample code, an answer, or any commentary.
+
+USER
+Generate one new, challenging competitive programming problem now.
+
+Student-solving templates
+
+The following templates are user messages. Mathematical reasoning uses the
+stage-specific formats below; the code template is shared by reward computation,
+discrepancy calibration, code OPD banks, and LiveCodeBench evaluation.
+
+MATH / Reward computation and discrepancy calibration
+
+USER
+{q}
+
+Please reason step by step, and put your final answer within \boxed{}.
+
+MATH / Downstream OPD on synthetic questions
+
+USER
+Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.
+{q}
+
+MATH / Vanilla OPD on real questions
+
+USER
+Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.
+{q}
+
+Remember to put your answer on its own line after "Answer:".
+
+MATH / Evaluation suffix
+
+Append to the existing evaluation prompt in the real-question format above.
+Please reason step by step, and put your final answer within \boxed{}.
+
+CODE / Student solving
+
+USER
+You will be given a question (problem specification) and will generate a correct Python program that matches the specification and passes all tests. You will NOT return anything except for the program.
+Question: {q}
+Read the inputs from stdin solve the problem and write the answer to stdout (do not directly test on the sample inputs). Enclose your code within delimiters as follows. Ensure that when the python program runs, it reads the inputs, runs the algorithm and writes output to STDOUT.
+
+```python
+
+# YOUR CODE HERE
+
+```

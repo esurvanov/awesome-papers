@@ -1,0 +1,2049 @@
+## Adaptive Multi-Token Prediction: 
+
+How far should we go?
+
+Emile Anand
+
+Mohammed Rehan Parwani
+
+Xinyuan Cao
+
+Affiliation: Georgia Institute of Technology
+
+Email: {eanand,mparwani3,xcao78}@gatech.edu
+
+Abstract
+
+Multi-token prediction (MTP) can accelerate language-model decoding by drafting several tokens and verifying them in a single target-model pass. However, the best speculation horizon changes with context: longer drafts offer greater amortization when reliable, but can waste compute on suffixes discarded after a rejection. Unlike autoregressive drafting, where a stopping rule can decide token by token, MTP must fix the horizon before drafting, as all heads fire in the same forward pass. We therefore formulate horizon selection as an online control problem, using verification feedback to learn how far the draft can be trusted in each context, and introduce Adaptive Multi-Token Prediction (AMTP): a lightweight controller that requires no retraining and leaves the exact verifier unchanged.
+To guide horizon selection, we characterize the expected number of tokens committed at each horizon via acceptance survival, the probability that a draft prefix is fully accepted.
+Before each round, AMTP predicts how far the draft is likely to survive and picks the horizon with the highest expected tokens per second, learning freely from every verification pass. Theoretically, we show that any online learner’s prediction error translates into throughput regret against the best horizon for each context, and in turn into a bound on wall-clock completion time. With online gradient descent, this regret is sublinear.
+Across five draft–target pairings built on Llama-3.1-8B-Instruct with Medusa heads, Meta’s MTP models, and Qwen3-4B-Inst-2507-MTP, evaluated on AIME 2025 and GSM8K, AMTP decodes up to 4.1 $\times$ faster than standard decoding and matches or outperforms the fixed window in 8 of 10 settings, with throughput gains of up to 10%.
+
+## 1 Introduction
+
+Autoregressive decoding generates each new token through an evaluation of a target language model. Speculative decoding reduces this sequential bottleneck by using a cheaper draft mechanism to propose several tokens and evaluating them in parallel with the target model (Stern et al., 2018; Leviathan et al., 2023; Chen et al., 2023). With an appropriate acceptance-and-correction rule, this procedure preserves the target distribution while committing multiple tokens in a single round (Leviathan et al., 2023; Chen et al., 2023; Xia et al., 2024). Multi-token prediction (MTP) provides a natural proposal mechanism by predicting several future tokens from a shared representation (Gloeckle et al., 2024; Cai et al., 2024; Ankner et al., 2024), and have witnessed enormous success in practice: for instance, MTP modules are now shipped in frontier models (DeepSeek-AI, 2024), and pretrained next-token models can be converted into MTP drafters without architectural changes (Samragh et al., 2025; Kirchenbauer et al., 2026; Zhao et al., 2026). These methods create an inference-time decision that is distinct from learning a good draft model: how many tokens should be proposed before the next verification step? We refer to this quantity as the speculation horizon.
+
+The speculation horizon directly affects decoding efficiency. A longer horizon amortizes verification over more committed tokens when the draft is reliable, but after an early rejection the discarded suffix adds latency and no output. Horizon selection therefore balances the expected gain from additional accepted tokens against the risk of speculating too far. We evaluate each horizon by its conditional throughput: the ratio of its expected number of committed tokens to its expected round latency. Even for a fixed draft-target pair, the throughput-maximizing horizon varies with context, because acceptance probabilities at each draft position depend on context. For MTP, this choice has a structure that isn’t exploited in current methods (Anand et al., 2026): an autoregressive drafter can decide token by token whether to keep drafting, but MTP heads produce all draft tokens in a single forward pass, so the horizon must be fixed before drafting, from information available at that point.
+
+Existing adaptive methods do not make this decision without additional training. Most stop an autoregressive drafter token by token, using a trained classifier or acceptance head (Mamou et al., 2024; Huang et al., 2024), entropy-based bounds (Agrawal et al., 2024; Zhang et al., 2025), or parallel drafting and verification (Liu et al., 2025). Others shape draft trees from confidence after drafting (Li et al., 2024a; Li et al., 2025; Chen, 2026), prune verification prefixes with predicted survival probabilities (Cheng et al., 2026), or train reinforcement-learning policies for draft depth (Zhang et al., 2026). Concurrent work trains a router that selects the span length before decoding, but requires new prediction heads and verifies against greedy decoding only (Chintha et al., 2026). In fact, to our knowledge, AMTP is the first training-free method that selects the MTP horizon before drafting at every round. A complementary line of work uses verification feedback online to adapt the draft model (Liu et al., 2024; Qian et al., 2026) or to select among drafters and hyperparameter configurations with regret guarantees against the best fixed choice (Liu et al., 2026; Hou et al., 2025). However, in this work, we compare against the stronger benchmark of the best horizon at each visited context. We study how learning acceptance behavior from verification feedback affects horizon-selection performance, and, for a given target model and draft mechanism, we develop an online controller and bound its conditional throughput regret relative to the best horizon at each visited context in terms of cumulative prediction error.
+Section 2 discusses related work in detail.
+
+To relate prediction error to horizon-selection, we first identify the acceptance statistics that influence the expected number of committed tokens for each horizon. A draft token can be committed as an accepted proposal only if all prior proposals are also accepted. We characterize the joint acceptance event via acceptance survival, the probability that a draft prefix is fully accepted, which further determines the expected number of committed tokens exactly. We express them in terms of conditional rejection hazards, where the hazard at a position is its rejection probability given acceptance of all prior proposals. Our analyses holds for general causal proposals, including independent and correlated prediction heads (Cai et al., 2024; Ankner et al., 2024). Estimating the hazards requires distinguishing between proposed and surviving prefixes: verification provides draft-target discrepancies along sampled proposal prefixes, whereas the hazards average these discrepancies under the distribution of prefixes that survive verification. So, we derive a survival-weighted regression objective that targets these conditional hazards, and its excess population loss is the survival-weighted hazard-prediction error that enters our throughput-regret bound, mirroring decision-focused learning, where prediction losses are judged by the induced decisions (Elmachtoub and Grigas, 2022).
+
+We use this objective to develop Adaptive Multi-Token Prediction (AMTP), a training-free horizon controller equipped with an online adaptive learning algorithm. Before drafting, AMTP combines hazard-based forecasts of committed tokens with estimates of round latency to evaluate the throughput of each horizon. Short horizons, however, conceal verification feedback at later positions. To learn under this partial feedback, AMTP combines greedy throughput-based selection with randomized full-horizon exploration (Langford and Zhang, 2007) and uses inverse-probability weighting to obtain unbiased estimates of the survival-weighted regression loss.
+
+Our contributions are as follows:
+
+• 
+
+Acceptance survival. We characterize horizon selection through accepted-prefix survival and round cost for general causal proposals, showing how survival determines the expected number of committed tokens for each horizon (§3).
+
+• 
+
+AMTP. We introduce a training-free online controller that chooses the MTP horizon before each round, by maximizing predicted tokens per second, learning from partial feedback of short horizons via randomized exploration and inverse-probability weighting (§4).
+
+• 
+
+Prediction error to wall-clock time. We show that the prediction error of any online learner translates into throughput regret against the best horizon for each context, and in turn into a bound on expected completion time. With online gradient descent (Zinkevich, 2003) under partial feedback, the regret is $O(T^{4/5}(1+P_{T})^{1/5})$ , which is sublinear (§5).
+
+• 
+
+Experiments. Across five draft–target pairings and two reasoning benchmarks, AMTP decodes up to 4.1 $\times$ faster than standard decoding and matches or outperforms the fixed window in 8 of 10 settings, with throughput gains of up to 10% (§6).
+
+## 2 Related Work
+
+Speculative decoding and multi-token proposals.
+Speculative decoding drafts tokens with a cheap proposal and verifies them in parallel with the target model, using an acceptance-and-correction rule that leaves the target distribution unchanged (Leviathan et al., 2023; Chen et al., 2023). Most work uses a separate next-token draft model, or, as in EAGLE, a lightweight head that drafts autoregressively at the feature level (Li et al., 2024b). Multi-token prediction (MTP) instead trains several future-token heads on a shared representation (Gloeckle et al., 2024); Medusa adds such heads to an existing model and verifies candidate continuations with tree attention (Cai et al., 2024), and recent work obtains MTP models from pretrained next-token models by self-distillation (Kirchenbauer et al., 2026). Joint multi-token prediction studies how to learn representations that support predicting several tokens at once (Ahn et al., 2025). We keep the exact verifier and study a different question: given a fixed proposal, how many tokens should we draft in each round?
+
+Adaptive draft length for autoregressive drafters.
+A substantial line of work adapts the draft length of a next-token drafter. DISCO trains a classifier that decides after each drafted token whether to continue (Mamou et al., 2024); SpecDec++ adds an acceptance-prediction head to the draft model and stops once the predicted probability of a rejection crosses a threshold (Huang et al., 2024); AdaEDL stops when an entropy-based lower bound on the acceptance probability falls below a threshold (Agrawal et al., 2024); and SVIP derives a similar entropy-based stopping policy for long-form generation (Zhang et al., 2025). EAGLE-2 instead grows a draft tree whose shape follows context-dependent confidence (Li et al., 2024a), and Learning to Draft trains reinforcement-learning policies for draft depth and verification size with throughput rewards (Zhang et al., 2026).
+These methods share a structural assumption: drafting is sequential, so the decision to stop can be made token by token, after each drafted token is observed and before the next one is paid for. However, MTP removes this option. All heads fire in the same forward pass, so the cost of drafting is incurred up front and the horizon must be fixed before any draft token is sampled. Truncating a complete MTP draft afterwards saves verification cost but not drafting cost, and choosing the cut point after inspecting sampled tokens can break exactness (Appendix 3.1). AMTP is designed for this setting: it chooses the horizon from pre-draft information only, and our statistical and online-optimization analysis of horizon selection and acceptance survival applies to any causal proposal, including both independent and correlated heads.
+
+Online learning for speculative decoding.
+Verification feedback has also been used to adapt speculative decoding online. OnlineSpec updates an evolving draft model and relates its dynamic regret to accepted length at a fixed candidate length (Qian et al., 2026). Not-a-Bandit gives no-regret guarantees for selecting among draft models (Liu et al., 2026). BanditSpec treats speculative-decoding hyperparameters, including the speculation length, as bandit arms and bounds regret against the best fixed configuration (Hou et al., 2025). Our guarantee uses a stronger comparator, the best horizon for each context along the realized decoding trajectory, and is learner-agnostic: any online regression method’s prediction error transfers to throughput regret, with online gradient descent (Zinkevich, 2003) as one instantiation. The broader strategy of translating prediction or optimization error into decision quality is related to perturbation-based model predictive control (Lin et al., 2022) and online adaptive policy selection (Lin et al., 2023; Lin et al., 2024), which rely on assumptions about the controlled dynamics, such as contractive perturbations, that we do not impose on the language-model prefixes.
+
+## 3 Speculation as a Survival Problem
+
+We first describe one round of speculation, and then show that a single sequence of rejection hazards determines the expected gain of every horizon.
+
+## 3.1 One Round of Speculation: Draft, Verify, Commit
+
+At round $t$ , let $H_{t}=x_{1:n_{t}}$ be the committed prefix and let $\mathcal{F}_{t}$ contain all information available before the next horizon is chosen, including $H_{t}$ , system state, and the controller parameters. For $1\leq k\leq K$ , we define the target and proposal block laws
+
+ $P_{t}^{(k)}(y_{1:k})=\prod_{j=1}^{k}p_{t,j}(y_{j}|y_{<j}),\qquad Q_{t}^{(k)}(y_{1:k})=\prod_{j=1}^{k}q_{t,j}(y_{j}|y_{<j}),$ 
+
+(1)
+
+where conditioning on $H_{t}$ and the fixed proposal parameters $\phi$ is suppressed. We let $\smash{P_{t}\coloneqq P_{t}^{(K)}}$ and $\smash{Q_{t}\coloneqq Q_{t}^{(K)}}$ . In this lens, independent MTP heads form the special case $\smash{q_{t,j}(\cdot|y_{<j})=q_{t,j}(\cdot|H_{t})}$ , where recurrent or otherwise correlated heads (Ankner et al., 2024) keep the dependence on $y_{<j}$ , and our analytic framework covers both of these cases.
+
+Figure 1: MTP with exact verification. Proposal heads condition on earlier sampled tokens. One target pass scores $p_{j}(\cdot|H_{t},Y_{<j})$ , and circles denote prefix-ordered acceptance. Rejection emits a residual correction $Z$ . The dashed bonus branch requires full acceptance.
+
+The horizon (or action) $k_{t}\in\{1,\dots,K\}$ is chosen before the current draft is sampled. Moreover, every horizon truncates the same causal law $Q_{t}$ , so changing $k$ does not change the distribution of earlier draft tokens: it only decides how many of them are drafted and sent to the verifier.
+A round proceeds as in Figure 1: the drafter samples $Y_{1:k}\sim Q_{t}^{(k)}$ , and a single target pass scores all $k$ positions. Exact speculative verification (Leviathan et al., 2023; Chen et al., 2023) then checks the draft from left to right, accepting $Y_{j}$ with probability
+
+ $\alpha_{t,j}\coloneqq\min\left\{1,\frac{p_{t,j}(Y_{j}|Y_{<j})}{q_{t,j}(Y_{j}|Y_{<j})}\right\},$ 
+
+(2)
+
+where $q_{t,j}(Y_{j}|Y_{<j})>0$ on a sampled proposal. At the first rejection, the verifier draws a correction token from the normalized positive part of $p_{t,j}-q_{t,j}$ . If all $k$ proposals are accepted, it draws a bonus token from the target conditional at the end of the draft. So, a round with horizon $k$ commits $L_{t}(k)=1+A_{t}(k)$ tokens, where $A_{t}(k)$ is the length of the accepted draft prefix, and the committed tokens follow the target law exactly (Leviathan et al., 2023; Chen et al., 2023). We analyze a fixed output-token budget where truncating the final output preserves its target law.
+
+Exactness requires choosing the horizon before drafting.
+
+Exactness continues to hold when $k_{t}$ is chosen adaptively, provided it depends only on $\mathcal{F}_{t}$ and on randomness independent of the current draft. Earlier acceptance decisions depend only on earlier proposals and independent coins, so the verifier reaches position $j$ with the proposal still distributed as $q_{t,j}(\cdot|Y_{<j})$ , and the standard one-step argument applies at every position and every round, however poorly the horizon is chosen. However, choosing the horizon after seeing the draft can break this, even for a perfect drafter. To see this, let $p=q$ be independent fair bits, draw $Y_{1},Y_{2}$ , and keep $k=2$ if $Y_{2}=1$ and $k=1$ otherwise. Every drafted token is accepted, so the second emitted token is $Y_{2}=1$ on the long branch and a new fair bonus token on the short one. It equals $1$ with probability $3/4$ rather than $1/2$ . AMTP therefore fixes $k_{t}$ before sampling the draft. Sampling transformations such as temperature or top- $p$ truncation must be built into the $p$ and $q$ the verifier uses.
+
+Moreover, how likely a draft token is to pass depends on how far the proposal is from the target at that position. For a proposed prefix $u=y_{<j}$ , we can measure this by the local discrepancy
+
+ $e_{t,j}(u)\coloneqq\mathrm{TV}\bigl(p_{t,j}(\cdot|u),q_{t,j}(\cdot|u)\bigr)=\tfrac{1}{2}\|p_{t,j}(\cdot|u)-q_{t,j}(\cdot|u)\|_{1},$ 
+
+(3)
+
+which is exactly the probability that position $j$ is rejected given that the verifier reaches it along prefix $u$ : equivalently, $\mathbb{E}[\alpha_{t,j}|Y_{<j}=u,\mathcal{F}_{t}]=1-e_{t,j}(u)$ .
+
+Importantly, accurate token marginals do not guarantee an accurate multi-token proposal. For instance (as in Appendix A), independent MTP heads can fit every position perfectly while missing dependencies among future tokens. The block KL divergence splits into a marginal fitting error and a dependence term that remains even for exact marginals. In a simple repeated-bit example, the block mismatch approaches its maximum while the expected number of committed tokens per round stays below three for every horizon, so longer windows add a verification cost with little additional token gain. The horizon should therefore be chosen from how long draft prefixes actually survive verification, and from what each round costs, rather than from marginal prediction accuracy alone.
+
+## 3.2 Survival and the Rejection Hazard
+
+We now make the the notion of “how long draft prefixes survive” precise, and formally define the acceptance survival and rejection hazard. For a virtual full draft $Y\sim Q_{t}$ , we define the prefix acceptance weight via $W_{t,0}=1$ and $W_{t,j}=\prod_{r=1}^{j}\alpha_{t,r}$ , which is the probability that the verifier accepts all of $Y_{1:j}$ given the sampled tokens.
+
+Definition 1 (Acceptance survival).
+
+The acceptance survival is the probability of accepting at least $j$ draft tokens, conditional on $\mathcal{F}_{t}$ , and is given by
+ $s_{t,j}=\mathbb{E}_{Q_{t}}[W_{t,j}]$ with $s_{t,0}=1$ .
+
+Definition 2 (Rejection hazard).
+
+The rejection hazard at position $j$ is the probability of rejection there, given that the preceding $j-1$ proposals were accepted, and is given (conditional on $\mathcal{F}_{t}$ ) by
+
+ $h_{t,j}=\frac{\mathbb{E}_{Q_{t}}[W_{t,j-1}e_{t,j}(Y_{<j})]}{s_{t,j-1}}.$ 
+
+(4)
+
+When $s_{t,j-1}=0$ , we set $h_{t,j}=0$ , as later survival probabilities are zero regardless of this convention. Since $\mathbb{E}[\alpha_{t,j}|Y_{<j},\mathcal{F}_{t}]=1-e_{t,j}(Y_{<j})$ , the survival and expected gain follow from the hazard:
+
+ $s_{t,j}=\prod_{r=1}^{j}(1-h_{t,r}),\qquad G_{t}(k):=\mathbb{E}[L_{t}(k)|\mathcal{F}_{t}]=1+\sum_{j=1}^{k}s_{t,j},$ 
+
+(5)
+
+where quantities indexed by an action refer to the potential outcome of choosing that horizon, even if the policy assigns it zero probability. To justify why hazards are the right prediction target, we point to Equation 5: a single vector $(h_{t,1}\dots,h_{t,K})$ determines the expected gain of all $K$ horizons at once, so a controller that predicts it can score every horizon before drafting. Indeed, the identities need no independence between draft positions, so they hold for correlated heads as well as independent ones.
+
+Why the hazard is survival-weighted. The numerator of Equation 4 weights each prefix by its likelihood of surviving to position $j$ . Replacing $h_{t,j}$ with the unweighted mean discrepancy $\mathbb{E}_{Q_{t}}[e_{t,j}(Y_{<j})]$ is generally incorrect since prefixes that survive verification are distributed differently from arbitrary draft prefixes. For instance, consider a binary vocabulary $\{a,b\}$ . The first head proposes $a$ or $b$ with probability $1/2$ each, while the target places mass $3/4$ on $a$ , so $\alpha_{t,1}=1$ on $a$ , $\alpha_{t,2}=1/2$ on $b$ , and $s_{t,1}=3/4$ . Then, suppose the second head matches the target exactly after $a$ but has disjoint support from it after $b$ , so $e_{t,2}(a)=0$ and $e_{t,2}(b)=1$ . The unweighted mean discrepancy at position $2$ is $1/2$ , but $\smash{h_{t,2}=\frac{1/4}{3/4}=1/3}$ , since a draft that starts with the poorly matched token $b$ is less likely to reach position $2$ at all. Here, the true gain is $\smash{G_{2}(2)=1+\tfrac{3}{4}+\tfrac{1}{2}=2.25}$ , and plugging this in the unweighted mean gives $2.125$ . Section 4 shows how to build this change of prefix distribution into the learning objective.
+
+## 4 Online Horizon Control
+
+Each round of speculative decoding poses a one-step control problem: before drafting, choose the horizon $k_{t}$ that maximizes throughput. If the rejection hazards were known, Section 3 would solve this problem exactly, since Equation 5 gives the expected gain of every horizon. However, since they are not known, AMTP uses certainty equivalence: it plugs in predicted hazards, acts on them, and updates the predictor via online gradient descent (OGD) from the feedback that verification provides. Algorithm 1 gives the full loop and Figure 2 illustrates it.
+
+Algorithm 1 Adaptive Multi-Token Prediction
+
+ 1:
+
+ Maximum horizon $K$ ; parameter set $\Theta$ and $\theta_{1}\in\Theta$ ; exploration rate $\varepsilon\in(0,1]$ ; step sizes $\eta_{t}$ ; initial cost model $\widehat{C}_{1}$ 
+
+ 2:
+
+ for each speculative round $t=1,2,\dots$ do
+
+ 3:
+
+   Observe pre-draft features $z_{t}$ ; predict hazards $\hat{h}_{\theta_{t},t,j}$ and costs $\widehat{C}_{t}(j)$ for $j=1,\dots,K$ 
+
+ 4:
+
+   Set $\kappa_{t}\leftarrow\arg\max_{k}\widehat{G}_{t}(k)/\widehat{C}_{t}(k)$ using equation 7 $\triangleright$ plug-in control, $O(K)$ 
+
+ 5:
+
+   With probability $\varepsilon$ set $k_{t}\leftarrow K$ ; otherwise $k_{t}\leftarrow\kappa_{t}$ $\triangleright$ exploration
+
+ 6:
+
+   Draft $Y_{1:k_{t}}\sim Q_{t}^{(k_{t})}$ and verify all $k_{t}$ positions in one target pass
+
+ 7:
+
+   Commit the accepted prefix and one correction or bonus token
+
+ 8:
+
+   For $j\leq k_{t}$ : record $e^{\mathrm{obs}}_{t,j}=e_{t,j}(Y_{<j})$ , $W_{t,j-1}=\prod_{r<j}\alpha_{t,r}$ and $\pi_{t,j}=(1-\varepsilon)\mathbf{1}\{j\leq\kappa_{t}\}+\varepsilon$ 
+
+ 9:
+
+   Update $\theta_{t+1}\leftarrow\Pi_{\Theta}\bigl(\theta_{t}-\eta_{t}\nabla\hat{\ell}_{t}(\theta_{t})\bigr)$ with $\hat{\ell}_{t}$ from equation 8 $\triangleright$ OGD
+
+ 10:
+
+   Record the measured round cost $c_{t}$ and update the cost model $\widehat{C}_{t+1}$ 
+
+ 11:
+
+ end for
+
+The Control Problem. Let $C_{t}(k)$ be the conditional expected cost of a round with horizon $k$ , including drafting, verification, synchronization and all controller overhead, with $0<c_{\min}\leq C_{t}(k)\leq c_{\max}<\infty$ . We compare horizons at the same learner state and under the same update protocol, where the controller’s objective is its throughput, and the optimal horizon at the current history is
+
+ $R_{t}(k)=\frac{G_{t}(k)}{C_{t}(k)},\qquad k_{t}^{\star}\in\arg\max_{1\leq k\leq K}R_{t}(k).$ 
+
+(6)
+
+AMTP predicts the rejection hazards $\hat{h}_{\theta_{t},t,j}\in[0,1]$ from pre-draft features $z_{t}$ and position $j$ , and estimates rounds costs $\widehat{C}_{t}(k)>0$ , where the predictions are $\mathcal{F}_{t}$ -measurable. It converts the hazard predictions into survival probabilities and expected token gains and selects a candidate horizon:
+
+ $\hat{s}_{t,j}=\prod_{r=1}^{j}\bigl(1-\hat{h}_{\theta_{t},t,r}\bigr),\qquad\widehat{G}_{t}(k)=1+\sum_{j=1}^{k}\hat{s}_{t,j},\qquad\kappa_{t}\in\arg\max_{1\leq k\leq K}\frac{\widehat{G}_{t}(k)}{\widehat{C}_{t}(k)},$ 
+
+(7)
+
+with a fixed tie-breaking rule. A running product and a running sum score all $K$ horizons in $O(K)$ time, and the controller does not assume that throughput is unimodal in $k$ , and so the only part of Equation 7 that must be learned is the hazard forecaster $\theta_{t}$ .
+
+## 4.1 Learning the hazards via Online Gradient Descent (OGD)
+
+OGD needs a loss whose error is reflective of the error attributed to the control problem. Following the change of prefix distribution in Section 3.2, we use the survival-weighted population loss
+
+ $\ell_{t}(\theta)=\mathbb{E}_{Q_{t}}\left[\sum_{j=1}^{K}W_{t,j-1}\bigl(e_{t,j}(Y_{<j})-\hat{h}_{\theta,t,j}\bigr)^{2}\right],$ 
+
+(8)
+
+conditional on $\mathcal{F}_{t}$ , with the proposal law and features held fixed. Let $\ell_{t}^{B}$ be the same expression with the true hazards $h_{t,j}$ in place of $\hat{h}_{\theta,t,j}$ . Then, $\ell_{t}^{B}$ represents the minimum loss over unrestricted pre-draft hazard predictions. We then show the following calibration identity:
+
+Lemma 1 (Calibration identity).
+
+For every $\mathcal{F}_{t}$ -measurable parameter $\theta$ ,
+
+ $\mathcal{E}_{t}(\theta):=\ell_{t}(\theta)-\ell_{t}^{B}=\sum_{j=1}^{K}s_{t,j-1}\bigl(\hat{h}_{\theta,t,j}-h_{t,j}\bigr)^{2}.$ 
+
+(9)
+
+Expanding the weighted square around $h_{t,j}$ yields the
+identity, and the cross term vanishes by the hazard definition in (4); so, the loss is minimized by the true hazards, and its excess is a hazard error weighted by how often each position is reached: it is weighted less on positions that are less likely to survive verification.
+Section 5 shows that this excess controls the throughput lost.
+
+Figure 2: AMTP’s online control loop. Before drafting, it picks the horizon with the highest predicted throughput. Verification feedback at every drafted position, including those after a rejection, enters the weighted loss in Equation 8, and an OGD step updates the hazard predictor.
+
+The ideal learner.
+If verification revealed $e^{\mathrm{obs}}_{t,j}=e_{t,j}(Y_{<j})$ and $W_{t,j-1}$ at all $K$ positions of a draft $Y\sim Q_{t}$ , then the realized loss $\smash{\tilde{\ell}_{t}(\theta)=\sum_{j=1}^{K}W_{t,j-1}(e^{\mathrm{obs}}_{t,j}-\hat{h}_{\theta,t,j})^{2}}$ would be unbiased for $\ell_{t}(\theta)$ , and the controller would simply run projected OGD (Zinkevich, 2003; Hazan, 2016):
+
+ $\theta_{t+1}=\Pi_{\Theta}\bigl(\theta_{t}-\eta\,\nabla\tilde{\ell}_{t}(\theta_{t})\bigr),$ 
+
+(10)
+
+where $\Pi_{\Theta}(\cdot)$ is the projection onto the (convex) set of parameters $\Theta$ . For an affine forecaster $\smash{\hat{h}_{\theta,t,j}=\langle\theta,x_{t,j}\rangle}$ , the gradient is $\smash{-2\sum_{j}W_{t,j-1}(e^{\mathrm{obs}}_{t,j}-\langle\theta,x_{t,j}\rangle)x_{t,j}}$ . This learner always acts greedily, and Section 5 shows that its throughput regret is sublinear in the number of rounds. However, this is an idealization as the discrepancy $e_{t,j}$ compares the draft with the target distribution $p_{t,j}$ , and the target computes $p_{t,j}$ only at positions it verifies. So, a round that drafts $k_{t}<K$ tokens gives no feedback at positions $k_{t}+1,\dots,K$ , and observing every position at each round would mean drafting and verifying the full window each time, which defeats the purpose of choosing the horizon. AMTP avoids this: it drafts the full window only in a small random fraction of rounds and re-weights the feedback so that the loss stays unbiased (Section 4).
+
+## 4.2 Learning from partial feedback
+
+A round with horizon $k_{t}$ reveals feedback only at positions $1,\dots,k_{t}$ . If a greedy controller underestimates late-position survival, its drafts might be short, it may never observe late positions, and it might never corrects the estimate. To address this, AMTP makes two changes to the ideal learner.
+
+Exploration.
+With probability $1-\varepsilon$ the controller drafts $k_{t}=\kappa_{t}$ , and with probability $\varepsilon$ it drafts the full window $k_{t}=K$ (Langford and Zhang, 2007). The randomness here is independent of the draft given $\mathcal{F}_{t}$ , so position $j$ is observed with known probability $\pi_{t,j}=(1-\varepsilon)\mathbf{1}\{j\leq\kappa_{t}\}+\varepsilon\geq\varepsilon$ . Other exploration schemes, such as Thompson sampling for contextual bandits (Zhang, 2021; Anand and Liaw, 2025), could replace uniform full-horizon exploration. We use $\varepsilon$ -greedy exploration because it gives known inclusion probabilities, which is needed for inverse-probability weighting.
+
+Inverse-probability weighting. After verification, $e^{\mathrm{obs}}_{t,j}$ and $W_{t,j-1}$ are available for every $j\leq k_{t}$ . Then, reweighting each observed term by its inclusion probability gives
+
+ $\hat{\ell}_{t}(\theta)=\sum_{j=1}^{k_{t}}\frac{W_{t,j-1}}{\pi_{t,j}}\bigl(e^{\mathrm{obs}}_{t,j}-\hat{h}_{\theta,t,j}\bigr)^{2},\qquad\mathbb{E}[\hat{\ell}_{t}(\theta)|\mathcal{F}_{t}]=\ell_{t}(\theta).$ 
+
+(11)
+
+AMTP runs (10) with $\hat{\ell}_{t}$ in place of $\smash{\tilde{\ell}_{t}}$ , holding $\smash{W_{t,j-1}}$ and $\smash{\pi_{t,j}}$ fixed in line 8 of Alg 1. However, relative to the ideal learner, exploration costs some throughput in rounds drafting $K$ , and the factor $\smash{1/\pi_{t,j}\leq 1/\varepsilon}$ makes gradients noisier: we quantify both in Section 5.
+
+## 5 From Prediction Error to Decoding Efficiency
+
+We now ask how much decoding efficiency AMTP loses by acting on predicted rather than true hazards. First, we show that, for any online learner, the throughput regret against the best horizon at each visited history is controlled by the learner’s excess prediction loss. We then bound that loss for OGD, first for the ideal full-feedback learner and then for AMTP’s partial-feedback learner, and then we bound the price of partial feedback. Finally, we show how to convert the throughput regret into bounds on expected completion time and speedup. We give complete proofs in Appendix B.
+
+## 5.1 Prediction error to throughput regret
+
+We allow the controller to maximize predicted throughput only approximately, with a selection error $\xi_{t}\geq 0$ that accommodates exploration:
+
+ $\widehat{R}_{t}(k)=\frac{\widehat{G}_{t}(k)}{C_{t}(k)},\qquad\widehat{R}_{t}(k_{t})\geq\max_{1\leq k\leq K}\widehat{R}_{t}(k)-\xi_{t}.$ 
+
+(12)
+
+For a comparator sequence $\theta^{\star}_{1:T}$ , define
+
+ $\mathcal{R}_{T}=\sum_{t=1}^{T}\bigl(\ell_{t}(\theta_{t})-\ell_{t}(\theta_{t}^{\star})\bigr),\qquad\mathcal{A}_{T}=\sum_{t=1}^{T}\bigl(\ell_{t}(\theta_{t}^{\star})-\ell_{t}^{B}\bigr),\qquad\mathcal{D}_{T}=\sum_{t=1}^{T}\bigl(R_{t}(k_{t}^{\star})-R_{t}(k_{t})\bigr).$ 
+
+Here $\mathcal{R}_{T}$ is the learner’s regression regret against the comparator, $\mathcal{A}_{T}\geq 0$ is the comparator’s approximation error, and $\mathcal{D}_{T}$ is the throughput regret against the best horizon at each history the learner visits. This comparator is stronger than the best fixed horizon: it may change from round to round with the context. By Lemma 1, $\mathcal{R}_{T}+\mathcal{A}_{T}=\sum_{t=1}^{T}\mathcal{E}_{t}(\theta_{t})\geq 0$ . Write $\Lambda_{K}=c_{\min}^{-1}\sqrt{\frac{K(K+1)(2K+1)}{6}}$ .
+
+Theorem 1 (Dynamic regret transfer).
+
+Under the preceding assumptions, for every comparator sequence and every realization of the pre-round histories and selected horizons, we have
+
+ $\mathcal{D}_{T}\leq 2\Lambda_{K}\sqrt{T\,(\mathcal{R}_{T}+\mathcal{A}_{T})}+\sum_{t=1}^{T}\xi_{t}.$ 
+
+(13)
+
+The key idea is to connect calibration to throughput prediction, and then to horizon selection. Telescoping the survival products and applying Lemma 1 bounds the error in predicted throughput uniformly over horizons. Combining this with Equation 12 bounds the per-round regret:
+
+ $\max_{1\leq k\leq K}\bigl|\widehat{R}_{t}(k)-R_{t}(k)\bigr|\leq\Lambda_{K}\sqrt{\mathcal{E}_{t}(\theta_{t})},\qquad R_{t}(k_{t}^{\star})-R_{t}(k_{t})\leq 2\Lambda_{K}\sqrt{\mathcal{E}_{t}(\theta_{t})}+\xi_{t}.$ 
+
+Summing over rounds and applying Cauchy–Schwarz gives Equation 13. A regression guarantee therefore becomes a throughput guarantee through the learner’s total excess prediction loss, including the comparator’s approximation error. Importantly, this does not depend on how $\theta_{t}$ is produced, which allows us to use any online learning algorithm and transfer their guarantees to our setting.
+
+Remark 1 (Sharpness).
+
+The square-root dependence in Eq. 13 cannot be improved uniformly. Prop. 2 with independent proposals and known costs incurs one-round throughput regret $\frac{2}{5}\sqrt{\mathcal{E}_{t}(\theta_{t})}$ .
+
+Remark 2 (Estimated costs).
+
+Suppose instead that the controller uses $\widehat{C}_{t}(k)\geq c_{\min}$ , and let $\delta^{C}_{t}=\max_{1\leq k\leq K}|\widehat{C}_{t}(k)-C_{t}(k)|$ . Then, measuring $\xi_{t}$ relative to $\widehat{G}_{t}(k)/\widehat{C}_{t}(k)$ gives
+
+ $\mathcal{D}_{T}\leq 2\Lambda_{K}\sqrt{T\,(\mathcal{R}_{T}+\mathcal{A}_{T})}+\sum_{t=1}^{T}\xi_{t}+\frac{2(K+1)}{c_{\min}^{2}}\sum_{t=1}^{T}\delta^{C}_{t}.$ 
+
+(14)
+
+## 5.2 Learning the hazards with OGD
+
+We now bound $\mathcal{R}_{T}$ for the two learners of Section 4. Both use an affine forecaster $\hat{h}_{\theta,t,j}=\langle\theta,x_{t,j}\rangle$ on a nonempty closed convex set $\Theta$ of diameter at most $D$ . The features are $\mathcal{F}_{t}$ -measurable with $\|x_{t,j}\|_{2}\leq F$ , and forecasts lie in $[0,1]$ for all $\theta\in\Theta$ . Initialize $\theta_{1}\in\Theta$ . The comparator $\theta^{\star}_{t}\in\Theta$ is $\mathcal{F}_{t}$ -measurable, and its path length is bounded almost surely by a deterministic quantity, $\sum_{t=1}^{T-1}\|\theta^{\star}_{t+1}-\theta^{\star}_{t}\|_{2}\leq P_{T}$ , as is standard for dynamic regret (Zinkevich, 2003; Besbes et al., 2015; Zhang et al., 2018). We assume known costs throughout this subsection.
+
+## Ideal full feedback.
+
+The ideal learner of Section 4 observes all $K$ positions and always acts greedily, so $\xi_{t}=0$ . Its gradients $\nabla\tilde{\ell}_{t}(\theta_{t})$ are unbiased for $\nabla\ell_{t}(\theta_{t})$ and satisfy $\|\nabla\tilde{\ell}_{t}(\theta_{t})\|_{2}\leq 2FK$ .
+
+Corollary 1 (OGD with full feedback).
+
+Under these conditions, projected OGD (Equation 10) on the full-feedback loss with constant step size $\eta>0$ satisfies
+
+ $\mathbb{E}\,\mathcal{R}_{T}\leq\frac{D^{2}+2DP_{T}}{2\eta}+2\eta F^{2}K^{2}T.$ 
+
+(15)
+
+Under realizability, optimizing $\eta$ , for fixed $K,c_{\min},D,F$ , gives $\mathbb{E}\,\mathcal{D}_{T}=O\bigl(T^{3/4}(1+P_{T})^{1/4}\bigr)$ .
+
+Equation 10 is the standard projected-OGD argument with a moving comparator. Theorem 1 and Jensen’s inequality then give the final rate. We give the result for any unbiased gradient with bounded second moment in Equation 10. As Section 4 explains, this learner needs the target distribution at all $K$ positions in every round, so this is only our benchmark for an implementable controller.
+
+Partial feedback.
+AMTP replaces $\tilde{\ell}_{t}$ with the observed loss. Here, the gradients remain unbiased, but each observed term is scaled by $\smash{\tfrac{1}{\pi_{t,j}}\leq\tfrac{1}{\varepsilon}}$ , so for $g_{t}=\nabla\hat{\ell}_{t}(\theta_{t})$ we have $\mathbb{E}[\|g_{t}\|_{2}^{2}|\mathcal{F}_{t}]\leq\frac{4F^{2}K^{2}}{\varepsilon}$ , where exploration rounds contribute $\mathbb{E}\sum_{t=1}^{T}\xi_{t}\leq\varepsilon T\frac{K+1}{c_{\min}}$ to the selection error.
+
+Corollary 2 (OGD with partial feedback).
+
+Under these conditions, Algorithm 1 with known costs, exploration rate $\varepsilon\in(0,1]$ and constant step size $\eta>0$ satisfies
+
+ $\mathbb{E}\,\mathcal{R}_{T}\leq\frac{D^{2}+2DP_{T}}{2\eta}+\frac{2\eta F^{2}K^{2}T}{\varepsilon}.$ 
+
+(16)
+
+Under realizability, optimizing $\eta$ , for fixed $K,c_{\min},D,F$ , gives $\mathbb{E}\,\mathcal{D}_{T}=O\bigl(T^{4/5}(1+P_{T})^{1/5}\bigr)$ .
+
+The projected-OGD bound with the second-moment estimate above gives equation 16, and Theorem 1 with Jensen’s inequality and a balancing argument gives the final rate. This tuning uses the number of rounds $T$ and a known bound $P_{T}$ on comparator variation.
+
+The price of partial feedback.
+Equations 15 and 16 differ only by the factor $\frac{1}{\varepsilon}$ in the gradient-noise term, and the rates differ only via the selection-error term $\varepsilon T$ . Here, exploration must be frequent enough to keep gradient noise in check, but it also drafts the full window when a shorter one may be better. Balancing these effects moves the rate from $T^{3/4}(1+P_{T})^{1/4}$ to $T^{4/5}(1+P_{T})^{1/5}$ , which are both sublinear when $P_{T}=o(T)$ . So, the average throughput approaches that of the best horizon at each history, and AMTP pays a vanishing gap for learning from the feedback of its horizon choices.
+
+## 5.3 From throughput regret to speedup
+
+We measure the throughput regret per round, as the goal is to minimize the time to produce an output. We fix an integer output budget $N\geq 1$ , and compare AMTP with a baseline under matched prompts, the same target output law and the same timing scope. Let $\smash{J_{N}^{\mathrm{base}}}$ denote the baseline’s completion time and define its effective rate $\smash{r_{\mathrm{base}}(N)=N/\mathbb{E}J_{N}^{\mathrm{base}}}$ , assuming $\smash{0<\mathbb{E}J_{N}^{\mathrm{base}}<\infty}$ .
+
+Corollary 3 (Completion time and speedup).
+
+Given $\max_{1\leq k\leq K}R_{t}(k)\geq\rho>0$ at each visited history, for some constant $\rho$ , let the realized round cost $c_{t}\geq 0$ satisfy $\mathbb{E}[c_{t}|\mathcal{F}_{t},k_{t}]=C_{t}(k_{t})$ , and let
+
+ $\sigma_{N}=\inf\Bigl\{m\geq 1:\sum_{t=1}^{m}L_{t}(k_{t})\geq N\Bigr\},\qquad J_{N}=\sum_{t=1}^{\sigma_{N}}c_{t}.$ 
+
+(17)
+
+Extend the same policy to $N$ rounds and suppose that $\mathbb{E}\,\mathcal{D}_{N}\leq B_{N}$ . Then, the expected completion time and the speedup, defined as the ratio of expected completion times, satisfy
+
+ $\mathbb{E}J_{N}\leq\frac{N+K+c_{\max}B_{N}}{\rho},\qquad S_{N}:=\frac{\mathbb{E}J_{N}^{\mathrm{base}}}{\mathbb{E}J_{N}}\geq\frac{\rho/r_{\mathrm{base}}(N)}{1+K/N+c_{\max}B_{N}/N}.$ 
+
+(18)
+
+In particular, $S_{N}>1$ whenever $\rho/r_{\mathrm{base}}(N)>1+K/N+c_{\max}B_{N}/N$ .
+
+To see why, let $\Delta_{t}=R_{t}(k_{t}^{\star})-R_{t}(k_{t})\geq 0$ . The assumption on $\rho$ gives $G_{t}(k_{t})\geq\rho\,C_{t}(k_{t})-c_{\max}\Delta_{t}$ . Each round commits at least one token, so $\sigma_{N}\leq N$ , and the final round overshoots the budget by at most $K$ tokens. Since $\{\sigma_{N}\geq t\}$ is determined before round $t$ , conditional expectations gives
+
+ $\rho\,\mathbb{E}J_{N}\leq\mathbb{E}\sum_{t=1}^{\sigma_{N}}L_{t}(k_{t})+c_{\max}\,\mathbb{E}\sum_{t=1}^{\sigma_{N}}\Delta_{t}\leq N+K+c_{\max}B_{N},$ 
+
+which is the bound in (18). Dividing the baseline’s completion time by this gives the claim.
+
+## Speedup guarantee of AMTP.
+
+Corollary 2 with $T=N$ gives $\smash{B_{N}=O(N^{4/5}(1+P_{N})^{1/5})}$ , so the penalty in Equation 18 is $O(K/N+({(1+P_{N})}/{N})^{1/5})$ . If $P_{N}=o(N)$ and $r_{\mathrm{base}}(N)\to r_{0}>0$ , the penalty vanishes and $\liminf_{N\to\infty}S_{N}\geq{\rho}/{r_{0}}$ . Acceptance and round cost thus set the achievable speedup ${\rho}/{r_{0}}$ , and learning the horizon costs only a vanishing fraction of it.
+
+## 6 Experiments
+
+We evaluate AMTP on three self-speculative multi-token-prediction families (self-distilled Qwen3-4B, Meta’s facebook/multi-token-prediction 7B, and Medusa heads on Llama-3.1-8B-Instruct) and two cross-model pairings with a separate, larger target (self-distilled 4B $\to$ Qwen3-14B; Meta MTP 7B $\to$ Llama-2-13B), on AIME 2025 and GSM8K (full setup in Table 4, Appendix D). All runs disable KV caching, so verification recomputes the full context each round; each condition is a single unseeded run, and we compare conditions only within a model since hardware differs across runs. The fixed-window baseline uses the largest window each draft supports ( $k{=}16$ , $4$ , $6$ ); the adaptive controller is the affine hazard predictor and cost model of Section 4 with $\varepsilon$ -bounded exploration, updated by one gradient step per round (hyperparameters in Table 5, Appendix D).
+
+AIME 2025
+GSM8K
+
+Model
+Decoding
+tok/s
+Speed-up
+tok/s
+Speed-up
+
+Self-distilled Qwen3-4B
+Plain (next-token)
+18.8
+1.00 $\times$ 
+16.2
+1.00 $\times$ 
+
+Fixed $k{=}16$ 
+34.0
+1.81 $\times$ 
+38.6
+2.39 $\times$ 
+
+Adaptive (ours)
+34.5
+1.83 $\times$ 
+38.3
+2.37 $\times$ 
+
+Meta MTP 7B
+Plain (next-token)
+12.5
+1.00 $\times$ 
+4.7b
+1.00 $\times$ 
+
+Fixed $k{=}4$ 
+37.7
+3.01 $\times$ 
+19.2b
+4.09 $\times$ 
+
+Adaptive (ours)
+31.9
+2.55 $\times$ 
+19.4b
+4.13 $\times$ 
+
+Meta MTP 7B $\to$ Llama-2-13B
+Plain (next-token)
+6.2
+1.00 $\times$ 
+2.7b
+1.00 $\times$ 
+
+Fixed $k{=}4$ 
+7.6
+1.23 $\times$ 
+4.7b
+1.75 $\times$ 
+
+Adaptive (ours)
+28.2
+4.55 $\times$ 
+11.6b
+4.30 $\times$ 
+
+Medusa, Llama-3.1-8B
+Plain (next-token)
+10.7
+1.00 $\times$ 
+13.0
+1.00 $\times$ 
+
+Fixed $k{=}6$ 
+23.6
+2.20 $\times$ 
+20.0
+1.54 $\times$ 
+
+Adaptive (ours)
+25.3
+2.37 $\times$ 
+19.4
+1.50 $\times$ 
+
+Self-dist. 4B $\to$ Qwen3-14B
+Plain (next-token)
+10.4
+1.00 $\times$ 
+6.4a
+1.00 $\times$ 
+
+Fixed $k{=}16$ 
+22.5
+2.17 $\times$ 
+21.3
+3.33 $\times$ 
+
+Adaptive (ours)
+24.7
+2.38 $\times$ 
+21.5
+3.36 $\times$ 
+
+Table 1: Decoding throughput (tokens/s) and speed-up over plain decoding for each draft/target pairing on AIME 2025 and GSM8K, with AMTP in bold if it exceeds the best fixed window by more than 1%. aPlain decoding run reached 1,166 of 1,319 GSM8K problems before its timeout: speed-up computed over that subset. bMeta MTP’s base checkpoints do not emit an end-of-sequence token after answering, so GSM8K runs for this pairing are capped at 100 problems, 100 rounds each.
+
+Discussion. AMTP helps most when drafting and verification differ in cost and when reasoning traces are long and variable in length. The cross-model pairings, where draft and target are separate models, show the largest gains over the fixed window:
+Meta MTP $7\mathrm{B}\to$ Llama-2-13B improves throughput by $268\%$ on AIME and $147\%$ on GSM8K (over its best fixed window), and self-distilled $4\mathrm{B}\to$ Qwen3-14B by $10\%$ on AIME while staying within $1\%$ of the best fixed window on GSM8K. In the self-speculative pairings, draft and target share one forward pass, so a longer horizon costs little extra and there is less to gain: self-distilled 4B and Medusa improve by $2$ – $7\%$ on AIME and stay within $3\%$ of the fixed window on GSM8K. The one regression is Meta MTP 7B on AIME ( $-15\%$ ). Meta’s base checkpoint does not reliably stop after answering, and every round of a longer generation costs more. We note, however, that its acceptance rate was higher under adaptive control throughout. Across all pairings, AMTP drafts fewer tokens per round while committing a similar number, allowing it to accept a higher fraction of what it drafts than any fixed window, converting wasted draft computation into completed tokens even where the net throughput effect is small.
+
+Accept. (%)
+Tokens/round
+Accuracy (%)
+
+Model
+Eval
+Fixed
+Adapt.
+Fixed
+Adapt.
+Plain
+Fixed
+Adapt.
+
+Self-distilled 4B
+GSM8K
+23
+32
+4.67
+4.63
+89.4
+85.0
+85.7
+
+Medusa 8B
+GSM8K
+33
+48
+2.99
+2.90
+83.2
+79.6
+79.2
+
+Self-dist. 4B $\to$ 14B
+GSM8K
+21
+29
+4.33
+4.33
+92.8a
+92.9
+93.5
+
+Self-distilled 4B
+AIME
+18
+34
+3.84
+3.83
+20.0
+30.0
+26.7
+
+Meta MTP 7B
+AIME
+50
+57
+3.00
+3.03
+0.0
+0.0
+0.0
+
+Meta MTP 13B
+AIME
+44
+52
+2.76
+2.51
+0.0
+0.0
+0.0
+
+Medusa 8B
+AIME
+22
+46
+2.34
+2.28
+0.0
+0.0
+0.0
+
+Self-dist. 4B $\to$ 14B
+AIME
+14
+28
+3.23
+3.20
+20.0
+20.0
+23.3
+
+Table 2: Draft acceptance rate, tokens committed per verification round, and accuracy for plain decoding, the best fixed window and AMTP on AIME 2025 and GSM8K. aPlain decoding run reached 1,166 of 1,319 GSM8K problems before its time limit; accuracy computed over that subset.
+
+Model
+Eval
+Mean $k_{t}$ 
+Std.
+Range
+Distinct $k$ 
+
+Self-distilled 4B
+GSM8K
+11.21
+2.73
+1–16
+16
+
+Meta MTP 7B
+AIME
+3.54
+0.69
+1–4
+4
+
+Meta MTP 13B
+AIME
+2.93
+0.99
+1–4
+4
+
+Medusa 8B
+GSM8K
+3.95
+1.02
+1–6
+6
+
+Table 3: Distribution of the draft window $k_{t}$ chosen by AMTP over all verification rounds of a run. We remark here that the window is not constant: it varies across rounds within a single generation and across generations.
+
+ $0$ $100$ $200$ $300$ $4$ $6$ $8$ $10$ $12$ Verification roundMean $k_{t}$ 
+
+Self-distilled Qwen3-4B
+GSM8K
+ $0$ $100$ $200$ $300$ $1$ $2$ $3$ $4$ $5$ Verification round
+
+Medusa Llama-3.1-8B
+GSM8K
+ $0$ $100$ $200$ $300$ $400$ $1$ $2$ $3$ $4$ $5$ Verification round
+
+Meta MTP 7B
+AIME 2025
+ $0$ $200$ $400$ $1$ $2$ $3$ $4$ $5$ Verification round
+
+Meta MTP 13B
+AIME 2025
+
+Figure 3: Draft window chosen by AMTP, averaged over generations in bins of 10 verification rounds (points; bars show one standard deviation across rounds in the bin). The window adapts as generation proceeds instead of staying at a single value.
+
+## 7 Conclusion and Future Work
+
+In this work, we study how far MTP should speculate. Since all MTP heads fire in a single forward pass, the horizon must be chosen before drafting, and the right choice changes with context. We showed that acceptance survival determines the expected number of committed tokens at every horizon for any causal proposal, and built AMTP, an online controller that learns survival from verification feedback and picks the horizon with the highest predicted throughput, without retraining any model or changing the exact verifier. We show that any online learner’s prediction error translates into throughput regret against the best horizon for each context, and in turn into a bound on wall-clock completion time. Empirically, AMTP decodes up to 4.1 $\times$ faster than standard decoding and matches or outperforms the fixed window in 8 of 10 settings.
+
+Several limitations point to future work. Our experiments decode one sequence at a time without a KV-cache: batched serving with caching changes the cost of each horizon and is a natural direction. Comparing hazard-based and direct survival prediction, and extending horizon control to tree-structured drafts, are promising directions. Finally, it would be interesting to extend our work to adaptive diffusion-based speculative methods.
+
+## AI Use Statement
+
+Generative AI tools assisted with editing the manuscript, generating code for the experiments, identifying and summarizing related literature, and proof-checking the mathematical formulations and proofs. The authors are responsible for checking the final claims, proofs, and citations.
+
+## Acknowledgements
+
+We thank Adam Wierman, Jacob Abernethy, Matthew Fahrbach, and Sarah Liaw for helpful comments. EA’s research is supported by NSF Grant CCF 2338816.
+
+## References
+
+Agrawal et al. (2024)
+S. Agrawal, W. Jeon, and M. Lee
+
+AdaEDL: early draft stopping for speculative decoding of large language models via an entropy-based lower bound on token acceptance probability.
+
+In Proceedings of the 4th NeurIPS Efficient Natural Language and Speech Processing Workshop,
+
+Proceedings of Machine Learning Research, Vol. 262.
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Ahn et al. (2025)
+K. Ahn, A. Lamb, and J. Langford
+
+Efficient joint prediction of multiple future tokens.
+
+arXiv preprint arXiv:2503.21801.
+
+External Links: Link
+
+Cited by: §2.
+
+Anand et al. (2026)
+E. Anand, A. Ateyeh, A. Wang, and M. Soljačić
+
+SMat-attention: structured long-context sequence modeling.
+
+External Links: 2609.36062,
+Link
+
+Cited by: §1.
+
+Anand and Liaw (2025)
+E. Anand and S. Liaw
+
+Feel-good Thompson sampling for contextual bandits: a Markov chain Monte Carlo showdown.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 38.
+
+Cited by: §4.2.
+
+Ankner et al. (2024)
+Z. Ankner, R. Parthasarathy, A. Nrusimha, C. Rinard, J. Ragan-Kelley, and W. Brandon
+
+Hydra: sequentially-dependent draft heads for medusa decoding.
+
+External Links: 2402.05109,
+Link
+
+Cited by: §1,
+§1,
+§3.1.
+
+Besbes et al. (2015)
+O. Besbes, Y. Gur, and A. Zeevi
+
+Non-stationary stochastic optimization.
+
+Operations Research 63 (5), pp. 1227–1244.
+
+Cited by: §5.2.
+
+Cai et al. (2024)
+T. Cai, Y. Li, Z. Geng, H. Peng, J. D. Lee, D. Chen, and T. Dao
+
+Medusa: simple LLM inference acceleration framework with multiple decoding heads.
+
+In Proceedings of the 41st International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 235, pp. 5209–5235.
+
+External Links: Link
+
+Cited by: §1,
+§1,
+§2.
+
+Chen (2026)
+C. Chen
+
+EntMTP: accelerating LLM inference with entropy guided multi token prediction.
+
+arXiv preprint arXiv:2606.27550.
+
+Cited by: §1.
+
+Chen et al. (2023)
+C. Chen, S. Borgeaud, G. Irving, J. Lespiau, L. Sifre, and J. Jumper
+
+Accelerating large language model decoding with speculative sampling.
+
+arXiv preprint arXiv:2302.01318.
+
+External Links: Link
+
+Cited by: §1,
+§2,
+§3.1,
+§3.1.
+
+Cheng et al. (2026)
+X. Cheng, X. Yu, C. Shao, J. Li, Y. Xiong, Y. Qian, J. Zhu, S. Ma, X. Zhang, J. Ye, Q. Chen, C. Deng, J. Yu, D. Dai, Z. Zhang, Y. Wei, Y. Tan, W. Yang, R. Xu, Y. Wu, Z. Xu, X. Wang, M. Chen, R. Tian, X. Bi, Z. Hao, S. Chen, H. Cao, W. Zhang, A. Xu, H. Zhang, D. Zhao, and W. Liang
+
+DSpark: confidence-scheduled speculative decoding with semi-autoregressive generation.
+
+arXiv preprint arXiv:2607.05147.
+
+External Links: Link
+
+Cited by: §1.
+
+Chintha et al. (2026)
+S. S. Chintha, C. Biringa, R. Sharma, A. Agrawal, P. Badarayani, G. Zhang, N. B. Kumankumah, M. Ayala, and S. Vesal
+
+Next token or vector? learning how far to decode.
+
+arXiv preprint arXiv:2610.22788.
+
+Cited by: §1.
+
+DeepSeek-AI (2024)
+DeepSeek-AI
+
+DeepSeek-V3 technical report.
+
+arXiv preprint arXiv:2412.19437.
+
+Cited by: §1.
+
+Elmachtoub and Grigas (2022)
+A. N. Elmachtoub and P. Grigas
+
+Smart “predict, then optimize”.
+
+Management Science 68 (1), pp. 9–26.
+
+Cited by: §1.
+
+Gloeckle et al. (2024)
+F. Gloeckle, B. Youbi Idrissi, B. Rozière, D. Lopez-Paz, and G. Synnaeve
+
+Better & faster large language models via multi-token prediction.
+
+In Proceedings of the 41st International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 235, pp. 15706–15734.
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Hazan (2016)
+E. Hazan
+
+Introduction to online convex optimization.
+
+Foundations and Trends in Optimization 2 (3–4), pp. 157–325.
+
+Cited by: §4.1.
+
+Hou et al. (2025)
+Y. Hou, F. Zhang, C. Du, X. Zhang, J. Pan, T. Pang, C. Du, V. Y. F. Tan, and Z. Yang
+
+BanditSpec: adaptive speculative decoding via bandit algorithms.
+
+In Proceedings of the 42nd International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 267.
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Huang et al. (2024)
+K. Huang, X. Guo, and M. Wang
+
+SpecDec++: boosting speculative decoding via adaptive candidate lengths.
+
+arXiv preprint arXiv:2405.19715.
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Kirchenbauer et al. (2026)
+J. Kirchenbauer, A. Hans, B. Bartoldson, M. Goldblum, A. Panda, and T. Goldstein
+
+Multi-token prediction via self-distillation.
+
+arXiv preprint arXiv:2602.06019.
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Langford and Zhang (2007)
+J. Langford and T. Zhang
+
+The epoch-greedy algorithm for multi-armed bandits with side information.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 20.
+
+Cited by: §1,
+§4.2.
+
+Leviathan et al. (2023)
+Y. Leviathan, M. Kalman, and Y. Matias
+
+Fast inference from transformers via speculative decoding.
+
+In Proceedings of the 40th International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 202, pp. 19274–19286.
+
+External Links: Link
+
+Cited by: §1,
+§2,
+§3.1,
+§3.1.
+
+Li et al. (2024a)
+Y. Li, F. Wei, C. Zhang, and H. Zhang
+
+EAGLE-2: faster inference of language models with dynamic draft trees.
+
+In Proceedings of the 2024 Conference on Empirical Methods in Natural Language Processing,
+
+pp. 7421–7432.
+
+External Links: Document,
+Link
+
+Cited by: §1,
+§2.
+
+Li et al. (2024b)
+Y. Li, F. Wei, C. Zhang, and H. Zhang
+
+EAGLE: speculative sampling requires rethinking feature uncertainty.
+
+In Proceedings of the 41st International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 235, pp. 28935–28948.
+
+External Links: Link
+
+Cited by: §2.
+
+Li et al. (2025)
+Y. Li, F. Wei, C. Zhang, and H. Zhang
+
+EAGLE-3: scaling up inference acceleration of large language models via training-time test.
+
+In Advances in Neural Information Processing Systems,
+
+Cited by: §1.
+
+Lin et al. (2022)
+Y. Lin, Y. Hu, G. Qu, T. Li, and A. Wierman
+
+Bounded-regret MPC via perturbation analysis: prediction error, constraints, and nonlinearity.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 35.
+
+External Links: Link
+
+Cited by: §2.
+
+Lin et al. (2023)
+Y. Lin, J. A. Preiss, E. Anand, Y. Li, Y. Yue, and A. Wierman
+
+Online adaptive policy selection in time-varying systems: no-regret via contractive perturbations.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 36.
+
+External Links: Link
+
+Cited by: §2.
+
+Lin et al. (2024)
+Y. Lin, J. A. Preiss, F. Xie, E. Anand, S. Chung, Y. Yue, and A. Wierman
+
+Online policy optimization in unknown nonlinear systems.
+
+In Proceedings of Thirty Seventh Conference on Learning Theory, S. Agrawal and A. Roth (Eds.),
+
+Proceedings of Machine Learning Research, Vol. 247, pp. 3475–3522.
+
+External Links: Link
+
+Cited by: §2.
+
+Liu et al. (2026)
+H. Liu, J. Huang, Z. Jia, Y. Park, and Y. Wang
+
+Not-a-bandit: provably no-regret drafter selection in speculative decoding for LLMs.
+
+In International Conference on Learning Representations,
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Liu et al. (2025)
+T. Liu, Y. Li, Q. Lv, K. Liu, J. Zhu, W. Hu, and X. Sun
+
+PEARL: parallel speculative decoding with adaptive draft length.
+
+External Links: 2408.11850,
+Link
+
+Cited by: §1.
+
+Liu et al. (2024)
+X. Liu, L. Hu, P. Bailis, A. Cheung, Z. Deng, I. Stoica, and H. Zhang
+
+Online speculative decoding.
+
+In Proceedings of the 41st International Conference on Machine Learning,
+
+Proceedings of Machine Learning Research, Vol. 235.
+
+Cited by: §1.
+
+Mamou et al. (2024)
+J. Mamou, O. Pereg, D. Korat, M. Berchansky, N. Timor, M. Wasserblat, and R. Schwartz
+
+Dynamic speculation lookahead accelerates speculative decoding of large language models.
+
+In Proceedings of the 4th NeurIPS Efficient Natural Language and Speech Processing Workshop,
+
+Proceedings of Machine Learning Research, Vol. 262, pp. 456–467.
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Qian et al. (2026)
+Y. Qian, H. Wu, Y. Fu, H. Zhang, and P. Zhao
+
+When drafts evolve: speculative decoding meets online learning.
+
+arXiv preprint arXiv:2603.12617.
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Samragh et al. (2025)
+M. Samragh, A. Kundu, D. Harrison, K. Nishu, D. Naik, M. Cho, and M. Farajtabar
+
+Your llm knows the future: uncovering its multi-token prediction potential.
+
+External Links: 2507.11851,
+Link
+
+Cited by: §1.
+
+Stern et al. (2018)
+M. Stern, N. Shazeer, and J. Uszkoreit
+
+Blockwise parallel decoding for deep autoregressive models.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 31.
+
+Cited by: §1.
+
+Xia et al. (2024)
+H. Xia, Z. Yang, Q. Dong, P. Wang, Y. Li, T. Ge, T. Liu, W. Li, and Z. Sui
+
+Unlocking efficiency in large language model inference: a comprehensive survey of speculative decoding.
+
+External Links: 2401.07851,
+Link
+
+Cited by: §1.
+
+Zhang et al. (2026)
+J. Zhang, Z. Yu, L. Wang, N. Yang, E. J. Yu, Z. Li, Y. Song, D. Zhu, X. Zhang, F. Wei, and S. Li
+
+Learning to draft: adaptive speculative decoding with reinforcement learning.
+
+arXiv preprint arXiv:2603.01639.
+
+External Links: Link
+
+Cited by: §1,
+§2.
+
+Zhang et al. (2018)
+L. Zhang, S. Lu, and Z. Zhou
+
+Adaptive online learning in dynamic environments.
+
+In Advances in Neural Information Processing Systems,
+
+Vol. 31.
+
+Cited by: §5.2.
+
+Zhang (2021)
+T. Zhang
+
+Feel-good thompson sampling for contextual bandits and reinforcement learning.
+
+External Links: 2110.00871,
+Link
+
+Cited by: §4.2.
+
+Zhang et al. (2025)
+Z. Zhang, J. Xu, T. Liang, X. Chen, Z. He, R. Wang, and Z. Tu
+
+Draft model knows when to stop: self-verification speculative decoding for long-form generation.
+
+In Proceedings of the 2025 Conference on Empirical Methods in Natural Language Processing,
+
+pp. 16685–16697.
+
+External Links: Document,
+Link
+
+Cited by: §1,
+§2.
+
+Zhao et al. (2026)
+G. Zhao, R. Xie, A. Wang, S. Li, H. Xie, and X. Sun
+
+Self-distillation for multi-token prediction.
+
+arXiv preprint arXiv:2603.23911.
+
+Cited by: §1.
+
+Zinkevich (2003)
+M. Zinkevich
+
+Online convex programming and generalized infinitesimal gradient ascent.
+
+In Proceedings of the 20th International Conference on Machine Learning,
+
+External Links: Link
+
+Cited by: Appendix B,
+3rd item,
+§2,
+§4.1,
+§5.2.
+
+Outline of the Appendices.
+
+• 
+
+Section A provides some motivation for adaptive horizon selection;
+
+• 
+
+Section B presents the proof of our main results;
+
+• 
+
+Section C shows how to estimate the costs and throughput measurements;
+
+• 
+
+Section D explains our experimental setup and provides further results.
+
+## Appendix A Why Longer Drafts Degrade
+
+Draft qualities can deteriorate with the horizon even if every head is accurate on its own. For independent heads, the block mismatch has two sources: marginal fitting error, and dependence among future target tokens that the heads cannot represent, neither of which individually determines the throughput-optimal horizon, which depends on the verifier’s acceptance profile and the round cost.
+
+Fix a round, condition on its committed context, and suppress the round index. Let $P^{(k)}$ and $Q^{(k)}$ be the target and proposal laws over the next $k$ tokens, assumed to be prefix marginals of common laws $P$ and $Q$ , and let $P_{j}$ be the position- $j$ target marginal. The vocabulary is finite and logarithms are natural; KL identities use the usual extended-value convention.
+
+Proposition 1 (Dependence and marginal fit).
+
+For independent heads $Q^{(k)}=\prod_{j=1}^{k}q_{j}$ , let $\mathrm{TC}_{P}(Y_{1:k}):=D_{\mathrm{KL}}\bigl(P^{(k)}\|\prod_{j=1}^{k}P_{j}\bigr)$ be the total correlation of the target block. Then,
+
+ $D_{\mathrm{KL}}(P^{(k)}\|Q^{(k)})=\mathrm{TC}_{P}(Y_{1:k})+\sum_{j=1}^{k}D_{\mathrm{KL}}(P_{j}\|q_{j}),$ 
+
+(19)
+
+and, at each position $j$ ,
+
+ $\mathbb{E}_{Y_{<j}\sim P^{(j-1)}}\bigl[D_{\mathrm{KL}}\bigl(p_{j}(\cdot\mid Y_{<j})\|q_{j}\bigr)\bigr]=I_{P}(Y_{j};Y_{<j})+D_{\mathrm{KL}}(P_{j}\|q_{j}).$ 
+
+(20)
+
+Proof.
+
+Insert $\prod_{j}P_{j}(y_{j})$ into the likelihood ratio:
+
+ $\log\frac{P^{(k)}(y_{1:k})}{\prod_{j}q_{j}(y_{j})}=\log\frac{P^{(k)}(y_{1:k})}{\prod_{j}P_{j}(y_{j})}+\sum_{j}\log\frac{P_{j}(y_{j})}{q_{j}(y_{j})},$ 
+
+and take expectations under $P^{(k)}$ . Inserting it in the conditional ratio $\frac{p_{j}(Y_{j}|Y_{<j})}{q_{j}(Y_{j})}$ gives Eq. 20.
+∎
+
+Even exact marginal heads, $q_{j}=P_{j}$ , therefore maintain the total correlation as their block KL divergence. The term $I_{P}(Y_{j};Y_{<j})$ is the information about earlier target tokens that an independent head cannot use, and heads that condition on earlier proposed tokens can reduce it.
+
+We now explain how the block mismatch grows with the horizon. Let $\delta(k):=\mathrm{TV}(P^{(k)},Q^{(k)})$ . Because marginalization contracts total variation, we have
+
+ $\displaystyle 2\delta(k)$ 
+ $\displaystyle=\sum_{y_{1:k}}\Bigl|\sum_{v}\bigl(P^{(k+1)}(y_{1:k},v)-Q^{(k+1)}(y_{1:k},v)\bigr)\Bigr|$ 
+
+ $\displaystyle\leq\sum_{y_{1:k},v}\bigl|P^{(k+1)}(y_{1:k},v)-Q^{(k+1)}(y_{1:k},v)\bigr|=2\delta(k+1).$ 
+
+Similarly, block mismatch caps survival: with the conditional kernels defined along a path, the probability that all $k$ sequential checks accept is
+
+ $s_{k}=\sum_{y_{1:k}}\prod_{j=1}^{k}\min\{p_{j}(y_{j}\mid y_{<j}),\,q_{j}(y_{j}\mid y_{<j})\}\leq 1-\delta(k),$ 
+
+(21)
+
+since each product of minima is at most the minimum of the two products.
+
+Example 1 (Perfect marginals, bounded gain).
+
+Let the target draw one fair bit $B$ and repeat it, $Y_{j}=B$ for all $j$ , so $P^{(k)}(0^{k})=P^{(k)}(1^{k})=1/2$ . Independent heads with exact marginals draw a fresh fair bit at each position, so $Q^{(k)}(y_{1:k})=2^{-k}$ . Then
+
+ $\delta(k)=1-2^{1-k},\qquad D_{\mathrm{KL}}(P^{(k)}\|Q^{(k)})=(k-1)\log 2.$ 
+
+The first proposal is always accepted. Given that the prefixes have been accepted, each later target conditional is a point mass at the first bit while the proposal is uniform, so each later position is accepted with probability $1/2$ . Therefore, we have that
+ $\smash{s_{j}=2^{1-j}}$ , and
+ $\smash{G(k)=1+\sum_{j=1}^{k}2^{1-j}=3-2^{1-k}<3}$ , showing that exact marginals can coexist with block mismatch approaching $1$ and an expected gain that never reaches $3$ tokens, no matter how long the draft.
+
+## Appendix B Proofs of the Efficiency Guarantees
+
+This section proves the results stated in the main text, in the order they appear. Throughout, write $E_{t}=\ell_{t}(\theta_{t})-\ell_{t}^{\mathrm{B}}$ and $\widehat{h}_{t,r}=\widehat{h}_{\theta_{t},t,r}$ . Then, by Lemma 1, we have $\sum_{t=1}^{T}E_{t}=\mathcal{R}_{T}+\mathcal{A}_{T}$ .
+
+Predictor class. We use an affine forecaster $\widehat{h}_{\theta,t,j}=\langle\theta,x_{t,j}\rangle$ . For instance, consider simplex weights $\theta$ and features $x_{t,j}\in[0,1]^{d}$ : here, the loss is convex in $\theta$ and the forecasts stay in $[0,1]$ .
+
+Proof of Lemma 1.
+
+Write $e_{t,j}(Y_{<j})-\widehat{h}_{\theta,t,j}=\bigl(e_{t,j}(Y_{<j})-h_{t,j}\bigr)+\bigl(h_{t,j}-\widehat{h}_{\theta,t,j}\bigr)$ and expand each square. By the definition of the hazard equation 4, the cross term vanishes:
+
+ $\mathbb{E}_{Q_{t}}\bigl[W_{t,j-1}\bigl(e_{t,j}(Y_{<j})-h_{t,j}\bigr)\bigr]=0.$ 
+
+The first square summed over $j$ is $\ell_{t}^{\mathrm{B}}$ , and the second is multiplied by $\mathbb{E}_{Q_{t}}[W_{t,j-1}]=s_{t,j-1}$ .
+∎
+
+Proof of Theorem 1.
+
+First, telescoping the survival products gives
+
+ $\widehat{s}_{t,j}-s_{t,j}=\sum_{r=1}^{j}s_{t,r-1}\,\bigl(h_{t,r}-\widehat{h}_{t,r}\bigr)\prod_{u=r+1}^{j}\bigl(1-\widehat{h}_{t,u}\bigr).$ 
+
+Every factor in the product lies in $[0,1]$ , so summing over $j\leq k$ , applying Cauchy–Schwarz, and using $s_{t,r-1}\leq 1$ and Lemma 1,
+
+ $\displaystyle\bigl|\widehat{G}_{t}(k)-G_{t}(k)\bigr|$ 
+ $\displaystyle\leq\sum_{r=1}^{k}(k-r+1)\,s_{t,r-1}\,\bigl|\widehat{h}_{t,r}-h_{t,r}\bigr|$ 
+
+ $\displaystyle\leq\Bigl(\sum_{r=1}^{k}(k-r+1)^{2}s_{t,r-1}\Bigr)^{1/2}\Bigl(\sum_{r=1}^{k}s_{t,r-1}\bigl(\widehat{h}_{t,r}-h_{t,r}\bigr)^{2}\Bigr)^{1/2}$ 
+
+ $\displaystyle\leq\sqrt{\frac{k(k+1)(2k+1)}{6}}\,\sqrt{E_{t}}.$ 
+
+(22)
+
+Dividing by $C_{t}(k)\geq c_{\min}$ and using $k\leq K$ gives $\max_{k}|\widehat{R}_{t}(k)-R_{t}(k)|\leq\Lambda_{K}\sqrt{E_{t}}$ . Combining this with the selection rule in equation 12 gives
+
+ $R_{t}(k_{t}^{\star})-R_{t}(k_{t})\leq\bigl[R_{t}(k_{t}^{\star})-\widehat{R}_{t}(k_{t}^{\star})\bigr]+\bigl[\widehat{R}_{t}(k_{t}^{\star})-\widehat{R}_{t}(k_{t})\bigr]+\bigl[\widehat{R}_{t}(k_{t})-R_{t}(k_{t})\bigr]\leq 2\Lambda_{K}\sqrt{E_{t}}+\xi_{t}.$ 
+
+Then, by Cauchy–Schwarz, we have $\sum_{t=1}^{T}\sqrt{E_{t}}\leq\sqrt{T\sum_{t}E_{t}}=\sqrt{T(\mathcal{R}_{T}+\mathcal{A}_{T})}$ .
+∎
+
+A general projected-OGD bound. Both learning corollaries follow from the standard projected-OGD argument [Zinkevich, 2003] with a moving comparator and stochastic gradients.
+
+Lemma 2 (Projected OGD with a moving comparator).
+
+Let $\Theta$ be a nonempty closed convex set of diameter at most $D$ , let $\theta_{1}\in\Theta$ , and let each $\ell_{t}$ be convex and differentiable on $\Theta$ . Suppose $\theta_{t+1}=\Pi_{\Theta}(\theta_{t}-\eta g_{t})$ with $\mathbb{E}[g_{t}|\mathcal{F}_{t}]=\nabla\ell_{t}(\theta_{t})$ and $\mathbb{E}[\|g_{t}\|_{2}^{2}|\mathcal{F}_{t}]\leq M^{2}$ . Let $\theta_{t}^{\star}\in\Theta$ be $\mathcal{F}_{t}$ -measurable with $\sum_{t<T}\|\theta_{t+1}^{\star}-\theta_{t}^{\star}\|_{2}\leq P_{T}$ almost surely, for a deterministic $P_{T}$ . Then
+
+ $\mathbb{E}\,\mathcal{R}_{T}\leq\frac{D^{2}+2DP_{T}}{2\eta}+\frac{\eta M^{2}T}{2}.$ 
+
+(23)
+
+With $\eta=\sqrt{\frac{D^{2}+2DP_{T}}{M^{2}T}}$ in the nondegenerate case, Theorem 1 and Jensen’s inequality give
+
+ $\mathbb{E}\,\mathcal{D}_{T}\leq 2\Lambda_{K}\sqrt{T\Bigl(M\sqrt{T(D^{2}+2DP_{T})}+\mathbb{E}\,\mathcal{A}_{T}\Bigr)}+\mathbb{E}\sum_{t=1}^{T}\xi_{t}.$ 
+
+(24)
+
+Proof.
+
+Nonexpansiveness of the projection gives
+
+ $\langle g_{t},\theta_{t}-\theta_{t}^{\star}\rangle\leq\frac{\|\theta_{t}-\theta_{t}^{\star}\|_{2}^{2}-\|\theta_{t+1}-\theta_{t}^{\star}\|_{2}^{2}}{2\eta}+\frac{\eta}{2}\|g_{t}\|_{2}^{2}.$ 
+
+By convexity and conditional unbiasedness, the expectation of the left-hand side is at least $\mathbb{E}[\ell_{t}(\theta_{t})-\ell_{t}(\theta_{t}^{\star})]$ . To telescope against a moving comparator, we use
+
+ $\Bigl|\|\theta_{t+1}-\theta_{t+1}^{\star}\|_{2}^{2}-\|\theta_{t+1}-\theta_{t}^{\star}\|_{2}^{2}\Bigr|\leq 2D\,\|\theta_{t+1}^{\star}-\theta_{t}^{\star}\|_{2}.$ 
+
+Summing over $t$ proves equation 23. Substituting the chosen $\eta$ gives $\mathbb{E}\,\mathcal{R}_{T}\leq M\sqrt{T(D^{2}+2DP_{T})}$ , and equation 24 follows from Theorem 1 and Jensen’s inequality.
+∎
+
+Proof of Corollary 1 (full feedback).
+
+Here, $g_{t}=-2\sum_{j=1}^{K}W_{t,j-1}(e^{\mathrm{obs}}_{t,j}-\langle\theta_{t},x_{t,j}\rangle)\,x_{t,j}$ is unbiased for $\nabla\ell_{t}(\theta_{t})$ , and since $W_{t,j-1}\leq 1$ , $|e^{\mathrm{obs}}_{t,j}-\widehat{h}_{t,j}|\leq 1$ and $\|x_{t,j}\|_{2}\leq F$ , we have $\|g_{t}\|_{2}\leq 2FK$ . Apply Lemma 2 with $M=2FK$ and $\xi_{t}=0$ . Under realizability, $\mathbb{E}\,\mathcal{D}_{T}=O\bigl(T^{3/4}(1+P_{T})^{1/4}\bigr)$ for fixed $K,c_{\min},D,F$ .
+∎
+
+Proof of Corollary 2 (partial feedback).
+
+Unbiased loss and gradient. Fix $\theta$ . Because the exploration coin is independent of the draft given $\mathcal{F}_{t}$ , for each position
+
+ $\mathbb{E}\Bigl[\frac{\mathbf{1}\{k_{t}\geq j\}}{\pi_{t,j}}\,W_{t,j-1}\bigl(e^{\mathrm{obs}}_{t,j}-\widehat{h}_{\theta,t,j}\bigr)^{2}\Bigm|\mathcal{F}_{t}\Bigr]=\mathbb{E}_{Q_{t}}\Bigl[W_{t,j-1}\bigl(e_{t,j}(Y_{<j})-\widehat{h}_{\theta,t,j}\bigr)^{2}\Bigr].$ 
+
+This discrepancy is needed only when the indicator is one. Summing over $j$ shows that the observed loss is conditionally unbiased, and differentiating shows this for the gradient of the affine predictor.
+
+Second moment. Using $\|\sum_{j=1}^{K}v_{j}\|_{2}^{2}\leq K\sum_{j=1}^{K}\|v_{j}\|_{2}^{2}$ , $W_{t,j-1}\leq 1$ and $\mathbb{E}[\mathbf{1}\{k_{t}\geq j\}|\mathcal{F}_{t}]=\pi_{t,j}$ ,
+
+ $\mathbb{E}\bigl[\|g_{t}\|_{2}^{2}|\mathcal{F}_{t}\bigr]\leq 4F^{2}K\sum_{j=1}^{K}\frac{1}{\pi_{t,j}}\leq\frac{4F^{2}K^{2}}{\varepsilon}.$ 
+
+Substituting $M^{2}=4F^{2}K^{2}/\varepsilon$ into equation 23 gives the regression bound.
+
+Selection error. On a greedy round $\xi_{t}=0$ . On an exploration round, $\xi_{t}=\max_{k}\widehat{R}_{t}(k)-\widehat{R}_{t}(K)\leq(K+1)/c_{\min}$ , so $\mathbb{E}\sum_{t}\xi_{t}\leq\varepsilon T(K+1)/c_{\min}$ . Combining these bounds gives the final rates.
+∎
+
+Proof of Corollary 3.
+
+Let $\Delta_{t}=R_{t}(k_{t}^{\star})-R_{t}(k_{t})\geq 0$ . Since $R_{t}(k_{t}^{\star})\geq\rho$ and $C_{t}(k_{t})\leq c_{\max}$ ,
+
+ $G_{t}(k_{t})=C_{t}(k_{t})\bigl(R_{t}(k_{t}^{\star})-\Delta_{t}\bigr)\geq\rho\,C_{t}(k_{t})-c_{\max}\Delta_{t}.$ 
+
+Every round commits at least one token, so $\sigma_{N}\leq N$ , and the last round overshoots the budget by at most $K$ tokens: $N\leq\sum_{t=1}^{\sigma_{N}}L_{t}\leq N+K$ . The event $\{\sigma_{N}\geq t\}$ is determined before round $t$ , so taking conditional expectations round by round and summing gives
+
+ $\rho\,\mathbb{E}J_{N}\leq\mathbb{E}\sum_{t=1}^{\sigma_{N}}L_{t}+c_{\max}\,\mathbb{E}\sum_{t=1}^{\sigma_{N}}\Delta_{t}\leq N+K+c_{\max}\,\mathbb{E}\,\mathcal{D}_{N},$ 
+
+where the last step uses $\sigma_{N}\leq N$ and $\Delta_{t}\geq 0$ . Dividing by $\rho$ gives the completion-time bound, and dividing the baseline’s expected completion time by it gives the speedup bound.
+∎
+
+The square-root dependence is tight. The transfer in Theorem 1 scales with the square root of the excess loss. The next result shows that this cannot be improved for the forecast-greedy controller, even with independent heads, known costs and $K=2$ .
+
+Proposition 2 (Square-root dependence is unavoidable).
+
+For every $\delta\in(0,1/2)$ there is an exact speculative-decoding instance with $K=2$ , costs $C(1)=1$ and $C(2)=5/4$ , and a pre-draft hazard forecast with excess loss $E=4\delta^{2}$ , such that forecast-greedy selection incurs
+
+ $R(k^{\star})-R(\widehat{k})=\frac{2}{5}\sqrt{E}.$ 
+
+(25)
+
+Repeating the construction over $T$ rounds gives
+
+ $\mathcal{D}_{T}=\frac{2}{5}\sqrt{T\sum_{t=1}^{T}E_{t}}.$ 
+
+(26)
+
+Hence no uniform $o(\sqrt{E})$ one-round bound holds under the assumptions of the transfer theorem.
+
+Proof.
+
+Instance. Take the vocabulary $\{0,1\}$ and a target that emits $0$ with probability one after every prefix. The independent proposal heads are $q_{1}(0)=1$ and $q_{2}(0)=1/2+\delta$ . The first token is always accepted, so $W_{1}=1$ and $e_{1}=h_{1}=0$ . At the second position $e_{2}=\mathrm{TV}(p_{2},q_{2})=1/2-\delta$ : a proposed $0$ is always accepted and a proposed $1$ always rejected, and both the correction and the bonus token are $0$ . Hence $h_{2}=1/2-\delta$ , $s_{1}=1$ and $s_{2}=1/2+\delta$ .
+
+Forecast and excess loss. Take $\widehat{h}_{1}=0$ and $\widehat{h}_{2}=1/2+\delta$ . The discrepancies are deterministic and $W_{0}=W_{1}=1$ , so $\ell(\widehat{h})=(2\delta)^{2}=4\delta^{2}$ and $\ell^{\mathrm{B}}=0$ , giving $E=4\delta^{2}$ . Both the forecast and the true hazards lie in the affine class $\widehat{h}_{\theta,j}=\theta_{j}$ on $\Theta=[0,1]^{2}$ .
+
+Regret. Counting the correction or bonus token, $G(1)=\widehat{G}(1)=2$ , $G(2)=5/2+\delta$ and $\widehat{G}(2)=5/2-\delta$ . With the stated costs, $R(1)=\widehat{R}(1)=2$ , $R(2)=2+4\delta/5$ and $\widehat{R}(2)=2-4\delta/5$ . So $k^{\star}=2$ and $\widehat{k}=1$ are unique, and the regret is $4\delta/5=(2/5)\sqrt{E}$ . Since $K$ and the costs stay fixed as $\delta\downarrow 0$ , no bound of the form $o(\sqrt{E})$ , and in particular none of the form $cE$ , can hold uniformly.
+
+Many rounds. Use the same models, costs and forecasts at every round. All committed tokens are $0$ and the models ignore the history, so these are consistent rounds of one decoding process, with $E_{t}=4\delta^{2}$ and $\mathcal{D}_{T}=4T\delta/5=(2/5)\sqrt{T\sum_{t}E_{t}}$ .
+∎
+
+The construction above places the two horizons arbitrarily close to a decision boundary. When every suboptimal horizon is separated from the best one, the transfer becomes linear in the excess loss.
+
+Proposition 3 (Transfer under a throughput gap).
+
+Under the known-cost assumptions of Theorem 1, suppose $\exists\gamma>0$ such that $R_{t}(k_{t}^{\star})-R_{t}(k)\in\{0\}\cup[\gamma,\infty)$ for every round $t$ and horizon $k$ . Then
+
+ $\mathcal{D}_{T}\leq\frac{4\Lambda_{K}^{2}}{\gamma}\bigl(\mathcal{R}_{T}+\mathcal{A}_{T}\bigr)+2\sum_{t=1}^{T}\xi_{t}.$ 
+
+Proof.
+
+Let $\Delta_{t}=R_{t}(k_{t}^{\star})-R_{t}(k_{t})$ and $d_{t}=\Lambda_{K}\sqrt{E_{t}}$ . Step 2 of the proof of Theorem 1 gives $\Delta_{t}\leq 2d_{t}+\xi_{t}$ . If $\Delta_{t}=0$ there is nothing to prove. Otherwise $\Delta_{t}\geq\gamma$ , and Young’s inequality $2d_{t}\leq\Delta_{t}/2+2d_{t}^{2}/\Delta_{t}$ gives, after rearranging,
+
+ $\Delta_{t}\leq\frac{4d_{t}^{2}}{\Delta_{t}}+2\xi_{t}\leq\frac{4\Lambda_{K}^{2}}{\gamma}E_{t}+2\xi_{t}.$ 
+
+Summing over $t$ completes the proof.
+∎
+
+Predicting survival directly. Hazards are one way to parameterize acceptance survival. The same verification feedback also supports predicting $s_{t,j}$ directly, using either of the labels
+
+ $Z_{t,j}=W_{t,j},\qquad Z_{t,j}^{\mathrm{RB}}=W_{t,j-1}\bigl(1-e^{\mathrm{obs}}_{t,j}\bigr).$ 
+
+(27)
+
+Both have conditional mean $s_{t,j}$ given $\mathcal{F}_{t}$ . The second equals $\mathbb{E}[W_{t,j}|\mathcal{F}_{t},Y_{<j}]$ : it integrates out the current proposed token, so it is a Rao–Blackwellization of the first and has no larger conditional variance. Both are available at every drafted position under the feedback assumptions of Section 4.
+
+Let $\widehat{s}_{\psi,t,j}$ be a pre-draft survival forecast, let $\zeta_{t,j}$ be either label, and define $\ell_{t}^{\mathrm{S}}(\psi)=\mathbb{E}_{Q_{t}}\bigl[\sum_{j=1}^{K}(\zeta_{t,j}-\widehat{s}_{\psi,t,j})^{2}\bigr]$ . As in Lemma 1, its excess loss is
+
+ $E_{t}^{\mathrm{S}}(\psi):=\ell_{t}^{\mathrm{S}}(\psi)-\ell_{t}^{\mathrm{S},B}=\sum_{j=1}^{K}\bigl(\widehat{s}_{\psi,t,j}-s_{t,j}\bigr)^{2}.$ 
+
+(28)
+
+With the same exploration scheme, the observed loss $\widehat{\ell}_{t}^{\mathrm{S}}(\psi)=\sum_{j=1}^{k_{t}}(\zeta_{t,j}-\widehat{s}_{\psi,t,j})^{2}/\pi_{t,j}$ is conditionally unbiased. With $\widehat{G}_{t}^{\mathrm{S}}(k)=1+\sum_{j=1}^{k}\widehat{s}_{\psi_{t},t,j}$ , Cauchy-Schwarz gives
+
+ $\bigl|\widehat{G}_{t}^{\mathrm{S}}(k)-G_{t}(k)\bigr|\leq\sqrt{k}\,\sqrt{E_{t}^{\mathrm{S}}(\psi_{t})},$ 
+
+(29)
+
+so with known costs the one-round throughput regret is at most $2\sqrt{KE_{t}^{\mathrm{S}}(\psi_{t})}/c_{\min}+\xi_{t}$ .
+
+## Appendix C Round Costs and Measured Throughput
+
+The marginal value of an extra position makes the tradeoff explicit. If $\Delta C_{t}(k)=C_{t}(k+1)-C_{t}(k)\geq 0$ , then
+
+ $R_{t}(k+1)\geq R_{t}(k)\quad\Longleftrightarrow\quad s_{t,k+1}\geq R_{t}(k)\,\Delta C_{t}(k).$ 
+
+(30)
+
+The gain in expected committed tokens must cover the extra round cost. This comparison is local; the controller scores every candidate and does not assume that $R_{t}(k)$ is unimodal.
+
+## Estimated latency costs.
+
+Write $E_{t}=E_{t}(\theta_{t})$ as in equation 9.
+If the controller instead uses
+ $\widehat{R}_{t}(k)=\widehat{G}_{t}(k)/\widehat{C}_{t}(k)$ ,
+assume $\widehat{C}_{t}(k)\geq c_{\min}$ and define
+
+ $\delta_{t}^{C}=\max_{1\leq k\leq K}|\widehat{C}_{t}(k)-C_{t}(k)|.$ 
+
+Then
+
+ $\max_{k}|\widehat{R}_{t}(k)-R_{t}(k)|\leq\Lambda_{K}\sqrt{E_{t}}+\frac{K+1}{c_{\min}^{2}}\delta_{t}^{C}.$ 
+
+Thus Theorem 1 becomes
+
+ $\mathcal{D}_{T}\leq 2\Lambda_{K}\sqrt{T(\mathcal{R}_{T}+\mathcal{A}_{T})}+\frac{2(K+1)}{c_{\min}^{2}}\sum_{t=1}^{T}\delta_{t}^{C}+\sum_{t=1}^{T}\xi_{t},$ 
+
+where $\xi_{t}$ is now defined relative to the estimated-cost
+objective.
+
+## Connection to measured acceptance.
+
+Over $T$ complete rounds, define the pooled draft acceptance
+rate, average window length, and average realized round cost by
+
+ $\widehat{a}_{T}=\frac{\sum_{t=1}^{T}A_{t}(k_{t})}{\sum_{t=1}^{T}k_{t}},\qquad\overline{k}_{T}=\frac{1}{T}\sum_{t=1}^{T}k_{t},\qquad\overline{c}_{T}=\frac{1}{T}\sum_{t=1}^{T}c_{t}.$ 
+
+Since $L_{t}=1+A_{t}(k_{t})$ , the measured throughput satisfies the
+exact identity
+
+ $\frac{\sum_{t=1}^{T}L_{t}}{\sum_{t=1}^{T}c_{t}}=\frac{1+\widehat{a}_{T}\,\overline{k}_{T}}{\overline{c}_{T}}.$ 
+
+(31)
+
+Consequently, acceptance improvements translate into throughput
+improvements through both the average window length and the
+round cost.
+Acceptance alone is insufficient: for a fixed context and draft
+law,
+
+ $\frac{\mathbb{E}[A_{t}(k)\mid\mathcal{F}_{t}]}{k}=\frac{1}{k}\sum_{j=1}^{k}s_{t,j}$ 
+
+is nonincreasing in $k$ , so shortening the window increases
+acceptance without increasing throughput.
+
+The identity in equation 31 applies to complete rounds under the one-correction-or-bonus convention. An output cutoff or early end-of-sequence token requires recording the actual committed count; the pooled identity should not be applied blindly to such truncated rounds.
+
+## Appendix D Experimental Setup and Further Results
+
+This section describes our experimental setup and provides further results. We use the following checkpoints that can be found on HuggingFace:
+
+1. 
+
+jwkirchenbauer/Qwen3-4B-Inst-2507-MTP,
+
+2. 
+
+facebook/multi-token-prediction (7B_1T_4),
+
+3. 
+
+meta-llama/Llama-3.1-8B-Instruct with Medusa heads,
+
+4. 
+
+Qwen/Qwen3-14B,
+
+5. 
+
+meta-llama/Llama-2-{7b,13b}-hf.
+
+Table 4: MTP draft/target experiment matrix, run without KV-caches. Rows 1-3 are the core self-speculative pairings; rows 4-5 are the cross-model scaling pairings. Each row is evaluated on GSM8K and AIME 2025 with a fixed window, AMTP, and plain (next-token) decoding of the target.
+
+#
+Family
+Pairing
+Draft
+Target
+Plain baseline
+Max $k$ 
+
+1
+Self-distilled
+Self-speculative
+Qwen3-4B-Inst-2507-MTP
+Same checkpoint
+Same checkpoint
+16
+
+2
+Meta MTP
+Self-speculative
+multi-token-prediction 7B
+Same checkpoint
+Llama-2-7B
+4
+
+3
+Medusa
+Self-speculative
+Llama-3.1-8B-Instruct + Medusa heads
+Same checkpoint
+Llama-3.1-8B-Instruct
+6
+
+4
+Self-distilled
+Cross-model
+Qwen3-4B-Inst-2507-MTP
+Qwen3-14B
+Qwen3-14B
+16
+
+5
+Meta MTP
+Cross-model
+multi-token-prediction 7B
+Llama-2-13B
+Llama-2-13B
+4
+
+Hardware and Software.
+Self-distilled Qwen3-4B, its Qwen3-14B cross-model pairing and Medusa runs use a NVIDIA H100 on a university SLURM cluster; Meta MTP runs use a single NVIDIA H100 SXM on a rented cloud pod. Every run occupies one GPU exclusively and processes one sample at a time, so measured wall time is not distorted by co-located jobs. Throughput is therefore comparable between conditions on the same hardware but not across the two hardware groups. Models are loaded in the checkpoint’s native precision through Hugging Face transformers; evaluations are driven by Inspect AI, using a custom model provider that wraps our speculative-decoding engine. The exact package versions are pinned in the released code’s lock file.
+
+Tasks and Caps. AIME 2025 uses all 30 problems with a limit of 1,000 verification rounds and 3,000 generated tokens per problem. GSM8K uses the standard ten-shot prompt (fixed few-shot seed) with a limit of 300 rounds per problem for the speculative conditions. The self-distilled runs (self-speculative and paired with the Qwen3-14B target) use all 1,319 test problems; the Medusa runs use the first 250. The Meta MTP checkpoints are base models that do not emit an end-of-sequence token after answering, so they generate until the round cap; for the Meta 13B pair on GSM8K we therefore cap each of the first 100 problems at 100 rounds (300 tokens for plain decoding) and use identical caps across conditions, and we re-analyse the earlier 300-round Meta 7B fixed run on the same prefix. These runs measure throughput and acceptance only, since a 7–13B base model’s GSM8K accuracy is not a meaningful check of lossless decoding. The Qwen3-14B plain-decoding baseline for the self-distilled cross-model pairing reached 1,166 of 1,319 GSM8K problems before its time limit; its throughput and accuracy are computed over that completed subset, and the fixed and adaptive conditions for this pairing still cover all 1,319. Sampling draws from the unmodified softmax of each model (no temperature scaling), without a fixed random seed, so runs are not bit-for-bit repeatable.
+
+Metrics. For a run with rounds $t=1,\dots,T$ , let $c_{t}$ be the number of tokens committed in round $t$ (accepted drafts plus the one token sampled from the target), $k_{t}$ the window used, and $\tau_{t}$ the measured wall time of the round, including drafting, verification and synchronization.
+
+tokens/round
+ $\displaystyle=\tfrac{1}{T}\textstyle\sum_{t}c_{t},$ 
+acceptance rate
+ $\displaystyle=\tfrac{\sum_{t}(c_{t}-1)}{\sum_{t}k_{t}},$ 
+
+throughput (tok/s)
+ $\displaystyle=\tfrac{\sum_{t}c_{t}}{\sum_{t}\tau_{t}},$ 
+speed-up
+ $\displaystyle=\tfrac{\text{throughput}}{\text{throughput of plain decoding}}.$ 
+
+For plain next-token decoding, a round produces exactly one token ( $c_{t}{=}1$ , no drafting). Sums run over all problems of an evaluation, so throughput is a token-weighted, not a per-problem, average. We report accuracy from the task’s own scorer.
+
+Baselines. Plain decoding uses the same target model and prompt with the standard autoregressive loop, also without a KV-cache, so speed-ups isolate the effect of speculation. For the self-speculative pairings (self-distilled Qwen3-4B, Medusa on Llama-3.1-8B-Instruct) the plain-decoding baseline is the same checkpoint decoding without drafting. Meta’s 7B multi-token-prediction checkpoint has no separately released plain next-token model, so its plain-decoding baseline is Llama-2-7B, the base architecture it was fine-tuned from; for the 13B pairing, the target itself, Llama-2-13B, is the baseline. For the self-distilled cross-model pairing, the baseline is the target alone, Qwen3-14B.
+
+## D.1 Draft-Model Implementations
+
+All draft models implement one interface: given the current context, return $k$ sampled tokens together with the $k$ distributions they were sampled from. The engine is agnostic to how the draft produces them, so AMTP and the verification step are shared across families.
+
+Self-speculative and cross-model pairings. In a self-speculative pairing the same weights draft and verify and are loaded once. In a cross-model pairing a small multi-token-prediction draft proposes tokens for a larger target of the same vocabulary: self-distilled Qwen3-4B for Qwen3-14B, and Meta’s 7B multi-token-prediction model for Llama-2-13B. The engine checks that the draft and target share a tokenizer and vocabulary; the self-distilled model declares extra mask tokens.
+
+Self-distilled Qwen3-4B (mask-token drafting). The checkpoint drafts $k$ tokens in one forward pass by appending $k{-}1$ reserved mask tokens (ids 151669–151700) to the context and reading the logits at the last real position and at each mask position. It supports $k\leq 16$ . It ships without its own verification scheme, so verification is performed by our engine with the standard accept/reject rule.
+
+Meta MTP (independent parallel heads). The 7B checkpoint has four output heads that read the trunk’s final hidden state and predict tokens $t{+}1,\dots,t{+}4$ independently. The checkpoint is not in Hugging Face format, so we load it with a self-contained implementation (transformer trunk, four heads, SentencePiece tokenizer). A single trunk forward produces all 4 distributions.
+
+Medusa on Llama-3.1-8B-Instruct. Six residual-block heads, each with its own output projection, predict from the last hidden state of the base model. The base model’s own next-token distribution supplies position one; head $i$ then predicts position $i{+}2$ . Head weights are loaded from a separate repository, and the base model is the unmodified instruct checkpoint.
+
+No KV-cache. All runs recompute the full context on every forward pass. This makes per-round cost depend visibly on context length, which AMTP’s cost model represents (Appendix D.2), and it removes cache-rollback logic that differs between attention variants and would confound the comparison across draft families. Absolute throughput is consequently lower than with an optimised cached implementation; the relative comparisons between conditions are what we report.
+
+Quantity
+Value
+
+Maximum window $K$ 
+4 / 6 / 16 (Meta / Medusa / self-dist.)
+
+Hazard model
+affine (linear, no sigmoid link), 5 inputs
+
+Hazard optimiser, learning rate
+Projected OGD, $0.01$ 
+
+Hazard projection radius $D$ 
+ $10.0$ 
+
+Exploration rate $\varepsilon$ 
+ $0.1$ 
+
+Cost optimiser, learning rate
+Adam, $0.01$ 
+
+Start-up updates $u_{\min}$ 
+ $20$ 
+
+Context scale $\ell$ , cost scale $\gamma$ 
+ $100$ , $1000$ 
+
+Checkpoint interval
+every $50$ updates
+
+Table 5: AMTP configuration used in all experiments. No value was tuned per model or per task.
+
+## D.2 Adaptive Multi-Token Prediction Details
+
+Hazard targets. The hazard label at drafted position $j$ is $\mathrm{TV}(p_{j},q_{j})=1-\sum_{v}\min(p_{j}(v),q_{j}(v))$ , the probability that a token drawn from $p_{j}$ is rejected. It is computed for every drafted position, including those after the first rejection, via the target distributions already produced by the verification.
+
+Cost target. The cost model is fitted to the whole round’s measured wall time, as AMTP’s decision only needs the total. Since every run disables the KV-cache (Appendix D.1), the cost model includes context length as a feature alongside the window $k$ ; a model fit with context length excluded explains almost none of the round-to-round cost variance under this setting.
+
+Checkpoint lineage. Control-block state is saved every 50 updates under a key made of the draft checkpoint, target checkpoint and an implementation tag. The tag changes whenever the cost regime changes, and the current tag identifies runs without a key–value cache and with the rescaled cost model, so weights fitted under a different regime are never loaded.
+
+Start-up. For the first 20 updates the window is drawn with probability proportional to $1/(n_{k}+1)$ , so the cost model observes several window sizes. All conditions labelled “adaptive” begin with this phase; the numbers we report include it.
+
+## D.3 Complete Results
+
+Tables 7 and 8 list our final results behind the main-text tables, and Table 6 gives the distribution of windows chosen by AMTP. Tables 1–3 in the main text are derived from the same records.
+
+Model / eval
+ $k{=}1$ 
+ $2$ 
+ $3$ 
+ $4$ 
+ $5$ – $6$ 
+ $\geq 7$ 
+
+Meta MTP 7B, AIME
+1.4
+7.3
+27.0
+64.3
+0.0
+0.0
+
+Meta MTP 13B, AIME
+9.5
+24.6
+29.5
+36.5
+0.0
+0.0
+
+Meta MTP 7B, GSM8K $\ast$ 
+0.3
+1.4
+19.0
+79.2
+0.0
+0.0
+
+Meta MTP 13B, GSM8K $\ast$ 
+0.5
+2.9
+16.7
+79.9
+0.0
+0.0
+
+Medusa 8B, GSM8K
+0.1
+4.7
+29.2
+43.5
+22.5
+0.0
+
+Self-dist. 4B, GSM8K
+0.0
+0.0
+0.0
+0.2
+2.9
+96.9
+
+Self-dist. 4B $\to$ 14B, AIME
+0.3
+1.1
+4.7
+10.4
+29.7
+53.8
+
+Self-dist. 4B $\to$ 14B, GSM8K
+0.0
+0.0
+0.2
+0.6
+4.0
+95.1
+
+Table 6: Share of verification rounds (%) in which the control block chose each window size, over the full round population. The distribution is wide for every model, and the mode differs by model and by task. ∗Capped runs (first 100 problems, first 100 rounds).
+
+Draft $\to$ target
+Condition
+Rounds
+Tok./round
+Accept. (%)
+Tok./s
+Gen. (h)
+Acc. (%)
+
+Self-dist. Qwen3-4B
+Plain
+81,791
+1.00
+–
+18.8
+1.21
+20.0
+
+Fixed $k{=}16$ 
+25,549
+3.84
+17.7
+34.0
+0.80
+30.0
+
+Adaptive
+25,927
+3.83
+33.9
+34.5
+0.80
+26.7
+
+Self-dist. 4B $\to$ Qwen3-14B
+Qwen3-14B
+60,091
+1.00
+–
+10.4
+1.61
+20.0
+
+Fixed $k{=}16$ 
+18,244
+3.23
+14.0
+22.5
+0.73
+20.0
+
+Adaptive
+16,525
+3.20
+28.2
+24.7
+0.60
+23.3
+
+Meta MTP 7B
+Llama-2-7B
+13,190
+1.00
+–
+12.5
+0.29
+0.0
+
+Fixed $k{=}4$ 
+7,009
+3.00
+50.0
+37.7
+0.16
+0.0
+
+Adaptive
+11,268
+3.03
+57.2
+31.9
+0.30
+0.0
+
+Meta MTP 7B $\to$ Llama-2-13B
+Llama-2-13B
+14,309
+1.00
+–
+6.2
+0.64
+0.0
+
+Fixed $k{=}4$ 
+5,370
+2.76
+43.9
+7.6
+0.54
+0.0
+
+Adaptive
+2,772
+2.51
+51.6
+28.2
+0.07
+0.0
+
+Medusa Llama-3.1-8B
+Plain
+53,294
+1.00
+–
+7.5
+1.97
+0.0
+
+Fixed $k{=}6$ 
+19,760
+2.34
+22.4
+23.6
+0.55
+0.0
+
+Adaptive
+18,395
+2.28
+46.2
+25.3
+0.46
+0.0
+
+Table 7: AIME 2025 evaluations ( $n{=}30$ problems in each row). Rounds: total verification rounds over all problems (one round is one token for plain decoding). Tok./s: total committed tokens per total measured round wall time. Gen. (h): summed round wall time. Acc.: fraction of problems answered correctly; it is $0$ for every 7–13B model (Meta and Llama), so it carries no signal there.
+
+Draft $\to$ target
+Condition
+Problems
+Rounds
+Tok./round
+Accept. (%)
+Tok./s
+Gen. (h)
+Acc. (%)
+
+Self-dist. Qwen3-4B
+Plain
+1319
+279,050
+1.00
+–
+16.2
+4.80
+89.4
+
+Fixed $k{=}16$ 
+1319
+64,008
+4.67
+23.0
+38.6
+2.15
+85.0
+
+Adaptive
+1319
+65,183
+4.63
+32.4
+38.3
+2.19
+85.7
+
+Self-dist. 4B $\to$ Qwen3-14B
+Qwen3-14B $\dagger$ 
+1166
+179,720
+1.00
+–
+6.4
+7.80
+92.8
+
+Fixed $k{=}16$ 
+1319
+47,643
+4.33
+20.8
+21.3
+2.69
+92.9
+
+Adaptive
+1319
+47,529
+4.33
+28.5
+21.5
+2.66
+93.5
+
+Meta MTP 7B $\ast$ 
+Llama-2-7B
+100
+24,440
+1.00
+–
+4.7
+1.44
+–
+
+Fixed $k{=}4$ 
+100
+8,913
+3.18
+54.5
+19.2
+0.41
+–
+
+Adaptive
+100
+9,065
+3.21
+58.6
+19.4
+0.42
+–
+
+Meta MTP 7B $\to$ Llama-2-13B $\ast$ 
+Llama-2-13B
+100
+23,660
+1.00
+–
+2.7
+2.46
+–
+
+Fixed $k{=}4$ 
+100
+8,108
+2.72
+42.9
+4.7
+1.31
+–
+
+Adaptive
+100
+8,206
+2.75
+46.6
+11.6
+0.54
+–
+
+Medusa Llama-3.1-8B
+Plain
+250
+44,877
+1.00
+–
+13.0
+0.96
+83.2
+
+Fixed $k{=}6$ 
+250
+15,619
+2.99
+33.1
+20.0
+0.65
+79.6
+
+Adaptive
+250
+16,739
+2.90
+48.2
+19.4
+0.69
+79.2
+
+Table 8: Complete GSM8K results. Self-distilled 4B and Qwen3-14B target rows use all 1,319 problems where finished; Medusa uses the first 250 problems; $\ast$ Meta MTP runs are capped (first 100 problems, first 100 rounds; $\sim$ 300 tokens for plain decoding) because the Meta base models do not terminate after answering, so their scored accuracy (1–4%, driven almost entirely by truncation) is not meaningful and is omitted. $\dagger$ The Qwen3-14B plain run reached 1,166 of 1,319 problems before its time limit; its accuracy is over those completed problems.
+
+Meta 7B(self)Meta 7B to 13B(cross)Medusa8BSelf-dist.4B (self)Self-dist.4B to 14B (cross) $0$ $10$ $20$ $30$ $40$ Tokens / secondAIME 2025Meta 7B(self)Meta 7B to 13B(cross)Medusa8BSelf-dist.4B (self)Self-dist.4B to 14B (cross) $0$ $10$ $20$ $30$ $40$ Tokens / secondGSM8K4(a)
+
+(a) Decoding throughput (tokens/second) for plain decoding, the best fixed window, and AMTP, across all five pairings and both evaluation tasks. Every multi-token-prediction condition beats plain decoding; the Meta MTP cross-model pairing (facebook/multi-token-prediction draft to Llama-2-13B target) shows the largest absolute gap between fixed and adaptive.
+
+Self-dist.4B AIMESelf-dist.4B GSM8KMedusaAIMEMedusaGSM8KMeta 7BGSM8K4B to 14BAIME4B to 14BGSM8K $-20$ $0$ $20$ $40$ +1%-1%+7%-3%+1%+10%+1%Adaptive vs. best fixed $k$ (%)
+
+(b) Throughput of AMTP, relative to the best fixed window, self-speculative pairings and the modest-effect cross-model pairing (self-distilled 4B $\to$ 14B).
+
+Meta MTP 7B to 13BAIME 2025Meta MTP 7B to 13BGSM8K $0$ $100$ $200$ $300$ +268%+147%Adaptive vs. best fixed $k$ (%)
+
+(c) The cross-model Meta MTP pairing (draft/target cost asymmetry), shown on its own axis given the scale of the effect relative to every other condition.
+
+Figure 4: Top: decoding throughput of plain decoding, the best fixed window and AMTP. Every multi-token-prediction condition is faster than plain decoding. Middle: throughput of AMTP relative to the best fixed window, for self-speculative pairings and the self-distilled cross-model pairing — effects are modest in both directions, within about 15% either way. Bottom: the Meta MTP cross-model pairing, shown separately because its gain ( $+268\%$ AIME, $+147\%$ GSM8K) is an order of magnitude larger than every other condition — draft/target cost asymmetry combined with long, variable-length reasoning produces the largest effect in this validation.
+
+Worked Examples.
+We provide real unedited excerpts from logged telemetry of a self-distilled Qwen3-4B adaptive run on AIME 2025: Let $A$ be the set of positive integer divisors of $2025$ . Let $B$ be a randomly selected subset of $A$ . The probability that $B$ is a nonempty set with the property that the least common multiple of its elements is $2025$ is $\frac{m}{n}$ , where $m$ and $n$ are relatively prime positive integers. Find $m+n$ .
+
+Figure 5: Four consecutive real verification rounds (648–651) from one adaptive-control-block run on AIME 2025 (self-distilled Qwen3-4B). Green tokens were accepted, the red token was rejected and replaced by the correction shown on the right (resampled from the residual), and grey tokens were drafted but never verified because the round already stopped at the rejection. The control block re-selects the window $k_{t}$ every round (shown on the left). All tokens, windows, and corrections are taken directly from logged telemetry.
+
+## Example 1: a difficult stretch, seven consecutive rounds.
+
+Roughly 650 verification rounds into its own generated solution, the model is deriving the number of qualifying subsets. Table 9 lists seven consecutive rounds verbatim. In each round the control block first chooses a window $k_{t}$ from its own hazard forecast, then drafts exactly $k_{t}$ tokens; the accepted column gives how many of those were accepted before the first rejection (or all $k_{t}$ , if none were rejected), and correction gives the resampled token that replaced the first rejected draft token. Draft tokens past the rejection point are never verified and contribute nothing to the committed output.
+
+Round
+ $k_{t}$ 
+
+Draft
+
+Accepted
+
+Correction
+
+648
+13
+
+2 7 6 8 - ␣ 4 8 6 4 = ␣ 2
+
+13/13 (all)
+
+—
+
+649
+12
+
+9 0 4 $ $ Yes But ␣ ␣of ␣of ␣number ␣subsets
+
+4/12
+
+Yes
+
+650
+14
+
+. ␣So , ␣$ ␣number ␣of 1 ␣subsets ␣subsets ␣with ␣is ␣** ␣$ ␣elements
+
+1/14
+
+So
+
+651
+14
+
+, ␣the ␣number ␣$ ␣of ␣ $\leq$ $ ␣the 4 0 4 ␣with ^ ␣\
+
+3/14
+
+␣of
+
+652
+16
+
+␣non ␣with B B ␣have ␣B (S ␣are ␣2 0 ^ $ ␣= 2 2
+
+1/16
+
+empty
+
+653
+8
+
+␣subsets ␣$ S ␣L CM ␣= ␣ 2
+
+3/8
+
+$
+
+654
+7
+
+␣such ␣that ␣L ␣l S (S ␣
+
+3/7
+
+CM
+
+Table 9: Seven consecutive real verification rounds (648–654) from one adaptive-control-block run. ␣ marks a leading space in a token; $ and \ are literal draft tokens (the model was mid-LaTeX). All data is taken directly from logged round telemetry.
+
+The committed text across these seven rounds, concatenated, reads: “2768 - 4864 = 27904$\n\nYes.\n\nSo, the number of nonempty subsets $S$ such that LCM” with two visible self-corrections (Yes, So) where the model’s own verification caught a drafted continuation it would not have produced itself. The chosen window swings from $k_{t}{=}7$ to $k_{t}{=}16$ round to round, and every round in this stretch needed at least one correction; this is a difficult patch of the derivation, not representative of the easier, longer-window stretches that dominate most of a generation.
+
+## Example 2: full acceptance with a bonus token.
+
+Later in the same run, round 101 is more typical of an easy stretch. The context ends “ …we want to count”, following directly from the probability setup. The control block forecasts rejection hazards $\widehat{h}_{t,1}{=}0.40$ , $\widehat{h}_{t,2}{=}0.48$ , $\widehat{h}_{t,3}{=}0.55$ for the next three positions, giving a predicted gain $\widehat{G}_{t}(3)\approx 1+0.60+0.31+0.14\approx 2.05$ expected committed tokens, and the controller selects $k_{t}{=}3$ . Table 10 lists the single round. Since the draft is verified in full with no rejection, the engine draws one additional bonus token directly from the target’s own distribution rather than discarding the round.
+
+Round
+ $k_{t}$ 
+
+Draft
+
+Accepted
+
+Bonus
+
+101
+3
+
+␣the ␣number ␣of
+
+3/3 (all)
+
+␣non
+
+Table 10: One real verification round (101) with full acceptance, from the same adaptive-control-block run as Table 9. The bonus token is sampled from the target’s distribution at the position immediately after the draft, since no rejection occurred.
+
+The committed text for the round is therefore “  the number of non”, four tokens from a single target forward pass, with no correction needed.

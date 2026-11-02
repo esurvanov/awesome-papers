@@ -1,0 +1,1287 @@
+## LSA-PAST: Layer-Specific Adaptation and Prototype Transport for Compositional Incremental Learning
+
+Kyle Stein
+
+Affiliation: University of West Florida, Pensacola, FL, USA
+
+Andrew Arash Mahyari
+
+Affiliation: Florida Institute for Human and Machine Cognition, Pensacola, FL, USA
+
+Guillermo Francia III
+
+Affiliation: University of West Florida, Pensacola, FL, USA
+
+Eman El-Sheikh
+
+Affiliation: University of West Florida, Pensacola, FL, USA
+
+Jiangpeng He
+
+Affiliation: Indiana Univeristy, Bloomington, IN, USA{kstein,gfranciaiii,eelsheikh}@uwf.edu, amahyari@ihmc.org, jhe2@iu.edu
+
+Abstract
+
+Class-Incremental Learning (CIL) enables models to recognize new classes over time while retaining prior knowledge, but many real-world problems are compositional, where visual concepts arise from combinations of primitives such as states (i.e., red, shiny) and objects (i.e., shoe, car). Standard CIL methods treat each composition as an independent class, ignoring shared primitives and providing no mechanism to stabilize their representations as new compositions arrive. This causes parameter updates to entangle primitives and induce drift that degrades performance on earlier compositions. Compositional Incremental Learning (composition-IL) formalizes this setting by introducing new state–object compositions across tasks. In this paper, we propose Layer-Specific Adaptation with Prototype-Anchored Adapter-Space Transport (LSA-PAST), a parameter-efficient method tailored to composition-IL. LSA integrates Low-Rank Adaptation (LoRA) into a frozen ViT with depth-specialized adapters for states, objects, and compositions. PAST then maps past, anchored prototypes into the current adapter space through a rehearsal-free affine transform fit on current-task data, enabling old prototypes to remain compatible with new adapters. Extensive experiments demonstrate that LSA-PAST achieves state-of-the-art (SOA) accuracy-forgetting trade-off performance for composition-IL.
+
+## 1 Introduction
+
+Deep learning has achieved remarkable success across visual recognition tasks, from fine-grained identification to large-scale categorization [16, 26, 2]. This success typically rests on the brittle assumption that the world can be captured in a single, static training set. However, in real-world deployments, data arrives sequentially and models must incorporate new knowledge without full retraining or access to past data. Class-Incremental Learning (CIL) [20, 28, 39, 29, 32] formalizes this setting where a learner is exposed to a sequence of tasks with expanding label space and must acquire new classes while preserving previously learned knowledge, reinforcing the issue of catastrophic forgetting [8]. Recent CIL methods adopt parameter-efficient fine-tuning (PEFT) of pre-trained models to alleviate forgetting through prompt-tuning [45, 40, 44] and adapters [54, 14, 25]. However, this progress is largely measured in object-only settings where classes are treated as singular entities, an assumption misaligned with the compositional nature of real-world concepts.
+
+Figure 1: Accuracy–forgetting trade-off on composition-IL benchmarks for adapter- and prompt-based methods.
+
+Concepts in the visual world are often compositional, combining primitives such as states (e.g., striped, leather) and objects (e.g., shirt, shoe) [22, 21, 7]. This structure is central to human cognition, yet most CIL methods and benchmarks treat classes as atomic and ignore compositionality. Compositional Incremental Learning (composition-IL), introduced in [52], addresses this gap by learning to acquire new state–object pairs over tasks while retaining performance on prior compositions. A key difficulty in composition-IL is state confusion: models often recognize the object but confuse its state (e.g., “shoe” vs. “leather shoe” or “canvas shoe”). Pretrained models bias representations toward object identity [10, 35], causing feature entanglement among compositions sharing an object [13, 30]. Furthermore, standard pretraining often lacks the fine-grained sensitivity to texture and material required for state discrimination [10, 46]. These issues worsen when object-centric CIL methods are applied to compositions. Fig. 1 shows that prior, object-centric CIL methods yield poor accuracy-forgetting trade-offs, while our method provides the strongest overall balance across all benchmarks.
+
+In this work, we propose Layer-Specific Adaptation with Prototype-Anchored Adapter-Space Transport (LSA-PAST) for composition-IL. Our approach introduces Layer-Specific Adaptation (LSA) with three depth-specialized Low-Rank Adaptation (LoRA) [18] adapters that exploit the hierarchical processing structure of vision transformers (ViTs) [6, 5, 36, 23, 38]: a state adapter in early layers reduces state confusion by amplifying low-level cues such as texture and color, an object adapter in middle layers learns shape and part structure, and a composition adapter in late layers integrates primitives into complete concepts. By exploiting this property and specializing transformer depths for different aspects of compositional reasoning, the model learns primitive-specific representations that transfer across compositional classes.
+
+To improve the stability of compositional decision boundaries, we introduce Primitive-Guided Stabilization (PGS), which anchors each composition prototype to directions from the state and object heads when its primitives recur across tasks. Finally, to alleviate catastrophic forgetting arising from inter-task prototype misalignment, we propose Adapter–Space Transport (AST). In the composition-IL setting, each task has unique LoRA adapters, so features and prototypes learned at different times live in task-specific adapter spaces. These task-specific adapter spaces are not directly interoperable, limiting the use of cross-space evidence for previously learned compositions [49]. AST addresses this by fitting a lightweight affine relation from each past adapter space to the current one using only current-task image pairs (rehearsal-free), and transporting the anchored unit prototypes from past tasks into the current adapter geometry. Overall, our key contributions can be summarized as follows:
+
+• 
+
+We introduce LSA-PAST, a parameter-efficient composition-IL framework with novel depth-specialized adaptation and rehearsal-free prototype transport across task-specific adapter spaces.
+
+• 
+
+We curate a new composition-IL benchmark for evaluating novel state–object combinations and recurring primitives across tasks.
+
+• 
+
+We provide strong baselines, ablations, and analysis showing improved accuracy-forgetting trade-offs on composition-IL benchmarks.
+
+## 2 Related Work
+
+## 2.1 Class-Incremental Learning
+
+Class-Incremental Learning (CIL) aims to learn new classes while retaining prior knowledge [56]. Classical methods such as EWC, LwF, and iCaRL respectively regularize parameter changes, distill from previous models, or combine exemplar replay with nearest-mean classification [20, 28, 39]. Exemplar-free CIL avoids storing past samples by regularizing the current model or allocating new capacity per task [56, 14], but still ignores compositional structure. Beyond the standard setting where tasks introduce disjoint class sets, related fields include multi-label CIL (MLCIL) [41, 4], which handles multi-label predictions per image, and blurry-CIL [1, 33], which allows overlapping class distributions across tasks. Related continual compositional works study continual compositional zero-shot learning (CCZSL) [51, 31] aimed at progressively improving zero-shot compositional generalization [27]. Composition-IL instead focuses on learning new state–object compositions, even when states and objects recur across tasks.
+
+CIL with pre-trained models has shifted from training from scratch to adapting frozen pre-trained models (PTMs) [6] with parameter-efficient methods [45, 53]. PTMs encode rich visual knowledge and constrain plasticity to a low-dimensional subspace, reducing representation drift across tasks. We therefore adapt PTMs for composition-IL with parameter-efficient fine-tuning (PEFT), broadly categorized into prompt-based and adapter-based approaches.
+
+Prompt-based methods introduce learnable tokens that steer a frozen backbone with high parameter efficiency [24, 19]. L2P retrieves prompts through query-key matching [45], Dual-Prompt separates shared and task-specific prompts [44], CODA-Prompt composes multiple prompts without full fine-tuning [40], and CompILer [52] extends this idea to composition-IL with multiple L2P-style prompt pools routed into state, object, and composition heads. Despite their efficiency, prompt-based methods often converge more slowly and are more difficult to optimize than adapter-based methods [3].
+
+Adapter-based methods inject lightweight modules into transformer blocks to shape intermediate features, mitigating forgetting by localizing updates to specific subspaces [12]. Notable methods include EASE [54], which adds task-specific expandable modules, CL-LoRA [14], which employs a dual-adapter design, and TUNA [43], which combines entropy-guided task-specific adapters with a fused universal adapter. However, these methods typically treat classes as independent entities, ignoring the compositional structure of images. Our method addresses this gap through depth specialization and cross-subspace alignment to stabilize novel compositional pairs.
+
+## 2.2 Hierarchical Processing in Vision Transformers
+
+Recent studies reveal that ViTs [6] process visual information through distinct stages of integration across depth [5, 38, 36, 23]. Early layers (e.g., 1-4) primarily extract disentangled primitive attributes such as color, texture, and simple edges. These layers exhibit highly localized receptive fields, resembling early convolutional filters that capture low-level statistics and fine-grained appearance cues [38, 5]. Middle layers (e.g., 5-8) progressively integrate these primitives into structured, object-level representations. As receptive fields expand, attention begins to aggregate features across parts, capturing relationships between components that define an object’s shape and spatial layout [23, 36]. Late layers perform global operations over integrated representation, where attention heads attend globally across the entire image [38], capturing contextual relationships between objects and implementing operations that generalize to novel feature combinations [36, 23]. This progression motivates our depth-specialized design. Unlike uniform approaches [14], we align adapter placement within stages of the ViT layers based on this evidence.
+
+## 3 Preliminaries
+
+Figure 2: (A) We adapt a frozen ViT with depth-specialized LoRA feeding three heads. (B) Post-training, empirical prototypes are blended with primitive directions (PGS) and stored. (C) Subsequent tasks instantiate fresh adapters for new compositions. (D) Using current-task images as transient correspondences, AST fits an affine map $\phi_{t^{\prime}\rightarrow t}$ to transport past prototypes into the current adapter space without rehearsal. (E) Inference ensembles cosine similarities across all adapter spaces, recognizing both new and previously learned compositions.
+
+## 3.1 Problem Setup
+
+In composition-IL, visual concepts of images are expressed as compositions of two primitive components: the state and an object. Let the state set be $\mathcal{S}=\{s_{1},s_{2},\dots,s_{n}\}$ and the object set be $\mathcal{O}=\{o_{1},o_{2},\dots,o_{m}\}$ . Each composition class is defined as $c=\langle s,o\rangle$ , where $s\in\mathcal{S}$ and $o\in\mathcal{O}$ , forming the global set of possible compositions $\mathcal{C}\subseteq\mathcal{S}\times\mathcal{O}$ . Learning proceeds over a sequence of $N$ tasks $\mathcal{T}=\{\mathcal{T}_{1},\mathcal{T}_{2},\dots,\mathcal{T}_{N}\}$ , where each task $\mathcal{T}_{t}$ introduces a disjoint set of composition classes $\mathcal{C}^{(t)}\subset\mathcal{C}$ , such that $\mathcal{C}^{(i)}\cap\mathcal{C}^{(j)}=\emptyset$ for any $i\neq j$ . Unlike compositions, the primitive classes (states and objects) may recur across tasks, allowing knowledge of previously seen primitives to benefit new compositions. Each task $\mathcal{T}_{t}$ provides a labeled dataset $\mathcal{D}^{(t)}=\{(x_{i},y_{i})\}$ , where each label $y_{i}=\langle s_{i},o_{i}\rangle$ denotes the composition of state $s_{i}$ and object $o_{i}$ . Furthermore, we follow the challenging rehearsal-free setting, where no exemplars from previous tasks are leveraged for knowledge replay [9, 54, 40]. The model must learn to recognize the new compositions while maintaining performance on all previously seen compositions.
+
+## 3.2 Adapter-Based Composition-IL
+
+Following prior work [52, 54, 14, 9], we adopt a pretrained ViT [6] and perform adapter-based incremental learning with LoRA [18]. In this section, we introduce main components of our method in forming task-specific adapter spaces with LoRA and prototype-classifier for composition-IL.
+
+Low-Rank Adaptation: LoRA [18] enables PEFT of pre-trained models by freezing the backbone weights and injecting trainable low-rank adapters into the attention projections of transformer layers. For a pre-trained weight matrix $\mathbf{W_{0}}\in\mathbb{R}^{d\times k}$ , LoRA modifies the feature extraction as:
+
+ $\mathbf{y}=\mathbf{W_{0}}\mathbf{x}+\Delta\mathbf{W}\,\mathbf{x},$ 
+
+(1)
+
+where $\mathbf{x}$ and $\mathbf{y}$ denote the input and output activations, respectively, and $\Delta\mathbf{W}=\mathbf{U}\mathbf{V}$ is a low-rank adaptation. Here, $\mathbf{V}\!\in\!\mathbb{R}^{r\times k}$ down-projects into a rank- $r$ subspace and $\mathbf{U}\!\in\!\mathbb{R}^{d\times r}$ projects back to the output. Only $(\mathbf{U},\mathbf{V})$ are trainable, adding $r(d{+}k)$ parameters while retaining the pretrained backbone. We apply LoRA to the Q/K/V projection matrices of the pre-trained ViT [6]. To reduce cross-task interference while preserving parameter efficiency, we instantiate one LoRA adapter per task: for task $t$ we optimize only the rank- $r$ updates $\{\Delta\mathbf{W}^{(t)}\}$ in selected layers, while all prior adapters $\{\Delta\mathbf{W}^{(t^{\prime})}\}_{t^{\prime}<t}$ remain frozen.
+
+Prototype-Classifier for Composition-IL:
+Standard CIL methods [54, 14, 43] pair the backbone with a single linear head trained with cross-entropy on each task. In our depth-specialized setting for composition-IL, we instead use three heads during training (state, object, composition), but at the end of task $t$ , only the composition head is replaced with a prototype classifier built from task- $t$ features. Let $f_{\text{comp}}^{(t)}(x)\in\mathbb{R}^{d}$ be the composition feature from the final ViT layer within the task- $t$ adapter space, and
+ $\widehat{z}_{\text{comp}}^{(t)}(x)=\operatorname{unit}\!\big(f_{\text{comp}}^{(t)}(x)\big)$ its L2-normalized version, where we define $\mathrm{unit}(\mathbf{v})=\frac{\mathbf{v}}{\|\mathbf{v}\|_{2}}$ . For each composition class $c\in\mathcal{C}^{(t)}$ , we compute the empirical prototype as:
+
+ $p_{c}^{\text{emp},(t)}\;=\;\operatorname{unit}\!\Big(\frac{1}{|\mathcal{D}^{(t)}(c)|}\sum_{x_{i}\in\mathcal{D}^{(t)}(c)}\widehat{z}_{\text{comp}}^{(t)}(x_{i})\Big),$ 
+
+(2)
+
+where $\mathcal{D}^{(t)}(c)=\{x_{i}\in\mathcal{D}^{(t)}:y_{i}=c\}$ . The resulting prototypes form the composition head used for inference, while the state and object heads remain standard linear classifiers for auxiliary supervision.
+
+## 4 Methodology
+
+## 4.1 Overview
+
+LSA-PAST combines three components for composition-IL. First, LSA attaches task-specific LoRA adapters to different ViT depths for state, object, and composition reasoning. Second, PGS anchors empirical composition prototypes using recurring state and object directions. Third, AST maps old prototypes into new task adapter spaces through a rehearsal-free affine transform fitted only on current-task images. Together, depth-specialized LoRA and prototype-anchored transport balance stability from frozen adapters with plasticity for new compositions (Fig. 2).
+
+## 4.2 Layer-Specific Adaptation with LoRA
+
+We introduce LSA, with LoRA specialization modules applied at selected depths of a ViT. Motivated by evidence that ViT representations evolve with depth [5, 36, 23, 38], we allocate separate LoRA branches for states, objects, and compositions to different depth ranges instead of adapting all layers uniformly. This depth specialization exploits the ViT hierarchy and allocates adaptation capacity only where needed, providing finer parameter control than uniform LoRA. In the incremental setting, we instantiate a separate set of adapters per task; once a task finishes, its adapters are frozen and a fresh set is created for the subsequent task.
+
+LoRA-Branch Configuration: Let $\mathbf{W}_{0}\in\mathbb{R}^{d\times k}$ denote a frozen attention projection matrix (query, key, or value) in the ViT backbone. For a given layer $\ell$ , we augment $\mathbf{W}_{0}$ with at most one low-rank adaptation, $\Delta\mathbf{W}$ (Eq.1). Rather than applying uniform LoRA across all layers, we exploit the hierarchical processing structure of ViTs. We partition the encoder into three disjoint depth ranges aligned with this hierarchy. This design helps mitigate state confusion by allocating early-layer adaptation to state cues such as texture and color, which are often suppressed by object-dominant representations in deeper layers. For layer $\ell$ assigned to branch $b\in\{\text{state},\text{obj},\text{comp}\}$ , the depth-specialized adaptation becomes:
+
+ $\Delta\mathbf{W}_{\ell}^{b}=\mathbf{U}_{\ell}^{b}\mathbf{V}_{\ell}^{b},$ 
+
+(3)
+
+where $\mathbf{U}_{\ell}^{b}\in\mathbb{R}^{d\times r_{b}}$ and $\mathbf{V}_{\ell}^{b}\in\mathbb{R}^{r_{b}\times k}$ are trainable with $r_{b}\ll\min(d,k)$ . This configuration enables fine-grained control: each branch can use different ranks $(r_{\text{state}},r_{\text{obj}},r_{\text{comp}})$ while maintaining parameter efficiency through non-overlapping layer assignments. During training on task $t$ , only the adapters for the current task $\{\mathbf{U}_{\ell}^{b,t},\mathbf{V}_{\ell}^{b,t}\}$ are updated and all previous task adapters $\{\mathbf{U}_{\ell}^{b,t^{\prime}},\mathbf{V}_{\ell}^{b,t^{\prime}}\}_{t^{\prime}<t}$ remain frozen.
+
+Multi-Branch Training Supervision: To leverage the depth-specialized LoRA adaptations, we introduce a multi-branch training scheme with dedicated classification heads for each semantic level. We maintain three linear classification heads that are updated incrementally across tasks, each parameterized by a weight matrix: $\mathbf{W}_{\text{state}}\in\mathbb{R}^{|\mathcal{S}|\times d}$ , $\mathbf{W}_{\text{obj}}\in\mathbb{R}^{|\mathcal{O}|\times d}$ , and $\mathbf{W}_{\text{comp}}\in\mathbb{R}^{|\mathcal{C}|\times d}$ , where $\mathcal{S}$ , $\mathcal{O}$ , and $\mathcal{C}$ denote the sets of states, objects, and compositions, respectively. Each head is trained using cross entropy loss:
+
+ $\displaystyle\mathcal{L}_{\text{comp}}^{(t)}(x,y)\;=\;-\log\frac{\exp\!\big([\mathbf{W}_{\text{comp}}\,\widehat{z}_{\text{comp}}^{(t)}(x)]_{y}\big)}{\sum_{c\in\mathcal{C}^{(t)}}\exp\!\big([\mathbf{W}_{\text{comp}}\,\widehat{z}_{\text{comp}}^{(t)}(x)]_{c}\big)}$ 
+
+(4)
+
+where $[\cdot]_{c}$ denotes the $c$ -th element of the logit vector. The losses $\mathcal{L}_{\text{state}}$ and $\mathcal{L}_{\text{obj}}$ are defined analogously. During training, the weighted multi-task loss backpropagates gradients through only the current task’s adapters. At inference, linear composition head is replaced with prototype-based classification (Eq. 2), using prototypes maintained across tasks.
+
+## 4.3 Prototype Anchoring with Primitive-Guided Stabilization
+
+Composition-IL naturally recurs primitives across tasks. For example, after learning “Red Shoe” in Task 1, Task 2 might introduce “Red Hat” (recurring state) or “Blue Shoe” (recurring object). PGS leverages this recurrence by blending empirical prototypes with primitive-guided directions at the end of each task. This provides a recurrence-dependent stabilization mechanism while preserving the task-native empirical representation.
+
+Blend prototypes with the final primitive direction:
+After training task $t$ , for each composition class introduced during that task, we first build empirical prototypes by averaging unit-normalized features from the training samples per compositional class (and re-normalizing) to obtain $p_{c}^{\text{emp},(t)}$ (Eq. 2). We then construct the end-of-task PGS direction from the primitive head weights after training task $t$ . Let $\mathbf{w}_{s}$ and $\mathbf{w}_{o}$ denote the weight vectors corresponding to state $s$ and object $o$ :
+
+ $\mathbf{d}^{\text{end}}_{\text{PGS}}(c)=\operatorname{unit}\left(\operatorname{unit}(\mathbf{w}_{s})+\operatorname{unit}(\mathbf{w}_{o})\right).$ 
+
+(5)
+
+Although $\mathbf{w}_{s}$ and $\mathbf{w}_{o}$ arise from their respective depth-specific state and object representations, PGS uses their normalized classifier weights as discriminative primitive directions rather than empirical feature prototypes, consistent with prior work demonstrating that normalized classifier weights encode meaningful class directions in representation space [37]. PGS uses these directions as weak cross-depth primitive guidance rather than assuming identical feature geometry. To stabilize prototypes across tasks, we lightly blend $p_{c}^{\text{emp},(t)}$ with $\mathbf{d}^{\text{end}}_{\text{PGS}}(c)$ using a recurrence-weighted factor $\eta_{c}$ to obtain the final native prototype in the task- $t$ adapter space:
+
+ $p_{c}^{(t)}\leftarrow\operatorname{unit}\!\big((1-\eta_{c})\,p_{c}^{\text{emp},(t)}+\eta_{c}\,\mathbf{d}_{\text{PGS}}^{\text{end}}(c)\big).$ 
+
+(6)
+
+Blending is applied once, when the compositional class first appears and prototypes from earlier tasks are not re-blended thereafter. Furthermore, the blending weight $\eta_{c}$ is determined by primitive recurrence at the time the composition was introduced. Let $\mathcal{S}^{<t}$ and $\mathcal{O}^{<t}$ denote states and objects seen before task $t$ . For each composition $c=\langle s,o\rangle$ , we set:
+
+ $\eta_{c}=\begin{cases}\eta_{\text{both}},&\text{if }s\in\mathcal{S}^{<t}\text{ and }o\in\mathcal{O}^{<t},\\[4.0pt]
+\eta_{\text{one}},&\text{if }(s\in\mathcal{S}^{<t})\oplus(o\in\mathcal{O}^{<t}),\\[4.0pt]
+0,&\text{if }s\notin\mathcal{S}^{<t}\text{ and }o\notin\mathcal{O}^{<t}.\end{cases}$ 
+
+(7)
+
+When neither primitive has been seen ( $\eta_{c}=0$ ), $p_{c}^{(t)}$ remains equal to the empirical prototype $p_{c}^{\text{emp},(t)}$ . When primitives recur, the state and object classifiers retain and refine their weight vectors across tasks, providing reusable discriminative guidance for blending. Therefore, PGS anchors new composition prototypes using learned primitive directions to improve stability across tasks.
+
+## 4.4 Adapter-Space Transport
+
+Each task $\mathcal{T}_{t}$ instantiates its own LoRA adapters (Sec. 4.2), which are frozen once training completes. Consequently, composition embeddings from different tasks live in adapter-specific feature spaces. We refer to the feature space induced by the adapters trained for task $a$ as adapter space $a$ . At the end of task $t$ , we maintain a block-structured prototype matrix $P$ , where each block $P[t^{\prime},a]\in\mathbb{R}^{|\mathcal{C}^{(t^{\prime})}|\times d}$ stores unit prototypes for classes introduced at task $t^{\prime}$ but expressed in adapter space $a\leq t$ . Diagonal blocks contain native PGS prototypes, while off-diagonal blocks store cross-subspace prototypes.
+
+For a new task $t$ , we first fill $P[t,t]$ with PGS-anchored prototypes from current-task images under the task- $t$ adapters. For the same classes, we obtain $P[t,a]$ for each earlier adapter space $a<t$ by passing current-task images through frozen past adapters. In contrast, for classes introduced in earlier tasks $t^{\prime}<t$ , we lack their images in the rehearsal-free setting [54, 15, 14] and cannot directly compute their prototypes under the current adapters. Their native prototypes remain reliable in their originating adapter spaces, but native-space scoring leaves the task-specific spaces isolated. AST instead makes these spaces interoperable by using current-task images as transient correspondences to express prior classes in later adapter spaces without rehearsal.
+
+Cross-Subspace Alignment:
+For a current task $t$ and any previous task index $t^{\prime}<t$ , we take the same current-task image $x\in\mathcal{D}^{(t)}$ and extract L2-normalized composition embeddings under both adapter sets: $\widehat{z}_{\text{comp}}^{(t^{\prime})}(x)\in\mathbb{R}^{d}$ from the frozen task- $t^{\prime}$ adapters and $\widehat{z}_{\text{comp}}^{(t)}(x)\in\mathbb{R}^{d}$ from the current adapters. The pairs $\big(\widehat{z}_{\text{comp}}^{(t^{\prime})}(x),\widehat{z}_{\text{comp}}^{(t)}(x)\big)$ provide transient correspondences that identify a cross-subspace relation between adapter spaces [11, 9, 49, 17, 47]. Using only these current-task correspondences, we fit a regularized affine map directly from each past adapter space $t^{\prime}$ to the current space $t$ and apply it to prior prototypes without rehearsal. By default, we use all current-task images and vary this number in our transport-budget ablation.
+
+We define the adapter-space transport map $\phi_{t^{\prime}\!\rightarrow t}:\mathbb{R}^{d}\!\rightarrow\!\mathbb{R}^{d}$ as an affine transformation:
+
+ $\phi_{t^{\prime}\!\rightarrow t}(u)\;=\;\mathbf{A}_{t^{\prime}\!\rightarrow t}\,u\;+\;\mathbf{b}_{t^{\prime}\!\rightarrow t},$ 
+
+(8)
+
+where $\mathbf{A}_{t^{\prime}\!\rightarrow t}\in\mathbb{R}^{d\times d}$ and $\mathbf{b}_{t^{\prime}\!\rightarrow t}\in\mathbb{R}^{d}$ . For a fixed past adapter index $t^{\prime}<t$ , we estimate $(\mathbf{A},\mathbf{b})\equiv(\mathbf{A}_{t^{\prime}\!\rightarrow t},\mathbf{b}_{t^{\prime}\!\rightarrow t})$ at the end of task $t$ by minimizing:
+
+ $\min_{\mathbf{A},\mathbf{b}}\;\sum_{x_{i}\in\mathcal{D}^{(t)}}\big\|\widehat{z}_{\text{comp}}^{(t)}(x_{i})-\big(\mathbf{A}\,\widehat{z}_{\text{comp}}^{(t^{\prime})}(x_{i})+\mathbf{b}\big)\big\|_{2}^{2}\;+\;\lambda\|\mathbf{A}\|_{F}^{2},$ 
+
+(9)
+
+where the ridge term $\lambda\|\mathbf{A}\|_{F}^{2}$ regularizes the linear component while leaving the bias unconstrained. With unit-normalized features, minimizing this objective aligns old-adapter directions to current-adapter directions on the current-task distribution. We fit $\phi_{t^{\prime}\!\rightarrow t}$ once per pair $(t^{\prime},t)$ at the end of task $t$ only into the current adapter space and do not refit maps between earlier adapters.
+
+Prototype Transport:
+After fitting maps for all $t^{\prime}<t$ , we transport all previously seen prototypes into the current adapter space. At the end of task $t$ , we already have the native prototype $p_{c}^{(t)}$ for each new class $c\in\mathcal{C}^{(t)}$ from PGS (Eq. 6), stored as the native diagonal block $P[t,t]$ of the prototype matrix, and we have directly computed cross-subspace prototypes $P[t,a]$ for all $a<t$ by passing current-task images through older adapters. More generally, for any composition class $c$ introduced at task $t_{c}$ , its stored, blended prototype $p_{c}^{(t_{c})}$ remains in its originating adapter space as the diagonal block $P[t_{c},t_{c}]$ .
+
+Applying $\phi_{t^{\prime}\!\rightarrow t}$ to these native prototypes yields a transported view in the current adapter space (adapter space $t$ ):
+
+ $\tilde{p}_{c}^{(t^{\prime}\!\rightarrow t)}\;=\;\operatorname{unit}\!\big(\mathbf{A}_{t^{\prime}\!\rightarrow t}\,p_{c}^{(t^{\prime})}+\mathbf{b}_{t^{\prime}\!\rightarrow t}\big),$ 
+
+(10)
+
+for all classes $c$ whose origin task is $t^{\prime}=t_{c}<t$ . The transported prototypes $\tilde{p}_{c}^{(t^{\prime}\!\rightarrow t)}$ are stored in the above-diagonal block $P[t^{\prime},t]$ . Intuitively, $\phi_{t^{\prime}\!\rightarrow t}$ determines how old classes would be embedded by the current adapters, based on how current-task images move between adapter spaces. This procedure is performed after every task: at the end of task $t$ we build new native prototypes $P[t,t]$ and their cross-subspace views $P[t,a]$ for all $a<t$ using current images, and fit a map $\phi_{t^{\prime}\!\rightarrow t}$ for each $t^{\prime}<t$ and use it to update the column $P[t^{\prime},t]$ . No past-task images are stored or replayed, the only persisted state comprises frozen adapters, PGS-anchored prototypes, and their transported versions.
+
+Method type
+Method
+%Params
+Split-Clothing
+Split-UT-Zappos
+Split-C-GQA
+
+5 tasks
+5 tasks
+10 tasks
+5 tasks
+
+Avg Acc % ( $\uparrow$ )
+FTT % ( $\downarrow$ )
+Avg Acc % ( $\uparrow$ )
+FTT % ( $\downarrow$ )
+Avg Acc % ( $\uparrow$ )
+FTT % ( $\downarrow$ )
+Avg Acc % ( $\uparrow$ )
+FTT % ( $\downarrow$ )
+
+Classic CIL
+EWC [20]
+100
+ $47.89\text{\scriptsize$\pm 0.87$}$ 
+ $52.75\text{\scriptsize$\pm 0.44$}$ 
+ $37.59\text{\scriptsize$\pm 2.06$}$ 
+ $55.70\text{\scriptsize$\pm 2.76$}$ 
+ $24.63\text{\scriptsize$\pm 0.94$}$ 
+ $61.31\text{\scriptsize$\pm 2.29$}$ 
+ $38.69\text{\scriptsize$\pm 1.39$}$ 
+ $38.98\text{\scriptsize$\pm 1.53$}$ 
+
+LwF [28]
+100
+ $49.96\text{\scriptsize$\pm 0.68$}$ 
+ $44.22\text{\scriptsize$\pm 0.53$}$ 
+ $40.15\text{\scriptsize$\pm 0.43$}$ 
+ $49.61\text{\scriptsize$\pm 0.68$}$ 
+ $30.38\text{\scriptsize$\pm 1.41$}$ 
+ $58.15\text{\scriptsize$\pm 0.20$}$ 
+ $45.95\text{\scriptsize$\pm 0.72$}$ 
+ $23.21\text{\scriptsize$\pm 1.05$}$ 
+
+iCaRL [39]
+100
+ $68.65\text{\scriptsize$\pm 0.41$}$ 
+ $31.74\text{\scriptsize$\pm 1.89$}$ 
+ $37.78\text{\scriptsize$\pm 2.14$}$ 
+ $55.06\text{\scriptsize$\pm 3.50$}$ 
+ $31.40\text{\scriptsize$\pm 1.96$}$ 
+ $59.65\text{\scriptsize$\pm 2.40$}$ 
+ $33.40\text{\scriptsize$\pm 0.40$}$ 
+ $53.32\text{\scriptsize$\pm 0.90$}$ 
+
+Prompt-based
+L2P [45]
+0.2
+ $83.16\text{\scriptsize$\pm 0.50$}$ 
+ $10.97\text{\scriptsize$\pm 2.02$}$ 
+ $35.26\text{\scriptsize$\pm 0.81$}$ 
+ $28.17\text{\scriptsize$\pm 0.05$}$ 
+ $31.65\text{\scriptsize$\pm 0.16$}$ 
+ $31.02\text{\scriptsize$\pm 1.62$}$ 
+ $39.39\text{\scriptsize$\pm 0.24$}$ 
+ $27.27\text{\scriptsize$\pm 1.67$}$ 
+
+Dual-Prompt [44]
+0.3
+ $85.47\text{\scriptsize$\pm 0.39$}$ 
+ $9.47\text{\scriptsize$\pm 1.26$}$ 
+ $36.59\text{\scriptsize$\pm 2.01$}$ 
+ $\mathbf{18.90}\text{\scriptsize$\pm 1.63$}$ 
+ $33.01\text{\scriptsize$\pm 1.65$}$ 
+ $24.61\text{\scriptsize$\pm 1.11$}$ 
+ $39.52\text{\scriptsize$\pm 0.33$}$ 
+ $17.13\text{\scriptsize$\pm 0.94$}$ 
+
+CODA-Prompt [40]
+4.3
+ $83.07\text{\scriptsize$\pm 2.56$}$ 
+ $11.04\text{\scriptsize$\pm 1.95$}$ 
+ $38.92\text{\scriptsize$\pm 0.27$}$ 
+ $20.55\text{\scriptsize$\pm 2.87$}$ 
+ $31.40\text{\scriptsize$\pm 0.36$}$ 
+ $30.54\text{\scriptsize$\pm 2.63$}$ 
+ $42.79\text{\scriptsize$\pm 0.51$}$ 
+ $18.63\text{\scriptsize$\pm 1.16$}$ 
+
+Sim-CompILer [52]
+3.1
+ $84.68\text{\scriptsize$\pm 0.58$}$ 
+ $9.98\text{\scriptsize$\pm 0.34$}$ 
+ $42.27\text{\scriptsize$\pm 0.63$}$ 
+ $23.89\text{\scriptsize$\pm 0.61$}$ 
+ $33.30\text{\scriptsize$\pm 0.10$}$ 
+ $30.31\text{\scriptsize$\pm 0.03$}$ 
+ $41.08\text{\scriptsize$\pm 0.27$}$ 
+ $21.20\text{\scriptsize$\pm 0.18$}$ 
+
+CompILer [52]
+3.1
+ $86.36\text{\scriptsize$\pm 0.36$}$ 
+ $7.76\text{\scriptsize$\pm 0.68$}$ 
+ $\mathbf{44.17}\text{\scriptsize$\pm 1.41$}$ 
+ $23.28\text{\scriptsize$\pm 2.00$}$ 
+ $34.43\text{\scriptsize$\pm 0.07$}$ 
+ $28.69\text{\scriptsize$\pm 0.82$}$ 
+ $42.49\text{\scriptsize$\pm 0.35$}$ 
+ $20.36\text{\scriptsize$\pm 0.10$}$ 
+
+Adapter-based
+EASE [54]
+2.2
+ $76.77\text{\scriptsize$\pm 0.18$}$ 
+ $9.79\text{\scriptsize$\pm 0.18$}$ 
+ $39.58\text{\scriptsize$\pm 0.14$}$ 
+ $24.26\text{\scriptsize$\pm 0.33$}$ 
+ $34.65\text{\scriptsize$\pm 0.22$}$ 
+ $\mathbf{19.60}\text{\scriptsize$\pm 0.43$}$ 
+ $\mathbf{48.19}\text{\scriptsize$\pm 0.15$}$ 
+ $18.79\text{\scriptsize$\pm 0.13$}$ 
+
+TUNA [43]
+2.2
+ $\mathbf{89.53}\text{\scriptsize$\pm 0.67$}$ 
+ $\mathbf{4.59}\text{\scriptsize$\pm 1.22$}$ 
+ $43.24\text{\scriptsize$\pm 1.38$}$ 
+ $24.09\text{\scriptsize$\pm 0.89$}$ 
+ $\mathbf{40.90}\text{\scriptsize$\pm 0.45$}$ 
+ $23.23\text{\scriptsize$\pm 0.43$}$ 
+ $45.08\text{\scriptsize$\pm 0.60$}$ 
+ $23.32\text{\scriptsize$\pm 0.24$}$ 
+
+CL-LoRA [14]
+0.5
+ $83.07\text{\scriptsize$\pm 0.15$}$ 
+ $6.70\text{\scriptsize$\pm 0.51$}$ 
+ $43.00\text{\scriptsize$\pm 1.44$}$ 
+ $28.02\text{\scriptsize$\pm 1.71$}$ 
+ $37.71\text{\scriptsize$\pm 0.80$}$ 
+ $29.25\text{\scriptsize$\pm 1.45$}$ 
+ $36.89\text{\scriptsize$\pm 0.09$}$ 
+ $\mathbf{13.58}\text{\scriptsize$\pm 1.06$}$ 
+
+LSA-PAST (ours)
+1.8
+ $\mathbf{91.86}\text{\scriptsize$\pm 0.99$}$ 
+ $\mathbf{2.61}\text{\scriptsize$\pm 0.32$}$ 
+ $\mathbf{44.71}\text{\scriptsize$\pm 0.68$}$ 
+ $\mathbf{14.22}\text{\scriptsize$\pm 2.18$}$ 
+ $\mathbf{39.78}\text{\scriptsize$\pm 0.86$}$ 
+ $\mathbf{16.78}\text{\scriptsize$\pm 0.57$}$ 
+ $\mathbf{48.57}\text{\scriptsize$\pm 1.09$}$ 
+ $\mathbf{11.58}\text{\scriptsize$\pm 0.46$}$ 
+
+Table 1: Average accuracy and forgetting on Split-Clothing, Split-UT-Zappos under 5-task and 10-task, and Split-C-GQA. %Params denotes cumulative additional parameters relative to the ViT-B/16 backbone. Best and Second-Best results highlighted.
+
+## 4.5 Optimization Objective
+
+Training.
+We train with a simple weighted multi-task objective over the three linear classification heads,
+
+ $\mathcal{L}\;=\;\mathcal{L}_{\text{comp}}\;+\;\lambda_{\text{prim}}\big(\mathcal{L}_{\text{state}}+\mathcal{L}_{\text{obj}}\big),$ 
+
+(11)
+
+where each loss term $\mathcal{L}_{\text{comp}}$ , $\mathcal{L}_{\text{state}}$ , and $\mathcal{L}_{\text{obj}}$ is computed as standard cross-entropy for its respective classification head and $\lambda_{\text{prim}}$ is the primitive weight for the state and object losses. Moreover, PAST does not alter the loss function, adding no extra forward-time cost during training.
+
+Inference.
+At task $t$ inference, we discard the linear composition head and classify with cosine similarity to stored prototypes using ensemble over adapter spaces. For each adapter space $a\leq t$ , the composition branch produces a feature $f_{\text{comp}}^{(a)}(x)$ for an image $x$ , which we unit-normalize to obtain $\widehat{z}_{\text{comp}}^{(a)}(x)$ . Each composition class $c\in\mathcal{C}^{\leq t}$ is first introduced at task $t_{c}$ and has a native prototype $p_{c}^{(t_{c})}$ in adapter space $t_{c}$ . Across subsequent tasks, we populate a prototype matrix that stores cross-subspace views of each class. When a prototype for class $c$ is available in adapter space $a$ , we denote it by $p_{c}^{(a)}$ . We predict the label for $x$ by ensembling cosine similarities across all adapter spaces up to $t$ :
+
+ $\widehat{y}\;=\;\arg\max_{c\in\mathcal{C}^{\leq t}}\sum_{a=1}^{t}w_{c,a}\,\widehat{z}_{\text{comp}}^{(a)}(x)^{\top}p_{c}^{(a)},$ 
+
+(12)
+
+We assign full weight to the native adapter of class $c$ ( $w_{c,t_{c}}=1$ ) and a smaller constant weight to all other available adapter spaces ( $w_{c,a}=0.1$ for $a\neq t_{c}$ in all experiments).
+
+## 5 Experiments and Results
+
+## 5.1 Experimental Setup
+
+Datasets. We evaluate on three composition-IL benchmarks: Split-Clothing [50], Split-UT-Zappos [48], and our proposed Split-C-GQA dataset derived from C-GQA [34]. Existing work evaluates only on smaller-scale, heavily recurring benchmarks while our Split-C-GQA introduces a larger, less-redundant setting. Split-Clothing has 35 compositions (9 states, 8 objects) across 5 tasks with all primitives recurring, Split-UT-Zappos has 80 compositions (15 states, 12 objects) with 9 states and all objects recurring, Split-C-GQA has 100 compositions (31 states, 31 objects) with 13 states and 18 objects recurring. Detailed statistics are summarized in the supplemental material.
+
+Type
+Method
+Split-Clothing
+Split-C-GQA
+
+State %
+Object %
+State %
+Object %
+
+Classic
+
+EWC [20]
+ $86.49\text{\scriptsize$\pm 0.97$}$ 
+ $52.72\text{\scriptsize$\pm 1.30$}$ 
+ $52.91\text{\scriptsize$\pm 0.28$}$ 
+ $60.42\text{\scriptsize$\pm 1.91$}$ 
+
+LwF [28]
+ $87.11\text{\scriptsize$\pm 0.66$}$ 
+ $54.57\text{\scriptsize$\pm 0.69$}$ 
+ $\mathbf{58.33}\text{\scriptsize$\pm 0.42$}$ 
+ $66.32\text{\scriptsize$\pm 0.31$}$ 
+
+iCaRL [39]
+ $91.21\text{\scriptsize$\pm 1.05$}$ 
+ $71.70\text{\scriptsize$\pm 0.99$}$ 
+ $46.96\text{\scriptsize$\pm 0.27$}$ 
+ $55.61\text{\scriptsize$\pm 0.45$}$ 
+
+Prompt
+
+L2P [45]
+ $85.41\text{\scriptsize$\pm 0.23$}$ 
+ $95.42\text{\scriptsize$\pm 0.42$}$ 
+ $51.65\text{\scriptsize$\pm 1.54$}$ 
+ $63.53\text{\scriptsize$\pm 1.04$}$ 
+
+Dual-Prompt [44]
+ $86.89\text{\scriptsize$\pm 0.37$}$ 
+ $95.87\text{\scriptsize$\pm 0.53$}$ 
+ $49.52\text{\scriptsize$\pm 0.69$}$ 
+ $64.15\text{\scriptsize$\pm 0.37$}$ 
+
+Sim-CompILer [52]
+ $87.14\text{\scriptsize$\pm 0.98$}$ 
+ $95.91\text{\scriptsize$\pm 0.12$}$ 
+ $51.85\text{\scriptsize$\pm 0.45$}$ 
+ $63.89\text{\scriptsize$\pm 0.38$}$ 
+
+CompILer [52]
+ $87.76\text{\scriptsize$\pm 1.29$}$ 
+ $\mathbf{96.46}\text{\scriptsize$\pm 0.08$}$ 
+ $52.70\text{\scriptsize$\pm 0.20$}$ 
+ $64.54\text{\scriptsize$\pm 0.22$}$ 
+
+Adapt
+
+EASE [54]
+ $77.50\text{\scriptsize$\pm 0.16$}$ 
+ $93.73\text{\scriptsize$\pm 0.14$}$ 
+ $58.19\text{\scriptsize$\pm 0.14$}$ 
+ $\mathbf{69.93}\text{\scriptsize$\pm 0.17$}$ 
+
+TUNA [43]
+ $\mathbf{92.73}\text{\scriptsize$\pm 0.93$}$ 
+ $95.84\text{\scriptsize$\pm 0.19$}$ 
+ $56.38\text{\scriptsize$\pm 0.23$}$ 
+ $65.66\text{\scriptsize$\pm 0.09$}$ 
+
+CL-LoRA [14]
+ $84.81\text{\scriptsize$\pm 0.27$}$ 
+ $96.00\text{\scriptsize$\pm 0.11$}$ 
+ $45.26\text{\scriptsize$\pm 0.17$}$ 
+ $59.28\text{\scriptsize$\pm 0.38$}$ 
+
+Ours
+ $\mathbf{94.24}\text{\scriptsize$\pm 0.21$}$ 
+ $\mathbf{96.64}\text{\scriptsize$\pm 0.25$}$ 
+ $\mathbf{58.74}\text{\scriptsize$\pm 0.28$}$ 
+ $\mathbf{71.01}\text{\scriptsize$\pm 0.23$}$ 
+
+Table 2: State and Object Accuracy (%) on Split-Clothing and Split-C-GQA (5 tasks). Best and Second-Best results highlighted.
+
+Baselines and Metrics. We opt to compare with Classic CIL [20, 28, 39], prompt-based methods [45, 44, 40, 52], and adapter-based CIL [54, 43, 14], using LAMDA-PILOT [42, 56, 53] and PyCIL [55] implementations with tested optimal hyperparameters. iCaRL is the only method which uses exemplars. Results come from our re-implementations using the same set of 3 random seeds.
+
+Metrics. The metrics reported are Average Accuracy (Avg. Acc) over all composition classes seen up to the current task, computed by evaluating the model on every previously seen task after each training step and averaging their accuracies and Forgetting (FTT), which quantifies the degradation on past tasks by comparing each task’s current accuracy to its best accuracy observed earlier.
+
+Implementation Details. We leverage ViT-B/16 [6] with ImageNet-21k pretrain following all prior works [54, 14, 52]. The multitask loss is set at $\lambda_{\text{prim}}=0.1$ . We set $(\eta_{\text{both}},\eta_{\text{one}})=(0.2,0.1)$ for Split-Clothing and Split-UT-Zappos, and $(0.15,0.075)$ for Split-C-GQA. All hyperparameters are selected once using only the first-task split and kept fixed for all subsequent tasks; we do not perform per-task hyperparameter tuning. A detailed complexity analysis, including storage, inference FLOPs, latency, and per-task training time, is provided in the supplemental material.
+
+## 5.2 Experimental Results
+
+Table 1 reports Avg Acc and FTT across all benchmarks, including a longer 10-task Split-UT-Zappos setting. LSA-PAST achieves the strongest overall accuracy-forgetting trade-off with low parameter overhead by combining depth-specialized adapters, PGS-anchored prototypes, and AST-based cross-task alignment. On Split-Clothing, LSA-PAST reaches 91.86% Avg Acc with only 2.61% FTT, improving over CompILer (86.36%, 7.76%) while using fewer trainable parameters. On Split-C-GQA, we also obtain the best Avg Acc and lowest FTT, showing that the method remains effective on a larger benchmark with lower primitive recurrence. On 5-task Split-UT-Zappos, LSA-PAST slightly improves Avg Acc over CompILer (44.71% vs. 44.17%) but substantially reduces forgetting (14.22% vs. 23.28%), demonstrating superior stability. Under the longer 10-task schedule, TUNA obtains higher Avg Acc, but LSA-PAST achieves lower FTT (16.78% vs. 23.23%), demonstrating that our method better preserves prior compositions as task sequences grow. Overall, LSA-PAST delivers the most consistent accuracy-forgetting balance across all settings.
+
+Table 2 reports state and object accuracy on Split-Clothing and Split-C-GQA. LSA-PAST achieves the best primitive-level accuracy across both benchmarks, supporting depth-specialized LoRA for preserving state/object knowledge and reducing state confusion while incrementally learning compositions.
+
+Split-Clothing
+Split-UT-Zappos
+
+LSA
+PGS
+Inference
+Avg Acc % ( $\uparrow$ )
+FTT % ( $\downarrow$ )
+Avg Acc % ( $\uparrow$ )
+FTT % ( $\downarrow$ )
+
+✓
+✓
+Unaligned Ens.
+ $75.71\text{\scriptsize$\pm 0.39$}$ 
+ $28.32\text{\scriptsize$\pm 0.53$}$ 
+ $29.92\text{\scriptsize$\pm 0.37$}$ 
+ $53.21\text{\scriptsize$\pm 1.51$}$ 
+
+✓
+✗
+Native
+ $90.29\text{\scriptsize$\pm 0.65$}$ 
+ $4.97\text{\scriptsize$\pm 0.48$}$ 
+ $40.85\text{\scriptsize$\pm 0.93$}$ 
+ $17.56\text{\scriptsize$\pm 1.71$}$ 
+
+✓
+✓
+Native
+ $90.74\text{\scriptsize$\pm 0.65$}$ 
+ $3.91\text{\scriptsize$\pm 0.37$}$ 
+ $41.67\text{\scriptsize$\pm 0.57$}$ 
+ $14.81\text{\scriptsize$\pm 1.85$}$ 
+
+✓
+✗
+AST Ens. (ours)
+ $90.81\text{\scriptsize$\pm 0.27$}$ 
+ $4.89\text{\scriptsize$\pm 0.87$}$ 
+ $44.58\text{\scriptsize$\pm 1.56$}$ 
+ $18.63\text{\scriptsize$\pm 3.17$}$ 
+
+✓
+✓
+LDC Ens. [11]
+ $91.41\text{\scriptsize$\pm 0.40$}$ 
+ $3.49\text{\scriptsize$\pm 0.73$}$ 
+ $43.73\text{\scriptsize$\pm 0.77$}$ 
+ $15.09\text{\scriptsize$\pm 1.74$}$ 
+
+✓
+✓
+DPCR Ens. [17]
+ $91.25\text{\scriptsize$\pm 0.84$}$ 
+ $3.72\text{\scriptsize$\pm 0.58$}$ 
+ $44.07\text{\scriptsize$\pm 0.74$}$ 
+ $15.26\text{\scriptsize$\pm 1.98$}$ 
+
+✓
+✓
+AST Ens. (ours)
+ $\mathbf{91.86}\text{\scriptsize$\pm 0.99$}$ 
+ $\mathbf{2.61}\text{\scriptsize$\pm 0.32$}$ 
+ $\mathbf{44.71}\text{\scriptsize$\pm 0.68$}$ 
+ $\mathbf{14.22}\text{\scriptsize$\pm 2.18$}$ 
+
+Table 3: Component and inference ablation. Native scores each class only in its originating adapter space, while ensemble (Ens.) variants additionally aggregate available cross-space evidence.
+
+Figure 3: PGS success and failure cases on Split-UT-Zappos and Split-C-GQA. Boxes show $\Delta$ forgetting, with green indicating reduced forgetting and red indicating no improvement.
+
+## 5.3 Ablation Study
+
+Component and Transport Ablation.
+We ablate the components of LSA-PAST in Table 3. The unaligned ensemble performs poorly, confirming that scores cannot be reliably aggregated across task-specific adapter spaces without alignment. Native-space inference provides a strong transport-free baseline by evaluating each class only in its originating space. Adding PGS consistently reduces forgetting in both Native and AST inference, supporting its role in stabilizing composition prototypes through recurring primitive knowledge. With PGS fixed, AST improves over Native by retaining reliable native evidence while incorporating lower-weight aligned evidence from non-native spaces, increasing Avg. Acc. from $90.74\%$ to $91.86\%$ on Split-Clothing and from $41.67\%$ to $44.71\%$ on Split-UT-Zappos. Finally, under the same LSA+PGS backbone and ensemble protocol, AST outperforms previous drift compensation methods LDC [11] and DPCR [17], yielding the strongest overall accuracy-forgetting trade-off.
+
+PGS Qualitative Analysis.
+Fig. 3 shows representative PGS success and failure cases on Split-UT-Zappos and Split-C-GQA. PGS substantially reduces forgetting for visually distinctive states such as “Leather” and “Parked,” where primitive information provides a reliable direction for prototype stabilization. In contrast, ambiguous states such as “Small” or “Synthetic” can produce slight degradation, suggesting that primitive anchoring is less reliable when state evidence is weak or visually subtle.
+
+Oracle Prototype Alignment.
+For each past class, we construct an oracle prototype from held-out test images passed through the current adapter and compare it with the Uncorrected prototype from task $t^{\prime}$ , LDC-corrected [11], DPCR-corrected [17], and AST-transported prototypes using cosine similarity (Table 4). Results are grouped by task gap $t-t^{\prime}$ , while Overall averages all past-to-current task-pair comparisons. LDC and DPCR are slightly stronger at gap 1 on Split-Clothing and Split-C-GQA, respectively, but AST performs best at gaps 2-4 and achieves the highest overall alignment on both datasets. This demonstrates that AST more closely approximates the current-space location of old-class prototypes as task separation increases.
+
+Split-Clothing
+Split-C-GQA
+
+Task Gap
+Uncorrected
+LDC [11]
+DPCR [17]
+AST
+Uncorrected
+LDC [11]
+DPCR [17]
+AST
+
+1
+ $0.740$ 
+ $\mathbf{0.898}$ 
+ $0.863$ 
+ $0.880$ 
+ $0.784$ 
+ $0.942$ 
+ $\mathbf{0.945}$ 
+ $0.941$ 
+
+2
+ $0.750$ 
+ $0.873$ 
+ $0.830$ 
+ $\mathbf{0.897}$ 
+ $0.786$ 
+ $0.928$ 
+ $0.934$ 
+ $\mathbf{0.945}$ 
+
+3
+ $0.704$ 
+ $0.844$ 
+ $0.812$ 
+ $\mathbf{0.886}$ 
+ $0.798$ 
+ $0.910$ 
+ $0.920$ 
+ $\mathbf{0.948}$ 
+
+4
+ $0.662$ 
+ $0.819$ 
+ $0.799$ 
+ $\mathbf{0.905}$ 
+ $0.774$ 
+ $0.881$ 
+ $0.894$ 
+ $\mathbf{0.952}$ 
+
+Overall
+ $0.728$ 
+ $0.872$ 
+ $0.836$ 
+ $\mathbf{0.889}$ 
+ $0.786$ 
+ $0.925$ 
+ $0.932$ 
+ $\mathbf{0.944}$ 
+
+Table 4: Cosine similarity to oracle current-space prototypes.
+
+Effect of Number of Transported Pairs.
+The top panel of Fig. 4 varies the number of current-task feature correspondences used to fit each AST map. Accuracy improves rapidly with a small transport budget, while additional correspondences further reduce forgetting by refining cross-space alignment. Increasing the budget affects only post-task AST fitting and does not increase inference-time cost. The 95% markers show that near-maximum accuracy is reached with fewer correspondences than near-optimal forgetting, suggesting that coarse alignment is sufficient for accuracy gains, whereas stronger retention benefits from finer transport estimates.
+
+Figure 4: Top: effect of AST transport-pair budget on accuracy and forgetting. Bottom: LSA ablation with explicit state (S), object (O), and composition (C) layer ranges.
+
+Effect of Layer Assignment. The bottom panel of Fig. 4 compares depth-specialized LSA with alternative layer assignments, including uniform LoRA under a matched parameter budget, where identical adapters are attached to all layers for S/O/C. Our LSA assignment follows the approximate hierarchy observed in prior work [5, 36, 23]: state cues are assigned to early layers, object structure to middle layers, and global operation to the final layers. While the uniform design is competitive, LSA consistently improves Avg Acc and further reduces FTT using the same number of trainable parameters. Depth specialization aligns adaptation with this hierarchy, avoiding uniform updates that can entangle unrelated features. This design also enables depthwise control (e.g., different LoRA ranks per depth), offering a more flexible alternative to uniform LoRA.
+
+## 6 Conclusion
+
+In this paper, we propose LSA-PAST, a framework for composition-IL that exploits the hierarchical processing structure of vision transformers and a novel, rehearsal-free cross-subspace alignment method for aligning old prototypes with current task subspaces. Through extensive experiments across multiple benchmark datasets, we demonstrate that our method achieves SOA performance in accuracy-forgetting trade off. Comprehensive studies validate the importance of both depth-specialized adapter placement and AST to overall performance. Finally, we provide contributions to an emerging field of incremental learning, introducing a framework that lays foundational groundwork for future research in compositional continual models.
+
+## References
+
+[1]
+J. Bang, H. Kim, Y. Yoo, J. Ha, and J. Choi (2021)
+
+Rainbow memory: continual learning with a memory of diverse samples.
+
+In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition,
+
+pp. 8218–8227.
+
+Cited by: §2.1.
+
+[2]
+F. Boutros, N. Damer, F. Kirchbuchner, and A. Kuijper (2022)
+
+Elasticface: elastic margin loss for deep face recognition.
+
+In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition,
+
+pp. 1578–1587.
+
+Cited by: §1.
+
+[3]
+N. Ding, Y. Qin, G. Yang, F. Wei, Z. Yang, Y. Su, S. Hu, Y. Chen, C. Chan, W. Chen, et al. (2023)
+
+Parameter-efficient fine-tuning of large-scale pre-trained language models.
+
+Nature Machine Intelligence 5 (3), pp. 220–235.
+
+Cited by: §2.1.
+
+[4]
+S. Dong, H. Luo, Y. He, X. Wei, J. Cheng, and Y. Gong (2023)
+
+Knowledge restore and transfer for multi-label class-incremental learning.
+
+In Proceedings of the IEEE/CVF International Conference on Computer Vision,
+
+pp. 18711–18720.
+
+Cited by: §2.1.
+
+[5]
+T. Dorszewski, L. Tětková, R. Jenssen, L. K. Hansen, and K. K. Wickstrøm (2025)
+
+From colors to classes: emergence of concepts in vision transformers.
+
+In World Conference on Explainable Artificial Intelligence,
+
+pp. 28–47.
+
+Cited by: §1,
+§2.2,
+§4.2,
+§5.3.
+
+[6]
+A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly, et al. (2021)
+
+An image is worth 16x16 words: transformers for image recognition at scale.
+
+International Conference on Learning Representations.
+
+Cited by: §1,
+§2.1,
+§2.2,
+§3.2,
+§3.2,
+§5.1.
+
+[7]
+S. M. Frankland and J. D. Greene (2020)
+
+Concepts and compositionality: in search of the brain’s language of thought.
+
+Annual review of psychology 71 (1), pp. 273–303.
+
+Cited by: §1.
+
+[8]
+R. M. French (1999)
+
+Catastrophic forgetting in connectionist networks.
+
+Trends in cognitive sciences 3 (4), pp. 128–135.
+
+Cited by: §1.
+
+[9]
+T. Fukuda, H. Kera, and K. Kawamoto (2025)
+
+Adapter merging with centroid prototype mapping for scalable class-incremental learning.
+
+In Proceedings of the Computer Vision and Pattern Recognition Conference,
+
+pp. 4884–4893.
+
+Cited by: §3.1,
+§3.2,
+§4.4.
+
+[10]
+R. Geirhos, P. Rubisch, C. Michaelis, M. Bethge, F. A. Wichmann, and W. Brendel (2018)
+
+ImageNet-trained cnns are biased towards texture; increasing shape bias improves accuracy and robustness.
+
+In International conference on learning representations,
+
+Cited by: §1.
+
+[11]
+A. Gomez-Villa, D. Goswami, K. Wang, A. D. Bagdanov, B. Twardowski, and J. van de Weijer (2024)
+
+Exemplar-free continual representation learning via learnable drift compensation.
+
+In European Conference on Computer Vision,
+
+pp. 473–490.
+
+Cited by: §4.4,
+§5.3,
+§5.3,
+Table 3,
+Table 4,
+Table 4.
+
+[12]
+Z. Han, C. Gao, J. Liu, J. Zhang, and S. Q. Zhang (2024)
+
+Parameter-efficient fine-tuning for large models: a comprehensive survey.
+
+arXiv preprint arXiv:2403.14608.
+
+Cited by: §2.1.
+
+[13]
+S. Hao, K. Han, and K. K. Wong (2023)
+
+Learning attention as disentangler for compositional zero-shot learning.
+
+In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+
+pp. 15315–15324.
+
+Cited by: §1.
+
+[14]
+J. He, Z. Duan, and F. Zhu (2025)
+
+CL-lora: continual low-rank adaptation for rehearsal-free class-incremental learning.
+
+In Proceedings of the Computer Vision and Pattern Recognition Conference,
+
+pp. 30534–30544.
+
+Cited by: §1,
+§2.1,
+§2.1,
+§2.2,
+§3.2,
+§3.2,
+§4.4,
+Table 1,
+§5.1,
+§5.1,
+Table 2.
+
+[15]
+J. He and F. Zhu (2022)
+
+Exemplar-free online continual learning.
+
+In 2022 IEEE International Conference on Image Processing (ICIP),
+
+pp. 541–545.
+
+Cited by: §4.4.
+
+[16]
+K. He, X. Zhang, S. Ren, and J. Sun (2016)
+
+Deep residual learning for image recognition.
+
+In Proceedings of the IEEE conference on computer vision and pattern recognition,
+
+pp. 770–778.
+
+Cited by: §1.
+
+[17]
+R. He, D. Fang, Y. Xu, Y. Cui, M. Li, C. Chen, Z. Zeng, and H. Zhuang (2025)
+
+Semantic shift estimation via dual-projection and classifier reconstruction for exemplar-free class-incremental learning.
+
+In Forty-second International Conference on Machine Learning,
+
+External Links: Link
+
+Cited by: §4.4,
+§5.3,
+§5.3,
+Table 3,
+Table 4,
+Table 4.
+
+[18]
+E. J. Hu, Y. Shen, P. Wallis, Z. Allen-Zhu, Y. Li, S. Wang, L. Wang, W. Chen, et al. (2022)
+
+Lora: low-rank adaptation of large language models..
+
+ICLR 1 (2), pp. 3.
+
+Cited by: §1,
+§3.2,
+§3.2.
+
+[19]
+M. Jia, L. Tang, B. Chen, C. Cardie, S. Belongie, B. Hariharan, and S. Lim (2022)
+
+Visual prompt tuning.
+
+In European conference on computer vision,
+
+pp. 709–727.
+
+Cited by: §2.1.
+
+[20]
+J. Kirkpatrick, R. Pascanu, N. Rabinowitz, J. Veness, G. Desjardins, A. A. Rusu, K. Milan, J. Quan, T. Ramalho, A. Grabska-Barwinska, et al. (2017)
+
+Overcoming catastrophic forgetting in neural networks.
+
+Proceedings of the national academy of sciences 114 (13), pp. 3521–3526.
+
+Cited by: §1,
+§2.1,
+Table 1,
+§5.1,
+Table 2.
+
+[21]
+B. M. Lake, T. D. Ullman, J. B. Tenenbaum, and S. J. Gershman (2017)
+
+Building machines that learn and think like people.
+
+Behavioral and brain sciences 40, pp. e253.
+
+Cited by: §1.
+
+[22]
+B. M. Lake (2014)
+
+Towards more human-like concept learning in machines: compositionality, causality, and learning-to-learn.
+
+Ph.D. Thesis, Massachusetts Institute of Technology.
+
+Cited by: §1.
+
+[23]
+M. Lepori, A. Tartaglini, W. K. Vong, T. Serre, B. M. Lake, and E. Pavlick (2024)
+
+Beyond the doors of perception: vision transformers represent relations between objects.
+
+Advances in Neural Information Processing Systems 37, pp. 131503–131544.
+
+Cited by: §1,
+§2.2,
+§4.2,
+§5.3.
+
+[24]
+B. Lester, R. Al-Rfou, and N. Constant (2021)
+
+The power of scale for parameter-efficient prompt tuning.
+
+arXiv preprint arXiv:2104.08691.
+
+Cited by: §2.1.
+
+[25]
+J. Li, S. Wang, B. Qian, Y. He, X. Wei, Q. Wang, and Y. Gong (2025)
+
+Dynamic integration of task-specific adapters for class incremental learning.
+
+In Proceedings of the Computer Vision and Pattern Recognition Conference,
+
+pp. 30545–30555.
+
+Cited by: §1.
+
+[26]
+Y. Li, C. Wu, H. Fan, K. Mangalam, B. Xiong, J. Malik, and C. Feichtenhofer (2022)
+
+Mvitv2: improved multiscale vision transformers for classification and detection.
+
+In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+
+pp. 4804–4814.
+
+Cited by: §1.
+
+[27]
+Z. Li, Y. Wu, C. Jing, C. Sun, C. Li, and Y. Jia (2026)
+
+Composition-incremental learning for compositional generalization.
+
+In Proceedings of the AAAI Conference on Artificial Intelligence,
+
+Vol. 40, pp. 6735–6743.
+
+Cited by: §2.1.
+
+[28]
+Z. Li and D. Hoiem (2017)
+
+Learning without forgetting.
+
+IEEE transactions on pattern analysis and machine intelligence 40 (12), pp. 2935–2947.
+
+Cited by: §1,
+§2.1,
+Table 1,
+§5.1,
+Table 2.
+
+[29]
+W. Liu, X. Wu, F. Zhu, M. Yu, C. Wang, and C. Liu (2025)
+
+Class incremental learning with self-supervised pre-training and prototype learning.
+
+Pattern Recognition 157, pp. 110943.
+
+Cited by: §1.
+
+[30]
+X. Lu, S. Guo, Z. Liu, and J. Guo (2023)
+
+Decomposed soft prompt guided fusion enhancing for compositional zero-shot learning.
+
+In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+
+pp. 23560–23569.
+
+Cited by: §1.
+
+[31]
+S. Maryam, S. Nadeem, F. Qureshi, and M. Ali (2025)
+
+Prompt-based continual compositional zero-shot learning.
+
+arXiv preprint arXiv:2512.09172.
+
+Cited by: §2.1.
+
+[32]
+Z. Meng, J. Zhang, C. Yang, Z. Zhan, P. Zhao, and Y. Wang (2024)
+
+Diffclass: diffusion-based class incremental learning.
+
+In European Conference on Computer Vision,
+
+pp. 142–159.
+
+Cited by: §1.
+
+[33]
+J. Moon, K. Park, J. U. Kim, and G. Park (2023)
+
+Online class incremental learning on stochastic blurry task boundary via mask and visual prompt tuning.
+
+In Proceedings of the IEEE/CVF international conference on computer vision,
+
+pp. 11731–11741.
+
+Cited by: §2.1.
+
+[34]
+M. F. Naeem, Y. Xian, F. Tombari, and Z. Akata (2021)
+
+Learning graph embeddings for compositional zero-shot learning.
+
+In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+
+pp. 953–962.
+
+Cited by: §5.1.
+
+[35]
+M. M. Naseer, K. Ranasinghe, S. H. Khan, M. Hayat, F. Shahbaz Khan, and M. Yang (2021)
+
+Intriguing properties of vision transformers.
+
+Advances in Neural Information Processing Systems 34, pp. 23296–23308.
+
+Cited by: §1.
+
+[36]
+X. Pan, A. Philip, Z. Xie, and O. Schwartz (2024)
+
+Dissecting query-key interaction in vision transformers.
+
+In Advances in Neural Information Processing Systems,
+
+pp. 54595–54631.
+
+Cited by: §1,
+§2.2,
+§4.2,
+§5.3.
+
+[37]
+H. Qi, M. Brown, and D. G. Lowe (2018)
+
+Low-shot learning with imprinted weights.
+
+In Proceedings of the IEEE conference on computer vision and pattern recognition,
+
+pp. 5822–5830.
+
+Cited by: §4.3.
+
+[38]
+M. Raghu, T. Unterthiner, S. Kornblith, C. Zhang, and A. Dosovitskiy (2021)
+
+Do vision transformers see like convolutional neural networks?.
+
+Advances in neural information processing systems 34, pp. 12116–12128.
+
+Cited by: §1,
+§2.2,
+§4.2.
+
+[39]
+S. Rebuffi, A. Kolesnikov, G. Sperl, and C. H. Lampert (2017)
+
+Icarl: incremental classifier and representation learning.
+
+In Proceedings of the IEEE conference on Computer Vision and Pattern Recognition,
+
+pp. 2001–2010.
+
+Cited by: §1,
+§2.1,
+Table 1,
+§5.1,
+Table 2.
+
+[40]
+J. S. Smith, L. Karlinsky, V. Gutta, P. Cascante-Bonilla, D. Kim, A. Arbelle, R. Panda, R. Feris, and Z. Kira (2023)
+
+Coda-prompt: continual decomposed attention-based prompting for rehearsal-free continual learning.
+
+In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition,
+
+pp. 11909–11919.
+
+Cited by: §1,
+§2.1,
+§3.1,
+Table 1,
+§5.1.
+
+[41]
+X. Song, K. Shu, S. Dong, J. Cheng, X. Wei, and Y. Gong (2024)
+
+Overcoming catastrophic forgetting for multi-label class-incremental learning.
+
+In Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision,
+
+pp. 2389–2398.
+
+Cited by: §2.1.
+
+[42]
+H. Sun, D. Zhou, D. Zhan, and H. Ye (2025)
+
+PILOT: a pre-trained model-based continual learning toolbox.
+
+SCIENCE CHINA Information Sciences 68 (4), pp. 147101.
+
+External Links: Document
+
+Cited by: §5.1.
+
+[43]
+Y. Wang, D. Zhou, and H. Ye (2025)
+
+Integrating task-specific and universal adapters for pre-trained model-based class-incremental learning.
+
+In Proceedings of the IEEE/CVF International Conference on Computer Vision,
+
+pp. 806–816.
+
+Cited by: §2.1,
+§3.2,
+Table 1,
+§5.1,
+Table 2.
+
+[44]
+Z. Wang, Z. Zhang, S. Ebrahimi, R. Sun, H. Zhang, C. Lee, X. Ren, G. Su, V. Perot, J. Dy, et al. (2022)
+
+Dualprompt: complementary prompting for rehearsal-free continual learning.
+
+In European conference on computer vision,
+
+pp. 631–648.
+
+Cited by: §1,
+§2.1,
+Table 1,
+§5.1,
+Table 2.
+
+[45]
+Z. Wang, Z. Zhang, C. Lee, H. Zhang, R. Sun, X. Ren, G. Su, V. Perot, J. Dy, and T. Pfister (2022)
+
+Learning to prompt for continual learning.
+
+In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition,
+
+pp. 139–149.
+
+Cited by: §1,
+§2.1,
+§2.1,
+Table 1,
+§5.1,
+Table 2.
+
+[46]
+K. Wei, M. Yang, H. Wang, C. Deng, and X. Liu (2019)
+
+Adversarial fine-grained composition learning for unseen attribute-object recognition.
+
+In Proceedings of the IEEE/CVF International Conference on Computer Vision,
+
+pp. 3741–3749.
+
+Cited by: §1.
+
+[47]
+F. Wu, L. Cheng, S. Tang, X. Zhu, C. Fang, D. Zhang, and M. Wang (2025)
+
+Navigating semantic drift in task-agnostic class-incremental learning.
+
+In Forty-second International Conference on Machine Learning,
+
+Cited by: §4.4.
+
+[48]
+A. Yu and K. Grauman (2014)
+
+Fine-grained visual comparisons with local learning.
+
+In Proceedings of the IEEE conference on computer vision and pattern recognition,
+
+pp. 192–199.
+
+Cited by: §5.1.
+
+[49]
+L. Yu, B. Twardowski, X. Liu, L. Herranz, K. Wang, Y. Cheng, S. Jui, and J. v. d. Weijer (2020)
+
+Semantic drift compensation for class-incremental learning.
+
+In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition,
+
+pp. 6982–6991.
+
+Cited by: §1,
+§4.4.
+
+[50]
+T. Zhang, K. Liang, R. Du, X. Sun, Z. Ma, and J. Guo (2022)
+
+Learning invariant visual representations for compositional zero-shot learning.
+
+In European conference on computer vision,
+
+pp. 339–355.
+
+Cited by: §5.1.
+
+[51]
+Y. Zhang, S. Feng, and J. Yuan (2024)
+
+Continual compositional zero-shot learning.
+
+In Proceedings of the Thirty-Third International Joint Conference on Artificial Intelligence,
+
+IJCAI ’24.
+
+Cited by: §2.1.
+
+[52]
+Y. Zhang, B. Qiu, Q. Jia, Y. Liu, and R. He (2024)
+
+Not just object, but state: compositional incremental learning without forgetting.
+
+Advances in Neural Information Processing Systems 37, pp. 123182–123206.
+
+Cited by: §1,
+§2.1,
+§3.2,
+Table 1,
+Table 1,
+§5.1,
+§5.1,
+Table 2,
+Table 2.
+
+[53]
+D. Zhou, H. Sun, J. Ning, H. Ye, and D. Zhan (2024)
+
+Continual learning with pre-trained models: a survey.
+
+In IJCAI,
+
+pp. 8363–8371.
+
+Cited by: §2.1,
+§5.1.
+
+[54]
+D. Zhou, H. Sun, H. Ye, and D. Zhan (2024)
+
+Expandable subspace ensemble for pre-trained model-based class-incremental learning.
+
+In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition,
+
+pp. 23554–23564.
+
+Cited by: §1,
+§2.1,
+§3.1,
+§3.2,
+§3.2,
+§4.4,
+Table 1,
+§5.1,
+§5.1,
+Table 2.
+
+[55]
+D. Zhou, F. Wang, H. Ye, and D. Zhan (2023)
+
+PyCIL: a python toolbox for class-incremental learning.
+
+SCIENCE CHINA Information Sciences 66 (9), pp. 197101.
+
+External Links: Document
+
+Cited by: §5.1.
+
+[56]
+D. Zhou, Q. Wang, Z. Qi, H. Ye, D. Zhan, and Z. Liu (2024)
+
+Class-incremental learning: a survey.
+
+IEEE Transactions on Pattern Analysis and Machine Intelligence.
+
+Cited by: §2.1,
+§5.1.

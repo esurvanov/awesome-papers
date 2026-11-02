@@ -1,0 +1,1243 @@
+## MoDDiT: Simple Token Routing in Diffusion Transformers
+
+Jarek Liesen
+
+Affiliation: British Open-ended Learning and Discovery
+
+Correspondence to: jarek.liesen@reuben.ox.ac.uk
+
+Matthew T. Jackson
+
+Affiliation: British Open-ended Learning and Discovery
+
+Benjamin Ellis
+
+Affiliation: British Open-ended Learning and Discovery
+
+Shimon Whiteson
+
+Affiliation: British Open-ended Learning and Discovery
+
+Jakob N. Foerster
+
+Affiliation: British Open-ended Learning and Discovery
+
+Abstract
+
+Real-time video generation, interactive world models, and on-device image synthesis are almost a reality.
+Diffusion Transformers (DiT) achieve excellent sample quality, shifting the bottleneck to the throughput of the models themselves.
+Natural images are inherently sparse, as large portions of an image are often background, contribute little to the scene content, and are easy to denoise.
+DiTs fail to exploit this sparsity, as they process image tokens statically and uniformly.
+
+We propose MoDDiT, a simple architecture modification that learns to route tokens through both MLP and self-attention operations.
+By routing tokens through both blocks independently, MoDDiT allows for dynamic compute allocation in MLPs that varies across tokens, images, and denoising timesteps.
+Using MoDDiT to train image generation models from scratch significantly reduces computational costs of training and inference, processing as few as 12.5% of the tokens.
+By increasing sparsity and model depth, MoDDiT reduces costs and improves generation performance over unrouted baselines.
+The learned allocation is interpretable, revealing how computation varies with visual content and noise level.
+We also use MoDDiT to train video generation models, where allocation correlates with motion, and to distill a dense bidirectional video model into a sparse autoregressive student.
+
+††affiliationnotice: Equal contribution
+
+## 1 Introduction
+
+Recent advancements in real-time video generation, interactive world models, and on-device image synthesis promise numerous new applications for generative models, and a new frontier of synthetic data.
+Diffusion models are at the forefront of this progress but are bottlenecked by their iterative generation procedure, which requires multiple model evaluations to generate samples.
+The resulting latency is often reduced by distilling models into smaller students or subsampling diffusion timesteps.
+A complementary axis of improvement is given by architecture modifications that reduce the cost of each inference step of the denoising process.
+
+A promising route is exploiting sparsity, inspired by the observation that images and videos are information-sparse modalities where few patches per frame contain a large amount of information.
+For example, in many images the background is much simpler than the foreground and is therefore easier to denoise.
+This effect is magnified in videos, where patches containing static objects can be simply copied over from the previous frame.
+Ideally, diffusion would focus computation on more relevant patches, reducing overall latency.
+However, predominant diffusion architectures such as diffusion transformers (Peebles and Xie, 2023, DiT,) fail to exploit this property, instead applying all operations to every token, thereby allocating compute uniformly over images and videos.
+
+In this work, we introduce MoDDiT, a simple mechanism for routing tokens through both MLP and self-attention operations (section 3).
+While routing through self-attention uses fixed capacity, routing through MLPs enables dynamic compute allocation across tokens, images, and denoising timesteps (section 3.2).
+This allows the model to devote more computation to regions that are visually complex and difficult to denoise.
+
+Unlike prior methods, MoDDiT reduces FLOPs during both training and inference, requires no auxiliary routing loss or post-processing, and enables efficient training on parallel GPU hardware without ragged batches.
+As illustrated in fig. 1, the resulting allocation is interpretable, with computation varying across image regions, samples, and denoising timesteps.
+
+Figure 1: Image generation and learned compute allocation in MoDDiT for a red panda example. (a) Generated images along the denoising trajectory, from left to right. (b) Self-attention allocation. (c) MLP allocation. Patch brightness indicates the proportion of blocks applied to each token at the given timestep; the strips below the allocation panels show register-token allocation.
+
+We evaluate MoDDiT across three settings: image generation, video generation, and video distillation.
+On ImageNet (Deng et al., 2009) (section 4), MoDDiT improves the quality–compute tradeoff over vanilla DiT across a range of routing capacities and sampling lengths.
+For video generation, we evaluate on the 1X World Modeling Challenge (1X, 2025) (section 5), where routing at 12.5% capacity improves video-prediction PSNR while requiring 36.92% fewer counted denoiser FLOPs on the profiled clip than the DiT baseline.
+Finally, we integrate sparse feedforward routing into the distillation of pretrained Wan2.1 (Wan et al., 2025), converting a dense bidirectional model into a sparse, few-step autoregressive generator (section 6).
+Compared with a matched dense autoregressive student, the sparse model almost matches the dense baseline with a $5\%$ overall reduction in score on the VBench benchmark (Huang et al., 2023), while reducing inference FLOPs by $24\%$ .
+We further analyze the learned routing behavior (figs. 4 and 5), showing how computation varies with denoising stage, image and patch class, and temporal change in video.
+
+In summary, MoDDiT provides a simple, efficient mechanism for dynamic token routing, exploiting token-level sparsity in diffusion transformers. By increasing model size and sparsity, it can increase performance while reducing training- and inference-time FLOPs.
+We compare routing choices and ablations on ImageNet, and give intuitive explanations for allocation across image content and time steps. On 1X, we test action-conditioned video generation and show that learned allocation varies with temporal change. Distilling Wan2.1 tests whether MoDDiT can be combined with distillation and few-step denoising, where the reduction in inference FLOPs comes with a modest reduction in VBench score.
+
+## 2 Background
+
+## 2.1 Diffusion Models
+
+Diffusion models (Sohl-Dickstein et al., 2015; Ho et al., 2020; Dhariwal and Nichol, 2021) generate images by iteratively removing noise from samples drawn from a known noisy distribution. Specifically, they consist of two complementary Markov processes: a forward noising process and a reverse denoising process. In the forward process, an initial clean image $x_{0}$ is progressively corrupted into a purely noisy image $x_{T}$ across a discrete sequence of timesteps $t=1,\dots,T$ , following the Gaussian conditional distribution $q(x_{t}\mid x_{t-1})=\mathcal{N}(x_{t};\sqrt{1-\beta_{t}}\,x_{t-1},\beta_{t}I)$ , where $\beta_{t}\in(0,1)$ defines the noise schedule at timestep $t$ .
+Equivalently, this forward process can be expressed as $x_{t}=\sqrt{\bar{\alpha}_{t}}\,x_{0}+\sqrt{1-\bar{\alpha}_{t}}\,\epsilon$ , with $\epsilon\sim\mathcal{N}(0,I)$ and $\bar{\alpha}_{t}=\prod_{i=1}^{t}(1-\beta_{i})$ .
+The reverse process, parameterized by a neural network, gradually reconstructs the original clean image from $x_{T}$ to $x_{0}$ by approximating the conditional distributions $p_{\theta}(x_{t-1}\mid x_{t})=\mathcal{N}(x_{t-1};\mu_{\theta}(x_{t},t),\Sigma_{\theta}(x_{t},t))$ .
+Model training involves minimizing the discrepancy between the predicted and actual noise at each timestep, enabling accurate modeling of the underlying data distribution.
+
+## 2.2 Vision- and Diffusion Transformers
+
+Following their success in language modeling, transformers (Vaswani et al., 2017) have been successfully applied to vision tasks. Vision transformer (Dosovitskiy et al., 2020, ViT) achieves this by constructing a flattened token sequence from pixel patches. Similar to transformers, ViT models consist of alternating self-attention (Bahdanau et al., 2014) and multi-layer perceptron (MLP) blocks, with intermediate layer normalization (Ba et al., 2016). In these models, self-attention distributes information across the sample, in this case passing information between image patches, while the MLP processes tokens independently. Diffusion transformers (Peebles and Xie, 2023, DiT, ) adapt ViT models for image diffusion with adaptive layer normalization (adaLN), which conditions the normalization operation on the diffusion timestep and image class.
+
+In addition to image generation, DiTs are the predominant architecture for video generation.
+Here, bidirectional video models such as Wan2.1 (Wan et al., 2025), which generate entire videos at once without causal constraints, are at the forefront of generation quality.
+To accelerate inference and allow for long-horizon generation, they are often finetuned into autoregressive models with fewer denoising steps
+(Yin et al., 2025; Huang et al., 2025; Zhu et al., 2026).
+MoDDiT is independent of, and compatible with these techniques.
+
+Outside of diffusion, various extensions to ViT have been proposed. Darcet et al. (2023) analyse the attention map of ViT models and find attention sinks: low-information image patches with anomalously high attention weights that pool global information. Therefore, the authors propose register tokens with learned embedding values that are appended to the image sequence and discarded at the end of the forward pass.
+We extend our models to use register tokens to improve compute allocation, inspired by
+Darcet et al. (2023), who demonstrate that removing the attention sinks from the image improves the performance and alignment of saliency maps with semantic features.
+
+## 2.3 Mixture-of-Experts Models
+
+Mixture-of-experts (Shazeer et al., 2017; Fedus et al., 2022, MoE,) approaches improve transformer scaling by dividing the transformer’s MLP blocks into multiple expert MLPs, with each token typically routed to only a single expert, as determined by a routing module, a small MLP that computes scalar scores for each token-expert pair. These scores determine the assignment of tokens to experts via (potentially stochastic) top- $K$ selection.
+
+While earlier approaches directly optimize stochastic routing decisions to minimize the expected loss using REINFORCE-style objectives (Bengio et al., 2015), recent work instead uses learned gating functions as the router, using the gate as a heuristic proxy for expert utility (Shazeer et al., 2017).
+(Raposo et al., 2024) use such a routing mechanism for sparse token processing in language processing, and we propose combining it with dynamic MLP sparsity for image patches.
+
+## 3 Token Routing in Diffusion Transformers
+
+Figure 2: Token routing in MoDDiT. Top: self-attention uses fixed top- $K$ routing per sample, selecting two of four tokens at the illustrated 50% capacity. Bottom: MLP routing shares the training budget across samples, selecting three green tokens and one blue token. Colors denote samples; striped overlays show additive updates. Funnels gather selected tokens and scatter their updates back to the original positions. The router gates update ( $\times$ ) before residual addition ( $+$ ); unselected tokens retain their original values.
+
+MoDDiT combines a token bypass (Krause et al., 2025) with separate routing for attention and MLPs (Zhao et al., 2025; Zhao et al., 2026), allowing for dynamic allocation in MLPs without ragged batches (Shi et al., 2025; Yuan et al., 2025).
+
+## 3.1 Learning to Route Tokens
+
+At the core of our method is a simple routing mechanism (see fig. 2), similar to an MoE routing module as used in (Raposo et al., 2024; You et al., 2025).
+Each of our router blocks consists of a tiny, two-layer MLP $R_{\phi}$ applied independently to each token $t_{i}$ with $i\in{1,\dots,N}$ to compute a scalar routing logit $R_{\phi}(t_{i})$ .
+During training, we apply stochastic Gumbel top- $K$ (Jang et al., 2016; Kool et al., 2019) routing to encourage exploratory routing decisions.
+Specifically, for each token we sample $g_{i}\sim\mathrm{Gumbel}(0,1)$ and select the $K$ tokens with the highest perturbed score,
+
+ $\tilde{r}_{i}=R_{\phi}(t_{i})+\tau g_{i},$ 
+
+where $\tau$ is a temperature parameter. By annealing $\tau\to 0$ , we encourage exploration during early training while recovering increasingly deterministic top- $K$ routing from the unperturbed logits.
+
+As in MoE models, the router receives gradients by simultaneously acting as a gating mechanism.
+Similarly to Raposo et al. (2024), we multiply the output of the routed block for each token by its routing weight,
+
+ $r_{i}=\sigma(R_{\phi}(t_{i})).$ 
+
+(1)
+
+## 3.2 Dynamic Allocation in MLP Routing
+
+MLPs process each token independently, allowing for a simple way to introduce dynamic sparsity.
+
+During training, instead of selecting the top- $K$ tokens per sample, we can merge the batch and token dimensions and select the top-( $B\cdot K$ ) tokens across the whole batch on each GPU (Shi et al., 2025; Yuan et al., 2025).
+Since samples in each batch belong to different classes and diffusion steps, the model can learn to dynamically allocate compute based on image class and diffusion step (section 4).
+
+At inference, however, we might want to generate a single sample ( $B=1$ ). Selecting the top- $(1\cdot K)$ tokens would lose the dynamic allocation based on class and noise level, thereby introducing a distribution shift in the number of selected tokens.
+Instead, we can approximate the global top- $(B\cdot K)$ operation applied during training by tracking a logit threshold $T$ at training time, such that $p(R_{\phi}(t_{i})\geq T)=c$ .
+Here $c=K/N$ is the model capacity, i.e., the targeted fraction of tokens we route on average.
+We initialize at $T=0$ and update $T\leftarrow T+\alpha(\hat{r}-c)$ , where $\alpha$ is a learning rate and $\hat{r}$ is the fraction of tokens with a clean score $R_{\phi}(t_{i})\geq T$ .
+
+This differs from Expert Race (Yuan et al., 2025), which averages the cutoff value to the top- $K$ .
+
+## 3.3 Fixed-Capacity Routing for Self-Attention
+
+In self-attention, the number of tokens in an example determines the dimensions of its attention matrix.
+For efficient parallel processing on GPUs, all examples in the same batch must use attention matrices with the same dimensions.
+Therefore, we cannot simply give each example a different number of tokens, because this would produce differently sized matrices and prevent efficient vectorized computation.
+We subsequently route a fixed number of $K$ tokens for each example.
+
+Additionally, tokens have two distinct roles, each producing an output value and serving as context for other tokens to attend to.
+This opens up a design space for routing context (keys and values) and output (queries) independently, or routing based on relevance as context.
+We elaborate and show results for possible setups in section A.3.1, and find that the simple method in section 3.1 is among the best, so we select it for its simplicity.
+
+## 4 Results on ImageNet
+
+Experimental Setup
+
+We perform experiments on ImageNet (Deng et al., 2009), using the Face-blurred ILSVRC 2012–2017 variant (Yang et al., 2022) at $256\times 256$ resolution. We train all models from scratch for 1M steps using the DiT-L/2 configuration and all hyperparameters from Peebles and Xie (2023) without further tuning.
+This includes using the same pre-trained variational autoencoder (Kingma et al., 2013, VAE) from Stable Diffusion (Rombach et al., 2022), with an $8\times$ downsample factor.
+To make MoDDiT comparable in FLOPs with DiT, we construct MoDDiT by replacing alternate DiT blocks with two MoDDiT blocks, approximately matching DiT FLOPs for a 50% capacity model with the same configuration. For more details, see section A.1.
+
+Evaluation Metrics
+
+We evaluate the performance of image generation using standard evaluation metrics of generative models: Fréchet Inception Distance (Heusel et al., 2017, FID), spatial FID (Nash et al., 2021, sFID), Inception Score (Salimans et al., 2016, IS), and Precision/Recall (Kynkäänniemi et al., 2019), each using 50k samples.
+
+Results
+
+Figure 3 and section A.2 show the FLOPs-normalized performance of 50%, 25%, and 12.5% MoDDiT models, as well as a dense DiT baseline.
+The 50% MoDDiT model, which we constructed to match the baseline FLOPs, consistently outperforms the DiT baseline in FID, sFID, precision, and IS.
+Notably, the 25% model achieves better FID, sFID, and IS, at a 22% reduction in training and inference FLOPs.
+Furthermore, the 12.5% model is competitive with DiT on all metrics, despite using 33% less FLOPs.
+
+Ablations
+
+We experiment with multiple attention gating methods (see section 3.3), and present full results in section A.3.1. Our evaluations show that no method uniformly performs best. We thus settle for the simplest possible attention gating setup, as visualized in fig. 2. Furthermore, section A.3.2 shows that learned token routing substantially improves over random token selection, while independent routing does not uniformly beat coupled routing. Coupled routing has better FID, while the full method has better sFID.
+
+Figure 3: ImageNet performance—we report FID-50K, sFID-50K, and IS for samples generated with varying numbers of diffusion timesteps. Precision and recall evaluation is in section A.2.
+
+Compute Allocation over Noise Levels
+
+fig. 4 shows the compute allocation of samples over denoising steps, as well as the difference in diffusion loss of MoDDiT models with different capacity levels. Again, we show only the MLP routing proportion since the self-attention capacity is constant across samples. We see increased compute allocation at lower noise levels (smaller timesteps) for all models, as well as a greater difference in allocated capacity between models, validating the qualitative example in fig. 1. The difference in loss between MoDDiT models is roughly proportional to the difference in compute allocation between them, suggesting models spend their increased capacity at low noise levels to decrease loss.
+
+Compute Allocation over Classes
+
+We analyze compute allocation of MoDDiT models, and find that the variance within each image’s latent representation is a strong predictor of allocation (fig. 4).
+We hypothesize that classes with high-variance latent patches require more iterative refinement throughout the whole denoising process, for example, to update boundaries and relationships to surrounding patches.
+A uniform patch’s representation contains relatively less information, so additional computation adds little bonus.
+We find that lower-capacity models have weaker correlation, full results can be found in fig. 8.
+
+Figure 4: MoDDiT compute allocation increases at lower noise levels, and shows a preference towards classes with higher clean latent variance.
+
+## 5 Results on 1X
+
+Experimental Setup
+
+We use the raw video dataset from the 1X World Modeling Challenge (1X, 2025), containing approximately 100 hours of humanoid robot POV video at 30 frames per second and $512\times 512$ resolution, as well as continuous controller actions for the robot at every frame. To embed these videos for latent diffusion, we use the pre-trained Cosmos Tokenizer (NVIDIA, 2025), selecting the continuous variant with an $8\times$ spatial and temporal downsample factor. This embeds 8 contiguous video frames with dimension $8\times 512\times 512\times 3$ into a latent frame with dimension $1\times 64\times 64\times 16$ .
+During training, we condition models on two latent context frames, equivalent to 16 image frames, as well as the next 8 robot actions (corresponding to 1 latent frame). We train models to denoise the next latent frame conditioned on this context, and autoregressively sample latent frames during evaluation.
+
+In order to support efficient training on video data, we also introduce spatio-temporal (ST) variants of DiT and MoDDiT, ST-DiT and ST-MoDDiT. These separate the self-attention operation into separate spatial and temporal attention operations, in which tokens attend to other tokens in the same frame or other tokens in the same position in previous frames, respectively. We compare ST-DiT and ST-MoDDiT using the DiT-L/2 configuration at 200,000 optimizer updates (section B.1).
+
+Results
+
+We evaluate the 200k EMA checkpoints on 400 paired validation clips, measuring PSNR at $0.5$ , $1.0$ and $2.0$ seconds after the observed context (table 1). ST-MoDDiT at 12.5% capacity improves PSNR by $0.677$ , $0.376$ and $0.213$  dB, respectively; all three pointwise 95% paired segment-bootstrap confidence intervals exclude zero. It uses 36.92% fewer counted denoiser FLOPs on the profiled clip. Sparse and dense models use training batches of 256 and 217, respectively, so equal optimizer-update counts do not imply equal training-data exposure.
+
+Table 1: 1X video prediction at 200k EMA checkpoints on 400 paired validation clips from 249 segments. The final two rows give sparse-minus-dense deltas and their pointwise 95% paired segment-bootstrap confidence intervals for PSNR gains. Denoiser TFLOPs cover the first clip’s full rollout, including both guidance branches (section B.1). Deltas are calculated before rounding.
+
+Model
+Parameters
+Denoiser
+PSNR (dB) $\uparrow$ 
+
+(M)
+(TFLOPs) $\downarrow$ 
++0.5s
++1.0s
++2.0s
+
+ST-DiT
+651.2
+7,746.3
+24.8
+22.6
+21.0
+
+ST-MoDDiT (12.5%)
+942.7
+4,886.4
+25.4
+23.0
+21.2
+
+ $\Delta$ (ST-MoDDiT $-$ ST-DiT)
++291.5
+ $-$ 2,859.8
+ $+$ 0.68
+ $+$ 0.38
+ $+$ 0.21
+
+95% CI
+
+[0.486, 0.871]
+[0.229, 0.515]
+[0.075, 0.344]
+
+Compute Allocation over Temporal Pixel Difference
+
+Video generation models are conditioned on previous frames, making it trivial to denoise future tokens corresponding to static objects; they can just be copied over. We therefore hypothesise that dynamic objects with high optical flow should benefit from increased compute allocation in MoDDiT models. To evaluate this, we measure the allocation percentage and absolute pixel difference in 8 consecutive frames (corresponding to the temporal downsampling factor of the video tokenizer). We visualise the result in fig. 5, which shows a strong positive correlation between a token’s frame difference and allocation frequency, confirming that MoDDiT uses more FLOPs to generate frames with many dynamic objects (section B.2).
+
+Figure 5: Compute allocation is strongly correlated with video motion—we show mean routing percentage for binned values of patch difference (clipped at the 99 ${}^{\text{th}}$ percentile). Patch difference is computed as the magnitude of the difference between generated patches in adjacent frames, and the model is trained on the 1X World Modeling Dataset, with a capacity of 12.5%.
+
+## 6 Sparse Distillation with Self-Forcing
+
+Experimental Setup
+
+We investigate the distillation of pretrained Wan2.1-T2V-14B (Wan et al., 2025) into a sparse, autoregressive few-step student initialized from Wan2.1-T2V-1.3B, following Self Forcing (Huang et al., 2025).
+Our student retains the native 30-block architecture and generates 81-frame videos at $832\times 480$ resolution, processing chunks of three latent frames with four denoising steps per chunk.
+
+We apply MoDDiT routing to MLP sublayers and self-attention queries, retaining dense keys, values, and text cross-attention.
+We found that decreasing capacity throughout the model’s blocks helped preserve both global structure and fine details; see section C.1.
+We train two models, Funnel50 and Funnel20, which respectively decrease each block’s capacity from 100% to 50% and 20%.
+Both models use sparse attention and MLP routing.
+To control stochastic exploration, we adapt the routing-noise temperature to attain a target replacement rate within the top- $K$ .
+The student weights and routers are jointly optimized.
+We gradually introduce sparsity during adaptation and use straight-through router gates to preserve the scale of pretrained updates.
+Training uses AdamW with gradient accumulation to obtain an effective batch size of 64.
+More details can be found in section C.1.
+
+Results
+
+Funnel20
+Funnel50
+Self-Forcing
+
+VBench Total $\uparrow$ 
+77.69
+78.03
+82.07
+
+VBench Quality $\uparrow$ 
+81.07
+81.15
+84.89
+
+VBench Semantic $\uparrow$ 
+64.14
+65.54
+70.82
+
+Motion dynamic $\uparrow$ 
+75
+75
+82
+
+Instruction following $\uparrow$ 
+98
+100
+98
+
+Transformer TFLOPs $\downarrow$ 
+722.53
+789.93
+950.39
+
+FLOP reduction $\uparrow$ 
+23.98%
+16.88%
+0%
+
+Figure 6: Results of distilling a MoDDiT model on the VBench benchmark, as well as qualitative results compared to the dense baseline (section C.2).
+
+We find that sparse MoDDiT models perform similarly to the dense Self Forcing baseline on the VBench benchmark, with modest reductions in most evaluation categories.
+The sparse models struggle particularly in generating spatial relations and multiple objects, which require compute to be distributed across the image.
+Overall, MoDDiT achieves a total VBench score that is $5.35\%$ lower than the dense baseline, at a $23.98\%$ reduction in transformer FLOPs (section C.2).
+
+## 7 Related Work
+
+Transformers have become the predominant architecture for flow-based generative modeling, in both image generation with models such as DiT (Peebles and Xie, 2023), DALL-E 3 (Goh et al., 2023), and Latte (Ma et al., 2024), as well as video generation in GAIA-2 (Russell et al., 2025), Genie 2 (Parker-Holder et al., 2024), Mochi (GenmoAI, 2024), Sora (Brooks et al., 2024), MovieGen (Polyak et al., 2024), and Wan2.1 (Wan et al., 2025). This paradigm naturally invites adaptive compute allocation, since denoising difficulty varies across noise levels and spatio-temporal regions. Furthermore, many of the downstream applications of these models, such as large-scale image generation and real-time video generation, have strict constraints on latency that require fast inference. Despite this, adaptive computation techniques have not yet been adopted in state-of-the-art models.
+
+However, interest in this research area has recently increased.
+Wang et al. (2024) learn sparsity masks for pre-trained diffusion models without content-dependent selection, while Xi et al. (2025) use online profiling to sparsify spatial-temporal attention connections while retaining all tokens.
+Token compression methods reduce the sequence length through token merging in ToMeSD (Bolya and Hoffman, 2023).
+ToCa (Zou et al., 2025) and RAS (Liu et al., 2026) reuse computation across denoising timesteps through cached token features and noise predictions for inactive regions, respectively.
+DiffCR (You et al., 2025) routes tokens through or around whole transformer blocks and learns layer- and timestep-specific capacities with an auxiliary budget loss, evaluated by fine-tuning pretrained diffusion models.
+
+More closely related, DyDiT (Zhao et al., 2025) and DyDiT++ (Zhao et al., 2026) combine timestep-conditioned width reduction with content-dependent token bypass in MLP blocks, using an auxiliary loss to control overall FLOPs.
+They require full self-attention during training, so sparsity is only introduced in inference.
+TREAD (Krause et al., 2025) accelerates training by randomly selecting tokens to bypass sequences of transformer blocks, while retaining dense computation at inference.
+Our method learns separate token routers for attention and MLP blocks jointly with the diffusion model from scratch, without auxiliary losses, while preserving tensor shapes for efficient batch inference with per-sample flexibility in the MLP blocks.
+
+Mixture-of-experts mechanisms (Shazeer et al., 2017; Fedus et al., 2022, MoE) allocate computation by routing tokens among multiple MLP experts, as in EC-DiT (Sun et al., 2025).
+DiffMoE (Shi et al., 2025) pools tokens across examples and learns a capacity predictor for adaptive inference; Expert Race (Yuan et al., 2025) combines global token–expert competition with tracked-threshold inference.
+MoDDiT shares these allocation principles but applies them to a single MLP branch, combines them with independently routed sparse attention, and trains the model from scratch without a separately supervised capacity predictor or auxiliary routing objectives.
+
+Outside of diffusion modeling, adaptive computation has become increasingly prevalent in transformer models, in order to allocate resources efficiently based on input complexity.
+Xin et al. (2020) propose a language model architecture with adaptive depth via an early exiting mechanism.
+Inspiring this work, mixture-of-depths (Raposo et al., 2024) uses a routing mechanism to limit the capacity of transformer layers in autoregressive language models. While this method shows improvements in the FLOPs-normalized performance frontier of such models, we find diffusion to be an even more suitable paradigm for this architecture, as the models avoid causal structure interfering with the top- $K$ operation.
+
+## 8 Conclusion
+
+Summary
+
+MoDDiT represents a significant advancement in efficient generative modeling, effectively addressing a computational inefficiency inherent in existing diffusion models by dynamically allocating compute across tokens, samples, and noise levels. By employing a minimal yet powerful routing mechanism, MoDDiT demonstrates considerable performance improvements at the same level of compute, on both image and video generation tasks. Our evaluation also provides an intuitive understanding of the learned routing mechanism, highlighting MoDDiT’s capability to align computational effort with semantic importance and temporal dynamics. Our work thus provides a step towards unlocking generative modeling in latency- and hardware-constrained settings and offers insights into the distribution of computational resources within diffusion models.
+
+Limitations and Future Work
+
+While our work provides an extensive evaluation, it is ultimately limited by our computational resources, providing the opportunity for further evaluation with alternate datasets, architectures, and generative algorithms.
+Namely, image generation datasets such as ArtBench (Liao et al., 2022) and Food (Bossard et al., 2014), as well as video generation datasets such as Taichi-HD (Siarohin et al., 2019) and Minecraft VPT (Baker et al., 2022), would strengthen confidence in the performance of MoDDiT.
+
+While MoDDiT can substantially reduce training and inference FLOPs, this reduction does not automatically translate into wall clock time savings.
+Even though we observe throughput gains at larger batch sizes 11
+ 1
+
+ At batch size 32, we measure 1.64 images/sec for a 50% MoDDiT model, vs. 1.55 images/sec for a DiT., generating few images in parallel is slower.
+This is likely due to a combination of the additional overhead of the gather and scatter operations, and the fact that dense matrix multiplication is already highly optimized itself.
+Future work can explore the development of optimized kernels for sparse MoDDiT blocks, which have proven to lead to significant performance increases for attention blocks (Dao, 2024).
+
+Finally, MoDDiT introduces a capacity hyperparameter for the MLP and self-attention blocks, providing a range of promising avenues for further investigation. While our method avoids auxiliary losses, the addition of such a loss could enable automatic tuning of this capacity, with a regularization penalty against high compute budgets. Furthermore, we use the same capacity for both MLP and self-attention blocks. Visual inspection suggests that they have distinct allocation dynamics (fig. 1), meaning their optimal capacities likely differ and should be investigated.
+
+## Contributions
+
+JL and MJ co-led the project. MJ developed and implemented the initial method, ran experiments on ImageNet and 1X, and wrote the first version of the paper (May 2025). JL ran extensive ablations, modified and extended the method, added experiments including sparse distillation, and polished the manuscript. JF, SW, and BE co-supervised the project.
+
+## References
+
+1X (2025)
+1X
+
+1X world model challenge raw dataset.
+
+ Hugging Face.
+
+Note: CC BY-NC-SA 4.0 license
+
+External Links: Link
+
+Cited by: §B.1,
+§1,
+§5.
+
+Ba et al. (2016)
+J. L. Ba, J. R. Kiros, and G. E. Hinton
+
+Layer normalization.
+
+arXiv preprint arXiv:1607.06450.
+
+Cited by: §2.2.
+
+Bahdanau et al. (2014)
+D. Bahdanau, K. Cho, and Y. Bengio
+
+Neural machine translation by jointly learning to align and translate.
+
+arXiv preprint arXiv:1409.0473.
+
+Cited by: §2.2.
+
+Baker et al. (2022)
+B. Baker, I. Akkaya, P. Zhokov, J. Huizinga, J. Tang, A. Ecoffet, B. Houghton, R. Sampedro, and J. Clune
+
+Video pretraining (vpt): learning to act by watching unlabeled online videos.
+
+Advances in Neural Information Processing Systems 35, pp. 24639–24654.
+
+Cited by: §8.
+
+Bengio et al. (2015)
+E. Bengio, P. Bacon, J. Pineau, and D. Precup
+
+Conditional computation in neural networks for faster models.
+
+CoRR abs/1511.06297.
+
+External Links: Link,
+1511.06297
+
+Cited by: §2.3.
+
+Bolya and Hoffman (2023)
+D. Bolya and J. Hoffman
+
+Token merging for fast stable diffusion.
+
+External Links: 2303.17604,
+Link
+
+Cited by: §7.
+
+Bossard et al. (2014)
+L. Bossard, M. Guillaumin, and L. Van Gool
+
+Food-101–mining discriminative components with random forests.
+
+In Computer vision–ECCV 2014: 13th European conference, zurich, Switzerland, September 6-12, 2014, proceedings, part VI 13,
+
+pp. 446–461.
+
+Cited by: §8.
+
+Brooks et al. (2024)
+T. Brooks, B. Peebles, C. Holmes, W. DePue, Y. Guo, L. Jing, D. Schnurr, J. Taylor, T. Luhman, E. Luhman, C. W. Y. Ng, R. Wang, and A. Ramesh
+
+Video generation models as world simulators.
+
+Note: OpenAI technical report
+
+Cited by: §7.
+
+Dao (2024)
+T. Dao
+
+FlashAttention-2: faster attention with better parallelism and work partitioning.
+
+In International Conference on Learning Representations (ICLR),
+
+Cited by: §8.
+
+Darcet et al. (2023)
+T. Darcet, M. Oquab, J. Mairal, and P. Bojanowski
+
+Vision transformers need registers.
+
+arXiv preprint arXiv:2309.16588.
+
+Cited by: §A.1,
+§2.2.
+
+Deng et al. (2009)
+J. Deng, W. Dong, R. Socher, L. Li, K. Li, and L. Fei-Fei
+
+ImageNet: a large-scale hierarchical image database.
+
+In 2009 IEEE Conference on Computer Vision and Pattern Recognition,
+
+Vol. , pp. 248–255.
+
+External Links: Document
+
+Cited by: §A.1,
+§1,
+§4.
+
+Dhariwal and Nichol (2021)
+P. Dhariwal and A. Nichol
+
+Diffusion models beat gans on image synthesis.
+
+Advances in neural information processing systems 34, pp. 8780–8794.
+
+Cited by: §2.1.
+
+Dosovitskiy et al. (2020)
+A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly, et al.
+
+An image is worth 16x16 words: transformers for image recognition at scale.
+
+arXiv preprint arXiv:2010.11929.
+
+Cited by: §2.2.
+
+Fedus et al. (2022)
+W. Fedus, B. Zoph, and N. Shazeer
+
+Switch transformers: scaling to trillion parameter models with simple and efficient sparsity.
+
+Journal of Machine Learning Research 23 (120), pp. 1–39.
+
+Cited by: §2.3,
+§7.
+
+GenmoAI (2024)
+GenmoAI
+
+Mochi: asymmetric diffusion transformer for video generation.
+
+External Links: Link
+
+Cited by: §7.
+
+Goh et al. (2023)
+G. Goh, J. Betker, L. Jing, A. Ramesh, T. Brooks, J. Wang, L. Li, L. Ouyang, J. Zhuang, J. Lee, P. Dhariwal, C. Chu, and J. Jiao
+
+DALL-E 3.
+
+Note: OpenAI Technical Report
+
+External Links: Link
+
+Cited by: §7.
+
+Heusel et al. (2017)
+M. Heusel, H. Ramsauer, T. Unterthiner, B. Nessler, and S. Hochreiter
+
+Gans trained by a two time-scale update rule converge to a local nash equilibrium.
+
+Advances in neural information processing systems 30.
+
+Cited by: §4.
+
+Ho et al. (2020)
+J. Ho, A. Jain, and P. Abbeel
+
+Denoising diffusion probabilistic models.
+
+Advances in neural information processing systems 33, pp. 6840–6851.
+
+Cited by: §2.1.
+
+Huang et al. (2025)
+X. Huang, Z. Li, G. He, M. Zhou, and E. Shechtman
+
+Self forcing: bridging the train-test gap in autoregressive video diffusion.
+
+External Links: 2506.08009,
+Link
+
+Cited by: §C.1,
+§2.2,
+§6.
+
+Huang et al. (2023)
+Z. Huang, Y. He, J. Yu, F. Zhang, C. Si, Y. Jiang, Y. Zhang, T. Wu, Q. Jin, N. Chanpaisit, Y. Wang, X. Chen, L. Wang, D. Lin, Y. Qiao, and Z. Liu
+
+VBench: comprehensive benchmark suite for video generative models.
+
+External Links: 2311.17982,
+Link
+
+Cited by: §C.2,
+§1.
+
+Jang et al. (2016)
+E. Jang, S. Gu, and B. Poole
+
+Categorical reparameterization with gumbel-softmax.
+
+arXiv preprint arXiv:1611.01144.
+
+Cited by: §3.1.
+
+Kingma et al. (2013)
+D. P. Kingma M. Welling et al.
+
+Auto-encoding variational bayes.
+
+ Banff, Canada.
+
+Cited by: §A.1,
+§4.
+
+Kool et al. (2019)
+W. Kool, H. Van Hoof, and M. Welling
+
+Stochastic beams and where to find them: the Gumbel-top-k trick for sampling sequences without replacement.
+
+In Proceedings of the 36th International Conference on Machine Learning, K. Chaudhuri and R. Salakhutdinov (Eds.),
+
+Proceedings of Machine Learning Research, Vol. 97, pp. 3499–3508.
+
+External Links: Link
+
+Cited by: §3.1.
+
+Krause et al. (2025)
+F. Krause, T. Phan, M. Gui, S. A. Baumann, V. T. Hu, and B. Ommer
+
+TREAD: token routing for efficient architecture-agnostic diffusion training.
+
+External Links: 2501.04765,
+Link
+
+Cited by: §3,
+§7.
+
+Kynkäänniemi et al. (2019)
+T. Kynkäänniemi, T. Karras, S. Laine, J. Lehtinen, and T. Aila
+
+Improved precision and recall metric for assessing generative models.
+
+Advances in neural information processing systems 32.
+
+Cited by: §4.
+
+Liao et al. (2022)
+P. Liao, X. Li, X. Liu, and K. Keutzer
+
+The artbench dataset: benchmarking generative models with artworks.
+
+arXiv preprint arXiv:2206.11404.
+
+Cited by: §8.
+
+Liu et al. (2026)
+Z. Liu, Y. Yang, C. Zhang, Y. Zhang, L. Qiu, Y. You, and Y. Yang
+
+Region-adaptive sampling for diffusion transformers.
+
+External Links: 2502.10389,
+Link
+
+Cited by: §7.
+
+Ma et al. (2024)
+X. Ma, Y. Wang, G. Jia, X. Chen, Z. Liu, Y. Li, C. Chen, and Y. Qiao
+
+Latte: latent diffusion transformer for video generation.
+
+arXiv preprint arXiv:2401.03048.
+
+Cited by: §7.
+
+Nash et al. (2021)
+C. Nash, J. Menick, S. Dieleman, and P. W. Battaglia
+
+Generating images with sparse representations.
+
+arXiv preprint arXiv:2103.03841.
+
+Cited by: §4.
+
+NVIDIA (2025)
+NVIDIA
+
+Cosmos world foundation model platform for physical ai.
+
+arXiv preprint arXiv:2501.03575.
+
+Cited by: §B.1,
+§5.
+
+Parker-Holder et al. (2024)
+J. Parker-Holder, P. Ball, J. Bruce, V. Dasagi, K. Holsheimer, C. Kaplanis, A. Moufarek, G. Scully, J. Shar, J. Shi, S. Spencer, J. Yung, M. Dennis, S. Kenjeyev, S. Long, V. Mnih, H. Chan, M. Gazeau, B. Li, F. Pardo, L. Wang, L. Zhang, F. Besse, T. Harley, A. Mitenkova, J. Wang, J. Clune, D. Hassabis, R. Hadsell, A. Bolton, S. Singh, and T. Rocktäschel
+
+Genie 2: a large-scale foundation world model.
+
+Note: Google DeepMind Blog
+
+External Links: Link
+
+Cited by: §7.
+
+Peebles and Xie (2023)
+W. Peebles and S. Xie
+
+Scalable diffusion models with transformers.
+
+In Proceedings of the IEEE/CVF international conference on computer vision,
+
+pp. 4195–4205.
+
+Cited by: §A.1,
+§A.1,
+§1,
+§2.2,
+§4,
+§7.
+
+Polyak et al. (2024)
+A. Polyak, A. Zohar, A. Brown, A. Tjandra, A. Sinha, A. Lee, A. Vyas, B. Shi, C. Ma, C. Chuang, et al.
+
+Movie gen: a cast of media foundation models.
+
+arXiv preprint arXiv:2410.13720.
+
+Cited by: §7.
+
+Raposo et al. (2024)
+D. Raposo, S. Ritter, B. Richards, T. Lillicrap, P. C. Humphreys, and A. Santoro
+
+Mixture-of-depths: dynamically allocating compute in transformer-based language models.
+
+arXiv preprint arXiv:2404.02258.
+
+Cited by: §2.3,
+§3.1,
+§3.1,
+§7.
+
+Rombach et al. (2022)
+R. Rombach, A. Blattmann, D. Lorenz, P. Esser, and B. Ommer
+
+High-resolution image synthesis with latent diffusion models.
+
+In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition,
+
+pp. 10684–10695.
+
+Cited by: §A.1,
+§4.
+
+Russell et al. (2025)
+L. Russell, A. Hu, L. Bertoni, G. Fedoseev, J. Shotton, E. Arani, and G. Corrado
+
+GAIA-2: a controllable multi-view generative world model for autonomous driving.
+
+arXiv preprint arXiv:2503.20523.
+
+Cited by: §B.1,
+§7.
+
+Salimans et al. (2016)
+T. Salimans, I. Goodfellow, W. Zaremba, V. Cheung, A. Radford, and X. Chen
+
+Improved techniques for training gans.
+
+Advances in neural information processing systems 29.
+
+Cited by: §4.
+
+Shazeer et al. (2017)
+N. Shazeer, A. Mirhoseini, K. Maziarz, A. Davis, Q. Le, G. Hinton, and J. Dean
+
+Outrageously large neural networks: the sparsely-gated mixture-of-experts layer.
+
+arXiv preprint arXiv:1701.06538.
+
+Cited by: §2.3,
+§2.3,
+§7.
+
+Shi et al. (2025)
+M. Shi, Z. Yuan, H. Yang, X. Wang, M. Zheng, X. Tao, W. Zhao, W. Zheng, J. Zhou, J. Lu, P. Wan, D. Zhang, and K. Gai
+
+DiffMoE: dynamic token selection for scalable diffusion transformers.
+
+arXiv preprint arXiv:2503.14487.
+
+Cited by: §3.2,
+§3,
+§7.
+
+Siarohin et al. (2019)
+A. Siarohin, S. Lathuilière, S. Tulyakov, E. Ricci, and N. Sebe
+
+First order motion model for image animation.
+
+Advances in neural information processing systems 32.
+
+Cited by: §8.
+
+Sohl-Dickstein et al. (2015)
+J. Sohl-Dickstein, E. Weiss, N. Maheswaranathan, and S. Ganguli
+
+Deep unsupervised learning using nonequilibrium thermodynamics.
+
+In International conference on machine learning,
+
+pp. 2256–2265.
+
+Cited by: §2.1.
+
+Sun et al. (2025)
+H. Sun, T. Lei, B. Zhang, Y. Li, H. Huang, R. Pang, B. Dai, and N. Du
+
+EC-dit: scaling diffusion transformers with adaptive expert-choice routing.
+
+External Links: 2410.02098,
+Link
+
+Cited by: §7.
+
+Vaswani et al. (2017)
+A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, Ł. Kaiser, and I. Polosukhin
+
+Attention is all you need.
+
+Advances in neural information processing systems 30.
+
+Cited by: §2.2.
+
+Wan et al. (2025)
+T. Wan, A. Wang, B. Ai, B. Wen, C. Mao, C. Xie, D. Chen, F. Yu, H. Zhao, J. Yang, J. Zeng, J. Wang, J. Zhang, J. Zhou, J. Wang, J. Chen, K. Zhu, K. Zhao, K. Yan, L. Huang, M. Feng, N. Zhang, P. Li, P. Wu, R. Chu, R. Feng, S. Zhang, S. Sun, T. Fang, T. Wang, T. Gui, T. Weng, T. Shen, W. Lin, W. Wang, W. Wang, W. Zhou, W. Wang, W. Shen, W. Yu, X. Shi, X. Huang, X. Xu, Y. Kou, Y. Lv, Y. Li, Y. Liu, Y. Wang, Y. Zhang, Y. Huang, Y. Li, Y. Wu, Y. Liu, Y. Pan, Y. Zheng, Y. Hong, Y. Shi, Y. Feng, Z. Jiang, Z. Han, Z. Wu, and Z. Liu
+
+Wan: open and advanced large-scale video generative models.
+
+arXiv preprint arXiv:2503.20314.
+
+Cited by: §1,
+§2.2,
+§6,
+§7.
+
+Wang et al. (2024)
+K. Wang, J. Chen, H. Li, Z. Mi, and J. Zhu
+
+SparseDM: toward sparse efficient diffusion models.
+
+arXiv preprint arXiv:2404.10445.
+
+Cited by: §7.
+
+Xi et al. (2025)
+H. Xi, S. Yang, Y. Zhao, C. Xu, M. Li, X. Li, Y. Lin, H. Cai, J. Zhang, D. Li, J. Chen, I. Stoica, K. Keutzer, and S. Han
+
+Sparse videogen: accelerating video diffusion transformers with spatial-temporal sparsity.
+
+arXiv preprint arXiv:2502.01776.
+
+Cited by: §7.
+
+Xin et al. (2020)
+J. Xin, R. Tang, J. Lee, Y. Yu, and J. Lin
+
+DeeBERT: dynamic early exiting for accelerating bert inference.
+
+In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics (ACL),
+
+pp. 2246–2251.
+
+Cited by: §7.
+
+Yang et al. (2022)
+K. Yang, J. H. Yau, L. Fei-Fei, J. Deng, and O. Russakovsky
+
+A study of face obfuscation in imagenet.
+
+In International conference on machine learning,
+
+pp. 25313–25330.
+
+Cited by: §A.1,
+§4.
+
+Yin et al. (2025)
+T. Yin, Q. Zhang, R. Zhang, W. T. Freeman, F. Durand, E. Shechtman, and X. Huang
+
+From slow bidirectional to fast autoregressive video diffusion models.
+
+External Links: 2412.07772,
+Link
+
+Cited by: §2.2.
+
+You et al. (2025)
+H. You, C. Barnes, Y. Zhou, Y. Kang, Z. Du, W. Zhou, L. Zhang, Y. Nitzan, X. Liu, Z. Lin, E. Shechtman, S. Amirghodsi, and Y. C. Lin
+
+Layer- and timestep-adaptive differentiable token compression ratios for efficient diffusion transformers.
+
+External Links: 2412.16822,
+Link
+
+Cited by: §3.1,
+§7.
+
+Yuan et al. (2025)
+Y. Yuan, Z. Wang, Z. Huang, D. Zhu, X. Zhou, J. Yu, and Q. Min
+
+Expert race: a flexible routing strategy for scaling diffusion transformer with mixture of experts.
+
+External Links: 2503.16057,
+Link
+
+Cited by: §3.2,
+§3.2,
+§3,
+§7.
+
+Zhao et al. (2026)
+W. Zhao, Y. Han, J. Tang, K. Wang, H. Luo, Y. Song, G. Huang, F. Wang, and Y. You
+
+DyDiT++: diffusion transformers with timestep and spatial dynamics for efficient visual generation.
+
+External Links: 2504.06803,
+Link
+
+Cited by: §3,
+§7.
+
+Zhao et al. (2025)
+W. Zhao, Y. Han, J. Tang, K. Wang, Y. Song, G. Huang, F. Wang, and Y. You
+
+Dynamic diffusion transformer.
+
+In International Conference on Learning Representations (ICLR),
+
+Cited by: §3,
+§7.
+
+Zhu et al. (2026)
+H. Zhu, M. Zhao, G. He, H. Su, C. Li, and J. Zhu
+
+Causal forcing: autoregressive diffusion distillation done right for high-quality real-time interactive video generation.
+
+External Links: 2602.02214,
+Link
+
+Cited by: §2.2.
+
+Zou et al. (2025)
+C. Zou, X. Liu, T. Liu, S. Huang, and L. Zhang
+
+Accelerating diffusion transformers with token-wise feature caching.
+
+External Links: 2410.05317,
+Link
+
+Cited by: §7.
+
+## Appendix A ImageNet experiments
+
+## A.1 Training and evaluation
+
+Dataset
+
+We perform experiments on ImageNet (Deng et al., 2009), using the Face-blurred ILSVRC 2012–2017 variant (Yang et al., 2022) at $256\times 256$ resolution.
+
+Model Architecture
+
+We train latent diffusion models using the pre-trained variational autoencoder (Kingma et al., 2013, VAE) from Stable Diffusion (Rombach et al., 2022), with an $8\times$ downsample factor, giving a latent embedding with dimensions $32\times 32\times 4$ .
+Our baseline is the DiT-L/2 architecture from Peebles and Xie (2023).
+To make MoDDiT comparable in FLOPs with DiT, we construct MoDDiT by replacing alternate DiT blocks with two MoDDiT blocks, approximately matching DiT FLOPs for a 50% capacity model with the same configuration.
+Finally, MoDDiT models append every latent image with 16 register tokens (Darcet et al., 2023), as we found this to help with aligning allocation masks with semantic features, giving a total embedding length of 272.
+We initialize the final router layer at zero, such that the output is constant $0.5$ .
+We use a cosine decay for router Gumbel noise, decaying from $5$ to $0$ over training.
+
+Training
+
+We train all models from scratch for 1M steps (requiring approximately 6 days on $4$ L40S GPUs) using hyperparameters from Peebles and Xie (2023) without further tuning.
+This includes using a global batch size of 256 with AdamW using a learning rate of $10^{-4}$ , $\beta=(0.9,0.999)$ , and no weight decay.
+We use an EMA value of $0.9999$ throughout training.
+
+Evaluation
+
+We evaluate all models using $50,000$ generated images at $64,128,256,$ and $512$ denoising steps and a classifier-free guidance scale of $1.5$ . We measure FLOPs on the first 1024 generated images, including both classifier-free guidance branches, excluding the VAE decoder.
+
+## A.2 Additional results
+
+Figure 7: ImageNet performance.
+
+Table 2: Evaluation at 512 DDPM steps with CFG scale 1.5.
+Quality metrics use 50,000 images; compute estimates average
+1,024 images and includes both CFG branches.
+
+Model
+TFLOPs/image
+FID $\downarrow$ 
+sFID $\downarrow$ 
+IS $\uparrow$ 
+Precision $\uparrow$ 
+Recall $\uparrow$ 
+
+DiT-L/2
+165.380
+5.069
+4.714
+208.861
+0.834
+0.488
+
+MoDDiT (50%)
+170.316
+4.390
+4.649
+233.120
+0.834
+0.505
+
+MoDDiT (25%)
+129.888
+4.795
+4.790
+212.914
+0.820
+0.510
+
+MoDDiT (12.5%)
+109.783
+5.081
+4.889
+202.856
+0.809
+0.516
+
+Figure 8: Allocation is consistently correlated with mean latent variance of each class, and the correlation becomes smaller for smaller capacities.
+
+## A.3 Routing design studies
+
+## A.3.1 Attention-routing alternatives
+
+Gating values serve as a proxy for token selection.
+But what form of gating produces the most useful proxy?
+Multiplying the attention output by the router score incentivises retaining tokens whose outputs reduce loss.
+However, there is no incentive to increase the scores of tokens that serve as useful context for others to attend to.
+To provide such a signal, we may additionally gate the attention values using the routing scores.
+Let $A=\operatorname{softmax}(QK^{T}/\sqrt{d})$ and $R=\operatorname{diag}(r)$ . While standard output gating computes $R\operatorname{attn}(x)=RAV$ , additionally gating the attention value yields
+
+ $RARV=(rr^{\top}\odot A)V\quad\text{where}\quad(rr^{\top}\odot A)_{ij}=r_{i}a_{ij}r_{j}.$ 
+
+This formulation introduces complementary incentives to increase the score $R_{\phi}(t_{i})$ of a token $t_{i}$ :
+
+• 
+
+Output gating: Does $t_{i}$ reduce downstream loss by attending to other tokens?
+
+• 
+
+Value gating: Do other tokens decrease downstream loss by attending to $t_{i}$ ?
+
+Disentangling both incentives by producing two routing scores opens a substantial design space. For example, consolidating both scores for top- $K$ selection can be done as a sum, product, or harmonic mean.
+Additionally, instead of consolidating scores, one may select two different top- $K$ subsets of tokens for $Q$ and $K$ / $V$ , and compute cross-attention, or implement sparsity only in keys and values.
+
+We test four of these configurations:
+
+• 
+
+Output-only: the default MoDDiT, gating only the self-attention output via $RAV$ .
+
+• 
+
+Shared value/output: gating the output and value by the same routing score via $RARV$ .
+
+• 
+
+Separate routers: two routers per attention operation, producing $R_{O}$ and $R_{V}$ , and selecting tokens independently, then gating as $R_{O}AR_{V}V$ .
+
+• 
+
+Sparse Q/dense KV: All tokens enter attention as context, but only selected tokens contribute to the output.
+
+Figure 9: Earlier routing sweep: FID and sFID versus counted denoiser arithmetic across sampling lengths and nominal capacities, using 10,000 images per point at 64, 128, 256, 512 denoising steps with classifier-free guidance scale of $4.0$ .
+
+## A.3.2 Selection and capacity ablations
+
+Figure 10: Routing selection and capacity ablations. Shared whole-block routing, separate fixed-capacity routing, separate adaptive routing and random selection use 25% MoDDiT models trained for 400k updates from a common initialization.
+
+## Appendix B 1X video prediction
+
+## B.1 Training and evaluation
+
+Dataset
+
+We use the 1X World Modeling Dataset (1X, 2025), with $512\times 512$ video at 30 Hz and 25-dimensional robot states.
+
+Model architecture
+
+We use the $12.5\%$ -capacity DiT-L/2, block-replacement scheme and register count from section A.1. The frozen Cosmos CV8x8x8 tokenizer (NVIDIA, 2025) produces $64\times 64\times 16$ latent frames. Each frame contains 1024 spatial tokens and eight state tokens in addition to the registers. We adopt spatiotemporal attention from (Russell et al., 2025), in which a token at a fixed spatial position and timestep attends to all tokens at the same timestep, and all tokens at the same spatial position in the past.
+
+Training
+
+We train from scratch with seed 0, using the AdamW settings and weight EMA from section A.1. Global batch sizes are 256 for ST-MoDDiT and 217 for ST-DiT. The learning rate warms up for 5,000 steps, then follows a cosine schedule towards $10^{-5}$ at 1M steps. Routing uses Gumbel-sigmoid temperature 5.
+
+Inference
+
+We encode the first 17 frames, then autoregressively predict eight latents (64 frames), retaining three context latents and conditioning on the next eight recorded robot states. Sampling uses 128 DDPM steps per latent and the classifier-free guidance scale from section A.1.
+
+Evaluation
+
+For table 1, we evaluate both models’ EMA checkpoints at exactly 200,000 optimizer updates on 400 paired, non-overlapping 81-frame windows from 249 segments in one video from the raw validation v2.0 split. Clip identities and sampling seeds are shared across models. PSNR is computed against raw RGB frames at 0.5, 1 and 2 seconds after the observed context, averaging squared error across pixels and channels before conversion to dB. We report the clip-weighted mean and paired sparse-minus-dense gains. Pointwise 95% percentile confidence intervals use 20,000 paired bootstrap draws over segments, with seed 20261011, retaining all windows within each sampled segment. These intervals reflect evaluation variability, not training-seed variability. The temporal-change analysis in section B.2 uses its separately saved 300k, 100-clip cohort.
+
+We count denoiser FLOPs over the first clip’s complete eight-latent rollout (128 DDPM calls per latent, CFG 1.5), including both guidance branches and all dense and routed blocks. Registered matrix, convolution and attention operations count a multiply-add as two FLOPs; tokenizer, scalar/nonlinear, normalization, selection and I/O work are excluded. The table reports total rollout TFLOPs, not per-call GFLOPs or measured throughput.
+
+## B.2 Temporal change and allocation
+
+Using the setup in section B.1, we measure temporal change by averaging absolute adjacent-frame grayscale differences over each latent’s temporal interval and spatial token footprint, including interval boundaries. For each spatial patch, allocation is the mean of its binary selection mask over attention and MLP branches, routed blocks, and denoising steps, expressed as a percentage. We use only the conditional guidance branch and exclude state/register tokens and dense blocks.
+
+For fig. 5, we clip frame differences at the global 99th percentile and group them into 100 equal-width bins. The line shows mean allocation; shading spans the within-bin 12.5th–87.5th percentiles, describing observed variation rather than uncertainty in the mean. Higher temporal change is associated with greater allocation, but frame difference is not optical flow, and this association does not establish a causal benefit from routing.
+
+## Appendix C Self-Forcing adaptation
+
+## C.1 Sparse architecture and adaptation
+
+We follow the chunk-wise Self-Forcing DMD protocol (Huang et al., 2025), including its prompt data, optimization settings, and inference procedure, with the following sparse adaptation details.
+
+Model architecture
+
+Starting from the released ODE checkpoint, we keep every third block dense and add separate routers of hidden width 256 for self-attention queries and MLP tokens in the remaining blocks. Keys, values, and text cross-attention remain dense, and we use straight-through gates to keep the output magnitude of the pretrained model. Attention uses fixed-count selection; MLP selection is fixed-count for Funnel20 and threshold-based for Funnel50 (section C.1).
+
+Capacity schedules
+
+We experiment with two MoDDiT models with capacity schedules we call Funnel20 and Funnel50. Across the 30 blocks, target capacity decreases linearly from 100% at block 1 to 20% or 50% at block 30, respectively. Blocks 1, 4, 7, …, 28 override this schedule and remain fully dense. The names are chosen as the final-block targets, not the average model-wide capacity.
+
+Initial qualitative experiments showed that increasing capacity in early blocks could recover structure that was otherwise lost under aggressive sparsity. We also retain dense keys and values, including cached context, so selected queries can attend to all available tokens, including tokens that receive no attention update.
+
+Training
+
+We jointly adapt the student and routers for 3,000 ODE updates, reducing capacity to the target with a cosine schedule over the first 600 updates. Trajectories use 48 sampling steps and guidance scale 6, retaining five states each. We then run 25 critic warmup iterations and 1,000 DMD iterations, starting student EMA at iteration 200.
+
+Evaluation
+
+We compare the final student EMA with the released dense EMA checkpoint from Self Forcing. VBench and compute protocols are in section C.2; qualitative comparisons are in section C.3.
+
+## C.2 VBench evaluation and compute accounting
+
+Evaluation
+
+We evaluate the released dense Self-Forcing EMA checkpoint and the Funnel50/Funnel20 EMA checkpoints after 1,000 DMD iterations using the sampling settings in section C.1. We use the original English VBench prompts (Huang et al., 2023), with five samples per prompt and reproducible seeds derived from the prompt and sample index. We apply the official category normalization and weights, and the total score weights quality and semantic scores 4:1. The separate motion and instruction scores in fig. 6 use 100 Causal-Forcing motion prompts, one sample each: motion is the percentage classified as dynamic, and instruction following is 100 times the mean VisionReward yes/no judgment, encoded as 1 or $-1$ .
+
+Scores
+
+Table 3 gives the category scores and aggregates. Relative to dense Self-Forcing, Funnel50 and Funnel20 reduce the total score by 4.93% and 5.35%, respectively, while decreasing inference FLOPs by 16.8% and 24.0%. Both lose more on multiple objects and spatial relationships than on imaging quality. This could be because they concentrate compute on a single part of the image, not capturing relationships between different image parts.
+
+Table 3: VBench scores for dense Self-Forcing and percentage-point changes for sparse EMA models relative to it (positive is better). Category scores are raw values multiplied by 100; aggregates use official normalization and weighting. Deltas are computed before rounding; categories are ordered by the Funnel20 point reduction, largest first. The final row gives absolute transformer TFLOPs for the matched clip described below (lower is better).
+
+Metric
+Self-Forcing
+Funnel50
+Funnel20
+
+Total
+82.07
+ $-4.04$ 
+ $-4.39$ 
+
+Quality
+84.89
+ $-3.73$ 
+ $-3.82$ 
+
+Semantic
+70.82
+ $-5.29$ 
+ $-6.68$ 
+
+Multiple objects
+70.93
+ $-18.05$ 
+ $-21.71$ 
+
+Spatial relationship
+80.03
+ $-8.72$ 
+ $-15.26$ 
+
+Object class
+83.80
+ $-9.79$ 
+ $-11.27$ 
+
+Aesthetic quality
+64.92
+ $-3.22$ 
+ $-6.35$ 
+
+Human action
+78.20
+ $-6.40$ 
+ $-6.00$ 
+
+Subject consistency
+95.70
+ $-4.11$ 
+ $-4.52$ 
+
+Scene
+29.78
+ $-2.65$ 
+ $-3.68$ 
+
+Color
+89.94
+ $-3.49$ 
+ $-3.43$ 
+
+Background consistency
+95.22
+ $-3.06$ 
+ $-2.42$ 
+
+Temporal flickering
+99.04
+ $-2.32$ 
+ $-2.20$ 
+
+Motion smoothness
+98.56
+ $-1.58$ 
+ $-2.01$ 
+
+Temporal style
+23.44
+ $-0.90$ 
+ $-0.85$ 
+
+Overall consistency
+24.26
+ $-0.36$ 
+ $-0.71$ 
+
+Imaging quality
+70.02
+ $-0.14$ 
+ $+0.32$ 
+
+Appearance style
+19.23
+ $+1.59$ 
+ $+1.78$ 
+
+Dynamic degree
+70.00
+ $-0.56$ 
+ $+5.28$ 
+
+Transformer TFLOPs $\downarrow$ 
+950.39
+789.93
+722.53
+
+Compute
+
+We count matrix-operation FLOPs for one matched 81-frame raccoon-guitar clip at $832\times 480$ , seed 0 and batch size 1, including 28 denoising calls and six KV-cache updates. A multiply-add counts as two FLOPs. Dense Self-Forcing and Funnel20 use runtime operator shapes; Funnel50 uses recorded query and realized MLP token counts. Transformer costs are 950.39, 789.93 and 722.53 TFLOPs for dense, Funnel50 and Funnel20, giving reductions of 16.88% and 23.98%. Adding the shared text-encoder and VAE matrix/convolution cost of 289.39 TFLOPs reduces these savings to 12.94% and 18.38%. Counts exclude scalar/nonlinear operations, indexing, memory transfers and hardware padding. They describe arithmetic for this clip, not benchmark-wide averages or measured speedups; dynamic MLP allocation varies with the input.
+
+## C.3 Qualitative comparisons
+
+Figure 11: Matched MovieGen prompt 0043, seed 0, for dense Self-Forcing, Funnel50 and Funnel20. Columns show frames 0, 26, 53 and 79 at 16 fps.

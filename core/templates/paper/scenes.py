@@ -1,43 +1,38 @@
 """Сцены нового ролика — ШАБЛОН (папка core/templates/paper копируется в papers/<arxiv-id>-<слово>/).
-Паспорт — passport.py рядом; порядок работы — PLAYBOOK.md в корне.
-Кадр сцены: uv run manimgl papers/<папка>/scenes.py A01 -s -w   ·   весь ролик: uv run python core/pipeline/build.py papers/<папка>"""
+Основа — core/manimkit/film.py (кадр = фраза, превращения по меткам, точный синхрон, начало с последнего кадра прошлой сцены, проверка
+наложений), помощники кадра — core/manimkit/annot.py (стрелки на выносных, подпись с плашкой, порядок слоёв, связка панелей).
+Мир этого ролика (свои фигуры, числа из рисунка) — в world.py рядом. Правила кадра — PLAYBOOK, законы 22–35.
+Кадр сцены: uv run manimgl papers/<папка>/scenes.py A01 -w -l  ·  весь ролик: uv run python core/pipeline/build.py papers/<папка>"""
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = next(d for d in HERE.parents if (d / "pyproject.toml").exists())  # корень репозитория, откуда бы ни лежал файл
-sys.path.insert(0, str(ROOT / "core"))  # общая часть: manimkit
-sys.path.insert(0, str(HERE))           # своя часть статьи: паспорт, текст, модели
+ROOT = next(d for d in HERE.parents if (d / "pyproject.toml").exists())
+sys.path.insert(0, str(ROOT / "core"))
+sys.path.insert(0, str(HERE))
 from manimlib import *
 from manimkit import *
+from manimkit.annot import *
+from manimkit.film import film_base
 import passport as P
+import narration as N
 
-Base = story_base(P.STATIONS, P.SCENES)  # темп под речь + полоса «мы здесь»
-
-C_A = "#58a6ff"     # смысловые имена цветов — как в паспорте COLORS
-C_NOTE = "#8b949e"
+ICONS = {}  # {"Станция": функция(масштаб) → VGroup} — значки полосы «мы здесь»
+Film, Film3D = film_base(P.STATIONS, P.SCENES, ICONS, N.TEXT, HERE)
 
 
-class A01(Base):
-    """О чём ролик, вопрос и ставка."""
+class A01(Film):
+    """Один вызов self.show на каждую фразу TEXT["A01"]; объект, который продолжается в следующем кадре, — с одной меткой tagged(m, "имя")."""
     def construct(self):
-        q = tx("Вопрос ролика", 44).to_edge(UP, buff=0.5)
-        self.play(Write(q), run_time=1.5)
-        self.play(FadeIn(pill("ставка: почему это интересно", C_A, 26).move_to(DOWN * 2.6)))
-        self.wait(2)
+        q = label("Вопрос ролика", [0, 1.5, 0], size=40)
+        self.show(tagged(q, "question"), c="о чём ролик")
 
 
-class A02(Base):
-    """Карточка статьи."""
+class A02(Film):
     def construct(self):
-        card = VGroup(tx("arXiv XXXX.XXXXX · дата", 22, C_NOTE), tx("Название статьи", 30), tx("Авторы", 24)).arrange(DOWN, buff=0.3)
-        self.play(FadeIn(card))
-        self.wait(2)
+        self.show(tagged(label("Вопрос ролика", [0, 2.6, 0], size=30), "question"), pill("ставка: почему это интересно").move_to([0, 0.5, 0]), c="ставка")
 
 
-class A03(Base):
-    """…"""
+class A03(Film):
     def construct(self):
-        self.add(head("Мир"))
-        self.play(FadeIn(note("одна мысль сцены")))
-        self.wait(2)
+        self.show(label("Мир", [0, 1.0, 0], size=36), c="одна мысль сцены")
