@@ -35,6 +35,7 @@
 - Три акта + приложение: A01–A12 рассказ, F01–F11 приложение, A13 «кто и когда». ~7,5 минут, из них рассказ ~4,5.
 - Голос: Silero `xenia`, без разметки ударений, чистка 1. Голоса OpenAI автор отверг (пафос, гнусавость), Милену — тоже.
 - Сборка: `uv run python core/pipeline/build.py papers/2610.23637-relation-gap`.
+- 📝 Статья в блоге (ru): https://www.urvanov.com/blog/relation-gap-how-many-rules/ · (en): https://www.urvanov.com/en/blog/relation-gap-how-many-rules/ — 02.11.2026, 22 картинки, формулы KaTeX, термины глоссария (репозиторий urvanov.com).
 - 🎥 YouTube (канал Digital nomads asia, доступ по ссылке): https://youtu.be/yPvbfDa_GCk — название, описание с главами, «не для детей» заполнены 21.10.2026.
 
 ## 📎 Приложение: формулы и аналогии
