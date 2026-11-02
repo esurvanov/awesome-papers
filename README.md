@@ -104,7 +104,7 @@ Then follow [PLAYBOOK.md](PLAYBOOK.md): read the paper, fill in the passport, ch
 
 ## Third-party code and licenses
 
-This repository has no license file of its own yet.
+The code and texts of this repository are under the [MIT license](LICENSE). Third-party parts below keep their own licenses. Finished films, frames and voice files are not in the repository and are not covered by it.
 
 | What | Source | License | How it is used |
 |---|---|---|---|
